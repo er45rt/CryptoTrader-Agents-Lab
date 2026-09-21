@@ -1,0 +1,88 @@
+"""Versioned, transport-agnostic event contracts (Phase 3).
+
+Contracts and semantics only: no broker, no event bus, no persistence, no business
+logic, and no execution. See :mod:`crypto_trader.events.base` for the delivery,
+ordering, and versioning rules encoded by this layer.
+"""
+
+from .base import (
+    DOMAIN_EVENT_TYPE_PATTERN,
+    FIRST_SCHEMA_VERSION,
+    DomainEvent,
+    EventEnvelope,
+    EventPayload,
+    is_valid_event_type,
+)
+from .contracts import (
+    EXECUTION_FILL_EVENT_TYPE,
+    ORDER_STATE_EVENT_TYPE,
+    RECOVERY_EVENT_TYPE,
+    RISK_DECISION_EVENT_TYPE,
+    STRATEGY_DECISION_EVENT_TYPE,
+    TRADE_INTENT_EVENT_TYPE,
+    ExecutionFillRecorded,
+    FillRecordPayload,
+    OrderStateChanged,
+    OrderStateChangePayload,
+    RecoveryStateChanged,
+    RecoveryStateChangePayload,
+    RiskDecisionPayload,
+    RiskDecisionRecorded,
+    StrategyDecisionPayload,
+    StrategyDecisionRecorded,
+    TradeIntentCreated,
+    TradeIntentPayload,
+    V1_CONTRACTS,
+)
+from .errors import (
+    DuplicateEventRegistrationError,
+    EventContractError,
+    EventValidationError,
+    UnknownEventTypeError,
+    UnsupportedSchemaVersionError,
+)
+from .registry import (
+    EventRegistry,
+    build_default_registry,
+    decode_event,
+    get_default_registry,
+    reset_default_registry,
+)
+
+__all__ = [
+    "DOMAIN_EVENT_TYPE_PATTERN",
+    "EXECUTION_FILL_EVENT_TYPE",
+    "FIRST_SCHEMA_VERSION",
+    "ORDER_STATE_EVENT_TYPE",
+    "RECOVERY_EVENT_TYPE",
+    "RISK_DECISION_EVENT_TYPE",
+    "STRATEGY_DECISION_EVENT_TYPE",
+    "TRADE_INTENT_EVENT_TYPE",
+    "DomainEvent",
+    "DuplicateEventRegistrationError",
+    "EventContractError",
+    "EventEnvelope",
+    "EventPayload",
+    "EventRegistry",
+    "EventValidationError",
+    "ExecutionFillRecorded",
+    "FillRecordPayload",
+    "OrderStateChanged",
+    "OrderStateChangePayload",
+    "RecoveryStateChanged",
+    "RecoveryStateChangePayload",
+    "RiskDecisionPayload",
+    "RiskDecisionRecorded",
+    "StrategyDecisionPayload",
+    "StrategyDecisionRecorded",
+    "TradeIntentCreated",
+    "TradeIntentPayload",
+    "UnknownEventTypeError",
+    "UnsupportedSchemaVersionError",
+    "V1_CONTRACTS",
+    "build_default_registry",
+    "decode_event",
+    "get_default_registry",
+    "is_valid_event_type",
+    "reset_default_registry",
+]
