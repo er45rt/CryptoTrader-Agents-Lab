@@ -15,9 +15,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crypto_trader")
 
-# Default configuration
+# Default configuration.
+# The default market-data provider is the official Binance public REST API
+# (https://api.binance.com), which requires no API key or other credential.
+# BINANCE_API_BASE_URL may override the host; BINANCE_HTTP_TIMEOUT and
+# BINANCE_HTTP_MAX_ATTEMPTS tune the request timeout and retry bound.
+DEFAULT_TARGET_SYMBOL = 'ETHUSDT'
+
 DEFAULT_CONFIG = {
-    'target_symbol': 'ETHUSDT',
+    'target_symbol': DEFAULT_TARGET_SYMBOL,
     'kline_interval': '4h',
     'kline_limit': 72,
     'output_dir': 'output'
@@ -39,17 +45,21 @@ def setup_environment() -> bool:
     else:
         logger.warning(f".env file not found at {dotenv_path}. Ensure API keys are set in your environment.")
     
-    # Check for necessary API keys
-    missing_critical_keys = False
-    
-    if not os.getenv("RAPIDAPI_KEY") or not os.getenv("RAPIDAPI_BINANCE_HOST"):
-        logger.error("RAPIDAPI_KEY or RAPIDAPI_BINANCE_HOST not found. Please set them in your .env file.")
-        missing_critical_keys = True
-    
+    # The market-data layer uses the official Binance public REST API and needs
+    # no API key. We only sanity-check an operator-supplied base URL override.
+    binance_base_url = (os.getenv("BINANCE_API_BASE_URL") or "").strip()
+    if binance_base_url and not binance_base_url.startswith(("https://", "http://")):
+        logger.error(
+            "BINANCE_API_BASE_URL must start with http:// or https:// (got %r). "
+            "Unset it to use the default official endpoint.",
+            binance_base_url,
+        )
+        return False
+
     if not os.getenv("SERPER_API_KEY"):
         logger.warning("SERPER_API_KEY not found. The NewsAndSentimentResearcherAgent might not function correctly.")
-    
-    return not missing_critical_keys
+
+    return True
 
 def validate_inputs(config: Dict[str, Any]) -> bool:
     """

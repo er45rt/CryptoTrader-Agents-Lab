@@ -17,7 +17,7 @@ crypto_trader/
 │       │   ├── agents.yaml  # Agent configurations
 │       │   └── tasks.yaml   # Task configurations
 │       ├── tools/
-│       │   └── binance_rapidapi_tool.py  # Tool for Binance API interactions
+│       │   └── binance_public_tool.py    # Tool for official Binance public market data
 │       ├── crew.py    # Main crew definition with agents and tasks
 │       ├── main.py    # Entry point and CLI interface
 │       └── __init__.py
@@ -48,8 +48,10 @@ crewai install
 
 4. Configure API keys:
    - Add `OPENAI_API_KEY` to `.env` file (for LLM access)
-   - Add `RAPIDAPI_KEY` and `RAPIDAPI_BINANCE_HOST` to `.env` file (for Binance data access)
    - Add `SERPER_API_KEY` to `.env` file (for web search capabilities)
+   - No Binance credentials are needed: market data comes from the official
+     Binance public REST API (`https://api.binance.com`). Optionally set
+     `BINANCE_API_BASE_URL`, `BINANCE_HTTP_TIMEOUT`, or `BINANCE_HTTP_MAX_ATTEMPTS`.
 
 ## Core Components
 
@@ -59,7 +61,7 @@ The system employs four specialized AI agents:
 
 1. **Binance Data Analyst**
    - Role: Fetch and process cryptocurrency market data from Binance
-   - Tools: BinanceRapidApiTool
+   - Tools: BinancePublicTool (official Binance public REST API, read-only)
    - LLM: nvidia_nim/meta/llama-3.3-70b-instruct
 
 2. **News and Sentiment Researcher**
@@ -90,7 +92,7 @@ The agents collaborate on a sequence of tasks:
 
 The project uses custom and third-party tools:
 
-1. **BinanceRapidApiTool**: Custom tool for accessing Binance cryptocurrency data via RapidAPI
+1. **BinancePublicTool**: Custom tool for accessing official Binance public market data (klines, price ticker, 24hr stats) with request timeout, bounded retry with backoff, and response validation. Public/read-only endpoints only.
 2. **SerperDevTool**: For web searching capabilities (from crewai_tools)
 3. **ScrapeWebsiteTool**: For extracting information from web pages (from crewai_tools)
 
@@ -105,7 +107,7 @@ crewai run
 ```
 
 This will:
-1. Generate a trading plan for the default cryptocurrency (PEPEUSDT)
+1. Generate a trading plan for the default cryptocurrency (ETHUSDT)
 2. Save the report to the `output/` directory
 
 ### Advanced Usage
@@ -117,7 +119,7 @@ python -m src.crypto_trader.main --symbol BTCUSDT --interval 1h --limit 100 --ou
 ```
 
 Available parameters:
-- `--symbol` or `-s`: Cryptocurrency trading symbol (default: PEPEUSDT)
+- `--symbol` or `-s`: Cryptocurrency trading symbol (default: ETHUSDT)
 - `--interval` or `-i`: Kline interval (default: 4h)
 - `--limit` or `-l`: Number of klines to fetch (default: 72)
 - `--output` or `-o`: Output directory (default: output)
@@ -156,7 +158,11 @@ Common issues:
 
 1. **API Key Errors**: Ensure all required API keys are properly set in the `.env` file
 2. **Dependency Issues**: Make sure UV is installed and dependencies are properly locked
-3. **Rate Limiting**: If hitting RapidAPI rate limits, consider implementing retry logic or upgrading your plan
+3. **Rate Limiting**: Binance returns HTTP 429 with a `Retry-After` header when throttled. The tool retries within a bounded budget and otherwise reports a structured error; tune with `BINANCE_HTTP_MAX_ATTEMPTS`.
+
+### Phase 1 migration note
+
+The default market-data provider is the official Binance public REST API. `RAPIDAPI_KEY` and `RAPIDAPI_BINANCE_HOST` are no longer used and can be removed from any local `.env`. The tool only calls public market-data endpoints (`/api/v3/klines`, `/api/v3/ticker/price`, `/api/v3/ticker/24hr`); it never places orders and never uses authenticated trading endpoints. The LLM configuration and the Serper-based news research are unchanged.
 
 ## Dependencies
 

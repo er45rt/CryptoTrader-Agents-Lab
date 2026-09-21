@@ -5,7 +5,7 @@ from crewai import Agent, Task, Crew, Process
 from crewai.project import CrewBase, agent, crew, task
 
 # Import existing and new tools
-from .tools.binance_rapidapi_tool import BinanceRapidApiTool
+from .tools.binance_public_tool import BinancePublicTool
 from crewai_tools import SerperDevTool, ScrapeWebsiteTool
 
 # Configure logging
@@ -26,14 +26,14 @@ class ToolManager:
             cls._instance = cls()
         return cls._instance
     
-    def get_binance_tool(self) -> BinanceRapidApiTool:
-        """Get or create the Binance RapidAPI tool instance"""
+    def get_binance_tool(self) -> BinancePublicTool:
+        """Get or create the Binance public market data tool instance"""
         if 'binance' not in self._tools:
             try:
-                self._tools['binance'] = BinanceRapidApiTool()
-                logger.debug("BinanceRapidApiTool initialized successfully")
+                self._tools['binance'] = BinancePublicTool()
+                logger.debug("BinancePublicTool initialized successfully")
             except Exception as e:
-                logger.error(f"Failed to initialize BinanceRapidApiTool: {e}")
+                logger.error(f"Failed to initialize BinancePublicTool: {e}")
                 raise
         return self._tools['binance']
     

@@ -2,7 +2,7 @@
 fetch_binance_klines_task:
   agent: binance_data_analyst
   description: >
-    As of {current_datetime}, using the "Binance Market Data Tool (via RapidAPI)", fetch historical Kline/Candlestick data.
+    As of {current_datetime}, using the "Binance Market Data Tool (Official Public API)", fetch historical Kline/Candlestick data.
     Action: 'get_kline_data'.
     Parameters:
       'symbol': '{target_symbol}'
@@ -22,7 +22,7 @@ fetch_binance_klines_task:
 fetch_binance_price_ticker_task:
   agent: binance_data_analyst
   description: >
-    As of {current_datetime}, using the "Binance Market Data Tool (via RapidAPI)", fetch the current price ticker.
+    As of {current_datetime}, using the "Binance Market Data Tool (Official Public API)", fetch the current price ticker.
     Action: 'get_symbol_price_ticker'.
     Parameters:
       'symbol': '{target_symbol}'
@@ -39,7 +39,7 @@ fetch_binance_price_ticker_task:
 fetch_binance_24hr_stats_task:
   agent: binance_data_analyst
   description: >
-    As of {current_datetime}, using the "Binance Market Data Tool (via RapidAPI)", fetch the 24-hour price change statistics.
+    As of {current_datetime}, using the "Binance Market Data Tool (Official Public API)", fetch the 24-hour price change statistics.
     Action: 'get_24hr_ticker'.
     Parameters:
       'symbol': '{target_symbol}'
