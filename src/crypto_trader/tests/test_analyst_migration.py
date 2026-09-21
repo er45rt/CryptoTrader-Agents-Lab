@@ -23,15 +23,18 @@ from crypto_trader.llm import (
     get_llm,
     load_profile,
 )
+from crypto_trader.tests.agent_expectations import (
+    EXPECTED_PROFILE_NAMES,
+    LEGACY_AGENT_MODEL,
+    LEGACY_AGENT_NAMES,
+    MIGRATED_AGENT_NAMES,
+)
 from crypto_trader.tools.binance_public_tool import BinancePublicTool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = PROJECT_ROOT / "src" / "crypto_trader"
 CONFIG_DIR = PACKAGE_DIR / "config"
 
-LEGACY_AGENT_MODEL = "openai/qwen-turbo-latest"
-LEGACY_AGENTS = ("binance_data_analyst", "news_and_sentiment_researcher")
-MIGRATED_AGENTS = ("trading_plan_strategist", "crypto_analyst")
 SENTINEL_KEY = "sentinel-not-a-real-key"
 
 
@@ -63,7 +66,7 @@ def crew_with_fake_factory(monkeypatch):
 
 # --- Exactly two agents migrated -------------------------------------------
 
-def test_exactly_two_agents_use_the_centralized_factory(crew_with_fake_factory):
+def test_all_migrated_agents_use_the_centralized_factory(crew_with_fake_factory):
     crew, recorded, _ = crew_with_fake_factory
 
     for builder in (
@@ -74,8 +77,8 @@ def test_exactly_two_agents_use_the_centralized_factory(crew_with_fake_factory):
     ):
         builder()
 
-    assert sorted(recorded) == sorted([CANARY_PROFILE_NAME, ANALYST_PROFILE_NAME])
-    assert len(recorded) == len(ACTIVE_PROFILE_NAMES) == 2
+    assert sorted(recorded) == sorted(EXPECTED_PROFILE_NAMES)
+    assert len(recorded) == len(ACTIVE_PROFILE_NAMES) == len(MIGRATED_AGENT_NAMES)
 
 
 def test_analyst_is_wired_through_the_factory(crew_with_fake_factory):
@@ -147,7 +150,7 @@ def test_analyst_and_strategist_share_one_provider_rate_limiter():
 def test_legacy_agents_keep_their_previous_configuration(crew_with_fake_factory):
     crew, _, _ = crew_with_fake_factory
 
-    for name in LEGACY_AGENTS:
+    for name in LEGACY_AGENT_NAMES:
         agent = getattr(crew, name)()
         assert agent.llm.model == LEGACY_AGENT_MODEL, f"{name} must stay on the legacy model"
 
@@ -155,9 +158,9 @@ def test_legacy_agents_keep_their_previous_configuration(crew_with_fake_factory)
 def test_agents_yaml_hardcodes_only_the_unmigrated_agents():
     agents = yaml.safe_load((CONFIG_DIR / "agents.yaml").read_text(encoding="utf-8"))
 
-    for name in MIGRATED_AGENTS:
+    for name in MIGRATED_AGENT_NAMES:
         assert "llm" not in agents[name], f"{name} must not hardcode a provider/model"
-    for name in LEGACY_AGENTS:
+    for name in LEGACY_AGENT_NAMES:
         assert agents[name]["llm"] == LEGACY_AGENT_MODEL
 
 

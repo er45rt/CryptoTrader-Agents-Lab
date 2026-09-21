@@ -295,9 +295,11 @@ def test_reasoner_profile_is_defined_but_not_active():
     assert profile.api_key_env == "DEEPSEEK_API_KEY"
 
 
-def test_active_profiles_are_the_two_migrated_agents():
-    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME, "deepseek_analyst")
-    assert CANARY_PROFILE_NAME == "deepseek_canary"
+def test_active_profiles_match_the_migrated_agents():
+    from crypto_trader.tests.agent_expectations import EXPECTED_PROFILE_NAMES
+
+    assert ACTIVE_PROFILE_NAMES == EXPECTED_PROFILE_NAMES
+    assert CANARY_PROFILE_NAME in ACTIVE_PROFILE_NAMES
     assert "deepseek_reasoner" not in ACTIVE_PROFILE_NAMES
 
 
@@ -319,8 +321,14 @@ def test_reasoner_profile_is_not_referenced_by_runtime_code():
 def test_active_profiles_are_wired_in_crew_source():
     from pathlib import Path
 
+    from crypto_trader.tests.agent_expectations import AGENT_PROFILE_MAP
+
     crew_source = (Path(__file__).resolve().parent.parent / "crew.py").read_text(encoding="utf-8")
 
-    assert "get_llm(CANARY_PROFILE_NAME)" in crew_source
-    assert "get_llm(ANALYST_PROFILE_NAME)" in crew_source
-    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME, "deepseek_analyst")
+    constants = {
+        "deepseek_canary": "CANARY_PROFILE_NAME",
+        "deepseek_analyst": "ANALYST_PROFILE_NAME",
+        "deepseek_market": "MARKET_PROFILE_NAME",
+    }
+    for profile_name in AGENT_PROFILE_MAP.values():
+        assert f"get_llm({constants[profile_name]})" in crew_source

@@ -1,8 +1,9 @@
 """Canary migration boundary tests (Phase 2).
 
-Verifies that exactly one agent - the Crypto Trading Plan Strategist - resolves its
-LLM through the centralized factory with the DeepSeek profile, that the other
-agents keep their existing configuration, and that Phase 1 constraints still hold.
+Verifies that the Crypto Trading Plan Strategist resolves its LLM through the
+centralized factory with its DeepSeek profile, that migrated agents (per
+``agent_expectations``) each use their own profile, that unmigrated agents keep their
+existing configuration, and that Phase 1 constraints still hold.
 """
 
 from pathlib import Path
@@ -14,15 +15,17 @@ from crewai.llms.base_llm import BaseLLM
 import crypto_trader.crew as crew_module
 from crypto_trader.crew import CryptoTraderCrew
 from crypto_trader.llm import CANARY_PROFILE_NAME, trading_plan_guardrail
+from crypto_trader.tests.agent_expectations import (
+    EXPECTED_PROFILE_NAMES,
+    LEGACY_AGENT_MODEL,
+    LEGACY_AGENT_NAMES,
+    MIGRATED_AGENT_NAMES,
+)
 from crypto_trader.tools.binance_public_tool import BinancePublicTool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_DIR = PROJECT_ROOT / "src" / "crypto_trader" / "config"
 PACKAGE_DIR = PROJECT_ROOT / "src" / "crypto_trader"
-
-LEGACY_AGENT_MODEL = "openai/qwen-turbo-latest"
-MIGRATED_AGENT_KEY = "trading_plan_strategist"
-
 
 class FakeLLM(BaseLLM):
     """Injected stand-in so the canary test never contacts DeepSeek."""
@@ -64,20 +67,20 @@ def test_legacy_agents_keep_their_existing_model(crew_with_canary_monkeypatched)
     """Agents not yet migrated must stay on their original llm configuration."""
     crew, recorded, _ = crew_with_canary_monkeypatched
 
-    for agent in (crew.binance_data_analyst(), crew.news_and_sentiment_researcher()):
-        assert agent.llm.model == LEGACY_AGENT_MODEL
+    for name in LEGACY_AGENT_NAMES:
+        assert getattr(crew, name)().llm.model == LEGACY_AGENT_MODEL
 
-    # Only the two migrated agents (strategist, analyst) consult the factory.
-    assert sorted(recorded) == sorted([CANARY_PROFILE_NAME, "deepseek_analyst"])
+    # Only migrated agents consult the factory, each with its own profile.
+    assert sorted(recorded) == sorted(EXPECTED_PROFILE_NAMES)
 
 
 def test_agents_yaml_only_migrated_agents_drop_hardcoded_model():
     agents = yaml.safe_load((CONFIG_DIR / "agents.yaml").read_text(encoding="utf-8"))
 
-    assert "llm" not in agents[MIGRATED_AGENT_KEY]
-    assert "llm" not in agents["crypto_analyst"]  # Phase 2, agent 2
+    for name in MIGRATED_AGENT_NAMES:
+        assert "llm" not in agents[name], f"{name} must not hardcode a provider/model"
     for name, config in agents.items():
-        if name in (MIGRATED_AGENT_KEY, "crypto_analyst"):
+        if name in MIGRATED_AGENT_NAMES:
             continue
         assert config["llm"] == LEGACY_AGENT_MODEL, f"{name} must remain on its current model"
 

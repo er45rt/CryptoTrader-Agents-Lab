@@ -10,7 +10,13 @@ from crewai_tools import SerperDevTool, ScrapeWebsiteTool
 
 # Centralized LLM layer (Phase 2). Only the canary agent uses it for now; the
 # remaining agents keep their existing YAML-configured model until migrated.
-from .llm import ANALYST_PROFILE_NAME, CANARY_PROFILE_NAME, get_llm, trading_plan_guardrail
+from .llm import (
+    ANALYST_PROFILE_NAME,
+    CANARY_PROFILE_NAME,
+    MARKET_PROFILE_NAME,
+    get_llm,
+    trading_plan_guardrail,
+)
 
 # Configure logging
 logger = logging.getLogger("crypto_trader.crew")
@@ -102,6 +108,9 @@ class CryptoTraderCrew():
             return Agent(
                 config=self.agents_config['binance_data_analyst'],
                 tools=[self.tool_manager.get_binance_tool()],
+                # Phase 2 (agent 3): provider path only - the Binance tool wiring above is
+                # unchanged, and the LLM now comes from the centralized factory.
+                llm=get_llm(MARKET_PROFILE_NAME),
                 verbose=self.verbose
             )
         except Exception as e:
