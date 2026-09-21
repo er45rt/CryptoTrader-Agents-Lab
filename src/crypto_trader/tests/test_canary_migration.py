@@ -51,39 +51,33 @@ def crew_with_canary_monkeypatched(monkeypatch):
 
 # --- Only the canary uses the factory --------------------------------------
 
-def test_only_strategist_resolves_its_llm_through_the_factory(crew_with_canary_monkeypatched):
+def test_strategist_resolves_its_llm_through_the_factory(crew_with_canary_monkeypatched):
     crew, recorded, fake = crew_with_canary_monkeypatched
 
-    crew.binance_data_analyst()
-    crew.news_and_sentiment_researcher()
-    crew.crypto_analyst()
     strategist = crew.trading_plan_strategist()
 
-    assert recorded == [CANARY_PROFILE_NAME]
+    assert CANARY_PROFILE_NAME in recorded
     assert strategist.llm is fake
 
 
-def test_other_agents_keep_their_existing_model(crew_with_canary_monkeypatched):
+def test_legacy_agents_keep_their_existing_model(crew_with_canary_monkeypatched):
+    """Agents not yet migrated must stay on their original llm configuration."""
     crew, recorded, _ = crew_with_canary_monkeypatched
 
-    others = [
-        crew.binance_data_analyst(),
-        crew.news_and_sentiment_researcher(),
-        crew.crypto_analyst(),
-    ]
-
-    for agent in others:
+    for agent in (crew.binance_data_analyst(), crew.news_and_sentiment_researcher()):
         assert agent.llm.model == LEGACY_AGENT_MODEL
-    # Exactly one factory call for the whole crew: the strategist canary.
-    assert recorded == [CANARY_PROFILE_NAME]
+
+    # Only the two migrated agents (strategist, analyst) consult the factory.
+    assert sorted(recorded) == sorted([CANARY_PROFILE_NAME, "deepseek_analyst"])
 
 
-def test_agents_yaml_only_migrated_agent_drops_hardcoded_model():
+def test_agents_yaml_only_migrated_agents_drop_hardcoded_model():
     agents = yaml.safe_load((CONFIG_DIR / "agents.yaml").read_text(encoding="utf-8"))
 
     assert "llm" not in agents[MIGRATED_AGENT_KEY]
+    assert "llm" not in agents["crypto_analyst"]  # Phase 2, agent 2
     for name, config in agents.items():
-        if name == MIGRATED_AGENT_KEY:
+        if name in (MIGRATED_AGENT_KEY, "crypto_analyst"):
             continue
         assert config["llm"] == LEGACY_AGENT_MODEL, f"{name} must remain on its current model"
 

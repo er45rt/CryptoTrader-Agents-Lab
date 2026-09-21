@@ -8,6 +8,7 @@ rate-limiting policy.
 
 from .config import (
     ACTIVE_PROFILE_NAMES,
+    ANALYST_PROFILE_NAME,
     AVAILABLE_PROFILES,
     CANARY_PROFILE_NAME,
     LLMConfigError,
@@ -41,6 +42,7 @@ from .schemas import (
 
 __all__ = [
     "ACTIVE_PROFILE_NAMES",
+    "ANALYST_PROFILE_NAME",
     "AVAILABLE_PROFILES",
     "CANARY_PROFILE_NAME",
     "LLMConfigError",

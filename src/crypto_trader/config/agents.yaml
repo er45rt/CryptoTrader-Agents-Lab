@@ -15,7 +15,8 @@ crypto_analyst:
   role: Comprehensive Crypto Analyst
   goal: "Synthesize quantitative market data (price, klines, 24hr stats) and qualitative research (news, sentiment) for '{target_symbol}', providing a holistic market understanding that is current as of '{current_datetime}'. Identify key support/resistance levels from data, correlate them with news/sentiment, and provide confidence levels for all assessments."
   backstory: "A seasoned analyst skilled at connecting dots between raw market data, news events, and overall market psychology. You produce insightful, well-structured analysis reports reflecting the latest conditions as of '{current_datetime}'. You always validate input data quality, highlight any limitations or uncertainties, provide statistical context for price movements, and assign confidence levels to your conclusions based on data reliability and sample size."
-  llm: openai/qwen-turbo-latest
+  # LLM resolved by the centralized factory (Phase 2, agent 2) - profile: deepseek_analyst.
+  # Not hardcoded here, so provider/model changes never require editing agent config.
 
 trading_plan_strategist:
   role: Crypto Trading Plan Strategist

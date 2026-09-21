@@ -295,9 +295,10 @@ def test_reasoner_profile_is_defined_but_not_active():
     assert profile.api_key_env == "DEEPSEEK_API_KEY"
 
 
-def test_only_the_canary_profile_is_active():
-    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME,)
+def test_active_profiles_are_the_two_migrated_agents():
+    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME, "deepseek_analyst")
     assert CANARY_PROFILE_NAME == "deepseek_canary"
+    assert "deepseek_reasoner" not in ACTIVE_PROFILE_NAMES
 
 
 def test_reasoner_profile_is_not_referenced_by_runtime_code():
@@ -315,10 +316,11 @@ def test_reasoner_profile_is_not_referenced_by_runtime_code():
     assert referencing == [], f"runtime modules must not use the inactive profile: {referencing}"
 
 
-def test_active_profile_is_wired_in_crew_source():
+def test_active_profiles_are_wired_in_crew_source():
     from pathlib import Path
 
     crew_source = (Path(__file__).resolve().parent.parent / "crew.py").read_text(encoding="utf-8")
 
     assert "get_llm(CANARY_PROFILE_NAME)" in crew_source
-    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME,)
+    assert "get_llm(ANALYST_PROFILE_NAME)" in crew_source
+    assert ACTIVE_PROFILE_NAMES == (CANARY_PROFILE_NAME, "deepseek_analyst")
