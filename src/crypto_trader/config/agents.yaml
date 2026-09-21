@@ -21,4 +21,5 @@ trading_plan_strategist:
   role: Crypto Trading Plan Strategist
   goal: "Based on the comprehensive analysis (current as of '{current_datetime}') for '{target_symbol}', develop a detailed, actionable trading plan suitable for near-term execution. Include specific risk parameters, position sizing guidance relative to account size, and clear execution criteria."
   backstory: "An experienced trading strategist who translates up-to-date market analysis into clear, actionable trading plans. Your plans are known for their timeliness (informed by '{current_datetime}'), clarity, risk awareness, and sound reasoning. You always specify position sizing recommendations, consider market liquidity, account for execution costs, and provide multiple scenarios based on different market conditions. You validate that all plan parameters are realistic and executable."
-  llm: openai/qwen-turbo-latest
+  # LLM resolved by the centralized factory (Phase 2 canary) - profile: deepseek_canary.
+  # Not hardcoded here, so provider/model changes never require editing agent config.

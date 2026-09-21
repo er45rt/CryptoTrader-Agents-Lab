@@ -8,6 +8,10 @@ from crewai.project import CrewBase, agent, crew, task
 from .tools.binance_public_tool import BinancePublicTool
 from crewai_tools import SerperDevTool, ScrapeWebsiteTool
 
+# Centralized LLM layer (Phase 2). Only the canary agent uses it for now; the
+# remaining agents keep their existing YAML-configured model until migrated.
+from .llm import CANARY_PROFILE_NAME, get_llm, trading_plan_guardrail
+
 # Configure logging
 logger = logging.getLogger("crypto_trader.crew")
 
@@ -165,6 +169,9 @@ class CryptoTraderCrew():
         try:
             return Agent(
                 config=self.agents_config['trading_plan_strategist'],
+                # Canary migration: the strategist resolves its provider/model from the
+                # centralized LLM factory (named profile) instead of hardcoding it.
+                llm=get_llm(CANARY_PROFILE_NAME),
                 verbose=self.verbose
             )
         except Exception as e:
@@ -294,7 +301,11 @@ class CryptoTraderCrew():
             return Task(
                 config=self.tasks_config['develop_trading_plan_task'],
                 agent=self.trading_plan_strategist(),
-                context=[self.analyze_crypto_data_task()]
+                context=[self.analyze_crypto_data_task()],
+                # Structured-output enforcement: invalid plans get one bounded repair
+                # attempt, then the task fails closed rather than passing bad fields on.
+                guardrail=trading_plan_guardrail,
+                guardrail_max_retries=1
             )
         except Exception as e:
             logger.error(f"Failed to create develop_trading_plan_task: {e}")

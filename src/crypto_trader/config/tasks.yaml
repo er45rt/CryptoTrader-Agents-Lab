@@ -164,7 +164,26 @@ develop_trading_plan_task:
        - Optimal timing considerations
        - Order type recommendations
        - Market impact considerations
-    
+
+    MACHINE-READABLE SUMMARY (REQUIRED - this output is validated; if it is missing or
+    invalid the task is retried once and then fails rather than passing bad fields on):
+    End your response with exactly one fenced ```json code block containing only these keys:
+      "symbol": string (e.g. "ETHUSDT")
+      "bias": one of "bullish", "bearish", "neutral"
+      "confidence": one of "low", "medium", "high"
+      "human_readable_plan": string - your full markdown plan from sections 1-6 above
+      "position_size_pct": number - percent of account equity, greater than 0 and at most 100
+      "entry_low": number - lower bound of the entry zone
+      "entry_high": number - upper bound of the entry zone (must be >= entry_low)
+      "stop_loss": number - must sit OUTSIDE the entry zone (below entry_low, or above entry_high)
+      "take_profit_targets": array of objects with "label" (string, optional), "level" (number) and
+        "allocation_pct" (number); the allocation_pct values must sum to 100
+      "max_loss_pct": number - greater than 0 and at most 100
+      "risk_reward_ratio": number - must not be negative
+      "plan_validity": string - timeframe and conditions under which the plan remains valid
+      "invalidation_conditions": array of non-empty strings - at least one
+    Use JSON numbers (not strings) for every numeric field, and do not add extra keys.
+
     VALIDATION REQUIREMENTS:
     - Ensure risk/reward ratio is favorable (minimum 1:1.5)
     - Verify all price levels are realistic given current market conditions
@@ -182,5 +201,6 @@ develop_trading_plan_task:
     6. Execution Guidelines (timing, order types, monitoring requirements)
     7. Plan Validity (timeframe, reassessment triggers)
     8. Disclaimer (plan limitations and assumptions)
+    9. A single machine-readable ```json block with the keys listed in the task description
     This is the final crew output with clear actionability and risk boundaries.
   output_file: output/trading_plan_{target_symbol}_{filename_datetime}.md

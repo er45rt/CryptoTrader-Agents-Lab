@@ -75,7 +75,7 @@ The system employs four specialized AI agents:
 
 4. **Trading Plan Strategist**
    - Role: Develop actionable trading plans based on analysis
-   - LLM: nvidia_nim/deepseek-ai/deepseek-r1
+   - LLM: centralized factory profile `deepseek_canary` (DeepSeek, output schema-validated)
 
 ### Tasks
 
@@ -163,6 +163,24 @@ Common issues:
 ### Phase 1 migration note
 
 The default market-data provider is the official Binance public REST API. `RAPIDAPI_KEY` and `RAPIDAPI_BINANCE_HOST` are no longer used and can be removed from any local `.env`. The tool only calls public market-data endpoints (`/api/v3/klines`, `/api/v3/ticker/price`, `/api/v3/ticker/24hr`); it never places orders and never uses authenticated trading endpoints. The LLM configuration and the Serper-based news research are unchanged.
+
+## Centralized LLM layer (Phase 2, canary)
+
+LLM access is centralized in `src/crypto_trader/llm/`:
+
+- `config.py` — named, environment-driven profiles. `deepseek_canary` targets the official
+  DeepSeek API (`deepseek/deepseek-chat`) and reads `DEEPSEEK_API_KEY`; `deepseek_reasoner`
+  is also defined. Credentials are never embedded, printed, or logged.
+- `factory.py` — `get_llm(profile)` returns a CrewAI LLM wrapped with a centralized timeout,
+  provider-level rate limiting, and bounded retry with exponential backoff. Failures raise a
+  typed `LLMProviderError`. A `builder` argument provides dependency injection for tests.
+- `schemas.py` — a Pydantic `TradingPlan` schema plus the guardrail that validates the
+  strategist's machine-readable JSON block. Invalid output triggers one bounded repair and
+  then fails closed instead of passing bad fields downstream.
+
+The canary migration covers exactly one agent: the **Crypto Trading Plan Strategist** now
+resolves its LLM through `get_llm("deepseek_canary")` and its output is schema-validated.
+The other agents keep their existing `llm:` values in `config/agents.yaml` until migrated.
 
 ## Dependencies
 
