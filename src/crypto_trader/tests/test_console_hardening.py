@@ -329,6 +329,7 @@ def test_active_profiles_are_wired_in_crew_source():
         "deepseek_canary": "CANARY_PROFILE_NAME",
         "deepseek_analyst": "ANALYST_PROFILE_NAME",
         "deepseek_market": "MARKET_PROFILE_NAME",
+        "deepseek_news": "NEWS_PROFILE_NAME",
     }
     for profile_name in AGENT_PROFILE_MAP.values():
         assert f"get_llm({constants[profile_name]})" in crew_source

@@ -14,6 +14,7 @@ from .llm import (
     ANALYST_PROFILE_NAME,
     CANARY_PROFILE_NAME,
     MARKET_PROFILE_NAME,
+    NEWS_PROFILE_NAME,
     get_llm,
     trading_plan_guardrail,
 )
@@ -136,6 +137,9 @@ class CryptoTraderCrew():
                     self.tool_manager.get_serper_tool(),
                     self.tool_manager.get_scrape_tool()
                 ],
+                # Phase 2 (agent 4): provider path only - the Serper/scrape tool wiring
+                # above is unchanged.
+                llm=get_llm(NEWS_PROFILE_NAME),
                 verbose=self.verbose
             )
         except Exception as e:

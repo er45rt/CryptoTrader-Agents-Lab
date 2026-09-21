@@ -10,7 +10,8 @@ news_and_sentiment_researcher:
   role: Crypto News and Sentiment Researcher  
   goal: "For the given cryptocurrency '{target_symbol}', gather the latest news, articles, and identify general market sentiment from online sources, focusing on information relevant up to '{current_datetime}'. Prioritize sources by reliability and recency, and provide confidence levels for sentiment assessments."
   backstory: "An expert in sifting through online information to find impactful news and gauge market sentiment towards specific cryptocurrencies, ensuring the information is current by referencing '{current_datetime}'. You use search tools to find relevant articles and discussions, and can scrape specific URLs if needed for more detail. You evaluate source credibility, avoid duplicate information, and clearly distinguish between confirmed facts and speculation. You quantify sentiment strength and indicate confidence levels in your assessments."
-  llm: openai/qwen-turbo-latest
+  # LLM resolved by the centralized factory (Phase 2, agent 4) - profile: deepseek_news.
+  # Not hardcoded here, so provider/model changes never require editing agent config.
 
 crypto_analyst:
   role: Comprehensive Crypto Analyst

@@ -25,7 +25,6 @@ from crypto_trader.llm import (
 )
 from crypto_trader.tests.agent_expectations import (
     EXPECTED_PROFILE_NAMES,
-    LEGACY_AGENT_MODEL,
     LEGACY_AGENT_NAMES,
     MIGRATED_AGENT_NAMES,
 )
@@ -147,12 +146,14 @@ def test_analyst_and_strategist_share_one_provider_rate_limiter():
 
 # --- Legacy agents unchanged ----------------------------------------------
 
-def test_legacy_agents_keep_their_previous_configuration(crew_with_fake_factory):
-    crew, _, _ = crew_with_fake_factory
+def test_no_agent_keeps_the_previous_configuration(crew_with_fake_factory):
+    crew, recorded, fake = crew_with_fake_factory
 
-    for name in LEGACY_AGENT_NAMES:
-        agent = getattr(crew, name)()
-        assert agent.llm.model == LEGACY_AGENT_MODEL, f"{name} must stay on the legacy model"
+    for name in MIGRATED_AGENT_NAMES:
+        assert getattr(crew, name)().llm is fake, f"{name} must resolve via the factory"
+
+    assert sorted(recorded) == sorted(EXPECTED_PROFILE_NAMES)
+    assert LEGACY_AGENT_NAMES == ()
 
 
 def test_agents_yaml_hardcodes_only_the_unmigrated_agents():
@@ -160,8 +161,7 @@ def test_agents_yaml_hardcodes_only_the_unmigrated_agents():
 
     for name in MIGRATED_AGENT_NAMES:
         assert "llm" not in agents[name], f"{name} must not hardcode a provider/model"
-    for name in LEGACY_AGENT_NAMES:
-        assert agents[name]["llm"] == LEGACY_AGENT_MODEL
+    assert not any("llm" in config for config in agents.values())
 
 
 def test_crew_source_contains_no_provider_branching_or_reasoner_use():

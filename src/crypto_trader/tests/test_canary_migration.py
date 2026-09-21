@@ -17,7 +17,6 @@ from crypto_trader.crew import CryptoTraderCrew
 from crypto_trader.llm import CANARY_PROFILE_NAME, trading_plan_guardrail
 from crypto_trader.tests.agent_expectations import (
     EXPECTED_PROFILE_NAMES,
-    LEGACY_AGENT_MODEL,
     LEGACY_AGENT_NAMES,
     MIGRATED_AGENT_NAMES,
 )
@@ -63,15 +62,15 @@ def test_strategist_resolves_its_llm_through_the_factory(crew_with_canary_monkey
     assert strategist.llm is fake
 
 
-def test_legacy_agents_keep_their_existing_model(crew_with_canary_monkeypatched):
-    """Agents not yet migrated must stay on their original llm configuration."""
-    crew, recorded, _ = crew_with_canary_monkeypatched
+def test_all_agents_resolve_through_the_factory(crew_with_canary_monkeypatched):
+    """End state of Phase 2: every agent resolves its LLM from the factory."""
+    crew, recorded, fake = crew_with_canary_monkeypatched
 
-    for name in LEGACY_AGENT_NAMES:
-        assert getattr(crew, name)().llm.model == LEGACY_AGENT_MODEL
+    for name in MIGRATED_AGENT_NAMES:
+        assert getattr(crew, name)().llm is fake
 
-    # Only migrated agents consult the factory, each with its own profile.
     assert sorted(recorded) == sorted(EXPECTED_PROFILE_NAMES)
+    assert LEGACY_AGENT_NAMES == ()  # no agent is left on the legacy configuration
 
 
 def test_agents_yaml_only_migrated_agents_drop_hardcoded_model():
@@ -79,10 +78,8 @@ def test_agents_yaml_only_migrated_agents_drop_hardcoded_model():
 
     for name in MIGRATED_AGENT_NAMES:
         assert "llm" not in agents[name], f"{name} must not hardcode a provider/model"
-    for name, config in agents.items():
-        if name in MIGRATED_AGENT_NAMES:
-            continue
-        assert config["llm"] == LEGACY_AGENT_MODEL, f"{name} must remain on its current model"
+    # Final Phase 2 state: no agent carries an agent-level model configuration any more.
+    assert not any("llm" in config for config in agents.values())
 
 
 def test_no_agent_contains_provider_specific_branching():

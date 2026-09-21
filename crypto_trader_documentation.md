@@ -67,7 +67,7 @@ The system employs four specialized AI agents:
 2. **News and Sentiment Researcher**
    - Role: Research and analyze news and market sentiment
    - Tools: SerperDevTool, ScrapeWebsiteTool
-   - LLM: nvidia_nim/meta/llama-3.3-70b-instruct
+   - LLM: centralized factory profile `deepseek_news` (DeepSeek)
 
 3. **Crypto Analyst**
    - Role: Analyze market data and news to provide comprehensive insights
@@ -166,13 +166,14 @@ The documented default target symbol is `ETHUSDT`, matching `DEFAULT_TARGET_SYMB
 
 LLM access is centralized in `src/crypto_trader/llm/`:
 
-- `config.py` — named, environment-driven profiles. `deepseek_canary` (Trading Plan
-  Strategist), `deepseek_analyst` (Comprehensive Crypto Analyst) and `deepseek_market`
-  (Binance Market Data Analyst) target the official DeepSeek API (`deepseek/deepseek-chat`)
-  and read `DEEPSEEK_API_KEY`; those are the **active** profiles (`ACTIVE_PROFILE_NAMES`).
-  `deepseek_reasoner` is defined for future use but is deliberately **not active** yet — no
-  agent, task, or runtime path references it. Credentials are never embedded, printed, or
-  logged.
+- `config.py` — named, environment-driven profiles. Each agent has its own profile:
+  `deepseek_canary` (Trading Plan Strategist), `deepseek_analyst` (Comprehensive Crypto
+  Analyst), `deepseek_market` (Binance Market Data Analyst) and `deepseek_news` (News and
+  Sentiment Researcher). All four target the official DeepSeek API
+  (`deepseek/deepseek-chat`) and read `DEEPSEEK_API_KEY`; they are the **active** profiles
+  (`ACTIVE_PROFILE_NAMES`). `deepseek_reasoner` is defined for future use but is deliberately
+  **not active** yet — no agent, task, or runtime path references it. Credentials are never
+  embedded, printed, or logged.
 - `factory.py` — `get_llm(profile)` returns a CrewAI LLM wrapped with a centralized timeout,
   provider-level rate limiting, and bounded retry with exponential backoff. Failures raise a
   typed `LLMProviderError`. A `builder` argument provides dependency injection for tests.
@@ -186,13 +187,14 @@ LLM access is centralized in `src/crypto_trader/llm/`:
   strategist's machine-readable JSON block. Invalid output triggers one bounded repair and
   then fails closed instead of passing bad fields downstream.
 
-Three agents are migrated so far: the **Crypto Trading Plan Strategist** resolves its LLM
-through `get_llm("deepseek_canary")` and its output is schema-validated, the **Comprehensive
-Crypto Analyst** uses `get_llm("deepseek_analyst")`, and the **Binance Market Data Analyst**
-uses `get_llm("deepseek_market")` while keeping its existing Binance public tool wiring. The
-analyst and market analyst outputs are consumed as LLM context rather than machine-parsed, so
-they carry no schema guardrail. The News and Sentiment Researcher keeps its existing `llm:`
-value until migrated.
+All four agents are migrated. The **Crypto Trading Plan Strategist** resolves its LLM through
+`get_llm("deepseek_canary")` and its output is schema-validated; the **Comprehensive Crypto
+Analyst** uses `get_llm("deepseek_analyst")`; the **Binance Market Data Analyst** uses
+`get_llm("deepseek_market")` while keeping its Binance public tool wiring; and the **News and
+Sentiment Researcher** uses `get_llm("deepseek_news")` while keeping its existing Serper
+search and scrape tools. No agent carries an agent-level `llm:` setting any more. The analyst,
+market and news outputs are consumed as LLM context rather than machine-parsed, so they carry
+no schema guardrail.
 
 ## Dependencies
 

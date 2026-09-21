@@ -23,7 +23,6 @@ from crypto_trader.llm import (
 )
 from crypto_trader.tests.agent_expectations import (
     EXPECTED_PROFILE_NAMES,
-    LEGACY_AGENT_MODEL,
     LEGACY_AGENT_NAMES,
     MIGRATED_AGENT_NAMES,
 )
@@ -74,17 +73,14 @@ def test_market_agent_is_wired_through_the_factory(crew_with_fake_factory):
     assert MARKET_PROFILE_NAME == "deepseek_market"
 
 
-def test_three_agents_use_the_factory_and_news_stays_legacy(crew_with_fake_factory):
+def test_all_four_agents_use_the_factory_with_distinct_profiles(crew_with_fake_factory):
     crew, recorded, _ = crew_with_fake_factory
 
     for name in MIGRATED_AGENT_NAMES + LEGACY_AGENT_NAMES:
         getattr(crew, name)()
 
     assert sorted(recorded) == sorted(EXPECTED_PROFILE_NAMES)
-    assert len(recorded) == 3  # market, analyst, strategist
-
-    news_agent = crew.news_and_sentiment_researcher()
-    assert news_agent.llm.model == LEGACY_AGENT_MODEL
+    assert len(set(recorded)) == 4  # one distinct profile per agent
 
 
 def test_market_profile_configuration():
@@ -99,11 +95,12 @@ def test_market_profile_configuration():
     assert profile.model != "deepseek/deepseek-reasoner"
 
 
-def test_all_three_deepseek_agents_share_one_provider_rate_limiter():
+def test_all_deepseek_agents_share_one_provider_rate_limiter():
     env = {"DEEPSEEK_API_KEY": SENTINEL_KEY}
     llms = [get_llm(name, env=env) for name in EXPECTED_PROFILE_NAMES]
 
-    assert len({llm.profile.name for llm in llms}) == 3
+    # One distinct profile per agent, but a single provider-level limiter for all of them.
+    assert len({llm.profile.name for llm in llms}) == len(EXPECTED_PROFILE_NAMES) == 4
     assert len({id(llm.rate_limiter) for llm in llms}) == 1  # provider-level, not per agent
 
 

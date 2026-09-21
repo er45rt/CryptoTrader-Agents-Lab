@@ -24,6 +24,7 @@ __all__ = [
     "ANALYST_PROFILE_NAME",
     "CANARY_PROFILE_NAME",
     "MARKET_PROFILE_NAME",
+    "NEWS_PROFILE_NAME",
     "AVAILABLE_PROFILES",
     "DEEPSEEK_DEFAULT_BASE_URL",
     "DEEPSEEK_DEFAULT_CHAT_MODEL",
@@ -169,6 +170,23 @@ _DEFAULT_PROFILES: dict[str, LLMProfile] = {
         min_seconds_between_requests=0.0,
         requests_per_minute=60,
     ),
+    # News/sentiment role profile (News and Sentiment Researcher). Same provider and
+    # policy; the news agent keeps its existing Serper/scrape tooling, only its LLM
+    # provider path is centralized.
+    "deepseek_news": LLMProfile(
+        name="deepseek_news",
+        provider=PROVIDER_DEEPSEEK,
+        model=DEEPSEEK_DEFAULT_CHAT_MODEL,
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url=DEEPSEEK_DEFAULT_BASE_URL,
+        temperature=0.2,
+        timeout_seconds=60.0,
+        max_attempts=3,
+        backoff_base_seconds=1.0,
+        backoff_max_seconds=8.0,
+        min_seconds_between_requests=0.0,
+        requests_per_minute=60,
+    ),
 }
 
 #: Name of the profile used by the first migrated (canary) agent.
@@ -180,6 +198,9 @@ ANALYST_PROFILE_NAME = "deepseek_analyst"
 #: Name of the profile used by the Binance Market Data Analyst (Phase 2, agent 3).
 MARKET_PROFILE_NAME = "deepseek_market"
 
+#: Name of the profile used by the News and Sentiment Researcher (Phase 2, agent 4).
+NEWS_PROFILE_NAME = "deepseek_news"
+
 #: Profiles currently wired into a live agent. Any profile that is not listed here
 #: is defined for future use and is intentionally NOT active yet - in particular
 #: ``deepseek_reasoner`` exists so the registry can express a second model shape
@@ -188,6 +209,7 @@ ACTIVE_PROFILE_NAMES: tuple[str, ...] = (
     CANARY_PROFILE_NAME,
     ANALYST_PROFILE_NAME,
     MARKET_PROFILE_NAME,
+    NEWS_PROFILE_NAME,
 )
 
 #: Every profile name known to this build, sorted.
