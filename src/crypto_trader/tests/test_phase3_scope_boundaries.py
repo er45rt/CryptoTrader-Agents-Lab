@@ -30,7 +30,6 @@ FORBIDDEN_RUNTIME_PACKAGES = (
     "oms",
     "risk",
     "simulator",
-    "execution",
     "event_bus",
     "redis",
     "broker",
@@ -75,6 +74,23 @@ def test_events_package_exists_with_expected_modules():
 def test_no_broker_or_runtime_component_was_added():
     for name in FORBIDDEN_RUNTIME_PACKAGES:
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"
+
+
+def test_execution_package_is_only_the_boundary_and_adapter():
+    """Phase 4 authorised an execution *boundary*, not an OMS/risk/simulator/broker stack."""
+    execution_dir = PACKAGE_DIR / "execution"
+    assert execution_dir.is_dir(), "the Phase 4 execution boundary package is expected to exist"
+
+    # No runtime components may hide inside the authorised package.
+    for name in ("oms", "risk", "simulator", "event_bus", "broker", "state_store", "redis"):
+        assert not (execution_dir / name).exists(), f"unexpected component inside execution/: {name}"
+
+    # The boundary itself stays engine-independent and free of broker clients / persistence.
+    for file in (execution_dir / "ports.py", execution_dir / "errors.py", execution_dir / "fake.py"):
+        text = file.read_text(encoding="utf-8")
+        assert "import nautilus" not in text and "from nautilus" not in text
+        for token in ("import redis", "import kafka", "sqlite", "requests.post"):
+            assert token not in text, f"{file.name} must not contain {token}"
 
 
 def test_no_broker_client_imports_in_runtime_code():

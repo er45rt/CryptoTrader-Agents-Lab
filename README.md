@@ -206,6 +206,63 @@ tool.
 - pydantic: For data validation
 - python-dotenv: For environment variable management
 
+## Production Nautilus execution boundary (Phase 4)
+
+NautilusTrader is the execution/simulation substrate *beneath* this system, never our domain
+language. It was selected on Spike A/Spike B evidence: runtime ingress viability, deterministic
+queue-aware simulation, bounded partial-fill behaviour, exact static latencies, a working public
+`FillModel` extension point, and 5/5 identical fresh-process semantic hashes.
+
+- **Supported engine version:** `nautilus_trader==1.231.0`, pinned exactly. The production
+  baseline is Python `>=3.12,<3.13` (owner decision, Gate 1) — the engine requires
+  `>=3.12,<3.15` and Spike A/B were run on 3.12.10.
+- **What we own:** the event contracts (`crypto_trader/events`), the LLM layer, the agents, the
+  engine-independent execution boundary (`crypto_trader/execution/ports.py`), and all decision
+  and risk semantics.
+- **What Nautilus owns:** order matching, simulated venue/account state, simulated latency and
+  fill mechanics, and the vendor data/instrument primitives used by the adapter.
+- **Anti-corruption rule:** engine imports are confined to `crypto_trader/execution/nautilus/`.
+  `crypto_trader/events`, `crypto_trader/llm`, `crypto_trader/crew.py` and `crypto_trader/tools`
+  must contain zero Nautilus references, enforced by tests. Nothing engine-native ever leaves
+  the adapter: observations and Phase 3 events are plain, typed, engine-independent values.
+- **Queue-aware simulation guard:** queue-aware behaviour requires the tested public combination
+  `queue_position=True`, `liquidity_consumption=True`, `book_type=BookType.L2_MBP`. The adapter
+  fails fast (`QueueAwareConfigurationError`) when a caller requests queue-aware behaviour with
+  any other configuration, because omitting the explicit L2 book type silently disables
+  queue-ahead modelling.
+- **Material limitation — dynamic latency is PARTIAL:** only static, separately configurable
+  insert/update/cancel latencies exist in 1.231.0. There is no proven public dynamic or
+  state-dependent Python latency hook, and none is claimed.
+- **L2 limitations:** hidden/iceberg liquidity and true exchange queue rank are not observable
+  from L2 market-by-price data. This is deterministic queue-aware simulation, not exchange
+  ground truth, and it does not reconstruct the real Binance queue.
+- **Upgrade policy:** the engine stays pinned. Any upgrade requires a dedicated branch, a
+  Spike/regression rerun (queue, partial-fill and latency checks), boundary tests, and explicit
+  owner approval. Nautilus is never auto-upgraded.
+- **Pre-live gaps still unresolved:** TOCTOU can only be narrowed, never eliminated; an
+  ambiguous post-submission outcome remains `UNKNOWN_PENDING_RECONCILIATION` with no blind
+  retry; the priority safety lane and emergency break-glass path are not implemented
+  (PRE-LIVE MANDATORY GAP); there is no recovery/reconciliation runtime, no production risk
+  engine, no persistent event store, and no authenticated or live exchange connectivity.
+
+### Execution boundary surface
+
+```text
+our application / domain            crypto_trader.execution (ports.py: engine-independent)
+        |                                       |
+        +--> ExecutionRequest / ExecutionObservation / typed errors
+                                                |
+                                  crypto_trader.execution.nautilus
+                                     guard  -> version + queue-config fail-fast
+                                     inbound  -> Nautilus public order/book/trade types
+                                     outbound -> our observations + Phase 3 events
+                                     runtime  -> start / submit / run / stop lifecycle
+```
+
+Phase 4 deliberately does **not** implement production risk, decision validity/staleness gates,
+an OMS, a persistent event store, recovery/reconciliation, a safety lane, break-glass, or any
+live/authenticated venue connectivity.
+
 ## License
 
 See LICENSE file for details. 

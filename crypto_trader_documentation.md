@@ -203,6 +203,47 @@ no schema guardrail.
 - pydantic: For data validation
 - python-dotenv: For environment variable management
 
+## Production Nautilus execution boundary (Phase 4)
+
+NautilusTrader sits *beneath* this system as execution/simulation infrastructure; it is never
+our domain language. Selection was evidence-based (Spike A: runtime ingress and load viability;
+Spike B: queue-aware simulation fidelity, partial fills, static latencies, a public `FillModel`
+extension point, and deterministic repeatability).
+
+- **Supported engine version:** `nautilus_trader==1.231.0`, pinned exactly; production baseline
+  Python `>=3.12,<3.13`.
+- **Ownership split:** we own the event contracts, the LLM layer, agents, the engine-independent
+  execution port, and all decision/risk semantics. Nautilus owns matching, simulated
+  venue/account state, simulated latency/fill mechanics and vendor data primitives.
+- **Anti-corruption boundary:** `nautilus_trader` imports are confined to
+  `crypto_trader/execution/nautilus/`; `crypto_trader/events`, `crypto_trader/llm`,
+  `crypto_trader/crew.py` and `crypto_trader/tools` contain zero Nautilus references (test
+  enforced). Domain payloads never hold engine objects.
+- **Queue-aware configuration requirement:** `queue_position=True`,
+  `liquidity_consumption=True`, `book_type=BookType.L2_MBP`. Any other combination requested as
+  queue-aware fails fast instead of silently degrading to unrealistic fills.
+- **Dynamic latency:** PARTIAL — static per-command insert/update/cancel latency only; no public
+  dynamic/state-dependent Python hook in 1.231.0.
+- **L2 limits:** hidden liquidity and true queue rank are not observable; no exchange-ground
+  truth claim.
+- **Upgrade policy:** pin, dedicated branch, Spike/regression rerun, boundary tests, explicit
+  owner approval; never auto-upgrade.
+- **Pre-live gaps:** TOCTOU only narrowed; `UNKNOWN_PENDING_RECONCILIATION` for ambiguous
+  post-submission outcomes with no blind retry; safety lane / break-glass and
+  recovery/reconciliation not implemented (PRE-LIVE MANDATORY GAP).
+
+### Execution boundary modules
+
+| Module | Role |
+|---|---|
+| `execution/ports.py` | engine-independent requests, observations, port protocol, lifecycle states |
+| `execution/errors.py` | typed boundary errors (fail-closed conditions) |
+| `execution/fake.py` | deterministic in-memory port proving dependency injection |
+| `execution/nautilus/guard.py` | supported-version and queue-aware-configuration fail-fast guards |
+| `execution/nautilus/inbound.py` | our request/market data → Nautilus public types (exact Decimals) |
+| `execution/nautilus/outbound.py` | Nautilus state → our observations + Phase 3 contracts (explicit map) |
+| `execution/nautilus/runtime.py` | start/submit/run/stop lifecycle; no inference in engine callbacks |
+
 ## License
 
 See LICENSE file for details.

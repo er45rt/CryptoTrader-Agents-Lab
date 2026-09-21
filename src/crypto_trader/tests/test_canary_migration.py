@@ -153,7 +153,10 @@ def test_binance_source_has_no_authenticated_or_trading_endpoints():
 
 
 def test_no_phase_three_components_were_introduced():
-    for name in ("tinyfish", "oms", "risk", "simulator", "execution", "event_bus", "redis"):
+    # NOTE (Phase 4): "execution" is now an authorised production package (the
+    # engine-independent execution boundary + Nautilus adapter). The components below
+    # remain out of scope and must still be absent.
+    for name in ("tinyfish", "oms", "risk", "simulator", "event_bus", "redis"):
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"
 
     # Scan runtime modules only; the test modules necessarily name these terms.

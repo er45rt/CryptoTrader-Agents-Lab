@@ -251,5 +251,6 @@ def test_binance_source_has_no_authenticated_or_trading_capability():
 
 
 def test_no_new_phase_2_components_were_added():
-    for name in ("tinyfish", "oms", "risk", "simulator", "execution", "event_bus", "redis"):
+    # NOTE (Phase 4): "execution" is an authorised boundary package now; the rest stay absent.
+    for name in ("tinyfish", "oms", "risk", "simulator", "event_bus", "redis"):
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"
