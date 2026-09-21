@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 __all__ = [
+    "ACTIVE_PROFILE_NAMES",
     "CANARY_PROFILE_NAME",
     "AVAILABLE_PROFILES",
     "DEEPSEEK_DEFAULT_BASE_URL",
@@ -113,6 +114,9 @@ _DEFAULT_PROFILES: dict[str, LLMProfile] = {
         min_seconds_between_requests=0.0,
         requests_per_minute=60,
     ),
+    # Defined for future use and intentionally NOT active: no agent, task, or runtime
+    # path references it (see ACTIVE_PROFILE_NAMES below). Kept because it exercises a
+    # second named profile shape (no temperature, longer timeout) at zero runtime cost.
     "deepseek_reasoner": LLMProfile(
         name="deepseek_reasoner",
         provider=PROVIDER_DEEPSEEK,
@@ -132,6 +136,12 @@ _DEFAULT_PROFILES: dict[str, LLMProfile] = {
 
 #: Name of the profile used by the first migrated (canary) agent.
 CANARY_PROFILE_NAME = "deepseek_canary"
+
+#: Profiles currently wired into a live agent. Any profile that is not listed here
+#: is defined for future use and is intentionally NOT active yet - in particular
+#: ``deepseek_reasoner`` exists so the registry can express a second model shape
+#: (no temperature, longer timeout), but no agent, task, or runtime path uses it.
+ACTIVE_PROFILE_NAMES: tuple[str, ...] = (CANARY_PROFILE_NAME,)
 
 #: Every profile name known to this build, sorted.
 AVAILABLE_PROFILES: tuple[str, ...] = tuple(sorted(_DEFAULT_PROFILES))

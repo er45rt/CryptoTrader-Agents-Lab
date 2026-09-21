@@ -167,11 +167,19 @@ The documented default target symbol is `ETHUSDT`, matching `DEFAULT_TARGET_SYMB
 LLM access is centralized in `src/crypto_trader/llm/`:
 
 - `config.py` — named, environment-driven profiles. `deepseek_canary` targets the official
-  DeepSeek API (`deepseek/deepseek-chat`) and reads `DEEPSEEK_API_KEY`; `deepseek_reasoner`
-  is also defined. Credentials are never embedded, printed, or logged.
+  DeepSeek API (`deepseek/deepseek-chat`) and reads `DEEPSEEK_API_KEY`. It is the only
+  **active** profile (`ACTIVE_PROFILE_NAMES`); `deepseek_reasoner` is defined for future use
+  but is deliberately **not active** yet — no agent, task, or runtime path references it.
+  Credentials are never embedded, printed, or logged.
 - `factory.py` — `get_llm(profile)` returns a CrewAI LLM wrapped with a centralized timeout,
   provider-level rate limiting, and bounded retry with exponential backoff. Failures raise a
   typed `LLMProviderError`. A `builder` argument provides dependency injection for tests.
+- `console.py` — Windows console hardening. CrewAI prints error panels containing non-ASCII
+  characters; on a strict cp1252 console that write can raise `UnicodeEncodeError` while
+  reporting a provider failure. Provider failures are now never masked: the encoding error is
+  retained as context and the original provider error is re-raised, while our own diagnostics
+  stay ASCII-only. Console handlers are only relaxed for streams that cannot encode the text,
+  and are restored immediately afterwards.
 - `schemas.py` — a Pydantic `TradingPlan` schema plus the guardrail that validates the
   strategist's machine-readable JSON block. Invalid output triggers one bounded repair and
   then fails closed instead of passing bad fields downstream.

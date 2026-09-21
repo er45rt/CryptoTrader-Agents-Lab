@@ -35,6 +35,12 @@ from crewai import LLM
 from crewai.llms.base_llm import BaseLLM
 
 from .config import LLMConfigError, LLMProfile, load_profile
+from .console import (
+    ascii_safe,
+    is_console_encoding_error,
+    recover_original_error,
+    tolerant_console_writes,
+)
 
 __all__ = [
     "LLMProviderError",
@@ -282,34 +288,69 @@ class ResilientLLM(LLM):
         while attempts < self.profile.max_attempts:
             attempts += 1
             try:
-                result = super().call(
-                    messages,
-                    tools=tools,
-                    callbacks=callbacks,
-                    available_functions=available_functions,
-                    from_task=from_task,
-                    from_agent=from_agent,
-                )
+                # CrewAI's console formatter prints a panel containing non-ASCII
+                # characters while reporting failures. On a strict, non-UTF-8
+                # console (cp1252 on Windows) that print raises UnicodeEncodeError
+                # and can mask the provider error. Tolerate unencodable output for
+                # the duration of the call only; the previous handler is restored.
+                with tolerant_console_writes():
+                    result = super().call(
+                        messages,
+                        tools=tools,
+                        callbacks=callbacks,
+                        available_functions=available_functions,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                    )
             except Exception as exc:  # noqa: BLE001 - re-raised as a typed error below
-                last_exc = exc
-                transient = is_transient_provider_error(exc)
+                # An output-encoding failure must never be reported as the provider
+                # failure. Recover the original provider error and report that,
+                # keeping the encoding error in the exception chain as context.
+                effective_error: BaseException = exc
+                reporting_failure = False
+                if is_console_encoding_error(exc):
+                    reporting_failure = True
+                    original = recover_original_error(exc)
+                    if isinstance(original, BaseException):
+                        logger.warning(
+                            ascii_safe(
+                                "Console output-encoding failure (%s) while reporting an LLM "
+                                "provider error; surfacing the original provider error (%s) instead."
+                            )
+                            % (type(exc).__name__, type(original).__name__)
+                        )
+                        effective_error = original
+                    else:
+                        logger.warning(
+                            ascii_safe(
+                                "Console output-encoding failure (%s) during an LLM call and no "
+                                "original provider error was attached; reporting the encoding failure."
+                            )
+                            % type(exc).__name__
+                        )
+
+                last_exc = effective_error
+                transient = is_transient_provider_error(effective_error)
                 if not transient or attempts >= self.profile.max_attempts:
                     self.last_call_metadata = self._build_metadata(
                         attempts=attempts,
                         started_at=started_at,
                         throttled_seconds=throttled_seconds,
                         success=False,
+                        reporting_failure=reporting_failure,
                     )
                     raise LLMProviderError(
-                        f"LLM provider '{self.profile.provider}' call failed for model "
-                        f"'{self.profile.model}' after {attempts} attempt(s) "
-                        f"(transient={transient}, cause={type(exc).__name__}).",
+                        ascii_safe(
+                            f"LLM provider '{self.profile.provider}' call failed for model "
+                            f"'{self.profile.model}' after {attempts} attempt(s) "
+                            f"(transient={transient}, cause={type(effective_error).__name__})."
+                        ),
                         provider=self.profile.provider,
                         model=self.profile.model,
                         attempts=attempts,
                         transient=transient,
-                        cause_type=type(exc).__name__,
-                    ) from exc
+                        cause_type=type(effective_error).__name__,
+                    ) from effective_error
 
                 delay = compute_backoff_delay(
                     attempts,
@@ -323,7 +364,7 @@ class ResilientLLM(LLM):
                     self.profile.model,
                     attempts,
                     self.profile.max_attempts,
-                    type(exc).__name__,
+                    type(effective_error).__name__,
                     delay,
                 )
                 self._sleeper(delay)
@@ -354,6 +395,7 @@ class ResilientLLM(LLM):
         started_at: float,
         throttled_seconds: float,
         success: bool,
+        reporting_failure: bool = False,
     ) -> dict[str, Any]:
         return {
             "provider": self.profile.provider,
@@ -362,6 +404,7 @@ class ResilientLLM(LLM):
             "attempts": attempts,
             "retries": attempts - 1,
             "success": success,
+            "reporting_failure": reporting_failure,
             "latency_ms": round((self._clock() - started_at) * 1000.0, 3),
             "throttled_ms": round(throttled_seconds * 1000.0, 3),
             "timeout_seconds": self.profile.timeout_seconds,
