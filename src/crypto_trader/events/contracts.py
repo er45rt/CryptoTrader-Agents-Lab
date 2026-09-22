@@ -24,6 +24,8 @@ Additive contracts added by later phases (existing schemas unchanged):
 7. ``validity.disposition.recorded`` (Phase 6) - deterministic validity/staleness verdict
 8. ``risk.evaluation.recorded``      (Phase 7) - deterministic Hard Risk rule audit
 9. ``safety.state.changed``          (Phase 9) - operational safety-mode transition
+10. ``safety.operator_command.recorded`` (Phase 13) - one auditable, idempotent operator
+    break-glass command and its deterministic disposition
 """
 
 from __future__ import annotations
@@ -73,6 +75,10 @@ __all__ = [
     "SafetyStateChangePayload",
     "SafetyStateChanged",
     "SafetyTrigger",
+    "OPERATOR_COMMAND_EVENT_TYPE",
+    "OperatorCommandRecordPayload",
+    "OperatorCommandRecorded",
+    "OperatorCommandType",
 ]
 
 STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
@@ -87,6 +93,8 @@ VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
 RISK_EVALUATION_EVENT_TYPE = "risk.evaluation.recorded"
 #: Phase 9 additive contract: a deterministic operational safety-mode transition.
 SAFETY_EVENT_TYPE = "safety.state.changed"
+#: Phase 13 additive contract: one operator break-glass command and its recorded disposition.
+OPERATOR_COMMAND_EVENT_TYPE = "safety.operator_command.recorded"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -125,6 +133,20 @@ SafetyMode = Literal[
 
 #: What caused a safety-mode transition.
 SafetyTrigger = Literal["operator", "risk", "recovery", "break_glass", "system"]
+
+#: The operational break-glass command vocabulary (Phase 13). The first five are the break-glass
+#: actions this phase must support; the last three are the mandatory lifecycle commands that gate
+#: any return to ``normal`` (reconciliation, explicit operator acknowledgement, restore).
+OperatorCommandType = Literal[
+    "halt_new_risk",
+    "cancel_open",
+    "reduce_only",
+    "enter_degraded",
+    "force_recovery_required",
+    "reconcile",
+    "acknowledge",
+    "restore_normal",
+]
 
 
 # --- 1. Strategy / AI decision ---------------------------------------------
@@ -418,6 +440,80 @@ class SafetyStateChanged(DomainEvent):
     payload: SafetyStateChangePayload
 
 
+# --- 10. Operator break-glass command record (Phase 13, additive) -----------
+
+class OperatorCommandRecordPayload(EventPayload):
+    """One operational break-glass command and its deterministic disposition.
+
+    The record is the operator-command audit trail: every break-glass request is journaled exactly
+    once and re-delivering the same ``command_id`` produces no second effect (the journal is the
+    idempotency ledger, keyed on ``command_id``).
+
+    ``correlation_id`` and ``causation_id`` live on the Phase 3 envelope, exactly as for every other
+    contract, so a command record carries its workflow trace and its cause without duplicating them
+    in the payload. ``command_digest`` is the deterministic fingerprint of the command's *semantic*
+    content (type, operator, reason, source): a re-delivery matches and is idempotent, while a
+    different request reusing the same ``command_id`` is a conflict and is refused.
+
+    The payload never contains credential material: the operator label is a name/label, never a
+    token, and the command model rejects credential-shaped free text before it reaches the journal.
+    """
+
+    command_id: UUID = Field(description="Operator-supplied idempotency key of this command.")
+    command_type: OperatorCommandType = Field(description="Requested operational action.")
+    requested_at: datetime = Field(description="Timezone-aware request time, normalized to UTC.")
+    operator_label: str = Field(min_length=1, description="Operator name or label (never a secret).")
+    operator_identity: str | None = Field(
+        default=None, description="Optional stronger operator identity; omit when unavailable."
+    )
+    reason: str = Field(min_length=1, description="Why the operator issued the command.")
+    source: str = Field(min_length=1, description="Control-channel identifier that delivered it.")
+    previous_safety_state: SafetyMode = Field(description="Safety mode before the command.")
+    resulting_safety_state: SafetyMode = Field(description="Safety mode after the command.")
+    disposition: Literal["accepted", "rejected"] = Field(
+        description="Whether the command was applied or refused."
+    )
+    reason_code: str = Field(min_length=1, description="Deterministic machine-readable outcome code.")
+    command_digest: str = Field(min_length=16, description="Fingerprint of the semantic content.")
+    mode_path: list[str] = Field(
+        min_length=1,
+        description="Safety modes this command traversed, starting with the previous mode.",
+    )
+    venue_control: Literal[
+        "not_requested", "confirmed", "ambiguous", "unavailable", "rejected"
+    ] = Field(description="Venue-side control disposition for this command.")
+    reconciliation_status: Literal[
+        "not_required", "pending", "resolved", "failed"
+    ] = Field(description="Reconciliation requirement standing after the command.")
+    epoch_opened: bool = Field(description="Whether this command opened a break-glass epoch.")
+    epoch_closed: bool = Field(description="Whether this command closed the break-glass epoch.")
+    fence_term: int = Field(ge=0, description="Ownership fencing term after the command.")
+
+    @field_validator("requested_at")
+    @classmethod
+    def _require_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("requested_at must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("operator_label", "reason", "source", "reason_code", "operator_identity")
+    @classmethod
+    def _non_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("operator command text fields must not be blank.")
+        return value
+
+
+class OperatorCommandRecorded(DomainEvent):
+    """An operator break-glass command was recorded with its deterministic disposition."""
+
+    event_type: Literal["safety.operator_command.recorded"] = OPERATOR_COMMAND_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: OperatorCommandRecordPayload
+
+
 #: Every V1 contract known to this build, in pipeline order.
 V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StrategyDecisionRecorded,
@@ -429,4 +525,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     ValidityDispositionRecorded,
     RiskEvaluationRecorded,
     SafetyStateChanged,
+    OperatorCommandRecorded,
 )

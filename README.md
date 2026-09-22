@@ -482,6 +482,56 @@ real capital and no withdrawal is involved.
 - **Readiness is not authorization:** a `TECHNICALLY READY` verdict does NOT authorize live
   trading. Jamal remains the only decider for any live/mainnet phase.
 
+## Operational break-glass hardening (Phase 13)
+
+`crypto_trader/breakglass` closes the Phase 12 PRE-LIVE MANDATORY GAP ("live break-glass path
+remains a PRE-LIVE MANDATORY GAP") by turning the Phase 9 interface/simulation foundation into a
+real, operator-initiated control path. Scope is unchanged: offline/scripted infrastructure and
+Binance SPOT TESTNET only, no real capital, no withdrawal, no liquidation.
+
+- **Deterministic, LLM-free ingress:** `BreakGlassControl` accepts only a validated
+  `OperatorCommand`. No model may decide, approve, translate, delay or execute a break-glass action,
+  and the package imports nothing from CrewAI, the LLM layer, the crew definition or the paper
+  path. The operator CLI (`python -m crypto_trader.breakglass.cli`) runs in its own process, so it
+  works while the AI queue/backlog is saturated.
+- **Supported actions:** `halt_new_risk`, `cancel_open`, `reduce_only`, `enter_degraded`,
+  `force_recovery_required`, plus the lifecycle commands `reconcile`, `acknowledge` and
+  `restore_normal`. There is NO panic liquidation and no automatic market sell: the path can cancel
+  open orders and apply safety policy, nothing else. `reduce_only` is a deterministic policy mode -
+  no exchange-native reduce-only flag is invented for Binance Spot.
+- **Fail-closed progression:** break-glass engagement moves the safety state into the requested
+  mode (more restrictively only: the ladder never downgrades) and an unconfirmed venue-side action
+  escalates `cancel_open` -> `degraded` -> `recovery_required`. New risk is impossible while the
+  epoch is open, and a restart restores the exact restricted posture. NORMAL is never restored
+  automatically: reconciliation AND an explicit operator acknowledgement are mandatory first, and
+  only then does the operator restore release the kill switch.
+- **Single authoritative writer + fencing:** `crypto_trader/breakglass/ownership.py` holds one
+  writer lease with a monotonic fencing term. An operator break-glass action performs an explicit
+  emergency takeover (`term + 1`), which invalidates the normal runtime's token so it can never
+  trade concurrently with emergency control; the operator restore mints a fresh normal lease and
+  invalidates the emergency one. With no lease held, no writer may trade.
+- **Operator command record (auditable + idempotent):** every request is journaled once through the
+  NEW additive contract `safety.operator_command.recorded` with `command_id`, `command_type`,
+  `requested_at`, the operator label/identity, reason, control-channel source, previous and
+  resulting safety states, `accepted`/`rejected` disposition, deterministic reason code, the
+  semantic `command_digest`, the mode path, the venue disposition, the reconciliation status, the
+  epoch flags and the fencing term (`correlation_id`/`causation_id` travel on the Phase 3
+  envelope). Re-delivering the same `command_id` is an idempotent no-op; reusing it for different
+  content is refused. No secret is ever journaled - the command model rejects credential-shaped
+  text, and the key pair is only ever read from the environment by the testnet adapter.
+- **Venue-side control:** `cancel_open` cancels through the Phase 11 Spot Testnet adapter after a
+  pre-flight that verifies the endpoint is the documented Spot Testnet host, the clock is
+  synchronized, the withdrawal capability is unavailable/disabled, and the safety state permits the
+  operation. An ambiguous cancel/send outcome is NEVER retried: it becomes
+  `UNKNOWN_PENDING_RECONCILIATION` and requires Phase 8 reconciliation.
+- **Audit:** `crypto_trader.breakglass.audit` runs 35 offline operational/fault-injection scenarios
+  and 16 checks and derives the verdict `BREAK-GLASS READY FOR OWNER REVIEW` or
+  `BREAK-GLASS NOT READY` mechanically. Retained limitations (e.g. the opt-in authenticated
+  testnet validation) are reported as *informational* and are never counted as passes.
+- **Readiness is not authorization:** break-glass readiness does NOT authorize live or mainnet
+  trading. No mainnet endpoint is configured, no real capital is used, and no withdrawal capability
+  exists anywhere on this path.
+
 ## License
 
 See LICENSE file for details. 

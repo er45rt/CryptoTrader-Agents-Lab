@@ -419,6 +419,49 @@ scenario to pass; retained limitations (L2 iceberg/queue-rank blindness, PARTIAL
 TOCTOU narrowing, live break-glass gap, withdrawal-disabled live key) are reported as
 *informational* rows and never inflate the verdict. Technical readiness is NOT live authorization.
 
+## Operational pre-live break-glass hardening (Phase 13)
+
+`crypto_trader/breakglass` closes the Phase 12 PRE-LIVE MANDATORY GAP. The Phase 9
+interface/simulation foundation is unchanged and still exists; Phase 13 adds the operational control
+path beside it (offline/scripted infrastructure and Binance SPOT TESTNET only).
+
+| Module | Role |
+|---|---|
+| `commands.py` | `OperatorCommand` + `OperatorCommandType`, strict parsing, credential-shaped text rejection, semantic `command_digest` |
+| `ownership.py` | single-writer lease, monotonic fencing terms, explicit emergency takeover, `WriterGuard` |
+| `state.py` | durable safety-state cache + deterministic journal replay + fail-closed restore |
+| `epoch.py` | the break-glass epoch derived from the journal (escalation path, reconciliation, acknowledgement, closure) |
+| `venue.py` | `EmergencyVenuePort` + Spot Testnet emergency control (cancel-open only, pre-flight verified) |
+| `control.py` | `BreakGlassControl`: the single deterministic ingress, journaling, gates, observability |
+| `cli.py` | the operator CLI (`python -m crypto_trader.breakglass.cli status\|run`) |
+| `audit/` | the Phase 13 audit: 35 scenarios, 16 checks, mechanical verdict, retained limitations |
+
+Command semantics: `halt_new_risk`, `cancel_open`, `reduce_only`, `enter_degraded`,
+`force_recovery_required` are the five operational actions; `reconcile`, `acknowledge` and
+`restore_normal` are the lifecycle commands that gate any return to `normal`. Every action engages
+the break-glass epoch: new risk is impossible, reconciliation is mandatory and the operator
+acknowledgement is mandatory. `cancel_open` cancels through the safety path; an unconfirmed venue
+outcome escalates `cancel_open` -> `degraded` -> `recovery_required` and is never retried. The
+safety ladder only ever escalates: a command that would be less restrictive is refused with
+`downgrade_refused_monotonic_escalation`.
+
+Ownership/fencing: exactly one writer lease exists. The runtime claims a normal lease at startup; an
+operator break-glass action takes the emergency lease with `term + 1`, so the normal writer's token
+is stale and its writes are refused (`StaleWriterFenceError`). Restoring normal is an explicit
+takeover back to a normal lease with a fresh term, which invalidates the emergency token. With no
+lease at all, no writer may trade.
+
+Persistence: the event journal is authoritative and holds the additive
+`safety.operator_command.recorded` contract plus the Phase 9 `safety.state.changed` transitions. The
+`safety_state.json` cache is written only AFTER the journal append and is cross-checked against the
+journal; a missing cache is rebuilt by replay, and a corrupt or contradictory cache restores
+`recovery_required` with the kill switch engaged - fail closed, never silently repaired.
+
+Verdict policy: `BREAK-GLASS READY FOR OWNER REVIEW` requires every required check and every
+scenario to pass; retained limitations (the opt-in authenticated testnet validation, and the
+absence of any automated liquidation) are reported separately as *informational*. Break-glass
+readiness is NOT live authorization: no mainnet endpoint, no real capital and no withdrawal.
+
 ## License
 
 See LICENSE file for details.

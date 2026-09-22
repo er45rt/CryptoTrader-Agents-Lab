@@ -159,4 +159,6 @@ def test_paper_adds_no_new_event_contract():
         "validity.disposition.recorded",
         "risk.evaluation.recorded",
         "safety.state.changed",
+        # Phase 13 additive contract (existing schemas unchanged).
+        "safety.operator_command.recorded",
     }

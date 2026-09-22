@@ -89,7 +89,7 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
     )
 
     # Phase 8 adds NO new event contract of its own: the Phase 3 contracts and the additive
-    # Phase 6 / Phase 7 / Phase 9 contracts are the only ones present.
+    # Phase 6 / Phase 7 / Phase 9 / Phase 13 contracts are the only ones present.
     assert event_types == {
         "strategy.decision.recorded",
         "trade.intent.created",
@@ -100,6 +100,7 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
         "validity.disposition.recorded",
         "risk.evaluation.recorded",
         "safety.state.changed",
+        "safety.operator_command.recorded",
     }
     source = "\n".join(file.read_text(encoding="utf-8") for file in _files())
     assert "from crypto_trader.events import" in source

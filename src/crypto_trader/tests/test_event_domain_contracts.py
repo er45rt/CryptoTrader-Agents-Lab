@@ -335,6 +335,8 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         "risk.evaluation.recorded",
         # Phase 9 additive contract (existing schemas unchanged).
         "safety.state.changed",
+        # Phase 13 additive contract (existing schemas unchanged).
+        "safety.operator_command.recorded",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)
 
