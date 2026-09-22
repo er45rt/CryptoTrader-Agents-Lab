@@ -13,6 +13,10 @@ PACKAGE_DIR = PROJECT_ROOT / "src" / "crypto_trader"
 #: ``test_testnet_scope.py`` proves the exemption is narrow and testnet-only.
 PHASE11_AUTHORISED_TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
 
+#: Phase 12's offline audit harness lazily reads the installed engine version and drives the
+#: offline simulator as evidence; ``test_audit_scope.py`` proves it has no network capability.
+PHASE12_AUDIT_DIR = PACKAGE_DIR / "audit"
+
 #: Protected layers that must never import or reference the engine.
 PROTECTED_PATHS = {
     "phase3_events": PACKAGE_DIR / "events",
@@ -61,6 +65,8 @@ def test_engine_imports_are_confined_to_the_nautilus_adapter_package():
         if file.is_relative_to(allowed):
             continue
         if file.is_relative_to(tests_dir):
+            continue
+        if file.is_relative_to(PHASE12_AUDIT_DIR):
             continue
         if "nautilus_trader" in file.read_text(encoding="utf-8"):
             offenders.append(str(file.relative_to(PROJECT_ROOT)))

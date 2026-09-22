@@ -53,9 +53,15 @@ def test_testnet_package_contains_only_authorized_components():
 
 
 def test_authenticated_capability_exists_only_in_the_authorised_directory():
+    """The Phase 12 audit harness is the second, verifier-only exemption (offline by design)."""
+    audit_dir = PACKAGE_DIR / "audit"
     offenders: list[str] = []
     for file in _python_files(PACKAGE_DIR):
         if file.is_relative_to(TESTNET_DIR) or file.is_relative_to(PACKAGE_DIR / "tests"):
+            continue
+        if file.is_relative_to(audit_dir):
+            # The auditor names the tokens it forbids and drives only the scripted transport;
+            # ``test_audit_scope.py`` proves it has no network capability and no credentials.
             continue
         text = file.read_text(encoding="utf-8").lower()
         for token in _AUTHENTICATED_TOKENS:

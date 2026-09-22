@@ -119,11 +119,16 @@ def test_only_infrastructure_may_import_the_engine():
     """The engine stays behind the adapter package, exactly as Phase 4 required."""
     allowed = PACKAGE_DIR / "execution" / "nautilus"
     tests_dir = PACKAGE_DIR / "tests"
+    audit_dir = PACKAGE_DIR / "audit"
     offenders = []
     for file in PACKAGE_DIR.rglob("*.py"):
         if "__pycache__" in file.parts:
             continue
         if file.is_relative_to(allowed) or file.is_relative_to(tests_dir):
+            continue
+        if file.is_relative_to(audit_dir):
+            # Phase 12's offline audit reads the installed engine version and runs the offline
+            # simulator as evidence; it has no network capability (see test_audit_scope.py).
             continue
         if "nautilus_trader" in file.read_text(encoding="utf-8"):
             offenders.append(str(file.relative_to(PROJECT_ROOT)))

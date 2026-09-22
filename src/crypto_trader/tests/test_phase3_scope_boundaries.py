@@ -62,6 +62,11 @@ FORBIDDEN_TRADING_TOKENS = (
 #: ``test_testnet_scope.py`` proves the exemption is narrow and testnet-only.
 PHASE11_AUTHORISED_TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
 
+#: Phase 12 adds an OFFLINE audit harness that must NAME the tokens it forbids and drive the
+#: testnet adapter through a scripted transport. ``test_audit_scope.py`` proves the harness has no
+#: network capability, no credentials and never constructs the live transport.
+PHASE12_AUDIT_DIR = PACKAGE_DIR / "audit"
+
 
 class FakeLLM(BaseLLM):
     """Stand-in LLM so the boundary test never contacts a provider."""
@@ -83,11 +88,12 @@ def _runtime_python_files() -> list[Path]:
 
 
 def _runtime_python_files_outside_authorised_testnet() -> list[Path]:
-    """Every production module except the Phase 11 authorised testnet adapter."""
+    """Every production module except the Phase 11 testnet adapter and the Phase 12 audit harness."""
     return [
         path
         for path in _runtime_python_files()
         if not path.is_relative_to(PHASE11_AUTHORISED_TESTNET_DIR)
+        and not path.is_relative_to(PHASE12_AUDIT_DIR)
     ]
 
 

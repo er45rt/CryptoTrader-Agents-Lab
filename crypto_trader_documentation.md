@@ -396,6 +396,29 @@ directory (`test_testnet_scope.py` proves the exemption is narrow, testnet-only 
 those guards still cover the rest of the production tree. No event contract was added - testnet
 lifecycle events reuse `order.state.changed` / `execution.fill.recorded`.
 
+## Live-readiness audit (Phase 12)
+
+`crypto_trader/audit` implements the technical live-readiness audit. It is offline-only and
+read-only with respect to external systems: no mainnet endpoint, no real capital, no withdrawal and
+no credential value is ever read.
+
+| Module | Role |
+|---|---|
+| `scenarios.py` | 15 fault-injection scenarios over the real components (+ scripted transport/engine) |
+| `checks.py` | static/dynamic readiness checks (pins, isolation, mainnet/withdrawal absence, docs) |
+| `matrix.py` | `ReadinessItem`, `AuditReport`, the mechanical verdict and the markdown matrix |
+
+Scenario coverage: restart + journal replay, duplicate delivery, stale AI response, backpressure
+exhaustion, risk breach (halt-new-risk only), unknown order result, cancel failure, network
+interruption, partial fill during downtime, reconciliation mismatch, kill switch under load,
+restart while halted, corrupt/unsupported event rejection, paper pipeline end-to-end and offline
+queue-aware Nautilus execution.
+
+Verdict policy: `TECHNICALLY READY FOR OWNER REVIEW` requires every required matrix item and every
+scenario to pass; retained limitations (L2 iceberg/queue-rank blindness, PARTIAL dynamic latency,
+TOCTOU narrowing, live break-glass gap, withdrawal-disabled live key) are reported as
+*informational* rows and never inflate the verdict. Technical readiness is NOT live authorization.
+
 ## License
 
 See LICENSE file for details.

@@ -458,6 +458,30 @@ testnet only: no mainnet, no futures/options/margin, no withdrawals, no real cap
   testnet outage is never disguised as an application PASS. **Testnet success does not authorize
   mainnet.**
 
+## Live-readiness audit (Phase 12)
+
+`crypto_trader/audit` is the technical live-readiness audit. It is fully offline: it injects faults
+into the REAL components (journal, validity, hard risk, safety, recovery, paper session, the
+testnet adapter with a scripted transport and the offline Nautilus simulator). No mainnet order, no
+real capital and no withdrawal is involved.
+
+- **Fault injection (15 scenarios):** process restart + journal replay, duplicate event delivery,
+  stale AI response, backpressure exhaustion (slow AI worker), deterministic risk breach, unknown
+  order result, cancel failure, simulated network interruption, partial fill during downtime,
+  reconciliation mismatch, kill switch while the AI queue is loaded, shutdown/restart while halted,
+  corrupt/unsupported event rejection, the full paper pipeline, and offline queue-aware Nautilus
+  execution.
+- **Readiness matrix (15 required items):** engine pin and Python baseline, engine-import
+  confinement, domain-layer isolation, no mainnet capability, no withdrawal capability, auditor has
+  no network capability, environment-only credentials, deterministic risk, and the documented
+  limitations and policies (TOCTOU, dynamic-latency PARTIAL, break-glass gap, upgrade policy,
+  UNKNOWN_PENDING_RECONCILIATION, testnet-≠-mainnet).
+- **Mechanical verdict:** `TECHNICALLY READY FOR OWNER REVIEW` only when every required item and
+  every scenario passes; otherwise `NOT READY`. Retained limitations are reported as
+  *informational*, never as passes.
+- **Readiness is not authorization:** a `TECHNICALLY READY` verdict does NOT authorize live
+  trading. Jamal remains the only decider for any live/mainnet phase.
+
 ## License
 
 See LICENSE file for details. 
