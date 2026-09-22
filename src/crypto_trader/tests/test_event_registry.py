@@ -56,6 +56,8 @@ def test_default_registry_registers_every_v1_contract():
         "validity.disposition.recorded",
         # Phase 7 additive contract (existing schemas unchanged).
         "risk.evaluation.recorded",
+        # Phase 9 additive contract (existing schemas unchanged).
+        "safety.state.changed",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:

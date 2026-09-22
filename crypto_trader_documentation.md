@@ -321,6 +321,30 @@ ambiguous; an unrecognised venue order is escalated. Every adjustment carries so
 state, after state and a reason code. No new event contract is introduced - the Phase 3
 `recovery.state.changed` contract is reused unchanged.
 
+## Safety lane + kill switch + break-glass foundation (Phase 9)
+
+`crypto_trader/safety` implements the deterministic operational safety controls that sit above the
+risk layer and below the operator.
+
+| Module | Role |
+|---|---|
+| `modes.py` | `SafetyMode` + capability matrix (pure function of the mode) |
+| `controls.py` | `SafetyController` (deterministic transitions, kill switch, break-glass posture, fail-closed restore) |
+| `lane.py` | `PrioritySafetyLane` + `LaneCommand` / `LanePriority` (safety-first, bounded normal lane) |
+| `journaling.py` | `record_safety_state` / `record_safety_transitions` (no event for an idempotent no-op) |
+| `breakglass.py` | `BreakGlassPort` interface + `SimulatedBreakGlass` (no I/O, no venue connectivity) |
+| `integration.py` | `risk_limits_for_safety` (mode -> Phase 7 `RiskLimits`, no parallel rule set) |
+
+Additive contract: `safety.state.changed` (mode, previous_mode, reason_code, reason, trigger,
+kill_switch_engaged). Derived capabilities are deliberately NOT stored in the event, so the record
+cannot drift from the policy.
+
+Guarantees: a persisted state that is missing, incomplete, unknown-version or self-inconsistent
+restores into `recovery_required` with the kill switch engaged; repeated identical requests are
+idempotent no-ops; safety commands bypass the AI/strategy backlog and are never dropped; break-glass
+forces `degraded` -> `recovery_required` and requires reconciliation plus an explicit operator
+return to `normal`. Live break-glass remains a pre-live mandatory gap.
+
 ## License
 
 See LICENSE file for details.

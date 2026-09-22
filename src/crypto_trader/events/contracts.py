@@ -18,6 +18,12 @@ Stages covered (one contract each):
 4. ``order.state.changed``         - order lifecycle state change
 5. ``execution.fill.recorded``     - execution/fill record
 6. ``recovery.state.changed``      - recovery/reconciliation state change
+
+Additive contracts added by later phases (existing schemas unchanged):
+
+7. ``validity.disposition.recorded`` (Phase 6) - deterministic validity/staleness verdict
+8. ``risk.evaluation.recorded``      (Phase 7) - deterministic Hard Risk rule audit
+9. ``safety.state.changed``          (Phase 9) - operational safety-mode transition
 """
 
 from __future__ import annotations
@@ -62,6 +68,11 @@ __all__ = [
     "RiskEvaluationRecorded",
     "RiskRuleResultPayload",
     "RiskRuleUnit",
+    "SAFETY_EVENT_TYPE",
+    "SafetyMode",
+    "SafetyStateChangePayload",
+    "SafetyStateChanged",
+    "SafetyTrigger",
 ]
 
 STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
@@ -74,6 +85,8 @@ RECOVERY_EVENT_TYPE = "recovery.state.changed"
 VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
 #: Phase 7 additive contract: the full deterministic Hard Risk rule audit for an intent.
 RISK_EVALUATION_EVENT_TYPE = "risk.evaluation.recorded"
+#: Phase 9 additive contract: a deterministic operational safety-mode transition.
+SAFETY_EVENT_TYPE = "safety.state.changed"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -99,6 +112,19 @@ ValidityDisposition = Literal[
     "superseded",
     "backpressure_rejected",
 ]
+
+#: Operational safety modes (Phase 9). Ordered from least to most restrictive below.
+SafetyMode = Literal[
+    "normal",
+    "reduce_only",
+    "halt_new_risk",
+    "cancel_open",
+    "degraded",
+    "recovery_required",
+]
+
+#: What caused a safety-mode transition.
+SafetyTrigger = Literal["operator", "risk", "recovery", "break_glass", "system"]
 
 
 # --- 1. Strategy / AI decision ---------------------------------------------
@@ -363,6 +389,35 @@ class RiskEvaluationRecorded(DomainEvent):
     payload: RiskEvaluationPayload
 
 
+# --- 9. Operational safety state (Phase 9, additive) -----------------------
+
+class SafetyStateChangePayload(EventPayload):
+    """A deterministic operational safety-mode transition.
+
+    The payload records the mode and why it changed. Derived policy (whether new risk is
+    allowed, whether cancels are required) is intentionally NOT embedded here: it is a pure
+    function of ``mode`` and lives in ``crypto_trader.safety``, so the record cannot drift from
+    the policy.
+    """
+
+    mode: SafetyMode = Field(description="Safety mode after the transition.")
+    previous_mode: SafetyMode = Field(description="Safety mode before the transition.")
+    reason_code: str = Field(min_length=1, description="Stable machine-readable reason.")
+    reason: str = Field(min_length=1, description="Human-readable reason for the transition.")
+    trigger: SafetyTrigger = Field(description="What caused the transition.")
+    kill_switch_engaged: bool = Field(
+        default=False, description="Whether the kill switch is engaged after this transition."
+    )
+
+
+class SafetyStateChanged(DomainEvent):
+    """An operational safety-mode transition was recorded."""
+
+    event_type: Literal["safety.state.changed"] = SAFETY_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: SafetyStateChangePayload
+
+
 #: Every V1 contract known to this build, in pipeline order.
 V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StrategyDecisionRecorded,
@@ -373,4 +428,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     RecoveryStateChanged,
     ValidityDispositionRecorded,
     RiskEvaluationRecorded,
+    SafetyStateChanged,
 )

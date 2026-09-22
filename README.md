@@ -370,6 +370,33 @@ execution/venue view without either silently overwriting the other.
 - **Journaled** through the existing Phase 3 `recovery.state.changed` contract
   (`detected` -> `reconciling` -> `resolved` | `failed`). Phase 8 adds **no** new event contract.
 
+## Safety lane + kill switch + break-glass foundation (Phase 9)
+
+`crypto_trader/safety` implements the deterministic operational safety controls. The mode is the
+only state and every capability is a pure function of it:
+
+`normal`, `reduce_only`, `halt_new_risk`, `cancel_open`, `degraded`, `recovery_required`.
+
+- **Priority safety lane:** halt / cancel-open / kill-switch commands travel on their own lane and
+  are always drained before strategy/AI work, so they never wait behind an inference backlog. The
+  normal lane is bounded and fails closed with backpressure; the safety lane never drops a
+  command. Commands are de-duplicated by `command_id`.
+- **Kill switch:** deterministic, observable, journaled, restart-persistent and fail-closed. An
+  unreadable, incomplete, unknown-version or self-inconsistent persisted state restores into
+  `recovery_required` with the kill switch engaged - never into `normal`.
+- **Idempotent actions:** re-requesting the current mode (or re-engaging the kill switch) is a
+  no-op that produces **no** duplicate event.
+- **Halt blocks new risk through the existing deterministic engine:** `risk_limits_for_safety`
+  derives the Phase 7 limits from the mode (`reduce_only` -> `reduce_only_mode`;
+  everything else / kill switch -> `trading_halted`). No second, parallel risk rule set.
+- **Break-glass foundation only:** an engine-independent `BreakGlassPort` plus a simulated
+  implementation that performs no I/O. Engaging break-glass forces `degraded` ->
+  `recovery_required` and prohibits new trading until reconciliation plus an explicit operator
+  return to `normal`. No venue connectivity, credentials or authenticated call exists here; the
+  live break-glass path remains a **PRE-LIVE MANDATORY GAP**.
+- **Journaled** through the NEW additive Phase 9 contract `safety.state.changed`. The Phase 3
+  `recovery.state.changed` semantics are untouched.
+
 ## License
 
 See LICENSE file for details. 
