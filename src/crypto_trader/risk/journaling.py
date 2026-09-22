@@ -27,8 +27,13 @@ def record_risk_decision(
     occurred_at: datetime,
     producer: str = "application.risk",
     event_id: UUID | None = None,
+    evaluation_event_id: UUID | None = None,
 ) -> tuple[UUID, UUID]:
-    """Append the semantic risk decision and its detailed audit to the journal."""
+    """Append the semantic risk decision and its detailed audit to the journal.
+
+    Pass the same ``event_id`` / ``evaluation_event_id`` when re-delivering the *same logical*
+    evaluation: both appends are idempotent by event id and produce exactly one effect.
+    """
     semantic = RiskDecisionRecorded(
         event_id=event_id or uuid4(),
         occurred_at=occurred_at,
@@ -41,8 +46,11 @@ def record_risk_decision(
             approved_quantity=decision.approved_quantity,
         ),
     )
-    evaluation = HardRiskEngine.to_phase3_evaluation(decision)
-    evaluation = evaluation.model_copy(update={"occurred_at": occurred_at})
+    evaluation = HardRiskEngine.to_phase3_evaluation(
+        decision,
+        occurred_at=occurred_at,
+        event_id=evaluation_event_id,
+    )
     journal.append(semantic)
     journal.append(evaluation)
     return semantic.event_id, evaluation.event_id

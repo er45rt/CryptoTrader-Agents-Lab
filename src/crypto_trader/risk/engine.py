@@ -16,7 +16,7 @@ safety phase.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -270,9 +270,22 @@ class HardRiskEngine:
         )
 
     @staticmethod
-    def to_phase3_evaluation(decision: RiskDecision) -> RiskEvaluationRecorded:
-        """Translate the decision into the additive ``risk.evaluation.recorded`` contract."""
+    def to_phase3_evaluation(
+        decision: RiskDecision,
+        *,
+        occurred_at: datetime,
+        event_id: UUID | None = None,
+    ) -> RiskEvaluationRecorded:
+        """Translate the decision into the additive ``risk.evaluation.recorded`` contract.
+
+        ``occurred_at`` is supplied by the caller so the engine itself never reads a clock and the
+        recorded evaluation stays deterministic and replayable.
+        """
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise RiskConfigError("risk evaluation occurred_at must be timezone-aware.")
         return RiskEvaluationRecorded(
+            event_id=event_id or uuid4(),
+            occurred_at=occurred_at.astimezone(timezone.utc),
             correlation_id=decision.correlation_id,
             producer="application.risk",
             symbol=decision.symbol,

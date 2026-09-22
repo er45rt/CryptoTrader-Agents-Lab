@@ -14,11 +14,13 @@ from .guard import (
     tested_queue_aware_settings,
 )
 from .runtime import NautilusExecutionRuntime
+from .simulation import NautilusSimulationRunner
 
 __all__ = [
     "SUPPORTED_ENGINE_VERSION",
     "TESTED_BOOK_TYPE_NAME",
     "NautilusExecutionRuntime",
+    "NautilusSimulationRunner",
     "QueueAwareSettings",
     "installed_engine_version",
     "require_queue_aware_settings",

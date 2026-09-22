@@ -345,6 +345,30 @@ idempotent no-ops; safety commands bypass the AI/strategy backlog and are never 
 forces `degraded` -> `recovery_required` and requires reconciliation plus an explicit operator
 return to `normal`. Live break-glass remains a pre-live mandatory gap.
 
+## Shadow + paper trading (Phase 10)
+
+`crypto_trader/paper` runs the real architecture with ZERO real orders.
+
+| Module | Role |
+|---|---|
+| `modes.py` | `TradingMode` (`shadow` / `paper`) + the tested queue-aware configuration guard |
+| `config.py` | `SessionConfig` + `load_session_config` (explicit, fail-closed, secret-free) |
+| `feed.py` | `MarketObservation`, `FrozenMarketDataFeed` (deterministic), `PublicMarketDataFeed` (injected public fetch) |
+| `decisions.py` | `StrategyDecision` + injected `DecisionSource` (the AI layer is never embedded) |
+| `session.py` | `TradingSession` (decision pipeline, journaling, resume index, simulated pass) |
+| `simulation.py` | `ExecutionSimulator` protocol + `SimulationOutcome` + `ScriptedSimulationRunner` |
+| `accounting.py` | `PositionLedger` (deterministic average-cost simulated accounting) |
+| `report.py` | `RunReport`, `report_from_journal`, JSON export + semantic hash |
+
+Infrastructure binding: `crypto_trader/execution/nautilus/simulation.py` (`NautilusSimulationRunner`)
+runs the approved requests through the offline queue-aware simulator, re-validates the engine
+version and the tested queue-aware settings, and returns OUR observations plus Phase 3 contracts.
+
+Design note: the decision pass produces the approved requests and the simulated pass then replays
+them, so simulated fills reach the ledger after the decision pass; intra-session risk feedback is a
+known limitation of this foundation. Phase 10 adds no event contract. No authenticated exchange
+capability, credential or live venue exists anywhere on this path.
+
 ## License
 
 See LICENSE file for details.

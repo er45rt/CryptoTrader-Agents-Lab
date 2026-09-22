@@ -397,6 +397,36 @@ only state and every capability is a pure function of it:
 - **Journaled** through the NEW additive Phase 9 contract `safety.state.changed`. The Phase 3
   `recovery.state.changed` semantics are untouched.
 
+## Shadow + paper trading (Phase 10)
+
+`crypto_trader/paper` runs the real architecture with ZERO real orders, in two explicit modes.
+Both run the real decision path (public market observation -> injected AI/strategy decision ->
+decision validity -> deterministic hard risk -> safety gate) and journal every stage through the
+existing Phase 3 contracts.
+
+- **SHADOW:** execution stops before order placement and records what *would* have been submitted.
+  `shadow_submits` additionally routes the would-be orders through the simulator (still no live
+  venue).
+- **PAPER:** the approved requests go to the injected simulated execution substrate and the
+  resulting lifecycle/fill events are journaled. ZERO authenticated exchange trading: no
+  credential, no signature, no order endpoint, no live venue client.
+- **Queue-aware guard:** paper mode requires the tested queue-aware configuration
+  (`queue_position=True`, `liquidity_consumption=True`, `book_type=L2_MBP`); anything else fails
+  closed instead of silently degrading to unrealistic fills. The Nautilus adapter re-validates the
+  same combination.
+- **Engine boundary:** the session depends only on the `ExecutionSimulator` protocol. The Nautilus
+  implementation lives in `execution/nautilus/simulation.py`; nothing in `paper/` imports the
+  engine, and the report contains no engine types.
+- **Run report:** decisions, validity outcomes (incl. stale/superseded/backpressure), risk
+  outcomes, safety events, recovery events, simulated orders/fills, positions, realized/unrealized
+  P&L and equity - plus the retained limitations. Deterministic `semantic_hash`, JSON export.
+- **Restart + replay:** `resume_index()` derives the resume point from the journal and every id is
+  derived from the session id plus the market reference, so re-processing never double-applies.
+  `report_from_journal` rebuilds a recorded session's semantics from the journal.
+- **Not a certification:** simulated accounting is not a performance claim and not a safety
+  certification. Retained limitations: L2 cannot reveal hidden/iceberg liquidity or true queue
+  rank; dynamic latency is PARTIAL; the decision pass precedes the simulated pass.
+
 ## License
 
 See LICENSE file for details. 
