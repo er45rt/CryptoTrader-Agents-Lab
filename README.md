@@ -427,6 +427,37 @@ existing Phase 3 contracts.
   certification. Retained limitations: L2 cannot reveal hidden/iceberg liquidity or true queue
   rank; dynamic latency is PARTIAL; the decision pass precedes the simulated pass.
 
+## Binance Spot Testnet execution (Phase 11)
+
+`crypto_trader/execution/binance_testnet` is the authenticated **Spot Testnet** adapter. Scope is
+testnet only: no mainnet, no futures/options/margin, no withdrawals, no real capital.
+
+- **Testnet-only endpoints:** the base URL is validated at construction against an explicit mainnet
+  blocklist; a mainnet (or any non-testnet) URL raises `MainnetForbiddenError` /
+  `TestnetEndpointError`. The blocklist itself is the only place a mainnet name appears.
+- **Credentials:** read from `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` only, never
+  logged, journaled, persisted, repr'd or echoed. `to_redacted_dict()` and `HttpRequest.safe_repr()`
+  exist so requests can be observed without exposing the key or the signature.
+- **Least privilege is verified, not assumed:** `verify_environment()` fails closed if
+  withdrawals are enabled or trading is disabled, and records the testnet identity.
+- **Ambiguity is never disguised:** a timeout, connection failure or 5xx on a *write* raises
+  `AmbiguousOrderError` (`UNKNOWN_PENDING_RECONCILIATION`); it is never blindly retried and never
+  locally marked failed. `recover_order()` adopts an order that already exists at the venue without
+  re-sending it, and Phase 8 reconciliation resolves it from venue evidence.
+- **Idempotency:** `newClientOrderId` is derived deterministically from the intent id, so a
+  duplicate submission (including after a restart) cannot create a second venue order.
+- **Rate limits and reconnects:** a weight bucket with deterministic backoff, `Retry-After`
+  honoured on 429, IP bans (418) stop the run, and reads retry while writes do not.
+- **Time synchronization:** an explicit clock offset with a `recvWindow` clamped to the documented
+  maximum; `-1021` re-synchronizes once for reads and fails closed for writes; excessive drift
+  refuses to sign.
+- **Journaled:** every lifecycle/fill event is appended through the existing Phase 3 contracts, so
+  testnet history lives in the same journal as paper/shadow history. No new event contract.
+- **Offline vs live:** the offline regression suite is fully green with the live tests skipped.
+  Live testnet tests are opt-in via `CRYPTO_TRADER_RUN_TESTNET=1` and are reported separately; a
+  testnet outage is never disguised as an application PASS. **Testnet success does not authorize
+  mainnet.**
+
 ## License
 
 See LICENSE file for details. 

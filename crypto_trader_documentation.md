@@ -369,6 +369,33 @@ them, so simulated fills reach the ledger after the decision pass; intra-session
 known limitation of this foundation. Phase 10 adds no event contract. No authenticated exchange
 capability, credential or live venue exists anywhere on this path.
 
+## Binance Spot Testnet execution (Phase 11)
+
+`crypto_trader/execution/binance_testnet` is the authenticated Spot Testnet adapter (infrastructure
+layer). Scope: testnet only, spot only.
+
+| Module | Role |
+|---|---|
+| `endpoints.py` | testnet-only endpoint policy + explicit mainnet blocklist |
+| `credentials.py` | environment-only credentials, redacted repr/dict, no persistence |
+| `signing.py` | HMAC-SHA256 query signing + log redaction helpers |
+| `clock.py` | server offset, `recvWindow` clamp, drift guard |
+| `transport.py` | `Transport` protocol, real requests transport, scripted double, log-safe requests |
+| `rate_limit.py` | weight bucket, deterministic backoff, 429/418 handling |
+| `client.py` | signed REST client (order/cancel/status/open orders/cancel-all), idempotency, ambiguity |
+| `models.py` | engine-independent orders/fills/account/environment + symbol rules |
+| `translate.py` | venue state -> Phase 3 contracts and recovery domain state (deterministic ids) |
+| `runtime.py` | execution port + Phase 8 venue view + safety-controller integration |
+
+Authorised test/live split: the offline suite exercises every behaviour with a scripted transport;
+`test_testnet_live_integration.py` holds the opt-in live tests (`CRYPTO_TRADER_RUN_TESTNET=1`) and is
+skipped by default. Live results are reported separately from the offline regression.
+
+Phase 11 deliberately narrows the older "no authenticated capability anywhere" guards to this one
+directory (`test_testnet_scope.py` proves the exemption is narrow, testnet-only and secret-safe);
+those guards still cover the rest of the production tree. No event contract was added - testnet
+lifecycle events reuse `order.state.changed` / `execution.fill.recorded`.
+
 ## License
 
 See LICENSE file for details.

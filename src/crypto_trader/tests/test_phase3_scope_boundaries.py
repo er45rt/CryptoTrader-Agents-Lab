@@ -57,6 +57,11 @@ FORBIDDEN_TRADING_TOKENS = (
     "api/v3/order",
 )
 
+#: Phase 11 authorises authenticated Binance SPOT TESTNET capability, and only there. Every other
+#: production module (including the rest of the execution layer) stays free of these tokens.
+#: ``test_testnet_scope.py`` proves the exemption is narrow and testnet-only.
+PHASE11_AUTHORISED_TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
+
 
 class FakeLLM(BaseLLM):
     """Stand-in LLM so the boundary test never contacts a provider."""
@@ -74,6 +79,15 @@ def _runtime_python_files() -> list[Path]:
         path
         for path in PACKAGE_DIR.rglob("*.py")
         if "tests" not in path.parts and "__pycache__" not in path.parts
+    ]
+
+
+def _runtime_python_files_outside_authorised_testnet() -> list[Path]:
+    """Every production module except the Phase 11 authorised testnet adapter."""
+    return [
+        path
+        for path in _runtime_python_files()
+        if not path.is_relative_to(PHASE11_AUTHORISED_TESTNET_DIR)
     ]
 
 
@@ -167,14 +181,14 @@ def test_events_package_public_api_is_contracts_and_registry_only():
 # --- No trading / authenticated exchange capability ---
 
 def test_no_order_placement_or_cancellation_capability_exists():
-    for path in _runtime_python_files():
+    for path in _runtime_python_files_outside_authorised_testnet():
         text = path.read_text(encoding="utf-8").lower()
         for token in FORBIDDEN_TRADING_TOKENS:
             assert token not in text, f"{path.name} contains trading capability: {token}"
 
 
 def test_no_authenticated_binance_capability_exists():
-    for path in _runtime_python_files():
+    for path in _runtime_python_files_outside_authorised_testnet():
         text = path.read_text(encoding="utf-8")
         for token in (
             "BINANCE_API_KEY",

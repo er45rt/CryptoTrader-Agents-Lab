@@ -35,3 +35,6 @@ type = "crew"
 [tool.pytest.ini_options]
 testpaths = ["src/crypto_trader/tests"]
 pythonpath = ["src"]
+markers = [
+    "testnet: live Binance SPOT TESTNET integration tests (opt-in; skipped by default)",
+]

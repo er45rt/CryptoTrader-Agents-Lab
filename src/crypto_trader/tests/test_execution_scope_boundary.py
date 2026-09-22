@@ -8,6 +8,11 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = PROJECT_ROOT / "src" / "crypto_trader"
 
+#: Phase 11 authorises authenticated Binance SPOT TESTNET execution in exactly this directory.
+#: Everything else in the execution layer remains free of authenticated/live capability;
+#: ``test_testnet_scope.py`` proves the exemption is narrow and testnet-only.
+PHASE11_AUTHORISED_TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
+
 #: Protected layers that must never import or reference the engine.
 PROTECTED_PATHS = {
     "phase3_events": PACKAGE_DIR / "events",
@@ -94,12 +99,36 @@ def test_no_authenticated_or_live_execution_capability_was_introduced():
     )
     offenders = []
     for file in (PACKAGE_DIR / "execution").rglob("*.py"):
+        if file.is_relative_to(PHASE11_AUTHORISED_TESTNET_DIR):
+            continue
         text = file.read_text(encoding="utf-8").lower()
         for token in forbidden:
             if token in text:
                 offenders.append(f"{file.name}:{token}")
 
     assert offenders == [], f"unexpected execution capability: {offenders}"
+
+
+def test_only_the_testnet_adapter_is_exempt_from_the_no_auth_guards():
+    """The Phase 11 exemption is exactly one directory, and it must be testnet-only."""
+    exempt = PHASE11_AUTHORISED_TESTNET_DIR
+    assert exempt.is_dir(), "the Phase 11 testnet adapter is expected to exist"
+
+    execution_files = [
+        file for file in (PACKAGE_DIR / "execution").rglob("*.py") if "__pycache__" not in file.parts
+    ]
+    subpackages = {
+        file.relative_to(PACKAGE_DIR / "execution").parts[0]
+        for file in execution_files
+        if len(file.relative_to(PACKAGE_DIR / "execution").parts) > 1
+    }
+    assert subpackages == {"nautilus", "binance_testnet"}
+
+    endpoints = (exempt / "endpoints.py").read_text(encoding="utf-8")
+    assert "testnet.binance.vision" in endpoints
+    assert "Binance mainnet endpoints are forbidden in Phase 11" in (
+        exempt / "endpoints.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_phase3_contracts_are_unchanged_by_phase4():
