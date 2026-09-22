@@ -244,6 +244,24 @@ extension point, and deterministic repeatability).
 | `execution/nautilus/outbound.py` | Nautilus state → our observations + Phase 3 contracts (explicit map) |
 | `execution/nautilus/runtime.py` | start/submit/run/stop lifecycle; no inference in engine callbacks |
 
+## Persistent event journal and replay (Phase 5)
+
+`crypto_trader/persistence` provides the durable application/domain history that sits above
+Nautilus and is authoritative for decisions, intents, risk/validity outcomes, lifecycle audit
+and correlation history.
+
+| Module | Role |
+|---|---|
+| `journal.py` | `EventJournal` protocol + `SQLiteEventJournal` (WAL, transactions, append-only, idempotent by `event_id`) |
+| `snapshots.py` | `SnapshotStore` for derived state with the recorded journal position (acceleration only) |
+| `replay.py` | `IdempotentConsumer` + `rebuild_state` (snapshot + deterministic ordered tail replay) |
+| `errors.py` | typed storage errors (`EventIdConflictError`, `JournalSchemaError`, `SnapshotError`) |
+
+Guarantees: lossless Phase 3 payloads decoded through the registry; indexed correlation/type/
+version/ordering queries; schema-version fail-closed on unknown databases; no pickle; no
+arbitrary code deserialization; no engine or LLM dependency; snapshot + replay-tail rebuild;
+crash-between-append-and-apply recovery; at-least-once delivery with exactly-once effects.
+
 ## License
 
 See LICENSE file for details.

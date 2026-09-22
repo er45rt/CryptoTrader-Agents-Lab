@@ -263,6 +263,34 @@ Phase 4 deliberately does **not** implement production risk, decision validity/s
 an OMS, a persistent event store, recovery/reconciliation, a safety lane, break-glass, or any
 live/authenticated venue connectivity.
 
+## Persistent event journal and replay (Phase 5)
+
+The application keeps its **own durable history** above Nautilus. Nautilus internal state is
+not the source of truth for AI decisions, trade intents, risk decisions, validity
+dispositions, lifecycle audit, or correlation history.
+
+- **Storage abstraction + local implementation:** `crypto_trader/persistence` exposes an
+  engine-independent `EventJournal` protocol and a SQLite implementation using the standard
+  library (`sqlite3`) in WAL mode with explicit transactions. No Redis, Kafka, or
+  microservices; no pickle and no arbitrary code deserialization.
+- **Append-only and idempotent:** `event_id` is the primary key, so re-delivering the same
+  logical event is a no-op. Re-appending *different* content for an existing `event_id` fails
+  closed (`EventIdConflictError`) rather than overwriting history.
+- **Lossless payloads:** the full Phase 3 envelope JSON is stored and decoded back through the
+  Phase 3 registry, so unknown event types and malformed payloads fail visibly instead of
+  being guessed.
+- **Indexed for the workflows we need:** correlation, event type/schema version, occurred-at
+  ordering, symbol/sequence and order history.
+- **Snapshots are acceleration only:** derived application state can be snapshotted, and every
+  snapshot records the exact journal position it represents (last event id, ordering key, last
+  sequence number). The journal remains authoritative.
+- **Replay is deterministic:** the same journal (or snapshot + tail) rebuilds the same state in
+  the same order; consumers are idempotent by `event_id`, so at-least-once delivery produces
+  exactly one application effect. A crash between journal append and consumer application is
+  recovered on restart without double-applying.
+
+Phase 5 does not add an event bus, a distributed store, or any new domain event contract.
+
 ## License
 
 See LICENSE file for details. 
