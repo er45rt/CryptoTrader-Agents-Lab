@@ -462,6 +462,39 @@ scenario to pass; retained limitations (the opt-in authenticated testnet validat
 absence of any automated liquidation) are reported separately as *informational*. Break-glass
 readiness is NOT live authorization: no mainnet endpoint, no real capital and no withdrawal.
 
+## Production runtime boundary + writer fencing (Phase 14)
+
+`crypto_trader/production` closes the two technical blockers from the Final Owner Review: there was
+no production endpoint path, and the normal-writer lease plus the persisted safety state were not
+consulted at any production decision boundary.
+
+| Module | Role |
+|---|---|
+| `environment.py` | explicit `testnet` / `mainnet` selection, endpoint allowlist/guard, production disabled by default, owner-authorization gate |
+| `errors.py` | typed, fail-closed production-runtime errors |
+| `fence.py` | the final safety + writer-fence gate: re-reads the journal, the persisted safety state and the ownership record on every call |
+| `runtime.py` | `ProductionRuntime`: fail-closed startup, lease claim, and the two-step decision path (`prepare_intent` / `submit_prepared`) |
+
+Environment selection: the default is `testnet`; an unknown value fails closed; the production
+environment exists as an explicit path but `MAINNET_ENABLED` is `False`, so requesting it raises
+before any client, credential or request. A testnet environment refuses a production host and a
+production environment refuses a testnet host, so the two can never be confused.
+
+Startup: resolve environment -> load persisted safety state (refuse unless `normal`, kill switch
+released and no break-glass epoch open) -> rebuild order state from the journal and refuse while
+reconciliation is unresolved -> claim the single authoritative normal writer lease with a fresh
+fencing term -> verify the held fence -> start the execution boundary (which re-verifies the venue
+endpoint, clock and least-privilege permissions).
+
+Order path: Trade Intent -> Decision Validity -> Deterministic Hard Risk -> persisted safety /
+writer-fence gate -> execution boundary -> venue adapter. The fence is re-validated immediately
+before the venue call and is never cached; an emergency break-glass takeover mints the next term and
+makes the running writer stale, and an AI/strategy decision can neither change the safety posture
+nor bypass the gate. Phase 14 reuses the Phase 5/6/7/8/9/11/13 components and adds no event contract.
+
+Scope: Binance SPOT TESTNET only; no production/mainnet order, no real capital, no withdrawal and no
+credential value. Readiness is NOT live authorization.
+
 ## License
 
 See LICENSE file for details.

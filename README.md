@@ -532,6 +532,50 @@ Binance SPOT TESTNET only, no real capital, no withdrawal, no liquidation.
   trading. No mainnet endpoint is configured, no real capital is used, and no withdrawal capability
   exists anywhere on this path.
 
+## Production runtime boundary + writer fencing (Phase 14)
+
+`crypto_trader/production` closes the two technical blockers from the Final Owner Review: there was
+no production endpoint path, and the normal-writer lease plus the persisted safety state were never
+consulted at a production decision boundary.
+
+- **Explicit environment selection, production disabled by default:** `resolve_environment()`
+  resolves `testnet` (the default) or `mainnet` from an explicit enum, never from a free-form host.
+  `MAINNET_ENABLED` is `False`, so a production environment is refused before any client is
+  constructed, any credential is read or any request is attempted - even when an authorization flag
+  and a base URL are supplied. Testnet and production endpoints cannot be confused: a testnet
+  environment refuses a production host and a production environment refuses a testnet host. The
+  runtime hard-codes no production URL; a future, owner-authorized phase supplies one.
+- **Fail-closed startup:** the runtime resolves the environment, loads the persisted safety state
+  and refuses to start unless the posture is `normal` with the kill switch released and no
+  break-glass epoch open; it rebuilds order state from the journal and refuses to start while
+  reconciliation is unresolved; then it claims the single authoritative normal writer lease (a fresh
+  fencing term) and verifies the held fence is current before serving any traffic. A missing,
+  unreadable or contradictory ownership/safety state fails closed.
+- **Final fence before every submission:** `prepare_intent()` runs Decision Validity and then the
+  deterministic Hard Risk engine and returns a preparation that grants NO authority.
+  `submit_prepared()` re-reads the authoritative journal, the persisted safety state and the current
+  ownership record IMMEDIATELY before the venue call, refuses a stale writer fence, an open
+  break-glass epoch, an engaged kill switch or any non-`normal` posture, and only then submits.
+  There is no cached authorization window.
+- **Enforced order path:** Trade Intent -> Decision Validity -> Deterministic Hard Risk -> persisted
+  safety / writer-fence gate -> execution boundary -> venue adapter. Risk, sizing and execution
+  authority never move into the LLM layer, and an AI/strategy decision cannot change the safety
+  posture or bypass the final gate.
+- **Reuse, not reimplementation:** the runtime integrates the real Phase 11 Spot Testnet execution
+  port, the Phase 8 recovery/reconciliation runtime, the Phase 9 safety controller, the Phase 13
+  break-glass ownership/fencing control, the Phase 5 journal, the Phase 6 validity gate and the
+  Phase 7 Hard Risk engine. Phase 14 adds **no** event contract.
+- **Evidence:** focused offline integration and fault tests cover lease ownership, competing and
+  stale writers, corrupt/missing leases, persisted degraded and recovery-required postures, takeover
+  during an in-flight decision, restart persistence, reconciliation-plus-acknowledgement gating, AI
+  backpressure, ambiguity without blind retry, deterministic journal replay, cancel-open through the
+  safety path and the production-disabled/withdrawal/secret invariants - plus an opt-in authenticated
+  Spot Testnet run of the production runtime itself.
+- **Scope:** Binance SPOT TESTNET only. No production/mainnet order, no real capital, no withdrawal
+  and no credential value is involved; an ambiguous submission still becomes
+  `UNKNOWN_PENDING_RECONCILIATION` and is never blindly retried. Phase 14 readiness is NOT live
+  authorization: LIVE TRADING IS NOT AUTHORIZED and no mainnet order may be placed.
+
 ## License
 
 See LICENSE file for details. 
