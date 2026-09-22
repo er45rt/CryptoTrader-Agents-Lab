@@ -36,6 +36,7 @@ __all__ = [
     "FillRecordPayload",
     "OrderStateChangePayload",
     "RECOVERY_EVENT_TYPE",
+    "RISK_EVALUATION_EVENT_TYPE",
     "RISK_DECISION_EVENT_TYPE",
     "RecoveryState",
     "RecoveryStateChangePayload",
@@ -57,6 +58,10 @@ __all__ = [
     "ValidityDisposition",
     "ValidityDispositionPayload",
     "ValidityDispositionRecorded",
+    "RiskEvaluationPayload",
+    "RiskEvaluationRecorded",
+    "RiskRuleResultPayload",
+    "RiskRuleUnit",
 ]
 
 STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
@@ -67,6 +72,8 @@ EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
 #: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
 VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
+#: Phase 7 additive contract: the full deterministic Hard Risk rule audit for an intent.
+RISK_EVALUATION_EVENT_TYPE = "risk.evaluation.recorded"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -298,6 +305,64 @@ class ValidityDispositionRecorded(DomainEvent):
     payload: ValidityDispositionPayload
 
 
+# --- 8. Deterministic Hard Risk evaluation (Phase 7, additive) --------------
+
+#: Explicit units used by risk rule results. No implicit conversions are performed anywhere.
+RiskRuleUnit = Literal["quote_currency", "count", "percent"]
+
+
+class RiskRuleResultPayload(EventPayload):
+    """One deterministic risk rule outcome."""
+
+    rule_id: str = Field(min_length=1, description="Stable rule identifier.")
+    allowed: bool = Field(description="Whether the rule permitted the intent.")
+    reason_code: str = Field(min_length=1, description="Deterministic reason code for the outcome.")
+    actual: Decimal = Field(description="Measured value in the rule's declared unit.")
+    limit: Decimal = Field(description="Configured limit in the rule's declared unit.")
+    unit: RiskRuleUnit = Field(description="Explicit unit of 'actual' and 'limit'.")
+
+
+class RiskEvaluationPayload(EventPayload):
+    """The complete deterministic Hard Risk audit for one intent.
+
+    Units are explicit: quote-currency amounts are Decimals in the quote currency (for example
+    USDT), percentages are Decimals expressed as percent (0-100), counts are integers.
+    """
+
+    limits_version: str = Field(min_length=1, description="Identity/version of the rule set used.")
+    intent_id: UUID = Field(description="Intent this evaluation applies to.")
+    symbol: str = Field(min_length=1)
+    side: Literal["buy", "sell"]
+    quantity: Decimal = Field(gt=0, description="Requested base-asset quantity.")
+    price: Decimal = Field(gt=0, description="Reference/limit price in quote currency.")
+    notional: Decimal = Field(gt=0, description="quantity * price, in quote currency.")
+    decision: Literal["allowed", "rejected"]
+    reason_codes: list[str] = Field(min_length=1, description="Deterministic reasons for the decision.")
+    rule_results: list[RiskRuleResultPayload] = Field(
+        min_length=1, description="Per-rule results, in evaluation order."
+    )
+    reduce_only_mode: bool = Field(default=False, description="Whether reduce-only mode was active.")
+    risk_actions: list[Literal["halt_new_risk"]] = Field(
+        default_factory=list,
+        description="Deterministic safety actions requested by this evaluation (never liquidation).",
+    )
+
+    @field_validator("reason_codes")
+    @classmethod
+    def _non_empty_reasons(cls, value: list[str]) -> list[str]:
+        if not value or any(not reason for reason in value):
+            raise ValueError("reason_codes must contain at least one non-empty code.")
+        return value
+
+
+class RiskEvaluationRecorded(DomainEvent):
+    """A deterministic Hard Risk evaluation was recorded for an intent."""
+
+    event_type: Literal["risk.evaluation.recorded"] = RISK_EVALUATION_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: RiskEvaluationPayload
+
+
 #: Every V1 contract known to this build, in pipeline order.
 V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StrategyDecisionRecorded,
@@ -307,4 +372,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     ExecutionFillRecorded,
     RecoveryStateChanged,
     ValidityDispositionRecorded,
+    RiskEvaluationRecorded,
 )

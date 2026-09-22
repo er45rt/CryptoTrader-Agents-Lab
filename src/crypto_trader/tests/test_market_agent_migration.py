@@ -233,5 +233,6 @@ def test_profiles_active_set_matches_migrated_agents():
 
 def test_no_unrelated_phase_2_components_exist():
     # NOTE (Phase 4): "execution" is an authorised boundary package now; the rest stay absent.
-    for name in ("tinyfish", "oms", "risk", "simulator", "event_bus", "redis"):
+    # NOTE (Phase 7): "risk" is an authorised production package now; the rest stay absent.
+    for name in ("tinyfish", "oms", "simulator", "event_bus", "redis"):
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"

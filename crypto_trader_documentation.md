@@ -281,6 +281,23 @@ Existing Phase 3 schemas are untouched. Freshness is measured from the original 
 observation; replaying the same market-state sequence with the same intent yields the same
 disposition. TOCTOU is narrowed, not eliminated.
 
+## Deterministic Hard Risk (Phase 7)
+
+`crypto_trader/risk` implements the deterministic, non-LLM risk layer that runs after validity
+and before the execution boundary.
+
+| Module | Role |
+|---|---|
+| `limits.py` | `RiskLimits` + `load_limits` (explicit units; missing/invalid configuration fails closed) |
+| `state.py` | `RiskStateSnapshot` (quote-currency Decimals, signed positions), `PendingIntentRegistry` (duplicate/conflict protection) |
+| `engine.py` | `HardRiskEngine` (13 deterministic rules, explicit units, fixed order) + Phase 3 translation |
+| `journaling.py` | `record_risk_decision` (semantic outcome + detailed audit, idempotent by event id) |
+
+Additive contract: `risk.evaluation.recorded` (limits_version, intent identity, symbol/side,
+quantity/price/notional, decision, reason codes, per-rule results with units, reduce-only flag,
+risk actions). The existing `risk.decision.recorded` contract carries the semantic outcome.
+Breaches halt new risk only; the engine never liquidates.
+
 ## License
 
 See LICENSE file for details.

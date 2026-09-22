@@ -156,7 +156,9 @@ def test_no_phase_three_components_were_introduced():
     # NOTE (Phase 4): "execution" is now an authorised production package (the
     # engine-independent execution boundary + Nautilus adapter). The components below
     # remain out of scope and must still be absent.
-    for name in ("tinyfish", "oms", "risk", "simulator", "event_bus", "redis"):
+    # NOTE (Phase 7): "risk" is now an authorised production package (the deterministic
+    # Hard Risk engine). The components below remain out of scope and must still be absent.
+    for name in ("tinyfish", "oms", "simulator", "event_bus", "redis"):
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"
 
     # Scan runtime modules only; the test modules necessarily name these terms.

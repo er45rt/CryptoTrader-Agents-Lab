@@ -320,6 +320,31 @@ validity → (later phases: Hard Risk → execution boundary).
 - **TOCTOU is only narrowed:** local validity checks reduce the race window up to the last
   locally controlled admission point; they are not atomic with venue acceptance.
 
+## Deterministic Hard Risk (Phase 7)
+
+Risk is deterministic and non-LLM: the model never approves its own risk. The engine evaluates
+typed inputs only and every rule carries an explicit unit.
+
+- **Explicit units, no implicit conversions:** `*_quote` limits/measurements are
+  `Decimal` amounts in the quote currency (e.g. USDT); `*_pct` values are `Decimal` percent
+  (0-100); counts are integers. Every rule result records `actual`, `limit` and `unit`.
+- **Configuration-driven, fail closed:** `load_limits({...})` requires every limit
+  (`max_order_notional_quote`, `max_symbol_exposure_quote`, `max_gross_exposure_quote`,
+  `max_net_exposure_quote`, `max_strategy_exposure_quote`, `loss_limit_quote`,
+  `max_drawdown_pct`, `concentration_limit_pct`, `max_open_orders`, `max_open_positions`,
+  `limits_version`) and rejects unknown keys or invalid values. No capital numbers are invented.
+- **Rules:** trading halt, duplicate intent, conflicting intent, reduce-only behaviour,
+  open orders/positions, order notional, symbol/strategy/gross/net exposure, loss limit,
+  drawdown, concentration — evaluated in a fixed deterministic order with stable reason codes.
+- **Safety semantics:** a loss-limit or drawdown breach only halts **new risk**
+  (`halt_new_risk`); the engine never instructs liquidation or unwind — that policy belongs to
+  the safety phase. `reduce_only_mode` blocks exposure-increasing orders.
+- **Stale state rejection:** with `max_state_age_seconds` configured, an old or timestamp-less
+  risk-state snapshot fails closed.
+- **Journaled:** each evaluation writes the existing Phase 3 `risk.decision.recorded` outcome
+  plus a NEW additive `risk.evaluation.recorded` audit (limits version, inputs, per-rule
+  results, reason codes, risk actions). Existing Phase 3 schemas are unchanged.
+
 ## License
 
 See LICENSE file for details. 

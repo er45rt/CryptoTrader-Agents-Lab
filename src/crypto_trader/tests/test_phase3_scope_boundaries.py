@@ -28,13 +28,26 @@ CONFIG_DIR = PACKAGE_DIR / "config"
 FORBIDDEN_RUNTIME_PACKAGES = (
     "tinyfish",
     "oms",
-    "risk",
     "simulator",
     "event_bus",
     "redis",
     "broker",
     "state_store",
 )
+
+
+def test_risk_package_is_only_the_deterministic_engine():
+    """Phase 7 authorised a deterministic, non-LLM Hard Risk engine - nothing else."""
+    risk_dir = PACKAGE_DIR / "risk"
+    assert risk_dir.is_dir(), "the Phase 7 risk package is expected to exist"
+
+    for name in ("oms", "simulator", "event_bus", "broker", "state_store", "redis"):
+        assert not (risk_dir / name).exists(), f"unexpected component inside risk/: {name}"
+
+    for file in risk_dir.rglob("*.py"):
+        text = file.read_text(encoding="utf-8")
+        for token in ("import nautilus", "from nautilus", "crewai", "crypto_trader.llm", "import redis", "requests.post"):
+            assert token not in text, f"risk/{file.name} must not reference {token}"
 
 FORBIDDEN_TRADING_TOKENS = (
     "create_order",

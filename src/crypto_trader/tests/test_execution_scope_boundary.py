@@ -117,3 +117,4 @@ def test_phase3_contracts_are_unchanged_by_phase4():
 
     assert original_six <= event_types, "the original Phase 3 event types must remain unchanged"
     assert "validity.disposition.recorded" in event_types, "Phase 6 additive contract expected"
+    assert "risk.evaluation.recorded" in event_types, "Phase 7 additive contract expected"

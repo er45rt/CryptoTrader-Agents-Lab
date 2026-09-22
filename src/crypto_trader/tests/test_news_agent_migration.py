@@ -212,5 +212,6 @@ def test_active_profiles_cover_all_four_agents():
 
 def test_no_other_phase_2_components_exist():
     # NOTE (Phase 4): "execution" is an authorised boundary package now; the rest stay absent.
-    for name in ("oms", "risk", "simulator", "event_bus", "redis"):
+    # NOTE (Phase 7): "risk" is an authorised production package now; the rest stay absent.
+    for name in ("oms", "simulator", "event_bus", "redis"):
         assert not (PACKAGE_DIR / name).exists(), f"unexpected module/package: {name}"
