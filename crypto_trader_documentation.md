@@ -262,6 +262,25 @@ version/ordering queries; schema-version fail-closed on unknown databases; no pi
 arbitrary code deserialization; no engine or LLM dependency; snapshot + replay-tail rebuild;
 crash-between-append-and-apply recovery; at-least-once delivery with exactly-once effects.
 
+## Decision validity / staleness gate (Phase 6)
+
+`crypto_trader/validity` implements the deterministic gate that runs between a trade intent and
+Hard Risk.
+
+| Module | Role |
+|---|---|
+| `market_state.py` | `MarketStateProvider` protocol, `LiveMarketStateProvider`, `ReplayMarketStateProvider`, validated `MarketObservation` |
+| `policy.py` | `ValidityPolicy` + `load_policy` (explicit thresholds, fail closed on missing/invalid configuration) |
+| `gate.py` | `DecisionValidityGate` (pure function of its inputs) and `to_phase3_event` |
+| `pending.py` | `BoundedPendingIntents` (bounded capacity, stale-intent eviction) |
+| `journaling.py` | `record_validity_decision` (journals every decision, idempotent by event id) |
+
+Additive contract: `validity.disposition.recorded` (payload: disposition, reason_code, intent_id,
+policy_id, decision_age_seconds, market_event_ts, decision_completed_at, market_move_bps, notes).
+Existing Phase 3 schemas are untouched. Freshness is measured from the original market
+observation; replaying the same market-state sequence with the same intent yields the same
+disposition. TOCTOU is narrowed, not eliminated.
+
 ## License
 
 See LICENSE file for details.

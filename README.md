@@ -291,6 +291,35 @@ dispositions, lifecycle audit, or correlation history.
 
 Phase 5 does not add an event bus, a distributed store, or any new domain event contract.
 
+## Decision validity / staleness gate (Phase 6)
+
+Deterministic validity runs **before** Hard Risk: AI/strategy decision → trade intent →
+validity → (later phases: Hard Risk → execution boundary).
+
+- **Freshness starts at the ORIGINAL market observation.** `market_event_ts` travels with the
+  intent; age never resets when the model finishes or when the intent is created.
+- **Dispositions (fixed vocabulary):** `ACCEPTED`, `EXPIRED` (explicit deadline passed),
+  `STALE` (age from the original observation exceeded the policy), `MARKET_MOVED` (time-valid
+  but the reference market moved beyond the strategy tolerance), `SUPERSEDED` (a newer intent
+  for the same decision scope exists), `BACKPRESSURE_REJECTED` (bounded capacity exhausted).
+  Precedence: EXPIRED → STALE → MARKET_MOVED → SUPERSEDED → BACKPRESSURE_REJECTED.
+- **Explicit configuration, fail closed:** `load_policy({...})` requires `policy_id`,
+  `max_age_seconds` and `max_market_move_bps` (optionally `valid_until_seconds`); missing or
+  invalid configuration, unknown keys, naive timestamps, or a missing current market
+  observation are all rejected rather than defaulted (a missing observation fails closed as
+  `STALE` / `market_state_unavailable`).
+- **Providers:** engine-independent `MarketStateProvider` with `LiveMarketStateProvider`
+  (caller-supplied feed; no networking in this layer) and `ReplayMarketStateProvider`
+  (deterministic frozen sequence) for replayable decisions.
+- **Bounded only:** `BoundedPendingIntents` rejects with `BACKPRESSURE_REJECTED` when full and
+  evicts intents whose age exceeds the policy, so a stale intent can never wait indefinitely
+  and execute later.
+- **Journaled:** every validity decision is appended to the Phase 5 journal as a NEW additive
+  contract, `validity.disposition.recorded` (the existing Phase 3 schemas are unchanged;
+  `risk.decision.recorded` is never overloaded with staleness).
+- **TOCTOU is only narrowed:** local validity checks reduce the race window up to the last
+  locally controlled admission point; they are not atomic with venue acceptance.
+
 ## License
 
 See LICENSE file for details. 

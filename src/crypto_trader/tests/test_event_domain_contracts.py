@@ -329,6 +329,8 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         "order.state.changed",
         "execution.fill.recorded",
         "recovery.state.changed",
+        # Phase 6 additive contract (existing schemas unchanged).
+        "validity.disposition.recorded",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)
 

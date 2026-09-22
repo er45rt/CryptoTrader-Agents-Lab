@@ -22,11 +22,13 @@ Stages covered (one contract each):
 
 from __future__ import annotations
 
+import math
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from .base import DomainEvent, EventPayload
 
@@ -42,6 +44,7 @@ __all__ = [
     "TRADE_INTENT_EVENT_TYPE",
     "ORDER_STATE_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
+    "VALIDITY_EVENT_TYPE",
     "StrategyDecisionPayload",
     "TradeIntentPayload",
     "StrategyDecisionRecorded",
@@ -51,6 +54,9 @@ __all__ = [
     "ExecutionFillRecorded",
     "RecoveryStateChanged",
     "V1_CONTRACTS",
+    "ValidityDisposition",
+    "ValidityDispositionPayload",
+    "ValidityDispositionRecorded",
 ]
 
 STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
@@ -59,6 +65,8 @@ RISK_DECISION_EVENT_TYPE = "risk.decision.recorded"
 ORDER_STATE_EVENT_TYPE = "order.state.changed"
 EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
+#: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
+VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -74,6 +82,16 @@ OrderState = Literal[
 
 #: Recovery/reconciliation states.
 RecoveryState = Literal["detected", "reconciling", "resolved", "failed"]
+
+#: Validity dispositions (Phase 6). Precedence is documented on the validity gate.
+ValidityDisposition = Literal[
+    "accepted",
+    "expired",
+    "stale",
+    "market_moved",
+    "superseded",
+    "backpressure_rejected",
+]
 
 
 # --- 1. Strategy / AI decision ---------------------------------------------
@@ -224,6 +242,62 @@ class RecoveryStateChanged(DomainEvent):
     payload: RecoveryStateChangePayload
 
 
+# --- 7. Decision validity / staleness (Phase 6, additive) ------------------
+
+class ValidityDispositionPayload(EventPayload):
+    """The deterministic validity verdict for one trade intent.
+
+    Freshness is measured from the ORIGINAL market observation (``market_event_ts``); it never
+    resets when the model finishes or the intent is created. This is an additive contract and
+    does not overload ``risk.decision.recorded``.
+    """
+
+    disposition: ValidityDisposition = Field(description="Validity verdict for this intent.")
+    reason_code: str = Field(min_length=1, description="Stable machine-readable reason.")
+    intent_id: UUID = Field(description="Intent this decision applies to.")
+    policy_id: str = Field(min_length=1, description="Identity of the explicit validity policy used.")
+    decision_age_seconds: float = Field(
+        ge=0, description="Decision age measured from the original market observation."
+    )
+    market_event_ts: datetime = Field(description="Timestamp of the original market observation.")
+    decision_completed_at: datetime = Field(
+        description="When the decision was produced; informational, never resets freshness."
+    )
+    market_move_bps: float | None = Field(
+        default=None, description="Absolute reference-market move in basis points, when measured."
+    )
+    notes: str | None = Field(default=None, description="Optional human-readable context.")
+
+    @field_validator("market_event_ts", "decision_completed_at")
+    @classmethod
+    def _require_aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("validity timestamps must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("decision_age_seconds")
+    @classmethod
+    def _finite_age(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("decision_age_seconds must be finite.")
+        return value
+
+    @field_validator("market_move_bps")
+    @classmethod
+    def _finite_move(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("market_move_bps must be finite when present.")
+        return value
+
+
+class ValidityDispositionRecorded(DomainEvent):
+    """A deterministic validity/staleness decision was recorded for an intent."""
+
+    event_type: Literal["validity.disposition.recorded"] = VALIDITY_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: ValidityDispositionPayload
+
+
 #: Every V1 contract known to this build, in pipeline order.
 V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StrategyDecisionRecorded,
@@ -232,4 +306,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     OrderStateChanged,
     ExecutionFillRecorded,
     RecoveryStateChanged,
+    ValidityDispositionRecorded,
 )

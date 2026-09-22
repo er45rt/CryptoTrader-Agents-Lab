@@ -103,11 +103,9 @@ def test_no_authenticated_or_live_execution_capability_was_introduced():
 
 
 def test_phase3_contracts_are_unchanged_by_phase4():
-    """Phase 4 adds no new domain contracts and does not edit the existing ones."""
+    """The original Phase 3 contracts are unchanged; later phases only ADD new contracts."""
     contracts = (PACKAGE_DIR / "events" / "contracts.py").read_text(encoding="utf-8")
-    event_types = set(re.findall(r'= "(strategy\.decision\.recorded|trade\.intent\.created|risk\.decision\.recorded|order\.state\.changed|execution\.fill\.recorded|recovery\.state\.changed)"', contracts))
-
-    assert event_types == {
+    original_six = {
         "strategy.decision.recorded",
         "trade.intent.created",
         "risk.decision.recorded",
@@ -115,3 +113,7 @@ def test_phase3_contracts_are_unchanged_by_phase4():
         "execution.fill.recorded",
         "recovery.state.changed",
     }
+    event_types = set(re.findall(r'= "([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"', contracts))
+
+    assert original_six <= event_types, "the original Phase 3 event types must remain unchanged"
+    assert "validity.disposition.recorded" in event_types, "Phase 6 additive contract expected"

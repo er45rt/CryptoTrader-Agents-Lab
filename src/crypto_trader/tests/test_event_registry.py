@@ -52,6 +52,8 @@ def test_default_registry_registers_every_v1_contract():
         "order.state.changed",
         "execution.fill.recorded",
         "recovery.state.changed",
+        # Phase 6 additive contract (existing schemas unchanged).
+        "validity.disposition.recorded",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:
