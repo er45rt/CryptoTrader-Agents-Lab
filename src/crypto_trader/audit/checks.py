@@ -36,6 +36,13 @@ ENGINE_INDEPENDENT_PACKAGES = (
 )
 
 TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
+
+#: Phase 15 authorises an authenticated MAINNET READ-ONLY dry-run adapter. Like the Phase 11 testnet
+#: exemption, this narrows the older "no mainnet capability at all" guard to exactly one directory;
+#: ``test_mainnet_scope.py`` proves the exemption is read-only, allowlist-only, secret-safe and
+#: cannot submit, cancel or replace anything.
+MAINNET_READONLY_DIR = PACKAGE_DIR / "mainnet"
+
 NAUTILUS_ADAPTER_DIR = PACKAGE_DIR / "execution" / "nautilus"
 
 REQUIRED_ENGINE_VERSION = "1.231.0"
@@ -242,6 +249,7 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
     for file in _production_files():
         if (
             file.is_relative_to(TESTNET_DIR)
+            or file.is_relative_to(MAINNET_READONLY_DIR)
             or file.is_relative_to(PACKAGE_DIR / "audit")
             or file.name == "binance_public_tool.py"
         ):
@@ -256,11 +264,17 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
             "Mainnet safety",
             True,
             "pass" if not mainnet_offenders else "fail",
-            "no authenticated mainnet/futures capability exists outside the testnet adapter",
+            "no authenticated mainnet MUTATION/futures capability exists outside the two "
+            "authorised adapters: the Spot Testnet adapter and the Phase 15 mainnet READ-ONLY "
+            "dry-run adapter (whose hard no-submit gate is proven by test_mainnet_scope.py and "
+            "test_mainnet_nosubmit.py)",
             {
                 "offenders": mainnet_offenders,
                 "exempt": [
                     _relative(TESTNET_DIR),
+                    _relative(MAINNET_READONLY_DIR)
+                    + " (Phase 15 mainnet READ-ONLY dry-run: allowlisted GET paths only, an "
+                    "internal hard no-submit gate and a strict read-only permission contract)",
                     "tools/binance_public_tool.py (public read-only)",
                     _relative(PACKAGE_DIR / "audit") + " (the auditor names the tokens it forbids)",
                 ],

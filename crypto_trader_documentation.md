@@ -495,6 +495,51 @@ nor bypass the gate. Phase 14 reuses the Phase 5/6/7/8/9/11/13 components and ad
 Scope: Binance SPOT TESTNET only; no production/mainnet order, no real capital, no withdrawal and no
 credential value. Readiness is NOT live authorization.
 
+## Mainnet read-only dry-run + canary guards (Phase 15)
+
+`crypto_trader/mainnet` implements the final pre-live MAINNET READ-ONLY dry-run and the guards for a
+future Controlled Live Canary. It cannot submit, cancel or replace a mainnet order, and it is NOT
+live trading authorization.
+
+| Module | Role |
+|---|---|
+| `credentials.py` | dedicated read-only key pair from `BINANCE_MAINNET_READONLY_API_KEY` / `BINANCE_MAINNET_READONLY_API_SECRET` only |
+| `endpoints.py` | mainnet host guard plus an explicit read-only GET path allowlist and a mutation denylist |
+| `permissions.py` | the strict signed `apiRestrictions` read-only contract and its fail-closed validation |
+| `filters.py` | dynamic symbol filters (NOTIONAL/MIN_NOTIONAL, LOT_SIZE, PRICE_FILTER, tickSize, stepSize, status) |
+| `envelope.py` | the locked pilot envelope, the spread/execution price rules, the LIMIT+FOK canary policy and the no-chasing rule |
+| `nosubmit.py` | the internal deterministic HARD NO-SUBMIT gate and the mode vocabulary (no LIVE member) |
+| `client.py` | authenticated read-only REST client (GET-only helper, no method parameter) |
+| `faults.py` | immediate-rejection vs post-send-ambiguity fault classification and injection |
+| `soak.py` | durable soak state and the twelve mechanical exit criteria |
+| `dryrun.py` | the dry-run pipeline ending in the hard no-submit gate |
+| `limitations.py` | the carried-forward FOK, dry-run and residual limitations |
+
+Permission profile: `enableReading` true and `enableWithdrawals`, `enableSpotAndMarginTrading`,
+`enableMargin`, `enableFutures`, `enableVanillaOptions` and `enableFixApiTrade` false, each as a real
+boolean. Missing/malformed fields, unexpected writable capabilities and parsing ambiguity fail
+closed, and the profile is re-validated at every would-be execution boundary.
+
+Pipeline: market snapshot -> decision -> trade intent -> decision validity -> deterministic hard
+risk -> safety/writer-fence gate -> OMS dry-run representation -> HARD NO-SUBMIT GATE, recording
+`WOULD_SUBMIT` or `WOULD_REJECT` and never calling a mainnet order endpoint.
+
+Pilot envelope (reference only, not permission to trade): capital 300 SAR, max order 50 SAR, max
+open exposure 150 SAR, daily loss halt 15 SAR, max 2 open orders, BTCUSDT/ETHUSDT, SPOT only, no
+margin/futures/leverage/borrowing/withdrawals. Price rules: `max_spread_bps = 30`,
+`max_normal_slippage_bps = 15` (a maximum allowed normal execution deviation, not an expectation)
+and `absolute_price_bound_bps = 50` (the future catastrophic execution ceiling). Entry policy:
+price-bounded LIMIT + FOK only, single-use market snapshots, no chasing, no IOC/GTC fallback; the
+first 10 canary trades are a review checkpoint only, and fewer than 5 completed FOK fills in a
+review window is `INSUFFICIENT_EXECUTION_SAMPLE`, never an automatic widening of the 15 bps limit.
+
+DOCUMENTED GAP: a read-only dry-run sends no orders, so empirical mainnet post-submit
+reconciliation is NOT validated in this phase; mainnet reconciliation here is logic-level plus
+read-only account-state validation, with actual post-submit ambiguity still covered by Binance
+Testnet evidence, deterministic post-send timeout/reset fault injection and the recovery tests.
+Phase 15 also narrows the Phase 12 "no mainnet capability" item to "no mainnet MUTATION capability",
+with the read-only adapter exempted explicitly and its narrowness proven by `test_mainnet_scope.py`.
+
 ## License
 
 See LICENSE file for details.

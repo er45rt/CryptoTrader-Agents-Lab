@@ -37,4 +37,5 @@ testpaths = ["src/crypto_trader/tests"]
 pythonpath = ["src"]
 markers = [
     "testnet: live Binance SPOT TESTNET integration tests (opt-in; skipped by default)",
+    "mainnet_readonly: live Binance MAINNET read-only dry-run validation (opt-in; skipped by default)",
 ]

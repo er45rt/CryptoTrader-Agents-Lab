@@ -576,6 +576,96 @@ consulted at a production decision boundary.
   `UNKNOWN_PENDING_RECONCILIATION` and is never blindly retried. Phase 14 readiness is NOT live
   authorization: LIVE TRADING IS NOT AUTHORIZED and no mainnet order may be placed.
 
+## Mainnet read-only dry-run + canary guards (Phase 15)
+
+`crypto_trader/mainnet` adds the final pre-live step that needs a real venue: an authenticated
+**MAINNET READ-ONLY dry-run**, plus the guards for the future Controlled Live Canary. It is NOT live
+trading authorization, and it cannot place, cancel or replace a mainnet order.
+
+- **Dedicated read-only credentials:** `BINANCE_MAINNET_READONLY_API_KEY` /
+  `BINANCE_MAINNET_READONLY_API_SECRET` only. The testnet pair is never read, never reused and never
+  accepted here; values are never printed, journaled, persisted, committed or put into an exception.
+- **Strict signed permission contract:** `GET /sapi/v1/account/apiRestrictions` is treated as a
+  strict USER_DATA contract. `enableReading` must be true and `enableWithdrawals`,
+  `enableSpotAndMarginTrading`, `enableMargin`, `enableFutures`, `enableVanillaOptions` and
+  `enableFixApiTrade` must all be false, as real booleans. A missing field, a malformed value, an
+  unexpected writable capability or any parsing ambiguity fails closed - HTTP success alone is never
+  sufficient. The profile is re-validated at **every would-be execution boundary** during the
+  dry-run, because key permissions can change externally without the key string changing.
+- **Internal HARD NO-SUBMIT gate:** the dry-run's safety never depends on Binance rejecting an
+  order. The gate implements the execution port and refuses every mutation with a typed error
+  *before* any transport call, so the order/cancel/replace endpoints are unreachable; the client can
+  only issue GET to an explicit read-only path allowlist, and the request helper does not accept an
+  HTTP method at all. There is no fallback path, the AI/strategist path has no setter that can relax
+  it, and configuration cannot downgrade the dry-run into live: the only mode that exists is
+  `mainnet_readonly_dry_run`.
+- **Defence in depth:** (1) the internal hard no-submit gate, (2) the strict API permission
+  verification, (3) the explicit `MAINNET READ-ONLY` environment guard, (4) withdrawal-disabled
+  validation, (5) the writer lease / fencing / persisted safety checks.
+- **Data:** authenticated mainnet reads (account/balance, account metadata, API restrictions,
+  open-order state, trade/account history) and public mainnet reads (BTCUSDT/ETHUSDT market data,
+  `exchangeInfo`, order book / ticker). No mutation of any kind.
+- **Dynamic symbol filters:** `NOTIONAL`/`MIN_NOTIONAL`, `LOT_SIZE`, `PRICE_FILTER`, `tickSize`,
+  `stepSize` and trading status are read from the venue and validated; no minimum order value, tick
+  or step is hard-coded, and a missing/malformed/inconsistent filter fails closed.
+- **Locked pilot envelope (reference only):** `capital_envelope_sar = 300`, `max_order_value_sar = 50`,
+  `max_open_exposure_sar = 150`, `daily_loss_halt_sar = 15`, `max_open_orders = 2`, symbols
+  `BTCUSDT`/`ETHUSDT`, SPOT only, no margin, no futures, no leverage, no borrowing, no withdrawals.
+  These are future Canary limits, NOT permission to trade; the envelope is `reference_only` and
+  reports `permission_to_trade = false`. No FX conversion is implemented.
+- **Spread / execution price rules:** `max_spread_bps = 30` (a top-of-book market-quality /
+  admission sanity check), `max_normal_slippage_bps = 15` (the maximum allowed normal execution
+  deviation - NOT expected slippage, NOT target slippage) and `absolute_price_bound_bps = 50` (the
+  future venue-enforced catastrophic execution ceiling). Spread observes top-of-book; the execution
+  bound must also constrain depth consumed through the order book, so they overlap but are not
+  identical. In DRY-RUN only the hypothetical values are calculated and journaled; no order may be
+  submitted.
+- **Future Canary entry policy:** price-bounded `LIMIT` + `FOK` only - no IOC, no GTC entry, no
+  automatic fallback and no automatic order chasing. If a future FOK does not fully fill, the
+  opportunity expires: the old `market_snapshot_id` can never be reused (no re-price, no re-submit,
+  no strategist retry on the old snapshot) and a NEW snapshot, decision, validity evaluation and
+  deterministic risk evaluation are required. No-chasing is enabled indefinitely. The first 10
+  canary trades are a mandatory review checkpoint only - nothing changes automatically. IOC/GTC
+  would need a separate partial-fill/dust design and explicit Owner approval.
+- **FOK limitations (retained):** FOK is a Canary-stage constraint, not the permanent optimal
+  execution strategy; it may lower the fill rate and has opportunity cost; it avoids venue-side
+  partial-fill/dust during the Canary; it does NOT eliminate transport ambiguity; a LIMIT FOK may
+  execute across multiple price levels up to the actual limit price; and 15 bps is a maximum
+  allowed execution deviation, not the realized expected value. Every future fill must be able to
+  record reference mid, limit price, average fill price and realized slippage bps.
+- **Unknown / reconciliation:** FOK does not remove ambiguous transport state. A future request that
+  is sent, may be accepted/filled/expired, and whose response is lost still becomes
+  `UNKNOWN_PENDING_RECONCILIATION`; it is never blindly retried, reconciliation uses deterministic
+  client/order identity and supports FILLED / EXPIRED / REJECTED / unresolved, and no
+  exposure-creating decision may bypass an unresolved required reconciliation state.
+- **Fault injection:** the two classes are distinguished in code. Immediate deterministic rejections
+  (permission, risk, validity, balance, filters) happen before the hypothetical send boundary;
+  post-send ambiguity (timeout, connection reset, lost response, unknown outcome) MUST become
+  `UNKNOWN_PENDING_RECONCILIATION` and drives the real Phase 8 recovery/reconciliation state machine.
+  Calling a pre-submit rejection "ambiguity" is refused.
+- **Soak exit criteria:** the durable soak state records `soak_start_time`, `continuous_runtime`,
+  `completed_pipeline_cycles`, `validity_rejections`, `halt_exercises`, `reconciliation_exercises`,
+  `restart_recovery_exercises`, `stale_fence_rejections`, `ambiguity_fault_injections`,
+  `secret_leaks`, `mainnet_mutation_attempts` and `manual_corrective_interventions`, and survives a
+  restart. Phase 15 completes only when all twelve criteria are genuinely satisfied: >= 72 hours
+  continuous, >= 50 complete cycles, a validity rejection observed, HALT_NEW_RISK exercised,
+  reconciliation exercised, a planned restart/recovery exercised, a stale/fencing rejection
+  exercised, post-send ambiguity exercised, no secret leakage, no mainnet mutation request, no
+  manual corrective intervention and deterministic journal/replay. A planned restart for the
+  recovery scenario is allowed and recorded; an unplanned interruption resets the window.
+- **DOCUMENTED GAP (not solved):** because a mainnet read-only dry-run sends no orders, empirical
+  mainnet post-submit reconciliation cannot be proven in this phase. Mainnet reconciliation here is
+  LOGIC-LEVEL plus READ-ONLY account-state validation, not empirical mainnet order-submission
+  reconciliation; actual post-send ambiguity remains covered by prior Binance Testnet evidence,
+  deterministic post-send timeout/reset fault injection and the recovery/reconciliation tests. No
+  real-money ambiguous order is ever created, and no empirical claim is made.
+- **Guard narrowing (disclosed):** Phase 15 narrows the Phase 12 "no mainnet capability" readiness
+  item to "no authenticated mainnet MUTATION/futures capability". The new adapter is exempted
+  exactly like the Phase 11 testnet adapter, and `test_mainnet_scope.py` proves the exemption is
+  read-only, allowlist-only, secret-safe and unable to submit, cancel or replace anything.
+- **Readiness is not authorization:** Phase 15 does NOT enable TRADE permission, does NOT begin the
+  Controlled Live Canary and is NOT live authorization.
+
 ## License
 
 See LICENSE file for details. 
