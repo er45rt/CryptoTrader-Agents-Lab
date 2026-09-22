@@ -298,6 +298,29 @@ quantity/price/notional, decision, reason codes, per-rule results with units, re
 risk actions). The existing `risk.decision.recorded` contract carries the semantic outcome.
 Breaches halt new risk only; the engine never liquidates.
 
+## Recovery + reconciliation (Phase 8)
+
+`crypto_trader/recovery` implements the deterministic restart-recovery and reconciliation
+foundation: restore snapshot -> replay journal tail -> rebuild pending state -> reconcile against
+the execution/venue view -> resolve only with evidence -> journal the outcome.
+
+| Module | Role |
+|---|---|
+| `models.py` | `LocalOrderState`, `VenueOrderReport`, `ReconciliationAdjustment`, `ReconciliationOutcome` |
+| `policy.py` | `ReconciliationPolicy` + `load_policy` (fail-closed, no ambiguous defaults) |
+| `engine.py` | `ReconciliationEngine` (pure function of its inputs; no wall clock, no I/O, no retry) |
+| `reconstruction.py` | `OrderStateReconstructor` + `reconstruct_order_states` (journal replay, JSON snapshot) |
+| `journaling.py` | `record_reconciliation` (journals `recovery.state.changed`, idempotent by event id) |
+| `runtime.py` | `RestartRecovery` + `VenueStateSource` / `StaticVenueStateSource` / `ReconciliationSources` |
+
+Semantics: a submission that may have been sent with no venue evidence is
+`unknown_pending_reconciliation` (never silently failed/rejected, never blindly retried); a crash
+before the recorded submission attempt is `never_submitted`; a local view ahead of the venue is
+`local_ahead_of_venue`; consistent duplicate reports are deduplicated while conflicting ones are
+ambiguous; an unrecognised venue order is escalated. Every adjustment carries source, before
+state, after state and a reason code. No new event contract is introduced - the Phase 3
+`recovery.state.changed` contract is reused unchanged.
+
 ## License
 
 See LICENSE file for details.

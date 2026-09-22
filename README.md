@@ -345,6 +345,31 @@ typed inputs only and every rule carries an explicit unit.
   plus a NEW additive `risk.evaluation.recorded` audit (limits version, inputs, per-rule
   results, reason codes, risk actions). Existing Phase 3 schemas are unchanged.
 
+## Recovery + reconciliation (Phase 8)
+
+`crypto_trader/recovery` is the deterministic restart-recovery foundation that sits above the
+Phase 5 journal and below nothing else: it reconciles OUR application view against an
+execution/venue view without either silently overwriting the other.
+
+- **One writer, evidence everywhere else:** our journal is the only writer of local order state;
+  the venue/execution view is *evidence*, not authority. Reconciliation never silently corrects
+  either side.
+- **Ambiguous submissions stay ambiguous:** a submission that may have been sent but has no
+  venue evidence becomes `UNKNOWN_PENDING_RECONCILIATION`. A network timeout is NEVER converted
+  to failed/rejected, and there is **no blind retry**.
+- **Crash-before-send is provable:** because the submission-attempt marker must be journaled
+  BEFORE the send, a crash before that send resolves to `NEVER_SUBMITTED` (canceled from journal
+  evidence only). A created order with no venue evidence is never left hanging.
+- **Explicit adjustments only:** every correction is a `ReconciliationAdjustment` carrying its
+  `source`, the `before` state, the `after` state and a `reason_code`. There is no silent state
+  correction anywhere.
+- **Local-ahead blocks new risk:** `LOCAL_AHEAD_OF_VENUE` is reported, not overwritten, and
+  blocks new risk until evidence appears. Two conflicting venue sources are ambiguous; two
+  agreeing sources are deduplicated.
+- **Unknown external orders are escalated**, never adopted and never ignored (fail closed).
+- **Journaled** through the existing Phase 3 `recovery.state.changed` contract
+  (`detected` -> `reconciling` -> `resolved` | `failed`). Phase 8 adds **no** new event contract.
+
 ## License
 
 See LICENSE file for details. 
