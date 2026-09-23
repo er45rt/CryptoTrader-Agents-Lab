@@ -41,6 +41,7 @@ _AUTHORIZED_MODULES = {
     "nosubmit.py",
     "permissions.py",
     "soak.py",
+    "soak_runner.py",
     "stream.py",
 }
 

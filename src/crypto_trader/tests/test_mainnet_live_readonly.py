@@ -72,12 +72,16 @@ def _now() -> datetime:
 
 
 def _live_client() -> MainnetReadOnlyClient:
-    return MainnetReadOnlyClient(
+    client = MainnetReadOnlyClient(
         credentials=credentials_from_environment(),
         transport=RequestsTransport(timeout_seconds=15.0),
         clock=HttpClock(time_source=time.time, recv_window_ms=5_000),
         symbol=SYMBOL,
     )
+    # The signed permission/account reads require a measured server offset: the clock is
+    # fail-closed until it has been synchronized with the venue (ClockDriftError otherwise).
+    client.synchronize_clock()
+    return client
 
 
 def _decision_source(client: MainnetReadOnlyClient, filters):
