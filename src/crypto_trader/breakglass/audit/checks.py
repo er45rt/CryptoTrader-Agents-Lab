@@ -18,6 +18,7 @@ from typing import Any
 
 from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
+    STREAM_LIFECYCLE_EVENT_TYPE,
     OperatorCommandRecordPayload,
     V1_CONTRACTS,
 )
@@ -416,14 +417,18 @@ def _contract_checks() -> list[BreakGlassItem]:
         if actual != tuple(sorted(expected)):
             unchanged.append(f"{key[0]} v{key[1]}: {actual}")
     new_contracts = sorted(set(registered) - set(PHASE12_CONTRACT_FIELDS))
+    expected_additive = sorted(
+        [(OPERATOR_COMMAND_EVENT_TYPE, 1), (STREAM_LIFECYCLE_EVENT_TYPE, 1)]
+    )
     items.append(
         BreakGlassItem(
             "tagged_contracts_unmodified",
             "Event contracts",
             True,
-            "pass" if not unchanged and new_contracts == [(OPERATOR_COMMAND_EVENT_TYPE, 1)] else "fail",
-            "every Phase 1-12 tagged contract keeps its exact payload fields and version; Phase 13 "
-            "adds exactly one additive v1 contract",
+            "pass" if not unchanged and new_contracts == expected_additive else "fail",
+            "every Phase 1-12 tagged contract keeps its exact payload fields and version; later "
+            "phases add only the reviewed additive v1 contracts (Phase 13 operator command, "
+            "Phase 15 stream lifecycle)",
             {
                 "modified": unchanged,
                 "additive": [f"{name} v{version}" for name, version in new_contracts],

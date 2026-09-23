@@ -113,6 +113,8 @@ def test_safety_reuses_the_phase3_state_and_only_adds_one_contract():
         "safety.state.changed",
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
+        # Phase 15 additive contract (existing schemas unchanged).
+        "stream.lifecycle.recorded",
     }
 
 

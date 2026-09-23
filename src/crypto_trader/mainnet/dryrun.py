@@ -398,6 +398,20 @@ class MainnetDryRunPipeline:
                 completed=False,
             )
         stages.append("decision")
+        if intent.market_reference != snapshot.market_reference:
+            # A decision/intent produced against a DIFFERENT snapshot (for example one created
+            # before a stream disconnect) is never executable: a fresh post-disconnect snapshot
+            # and a fresh decision/validity/risk pass are required.
+            return self._finish(
+                symbol=symbol,
+                disposition=DryRunDisposition.WOULD_REJECT,
+                reason_code="decision_snapshot_mismatch",
+                stages=tuple(stages + ["decision:snapshot_mismatch"]),
+                snapshot_reference=snapshot.market_reference,
+                order=None,
+                now=now,
+                completed=True,
+            )
         controller = self._control.load_safety_state().controller
 
         # Decision validity (Phase 6).

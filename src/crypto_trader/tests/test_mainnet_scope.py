@@ -41,6 +41,7 @@ _AUTHORIZED_MODULES = {
     "nosubmit.py",
     "permissions.py",
     "soak.py",
+    "stream.py",
 }
 
 
@@ -117,7 +118,12 @@ def test_the_locked_envelope_is_reference_only_in_this_phase():
     assert record["withdrawals_allowed"] is False
 
 
-def test_phase15_adds_no_event_contract():
+def test_phase15_adds_exactly_one_additive_stream_lifecycle_contract():
+    """Phase 15 adds ONE additive contract: the secret-free stream lifecycle record.
+
+    Existing contracts and their schema versions are unchanged; the new type is additive v1 and
+    the registry still fails closed on unknown types/versions.
+    """
     contracts = (PACKAGE_DIR / "events" / "contracts.py").read_text(encoding="utf-8")
     event_types = set(re.findall(r'= "([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"', contracts))
 
@@ -132,6 +138,8 @@ def test_phase15_adds_no_event_contract():
         "risk.evaluation.recorded",
         "safety.state.changed",
         "safety.operator_command.recorded",
+        # Phase 15 additive contract (existing schemas unchanged).
+        "stream.lifecycle.recorded",
     }
 
 

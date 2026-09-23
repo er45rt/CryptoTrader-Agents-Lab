@@ -26,6 +26,8 @@ Additive contracts added by later phases (existing schemas unchanged):
 9. ``safety.state.changed``          (Phase 9) - operational safety-mode transition
 10. ``safety.operator_command.recorded`` (Phase 13) - one auditable, idempotent operator
     break-glass command and its deterministic disposition
+11. ``stream.lifecycle.recorded``      (Phase 15) - one deterministic market-data stream
+    lifecycle transition (disconnect/reconnect/resubscribe/resync), secret-free
 """
 
 from __future__ import annotations
@@ -79,6 +81,12 @@ __all__ = [
     "OperatorCommandRecordPayload",
     "OperatorCommandRecorded",
     "OperatorCommandType",
+    "STREAM_LIFECYCLE_EVENT_TYPE",
+    "StreamLifecyclePayload",
+    "StreamLifecycleRecorded",
+    "StreamLifecycleState",
+    "StreamReasonCode",
+    "StreamStepResult",
 ]
 
 STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
@@ -95,6 +103,8 @@ RISK_EVALUATION_EVENT_TYPE = "risk.evaluation.recorded"
 SAFETY_EVENT_TYPE = "safety.state.changed"
 #: Phase 13 additive contract: one operator break-glass command and its recorded disposition.
 OPERATOR_COMMAND_EVENT_TYPE = "safety.operator_command.recorded"
+#: Phase 15 additive contract: one deterministic market-data stream lifecycle transition.
+STREAM_LIFECYCLE_EVENT_TYPE = "stream.lifecycle.recorded"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -514,6 +524,105 @@ class OperatorCommandRecorded(DomainEvent):
     payload: OperatorCommandRecordPayload
 
 
+# --- 11. Market-data stream lifecycle (Phase 15, additive) ------------------
+
+#: The stream lifecycle vocabulary. ``ready`` is reachable only after a fresh synchronized
+#: snapshot exists; every other state keeps new risk blocked.
+StreamLifecycleState = Literal[
+    "connected",
+    "stale",
+    "reconnecting",
+    "resubscribing",
+    "resyncing",
+    "ready",
+]
+
+#: Deterministic stream reasons. The two disconnect reasons stay distinct: an explicit close is
+#: never conflated with a socket that stays logically open and simply stops sending data.
+StreamReasonCode = Literal[
+    "CLEAN_CLOSE",
+    "SILENT_TIMEOUT",
+    "TRANSPORT_ERROR",
+    "SUBSCRIPTION_FAILED",
+    "RESYNC_FAILED",
+    "RECONNECT_BUDGET_EXHAUSTED",
+]
+
+#: Outcome of one recovery step (resubscription / state resynchronization).
+StreamStepResult = Literal["pending", "succeeded", "failed"]
+
+
+class StreamLifecyclePayload(EventPayload):
+    """One deterministic market-data stream lifecycle transition.
+
+    The record is secret-free by construction: it carries identifiers, timestamps, outcome enums
+    and counters only. Session identifiers are generated locally and never derived from a
+    credential. No API key, authorization header, signed payload or credential material has a
+    field here, and the module rejects credential-shaped text before it reaches the journal.
+    """
+
+    state: StreamLifecycleState = Field(description="Lifecycle state after the transition.")
+    previous_state: StreamLifecycleState = Field(
+        description="Lifecycle state before the transition."
+    )
+    reason_code: StreamReasonCode | None = Field(
+        default=None, description="Deterministic reason when a failure drove the transition."
+    )
+    session_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Current stream session identity (locally generated; never a credential).",
+    )
+    previous_session_id: str | None = Field(
+        default=None, max_length=128, description="Session identity that was replaced, if any."
+    )
+    disconnect_at: datetime | None = Field(
+        default=None, description="When the current disconnect was detected."
+    )
+    reconnect_at: datetime | None = Field(
+        default=None, description="When the current reconnect completed, when applicable."
+    )
+    resubscription_result: StreamStepResult | None = Field(
+        default=None, description="Outcome of the resubscription step for this transition."
+    )
+    resync_result: StreamStepResult | None = Field(
+        default=None, description="Outcome of the state-resynchronization step for this transition."
+    )
+    attempt: int = Field(ge=0, description="Recovery attempt number (0 before any retry).")
+    delay_seconds: float = Field(
+        ge=0.0, description="Deterministic backoff delay applied before this transition."
+    )
+    new_risk_permitted: bool = Field(
+        description="Whether the state after this transition permits new risk (ready only)."
+    )
+
+    @field_validator("disconnect_at", "reconnect_at")
+    @classmethod
+    def _require_aware_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("stream lifecycle timestamps must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("session_id", "previous_session_id")
+    @classmethod
+    def _non_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("stream session identifiers must not be blank.")
+        return value
+
+
+class StreamLifecycleRecorded(DomainEvent):
+    """A deterministic market-data stream lifecycle transition was recorded."""
+
+    event_type: Literal["stream.lifecycle.recorded"] = STREAM_LIFECYCLE_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: StreamLifecyclePayload
+
+
 #: Every V1 contract known to this build, in pipeline order.
 V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StrategyDecisionRecorded,
@@ -526,4 +635,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     RiskEvaluationRecorded,
     SafetyStateChanged,
     OperatorCommandRecorded,
+    StreamLifecycleRecorded,
 )

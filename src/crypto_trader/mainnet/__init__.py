@@ -73,6 +73,11 @@ from .errors import (
     OldSnapshotReuseError,
     PermissionSchemaError,
     ReadOnlyPermissionError,
+    StreamLifecycleError,
+    StreamRecoveryExhaustedError,
+    StreamSessionMismatchError,
+    StreamStateError,
+    StreamTransportError,
     SymbolFilterError,
 )
 from .faults import (
@@ -114,6 +119,16 @@ from .soak import (
     SoakState,
     SoakStateStore,
     evaluate_exit_criteria,
+)
+from .stream import (
+    BoundedReconnectPolicy,
+    OfflineStreamTransport,
+    StreamLifecycleRecord,
+    StreamLifecycleState,
+    StreamMarketStateProvider,
+    StreamReason,
+    StreamSnapshot,
+    StreamSupervisor,
 )
 
 __all__ = [
@@ -173,6 +188,19 @@ __all__ = [
     "SoakRecorder",
     "SoakState",
     "SoakStateStore",
+    "BoundedReconnectPolicy",
+    "OfflineStreamTransport",
+    "StreamLifecycleRecord",
+    "StreamLifecycleState",
+    "StreamMarketStateProvider",
+    "StreamReason",
+    "StreamSnapshot",
+    "StreamSupervisor",
+    "StreamLifecycleError",
+    "StreamRecoveryExhaustedError",
+    "StreamSessionMismatchError",
+    "StreamStateError",
+    "StreamTransportError",
     "SymbolFilterError",
     "SymbolFilters",
     "assert_no_mutation_surface",

@@ -173,6 +173,7 @@ def test_phase13_adds_exactly_one_additive_event_contract():
         "risk.evaluation.recorded",
         "safety.state.changed",
         "safety.operator_command.recorded",
+        "stream.lifecycle.recorded",
     }
 
 

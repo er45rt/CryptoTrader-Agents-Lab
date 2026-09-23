@@ -145,6 +145,8 @@ def test_phase14_adds_no_event_contract():
         "risk.evaluation.recorded",
         "safety.state.changed",
         "safety.operator_command.recorded",
+        # Phase 15 additive contract (existing schemas unchanged).
+        "stream.lifecycle.recorded",
     }
 
 

@@ -18,6 +18,11 @@ __all__ = [
     "OldSnapshotReuseError",
     "PermissionSchemaError",
     "ReadOnlyPermissionError",
+    "StreamLifecycleError",
+    "StreamRecoveryExhaustedError",
+    "StreamSessionMismatchError",
+    "StreamStateError",
+    "StreamTransportError",
     "SymbolFilterError",
 ]
 
@@ -75,3 +80,23 @@ class OldSnapshotReuseError(CanaryPolicyError):
 
 class DryRunError(MainnetError):
     """The dry-run pipeline could not complete deterministically."""
+
+
+class StreamLifecycleError(MainnetError):
+    """Base class for deterministic market-data stream lifecycle failures."""
+
+
+class StreamStateError(StreamLifecycleError):
+    """A lifecycle transition was requested that the state machine does not permit."""
+
+
+class StreamTransportError(StreamLifecycleError):
+    """The stream transport is closed, silent, or otherwise unusable for a read."""
+
+
+class StreamSessionMismatchError(StreamLifecycleError):
+    """A snapshot/decision referenced a session that is no longer current (fail closed)."""
+
+
+class StreamRecoveryExhaustedError(StreamLifecycleError):
+    """The bounded reconnect budget was exhausted; the stream stays stale and new risk blocked."""

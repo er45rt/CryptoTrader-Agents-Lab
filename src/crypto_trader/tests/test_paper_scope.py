@@ -161,4 +161,6 @@ def test_paper_adds_no_new_event_contract():
         "safety.state.changed",
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
+        # Phase 15 additive contract (existing schemas unchanged).
+        "stream.lifecycle.recorded",
     }
