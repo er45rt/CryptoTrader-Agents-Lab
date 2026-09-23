@@ -154,6 +154,8 @@ def test_paper_adds_no_new_event_contract():
         "trade.intent.created",
         "risk.decision.recorded",
         "order.state.changed",
+        # Phase 15 durable ambiguity additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "execution.fill.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",

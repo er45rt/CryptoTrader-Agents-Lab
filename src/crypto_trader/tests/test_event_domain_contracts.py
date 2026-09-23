@@ -18,6 +18,7 @@ from crypto_trader.events import (
     FillRecordPayload,
     OrderStateChanged,
     OrderStateChangePayload,
+    OrderSubmissionAttempted,
     RecoveryStateChanged,
     RecoveryStateChangePayload,
     RiskDecisionPayload,
@@ -268,6 +269,7 @@ def test_recovery_state_contract_defaults_to_no_affected_orders():
         ("causal_trade_intent", TradeIntentCreated),
         ("risk_decision", RiskDecisionRecorded),
         ("order_state_changed", OrderStateChanged),
+        ("order_submission_attempted", OrderSubmissionAttempted),
         ("partial_fill", ExecutionFillRecorded),
         ("recovery_state_changed", RecoveryStateChanged),
     ],
@@ -338,6 +340,7 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
         # Phase 15 additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "stream.lifecycle.recorded",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)

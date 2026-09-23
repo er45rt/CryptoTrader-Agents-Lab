@@ -14,8 +14,10 @@ from .base import (
     is_valid_event_type,
 )
 from .contracts import (
+    AttemptTimeInForce,
     EXECUTION_FILL_EVENT_TYPE,
     ORDER_STATE_EVENT_TYPE,
+    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     OPERATOR_COMMAND_EVENT_TYPE,
     RECOVERY_EVENT_TYPE,
     RISK_DECISION_EVENT_TYPE,
@@ -29,6 +31,8 @@ from .contracts import (
     FillRecordPayload,
     OrderStateChanged,
     OrderStateChangePayload,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
     OperatorCommandRecorded,
     OperatorCommandRecordPayload,
     OperatorCommandType,
@@ -74,10 +78,12 @@ from .registry import (
 )
 
 __all__ = [
+    "AttemptTimeInForce",
     "DOMAIN_EVENT_TYPE_PATTERN",
     "EXECUTION_FILL_EVENT_TYPE",
     "FIRST_SCHEMA_VERSION",
     "ORDER_STATE_EVENT_TYPE",
+    "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
     "OPERATOR_COMMAND_EVENT_TYPE",
     "RECOVERY_EVENT_TYPE",
     "RISK_DECISION_EVENT_TYPE",
@@ -98,6 +104,8 @@ __all__ = [
     "FillRecordPayload",
     "OrderStateChanged",
     "OrderStateChangePayload",
+    "OrderSubmissionAttemptPayload",
+    "OrderSubmissionAttempted",
     "OperatorCommandRecorded",
     "OperatorCommandRecordPayload",
     "OperatorCommandType",

@@ -28,6 +28,9 @@ Additive contracts added by later phases (existing schemas unchanged):
     break-glass command and its deterministic disposition
 11. ``stream.lifecycle.recorded``      (Phase 15) - one deterministic market-data stream
     lifecycle transition (disconnect/reconnect/resubscribe/resync), secret-free
+12. ``order.submission.attempted``     (Phase 15 durable ambiguity) - one durable fact that a
+    venue submission was attempted, recorded BEFORE the external transport call, carrying the
+    stable venue-facing client order identity and the immutable economic anchors
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from pydantic import Field, field_validator, model_validator
 from .base import DomainEvent, EventPayload
 
 __all__ = [
+    "AttemptTimeInForce",
     "FillRecordPayload",
     "OrderStateChangePayload",
     "RECOVERY_EVENT_TYPE",
@@ -54,6 +58,7 @@ __all__ = [
     "STRATEGY_DECISION_EVENT_TYPE",
     "TRADE_INTENT_EVENT_TYPE",
     "ORDER_STATE_EVENT_TYPE",
+    "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
     "VALIDITY_EVENT_TYPE",
     "StrategyDecisionPayload",
@@ -62,6 +67,8 @@ __all__ = [
     "TradeIntentCreated",
     "RiskDecisionRecorded",
     "OrderStateChanged",
+    "OrderSubmissionAttemptPayload",
+    "OrderSubmissionAttempted",
     "ExecutionFillRecorded",
     "RecoveryStateChanged",
     "V1_CONTRACTS",
@@ -93,6 +100,8 @@ STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
 TRADE_INTENT_EVENT_TYPE = "trade.intent.created"
 RISK_DECISION_EVENT_TYPE = "risk.decision.recorded"
 ORDER_STATE_EVENT_TYPE = "order.state.changed"
+#: Phase 15 durability additive contract: the durable pre-send submission attempt fact.
+ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE = "order.submission.attempted"
 EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
 #: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
@@ -258,6 +267,83 @@ class OrderStateChanged(DomainEvent):
     event_type: Literal["order.state.changed"] = ORDER_STATE_EVENT_TYPE
     schema_version: Literal[1] = 1
     payload: OrderStateChangePayload
+
+
+# --- 4b. Durable submission attempt (Phase 15 durability, additive) --------
+
+#: Time-in-force vocabulary of the durable attempt record. Lowercase, engine-independent; the
+#: venue adapters translate it to the venue's own uppercase form at the transport boundary.
+AttemptTimeInForce = Literal["gtc", "ioc", "fok"]
+
+
+class OrderSubmissionAttemptPayload(EventPayload):
+    """The durable, pre-send submission attempt fact for one order.
+
+    This record is written BEFORE the external transport call. It carries exactly the facts a
+    restart needs to correlate an unresolved attempt with the venue and to validate that whatever
+    the venue reports later is the same economic order:
+
+    * ``venue_reference`` - the stable client order identity sent to the venue (the idempotency
+      key and the key an authoritative per-order lookup uses after a restart);
+    * ``intent_id`` - the originating intent identity, which is NOT recoverable from the client
+      order identity alone;
+    * the immutable economic anchors ``side`` / ``order_type`` / ``quantity`` / ``limit_price`` /
+      ``time_in_force``;
+    * ``venue_producer`` - an explicit provenance anchor naming the producer whose lifecycle and
+      fill records for this order are authoritative venue evidence. Authority is read from this
+      durable fact, never inferred from timestamps or from a producer-string convention.
+
+    The event envelope carries ``order_id`` (the deterministic system order identity), ``symbol``,
+    ``correlation_id`` and ``occurred_at``. ``sequence_number`` is deliberately left unset: no
+    recovery decision may depend on it.
+    """
+
+    venue_reference: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable client order identity sent to the venue (idempotency key).",
+    )
+    intent_id: UUID = Field(description="Originating intent identity (not derivable from the key).")
+    side: Literal["buy", "sell"] = Field(description="Direction of the attempted order.")
+    order_type: Literal["market", "limit"] = Field(description="Attempted order type.")
+    quantity: Decimal = Field(
+        gt=0, description="Immutable original quantity (the Q anchor for quantity invariants)."
+    )
+    limit_price: Decimal | None = Field(
+        default=None, gt=0, description="Immutable limit price; required for limit attempts only."
+    )
+    time_in_force: AttemptTimeInForce = Field(description="Time in force of the attempted order.")
+    venue_producer: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "Producer identifier whose lifecycle/fill records for this order are authoritative "
+            "venue evidence (explicit provenance; never inferred from time)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_order_type_fields(self) -> "OrderSubmissionAttemptPayload":
+        if self.order_type == "limit" and self.limit_price is None:
+            raise ValueError("limit_price is required when order_type is 'limit'.")
+        if self.order_type == "market" and self.limit_price is not None:
+            raise ValueError("limit_price must be omitted when order_type is 'market'.")
+        return self
+
+    @field_validator("venue_reference", "venue_producer")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("durable attempt identity fields must not be blank.")
+        return value
+
+
+class OrderSubmissionAttempted(DomainEvent):
+    """A submission attempt was durably recorded before the external transport call."""
+
+    event_type: Literal["order.submission.attempted"] = ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: OrderSubmissionAttemptPayload
 
 
 # --- 5. Execution / fill ---------------------------------------------------
@@ -629,6 +715,7 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     TradeIntentCreated,
     RiskDecisionRecorded,
     OrderStateChanged,
+    OrderSubmissionAttempted,
     ExecutionFillRecorded,
     RecoveryStateChanged,
     ValidityDispositionRecorded,

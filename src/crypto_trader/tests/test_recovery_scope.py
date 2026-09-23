@@ -88,13 +88,16 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
         re.findall(r'= "([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"', contracts)
     )
 
-    # Phase 8 adds NO new event contract of its own: the Phase 3 contracts and the additive
-    # Phase 6 / Phase 7 / Phase 9 / Phase 13 / Phase 15 contracts are the only ones present.
+        # Phase 8 adds NO new event contract of its own: the Phase 3 contracts and the additive
+        # Phase 6 / Phase 7 / Phase 9 / Phase 13 / Phase 15 contracts are the only ones present.
+        # Phase 15 durable ambiguity adds exactly one more additive contract, consumed by
+        # reconstruction; recovery still adds none of its own.
     assert event_types == {
         "strategy.decision.recorded",
         "trade.intent.created",
         "risk.decision.recorded",
         "order.state.changed",
+        "order.submission.attempted",
         "execution.fill.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",

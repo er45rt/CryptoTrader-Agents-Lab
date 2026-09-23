@@ -20,6 +20,7 @@ __all__ = [
     "FIXTURES",
     "FIXTURE_CAUSAL_TRADE_INTENT",
     "FIXTURE_ORDER_STATE_CHANGED",
+    "FIXTURE_ORDER_SUBMISSION_ATTEMPTED",
     "FIXTURE_PARTIAL_FILL",
     "FIXTURE_RECOVERY_STATE_CHANGED",
     "FIXTURE_RISK_DECISION",
@@ -160,10 +161,36 @@ FIXTURE_RECOVERY_STATE_CHANGED: dict[str, Any] = {
     },
 }
 
+# 7. Durable pre-send submission attempt (Phase 15 durability, additive contract).
+FIXTURE_ORDER_SUBMISSION_ATTEMPTED: dict[str, Any] = {
+    "event_id": "99999999-9999-4999-8999-999999999999",
+    "event_type": "order.submission.attempted",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:01Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": None,
+    "producer": "application.production",
+    "strategy_id": "strat-synthetic-1",
+    "order_id": ORDER_ID,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "venue_reference": "ct-44444444444444444444",
+        "intent_id": "55555555-5555-4555-8555-555555555555",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "1.00000000",
+        "limit_price": "100.25000000",
+        "time_in_force": "gtc",
+        "venue_producer": "infrastructure.binance_testnet",
+    },
+}
+
 FIXTURES: dict[str, dict[str, Any]] = {
     "root_strategy_decision": FIXTURE_ROOT_STRATEGY_DECISION,
     "causal_trade_intent": FIXTURE_CAUSAL_TRADE_INTENT,
     "risk_decision": FIXTURE_RISK_DECISION,
+    "order_submission_attempted": FIXTURE_ORDER_SUBMISSION_ATTEMPTED,
     "order_state_changed": FIXTURE_ORDER_STATE_CHANGED,
     "partial_fill": FIXTURE_PARTIAL_FILL,
     "recovery_state_changed": FIXTURE_RECOVERY_STATE_CHANGED,
