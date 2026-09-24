@@ -15,7 +15,7 @@ Scope: authenticated **Spot Testnet** only.
 Testnet success never authorizes mainnet trading.
 """
 
-from .client import BinanceSpotTestnetClient, WithdrawalPolicy
+from .client import BinanceSpotTestnetClient, PreparedTestnetOrder, WithdrawalPolicy
 from .clock import MAX_ABS_CLOCK_OFFSET_MS, MAX_RECV_WINDOW_MS, TestnetClock
 from .credentials import (
     API_KEY_ENV_VAR,
@@ -34,6 +34,7 @@ from .endpoints import (
 )
 from .errors import (
     AmbiguousOrderError,
+    AttemptJournalRequiredError,
     BinanceTestnetError,
     ClockDriftError,
     MainnetForbiddenError,
@@ -44,6 +45,7 @@ from .errors import (
     TestnetRejectedError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
+    VenueProtocolRejectionError,
 )
 from .models import (
     STATUS_TO_STATE,
@@ -63,6 +65,7 @@ from .transport import (
     API_KEY_HEADER,
     HttpRequest,
     HttpResponse,
+    PreSendTransportError,
     RequestsTransport,
     ScriptedTransport,
     Transport,
@@ -75,6 +78,7 @@ __all__ = [
     "API_KEY_HEADER",
     "API_SECRET_ENV_VAR",
     "AmbiguousOrderError",
+    "AttemptJournalRequiredError",
     "BinanceSpotTestnetClient",
     "BinanceTestnetError",
     "ClockDriftError",
@@ -85,6 +89,8 @@ __all__ = [
     "MAX_RECV_WINDOW_MS",
     "MainnetForbiddenError",
     "PRODUCER",
+    "PreSendTransportError",
+    "PreparedTestnetOrder",
     "RateLimitBanError",
     "RateLimitBudget",
     "RateLimitError",
@@ -113,6 +119,7 @@ __all__ = [
     "TransportError",
     "TransportTimeout",
     "UnsafeTestnetAccountError",
+    "VenueProtocolRejectionError",
     "WithdrawalPolicy",
     "assert_no_mainnet_reference",
     "credentials_from_environment",

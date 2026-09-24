@@ -12,12 +12,16 @@ This is the only place where the authenticated testnet client is driven. It:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from crypto_trader.events import OrderStateChanged
+from crypto_trader.events import (
+    OrderStateChanged,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
+)
 from crypto_trader.persistence import EventJournal
 from crypto_trader.recovery.models import LocalOrderState, VenueOrderReport
 from crypto_trader.safety import SafetyController
@@ -31,9 +35,16 @@ from ..ports import (
     InstrumentSpec,
     OrderLifecycleState,
 )
-from .client import BinanceSpotTestnetClient
-from .errors import AmbiguousOrderError, BinanceTestnetError, TestnetRejectedError
+from .client import BinanceSpotTestnetClient, PreparedTestnetOrder
+from .errors import (
+    AmbiguousOrderError,
+    AttemptJournalRequiredError,
+    BinanceTestnetError,
+    TestnetRejectedError,
+    VenueProtocolRejectionError,
+)
 from .models import TestnetOrder, TestnetOrderRequest, format_decimal
+from .transport import PreSendTransportError
 from .translate import (
     PRODUCER,
     deterministic_order_uuid,
@@ -82,6 +93,8 @@ class TestnetOrderRuntime:
     journal: EventJournal | None = None
     safety: SafetyController | None = None
     producer: str = PRODUCER
+    #: Injected clock for durable markers/resolutions (never read at import time).
+    clock: Callable[[], datetime] | None = None
     _state: ExecutionRuntimeState = ExecutionRuntimeState.STOPPED
     _observations: list[ExecutionObservation] = field(default_factory=list)
     _orders: dict[str, TestnetOrder] = field(default_factory=dict)
@@ -111,7 +124,18 @@ class TestnetOrderRuntime:
         return f"ct-{intent_id.hex[:20]}"
 
     def submit(self, request: ExecutionRequest) -> str:
-        """Place one order. Returns the deterministic client order id."""
+        """Prepare, durably mark the attempt, then send exactly once.
+
+        Sequence (Stage 2 invariant):
+
+        1. ``prepare_order`` - every locally rejectable step, read-only venue calls, rate/backoff
+           admission, the clock precondition, timestamp/recvWindow, signing and serialization;
+        2. commit the durable ``order.submission.attempted`` marker;
+        3. ``submit_prepared`` - the exact prepared request, one ``transport.send`` call maximum.
+
+        Between a successful marker commit and the first venue-write network I/O there is no new
+        validation, rate admission, clock work, signing, identity generation or request rebuild.
+        """
         if self._state is not ExecutionRuntimeState.RUNNING:
             raise RuntimeStateError("the testnet runtime must be started before submitting.")
         request.validate_for(self.instrument)
@@ -119,12 +143,14 @@ class TestnetOrderRuntime:
             raise BinanceTestnetError(
                 "new risk is halted by the safety controller; the order was not sent."
             )
+        if self.journal is None:
+            raise AttemptJournalRequiredError(
+                "refusing a venue write without a durable attempt journal: the "
+                "order.submission.attempted marker cannot be committed before the send. No order "
+                "was prepared and no request was sent."
+            )
 
         client_order_id = self.client_order_id_for(request.intent_id)
-        self._intents[client_order_id] = request.intent_id
-        self._correlations[client_order_id] = request.correlation_id
-        self._pending_submissions[client_order_id] = request.correlation_id
-
         order_request = TestnetOrderRequest(
             client_order_id=client_order_id,
             symbol=request.symbol,
@@ -139,18 +165,140 @@ class TestnetOrderRuntime:
             ),
         )
 
+        # 1. Prepare: all locally rejectable work happens before the durable marker exists.
+        prepared = self.client.prepare_order(order_request)
+
+        self._intents[client_order_id] = request.intent_id
+        self._correlations[client_order_id] = request.correlation_id
+
+        if not prepared.requires_write:
+            # The venue already knows this order: adopt it without a marker and without a POST.
+            order = self.client.submit_prepared(prepared)
+            self._record(order, correlation_id=request.correlation_id)
+            return client_order_id
+
+        # 2. Durable attempt marker, committed BEFORE the first venue-write network I/O.
+        marker = self._commit_attempt_marker(prepared, request)
+        # Authorization happens ONLY after the append returned successfully, and it binds the
+        # committed marker to this exact prepared order (identity + economic anchors).
+        prepared = self.client._authorize_attempt(
+            prepared,
+            marker_event_id=marker.event_id,
+            venue_reference=marker.payload.venue_reference,
+            order_id=marker.order_id,
+            intent_id=marker.payload.intent_id,
+            correlation_id=marker.correlation_id,
+            symbol=marker.symbol,
+            side=marker.payload.side,
+            order_type=marker.payload.order_type,
+            quantity=marker.payload.quantity,
+            limit_price=marker.payload.limit_price,
+            time_in_force=marker.payload.time_in_force,
+        )
+        self._pending_submissions[client_order_id] = request.correlation_id
+
+        # 3. The exact prepared request; at most one POST attempt for this invocation.
         try:
-            order = self.client.place_order(order_request)
-        except AmbiguousOrderError:
-            # UNKNOWN_PENDING_RECONCILIATION: keep the submission marker so recovery can reconcile
-            # it against venue evidence. Never retried here.
+            order = self.client.submit_prepared(prepared)
+        except PreSendTransportError as exc:
+            # Proven not transmitted: record the resolution, never retry inside this call.
+            self._journal_attempt_resolution(
+                prepared,
+                request,
+                state=OrderLifecycleState.CANCELED,
+                reason=f"pre_send_failure_proven:{type(exc).__name__}",
+            )
+            self._pending_submissions.pop(client_order_id, None)
             raise
-        except TestnetRejectedError:
+        except VenueProtocolRejectionError as exc:
+            # The venue refused the request before any order was created (-1021).
+            self._journal_attempt_resolution(
+                prepared,
+                request,
+                state=OrderLifecycleState.REJECTED,
+                reason=f"{type(exc).reason_code}:{type(exc).evidence_code}",
+            )
+            self._pending_submissions.pop(client_order_id, None)
+            raise
+        except AmbiguousOrderError:
+            # UNKNOWN_PENDING_RECONCILIATION: keep the durable attempt and the pending marker so
+            # recovery can reconcile it against authoritative venue evidence. Never retried here.
+            raise
+        except TestnetRejectedError as exc:
+            self._journal_attempt_resolution(
+                prepared,
+                request,
+                state=OrderLifecycleState.REJECTED,
+                reason=f"venue_order_rejected:{type(exc).__name__}",
+            )
             self._pending_submissions.pop(client_order_id, None)
             raise
         self._record(order, correlation_id=request.correlation_id)
         self._pending_submissions.pop(client_order_id, None)
         return client_order_id
+
+    def _commit_attempt_marker(
+        self, prepared: PreparedTestnetOrder, request: ExecutionRequest
+    ) -> OrderSubmissionAttempted:
+        """Durably record the submission attempt, or fail closed before any send."""
+        assert self.journal is not None
+        marker = OrderSubmissionAttempted(
+            event_id=uuid4(),
+            occurred_at=self._now(),
+            correlation_id=request.correlation_id,
+            producer=self.producer,
+            order_id=deterministic_order_uuid(prepared.client_order_id),
+            symbol=prepared.symbol,
+            payload=OrderSubmissionAttemptPayload(
+                venue_reference=prepared.client_order_id,
+                intent_id=request.intent_id,
+                side=request.side.value,
+                order_type=request.order_type.value,
+                quantity=request.quantity,
+                limit_price=request.limit_price,
+                time_in_force=request.time_in_force.value,
+                venue_producer=PRODUCER,
+            ),
+        )
+        # A journal failure propagates unchanged (the journal's own typed error): the caller must
+        # never reach ``submit_prepared`` without a committed marker.
+        self.journal.append(marker)
+        stored = self.journal.read_by_id(marker.event_id)
+        if stored is None or stored.event_type != marker.event_type:
+            raise AttemptJournalRequiredError(
+                "the durable attempt marker could not be read back after the append; refusing to "
+                "send any request."
+            )
+        return marker
+
+    def _journal_attempt_resolution(
+        self,
+        prepared: PreparedTestnetOrder,
+        request: ExecutionRequest,
+        *,
+        state: OrderLifecycleState,
+        reason: str,
+    ) -> None:
+        """Record a mechanically established outcome for a durable attempt."""
+        assert self.journal is not None
+        order = TestnetOrder(
+            symbol=prepared.symbol,
+            client_order_id=prepared.client_order_id,
+            venue_order_id=None,
+            state=state,
+            status=state.value.upper(),
+            original_quantity=request.quantity,
+        )
+        for event in testnet_order_to_phase3_events(
+            order, correlation_id=request.correlation_id, occurred_at=self._now(), reason=reason
+        ):
+            self.journal.append(event)
+
+    def _now(self) -> datetime:
+        stamp = self.clock() if self.clock is not None else datetime.now(timezone.utc)
+        if stamp.tzinfo is None or stamp.utcoffset() is None:
+            raise RuntimeStateError("the testnet runtime clock must return timezone-aware time.")
+        return stamp.astimezone(timezone.utc)
 
     def cancel(self, client_order_id: str) -> TestnetOrder:
         """Cancel one order (idempotent)."""

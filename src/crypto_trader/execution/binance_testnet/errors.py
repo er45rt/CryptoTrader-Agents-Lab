@@ -8,6 +8,7 @@ from __future__ import annotations
 
 __all__ = [
     "AmbiguousOrderError",
+    "AttemptJournalRequiredError",
     "BinanceTestnetError",
     "ClockDriftError",
     "MainnetForbiddenError",
@@ -18,6 +19,7 @@ __all__ = [
     "TestnetSymbolError",
     "TestnetRejectedError",
     "UnsafeTestnetAccountError",
+    "VenueProtocolRejectionError",
 ]
 
 
@@ -59,12 +61,34 @@ class ClockDriftError(BinanceTestnetError):
     """The local clock drifted beyond the configured tolerance; refuse to sign requests."""
 
 
+class VenueProtocolRejectionError(ClockDriftError):
+    """The venue mechanically rejected the request before any order could be created.
+
+    This is a transport/venue fact (``VENUE_RESPONDED``), not a local rejection and not an ordinary
+    venue order rejection: Binance ``-1021`` means the signed timestamp was outside ``recvWindow``,
+    so the order was never processed. The write is never retried; the durable submission attempt
+    stays as historical proof that a submission was attempted.
+    """
+
+    reason_code = "venue_protocol_rejection_before_order_creation"
+    evidence_code = "venue_timestamp_outside_recv_window"
+
+
 class TestnetRejectedError(BinanceTestnetError):
     """The venue rejected the request deterministically (a real, non-ambiguous outcome)."""
 
 
 class UnsafeTestnetAccountError(BinanceTestnetError):
     """The testnet account has unsafe permissions (for example withdrawals are enabled)."""
+
+
+class AttemptJournalRequiredError(BinanceTestnetError):
+    """A venue write was refused because no durable attempt journal is available.
+
+    Stage 2 invariant: a new venue-writing path must fail closed *before* any POST unless it can
+    commit the durable ``order.submission.attempted`` marker first. This error is never raised for
+    a successful write, and it never follows a POST.
+    """
 
 
 class TestnetSymbolError(BinanceTestnetError):

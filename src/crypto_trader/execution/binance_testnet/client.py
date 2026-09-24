@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ..ports import OrderLifecycleState
 from .clock import TestnetClock
@@ -30,12 +30,14 @@ from .credentials import TestnetCredentials
 from .endpoints import SPOT_TESTNET_REST_BASE, require_testnet_base_url
 from .errors import (
     AmbiguousOrderError,
+    AttemptJournalRequiredError,
     BinanceTestnetError,
     ClockDriftError,
     RateLimitError,
     TestnetRejectedError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
+    VenueProtocolRejectionError,
 )
 from .models import (
     STATUS_TO_STATE,
@@ -54,12 +56,14 @@ from .transport import (
     API_KEY_HEADER,
     HttpRequest,
     HttpResponse,
+    PreSendTransportError,
     Transport,
     TransportError,
     TransportTimeout,
 )
+from .translate import deterministic_order_uuid
 
-__all__ = ["BinanceSpotTestnetClient"]
+__all__ = ["AttemptAuthorization", "BinanceSpotTestnetClient", "PreparedTestnetOrder"]
 
 
 class WithdrawalPolicy(str, Enum):
@@ -74,6 +78,57 @@ class WithdrawalPolicy(str, Enum):
 
     REQUIRE_DISABLED = "require_disabled"
     RECORD_ONLY = "record_only"
+
+
+@dataclass(frozen=True)
+class AttemptAuthorization:
+    """The mechanical binding between a durably committed attempt marker and one prepared write.
+
+    Produced only by :meth:`BinanceSpotTestnetClient._authorize_attempt`, which the production
+    runtime invokes immediately after ``order.submission.attempted`` has been durably appended.
+    It binds the marker identity to the exact economic anchors of the prepared order, so a
+    prepared write cannot be sent without a committed durable attempt anchor.
+    """
+
+    marker_event_id: UUID
+    client_order_id: str
+    order_id: UUID
+    intent_id: UUID
+    correlation_id: UUID
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    limit_price: Decimal | None
+    time_in_force: str
+
+
+@dataclass(frozen=True)
+class PreparedTestnetOrder:
+    """The fully prepared, signed write for one order (Stage 2).
+
+    Everything locally rejectable happens BEFORE this object exists: dedup reads, symbol-rule
+    reads, order validation, rate-budget admission, the clock precondition, timestamp generation,
+    recvWindow construction, signing and serialization. After a durable attempt marker is
+    committed, the only remaining write-path action is ``transport.send(prepared.request)``.
+
+    ``request`` is ``None`` when the order is already known (an idempotent re-read needs no write).
+    """
+
+    client_order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    limit_price: Decimal | None
+    time_in_force: str
+    request: HttpRequest | None
+    existing: TestnetOrder | None = None
+    attempt_authorization: AttemptAuthorization | None = None
+
+    @property
+    def requires_write(self) -> bool:
+        return self.request is not None
 
 # Endpoint paths (Spot REST, documented).
 PATH_TIME = "/api/v3/time"
@@ -247,12 +302,33 @@ class BinanceSpotTestnetClient:
 
     # --- orders -------------------------------------------------------------
 
-    def place_order(self, request: TestnetOrderRequest) -> TestnetOrder:
-        """Place one order. A duplicate ``client_order_id`` is never sent twice."""
+    def prepare_order(self, request: TestnetOrderRequest) -> PreparedTestnetOrder:
+        """Do every locally rejectable step for a write, without performing the write.
+
+        Read-only venue calls (an idempotency status lookup and symbol-rule retrieval) are allowed
+        here: they happen before the durable attempt marker is committed and cannot mutate an order.
+        Rate/backoff admission, the clock precondition, timestamp generation, recvWindow
+        construction, signing and serialization also happen here, so the caller can commit a durable
+        attempt marker knowing that nothing after it may reject the write locally.
+
+        Budget consumption is intentionally conservative: a token spent before a marker write that
+        later fails is never refunded.
+        """
         existing = self._orders.get(request.client_order_id)
         if existing is not None:
             current = self.order_status(request.symbol, request.client_order_id)
-            return replace(current, deduplicated=True)
+            self._orders[current.client_order_id] = current
+            return PreparedTestnetOrder(
+                client_order_id=request.client_order_id,
+                symbol=request.symbol,
+                side=request.side.lower(),
+                order_type=request.order_type.lower(),
+                quantity=request.quantity,
+                limit_price=request.price,
+                time_in_force=(request.time_in_force or "").lower(),
+                request=None,
+                existing=replace(current, deduplicated=True),
+            )
 
         rules = self.symbol_rules(request.symbol)
         if not rules.quantity_is_valid(request.quantity):
@@ -285,20 +361,269 @@ class BinanceSpotTestnetClient:
             params["price"] = format_decimal(request.price)  # type: ignore[arg-type]
             params["timeInForce"] = request.time_in_force
 
-        try:
-            body = self._request(
-                PATH_ORDER, params, weight=_WEIGHT_WRITE, is_write=True, signed=True
+        # Rate/backoff admission and the clock/signing preconditions are the last local steps that
+        # can reject the write, so they must complete before the caller commits the attempt marker.
+        assert self.budget is not None
+        self.budget.enforce_backoff()
+        self.budget.bucket.acquire(_WEIGHT_WRITE)
+        signed_payload = self.clock.signed_timestamp_params(params)
+        query = signed_query_string(signed_payload, self.credentials.with_secret())
+        http_request = HttpRequest(
+            method="POST",
+            url=f"{self.base_url}{PATH_ORDER}",
+            query=query,
+            headers=self._headers(),
+            weight=_WEIGHT_WRITE,
+            is_write=True,
+        )
+        return PreparedTestnetOrder(
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side.lower(),
+            order_type=request.order_type.lower(),
+            quantity=request.quantity,
+            limit_price=request.price,
+            time_in_force=(request.time_in_force or "").lower(),
+            request=http_request,
+        )
+
+    def _authorize_attempt(
+        self,
+        prepared: PreparedTestnetOrder,
+        *,
+        marker_event_id: UUID,
+        venue_reference: str,
+        order_id: UUID,
+        intent_id: UUID,
+        correlation_id: UUID,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        limit_price: Decimal | None,
+        time_in_force: str,
+    ) -> PreparedTestnetOrder:
+        """Bind a durably appended attempt marker to the exact prepared write.
+
+        Called ONLY by the production runtime (``execution/binance_testnet/runtime.py``) and only
+        after ``journal.append(marker)`` has returned successfully. The client never reads the
+        journal: it validates that the marker fields it is handed are exactly the prepared order's
+        own identity and economic anchors, so an unauthorized prepared write can never be sent.
+        """
+        if not isinstance(prepared, PreparedTestnetOrder):
+            raise AttemptJournalRequiredError("attempt authorization expects a prepared order.")
+        if prepared.request is None:
+            raise AttemptJournalRequiredError(
+                "attempt authorization was requested for an order that requires no write."
             )
-        except TestnetRejectedError as exc:
-            if "duplicate" not in str(exc).lower():
-                raise
-            # The venue deduplicated on newClientOrderId (for example after a restart where the
-            # local record was lost). Adopt the existing order instead of treating this as a
-            # failure - and still never send a second order.
-            order = self.order_status(request.symbol, request.client_order_id)
+        expected_order_id = deterministic_order_uuid(prepared.client_order_id)
+        mismatches: list[str] = []
+        if not isinstance(marker_event_id, UUID):
+            mismatches.append("marker_event_id")
+        if venue_reference != prepared.client_order_id:
+            mismatches.append("venue_reference")
+        if order_id != expected_order_id:
+            mismatches.append("order_id")
+        if not isinstance(intent_id, UUID):
+            mismatches.append("intent_id")
+        if not isinstance(correlation_id, UUID):
+            mismatches.append("correlation_id")
+        if symbol != prepared.symbol:
+            mismatches.append("symbol")
+        if side != prepared.side:
+            mismatches.append("side")
+        if order_type != prepared.order_type:
+            mismatches.append("order_type")
+        if quantity != prepared.quantity:
+            mismatches.append("quantity")
+        if limit_price != prepared.limit_price:
+            mismatches.append("limit_price")
+        if prepared.order_type == "limit" and time_in_force != prepared.time_in_force:
+            mismatches.append("time_in_force")
+        if mismatches:
+            raise AttemptJournalRequiredError(
+                "the durable attempt marker does not bind to this prepared order (fields: "
+                + ", ".join(sorted(mismatches))
+                + "); refusing to send."
+            )
+        return replace(
+            prepared,
+            attempt_authorization=AttemptAuthorization(
+                marker_event_id=marker_event_id,
+                client_order_id=prepared.client_order_id,
+                order_id=expected_order_id,
+                intent_id=intent_id,
+                correlation_id=correlation_id,
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                limit_price=limit_price,
+                time_in_force=time_in_force,
+            ),
+        )
+
+    @staticmethod
+    def _verify_attempt_authorization(prepared: PreparedTestnetOrder) -> None:
+        """Fail closed unless the prepared write carries a matching durable authorization."""
+        authorization = prepared.attempt_authorization
+        if authorization is None:
+            raise AttemptJournalRequiredError(
+                "refusing to send a prepared order without a durably committed "
+                "order.submission.attempted authorization."
+            )
+        mismatches: list[str] = []
+        if authorization.client_order_id != prepared.client_order_id:
+            mismatches.append("client_order_id")
+        if authorization.order_id != deterministic_order_uuid(prepared.client_order_id):
+            mismatches.append("order_id")
+        if authorization.symbol != prepared.symbol:
+            mismatches.append("symbol")
+        if authorization.side != prepared.side:
+            mismatches.append("side")
+        if authorization.order_type != prepared.order_type:
+            mismatches.append("order_type")
+        if authorization.quantity != prepared.quantity:
+            mismatches.append("quantity")
+        if authorization.limit_price != prepared.limit_price:
+            mismatches.append("limit_price")
+        if prepared.order_type == "limit" and authorization.time_in_force != prepared.time_in_force:
+            mismatches.append("time_in_force")
+        if mismatches:
+            raise AttemptJournalRequiredError(
+                "the attempt authorization does not match the prepared order (fields: "
+                + ", ".join(sorted(mismatches))
+                + "); refusing to send."
+            )
+
+    def submit_prepared(self, prepared: PreparedTestnetOrder) -> TestnetOrder:
+        """Send the exact prepared request. This is the ONLY venue-write call site.
+
+        No validation, rate admission, clock work, signing or request reconstruction happens here:
+        the caller commits the durable attempt marker immediately before this call, and the next
+        write-path action is ``transport.send`` of the already-prepared request.
+        """
+        if not isinstance(prepared, PreparedTestnetOrder):
+            raise BinanceTestnetError("submit_prepared expects a PreparedTestnetOrder.")
+        if prepared.existing is not None:
+            return replace(prepared.existing, deduplicated=True)
+        http_request = prepared.request
+        if http_request is None:
+            raise BinanceTestnetError("a prepared order without a request cannot be submitted.")
+        # The venue-write boundary: a prepared write is only sendable with a durable authorization
+        # bound to the attempt marker the runtime committed.
+        self._verify_attempt_authorization(prepared)
+
+        # Only the redacted form is ever recorded: the API key and signature never enter the log.
+        self._request_log.append(http_request.safe_repr())
+        try:
+            response = self.transport.send(http_request)
+        except PreSendTransportError:
+            # Mechanically proven not transmitted: typed pre-send evidence, never retried here.
+            raise
+        except (TransportTimeout, TransportError) as exc:
+            raise AmbiguousOrderError(
+                "the write outcome is unknown (transport failure before a response); the "
+                "order is NOT retried and must go through reconciliation."
+            ) from exc
+        return self._resolve_write_response(response, prepared)
+
+    def place_order(self, request: TestnetOrderRequest) -> TestnetOrder:
+        """Compatibility path: adopt a known order, or fail closed for a fresh write.
+
+        A fresh venue write requires the durable ``order.submission.attempted`` anchor and the
+        runtime-owned authorization, so this method never performs one: it may only resolve an
+        already-known order (the read-only dedup path) and otherwise raises
+        :class:`AttemptJournalRequiredError` with zero POSTs.
+        """
+        prepared = self.prepare_order(request)
+        if prepared.request is None and prepared.existing is not None:
+            return replace(prepared.existing, deduplicated=True)
+        raise AttemptJournalRequiredError(
+            "place_order cannot perform a fresh venue write: a durable attempt marker must be "
+            "committed by TestnetOrderRuntime before submit_prepared may send. No request was sent."
+        )
+
+    def _resolve_write_response(
+        self, response: HttpResponse, prepared: PreparedTestnetOrder
+    ) -> TestnetOrder:
+        """Classify one venue response to a write; HTTP 200 alone never implies success."""
+        status_code = response.status_code
+        if 300 <= status_code < 400:
+            # The redirect was NOT followed: the request reached a server, but no order outcome can
+            # be established, and the credentials/signature are never replayed to the Location.
+            raise AmbiguousOrderError(
+                f"the venue returned HTTP {status_code} for a write and the redirect was not "
+                "followed; the order outcome is unknown and the order is not retried."
+            )
+        if status_code == 200:
+            return self._parse_write_success(response.body, prepared)
+        if status_code == 418:
+            assert self.budget is not None
+            self.budget.record_418(response.retry_after_seconds)
+        if status_code == 429:
+            assert self.budget is not None
+            delay = self.budget.record_429(response.retry_after_seconds)
+            raise RateLimitError(
+                f"rate limited on a write (429); backing off {delay}s without retrying."
+            )
+        if 500 <= status_code < 600:
+            raise AmbiguousOrderError(
+                f"the venue returned {status_code} for a write; the outcome is unknown and the "
+                "order is not retried."
+            )
+        code, message = self._error_of(response)
+        if "duplicate" in message.lower():
+            # A duplicate-identity response does NOT prove the order does not exist: the same
+            # client order id may already exist at the venue (an earlier uncertain submission, a
+            # replicated executor, an operator, or any external state change between our read and
+            # this POST). Terminalising it as REJECTED would be a false negative, so the ONLY safe
+            # treatment is reconciliation by the SAME identity: re-read the order and adopt the
+            # venue view. The write is never retried (this POST count stays at one) and the durable
+            # attempt marker stays in place for reconciliation.
+            order = self.order_status(prepared.symbol, prepared.client_order_id)
             self._orders[order.client_order_id] = order
             return replace(order, deduplicated=True)
-        order = self._parse_order(body)
+        if code == CODE_TIMESTAMP_OUTSIDE_RECV_WINDOW:
+            raise VenueProtocolRejectionError(
+                "the venue rejected the write timestamp (-1021): the request was refused before any "
+                "order was created. The write is NOT retried; the durable attempt remains and must "
+                "be reconciled."
+            )
+        # HTTP 429/418 (and the generic deterministic-rejection branch below) mean the venue
+        # responded, but 429/418 alone do NOT prove the final order-processing outcome, so they are
+        # neither PRE_SEND nor a terminal REJECTED: the RateLimitError/RateLimitBanError raised
+        # here leaves the durable attempt marker in place, keeps the order fenced pending
+        # reconciliation, and never triggers an automatic POST retry.
+        raise TestnetRejectedError(
+            f"the testnet venue rejected the request (HTTP {status_code}, code "
+            f"{code}): {self._safe_message(message)}"
+        )
+
+    def _parse_write_success(self, body: Any, prepared: PreparedTestnetOrder) -> TestnetOrder:
+        """A write must be mechanically recognizable as successful, or it is ambiguous."""
+        if not isinstance(body, Mapping):
+            raise AmbiguousOrderError(
+                "the write returned HTTP 200 without a usable order payload (empty or non-JSON "
+                "body); the order outcome is unknown and the order is not retried."
+            )
+        try:
+            order = self._parse_order(body)
+        except BinanceTestnetError as exc:
+            raise AmbiguousOrderError(
+                "the write returned HTTP 200 with an unparseable order payload "
+                f"({type(exc).__name__}); the order outcome is unknown and the order is not retried."
+            ) from exc
+        if not order.venue_order_id:
+            raise AmbiguousOrderError(
+                "the write response carried no venue order identifier; the order outcome is "
+                "unknown and the order is not retried."
+            )
+        if order.client_order_id != prepared.client_order_id:
+            raise AmbiguousOrderError(
+                "the write response carried a different client order identity than the prepared "
+                "order; the order outcome is unknown and the order is not retried."
+            )
         self._orders[order.client_order_id] = order
         return order
 

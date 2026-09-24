@@ -91,7 +91,7 @@ def test_place_order_sends_a_signed_limited_order():
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
-    order = client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    order = fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert order.client_order_id == CLIENT_ORDER_ID
     assert order.state.value == "accepted"
@@ -116,8 +116,8 @@ def test_duplicate_client_order_id_never_places_a_second_order():
     client.clock.synchronize(fx.SERVER_TIME_MS)
     request = fx.limit_order_request(CLIENT_ORDER_ID)
 
-    first = client.place_order(request)
-    second = client.place_order(request)
+    first = fx.place_order(client, request)
+    second = fx.place_order(client, request)
 
     assert first.deduplicated is False
     assert second.deduplicated is True
@@ -137,7 +137,7 @@ def test_venue_side_duplicate_is_adopted_instead_of_failing():
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
-    order = client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    order = fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert order.deduplicated is True
     assert order.venue_order_id == "99"
@@ -160,7 +160,7 @@ def test_partial_fill_is_reported_with_exact_decimals():
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
-    order = client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    order = fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert order.state.value == "partially_filled"
     assert order.executed_quantity == Decimal("0.00040000")
@@ -179,7 +179,7 @@ def test_cancel_order_returns_the_canceled_state_and_is_idempotent():
     )
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
-    client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     canceled = client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
     again = client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
@@ -212,7 +212,7 @@ def test_order_validation_never_rounds():
     client = fx.client(transport)
 
     with pytest.raises(SymbolError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID, quantity="0.00150000"))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID, quantity="0.00150000"))
 
 
 # --- ambiguity / retries / rate limits -------------------------------------
@@ -225,7 +225,7 @@ def test_write_timeout_is_ambiguous_and_never_retried():
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
     with pytest.raises(AmbiguousOrderError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     posts = [item for item in transport.requests if item.method == "POST"]
     assert len(posts) == 1
@@ -239,7 +239,7 @@ def test_write_server_error_is_ambiguous_and_never_retried():
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
     with pytest.raises(AmbiguousOrderError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
 
@@ -252,7 +252,7 @@ def test_rejected_order_raises_a_deterministic_error_without_ambiguity():
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
     with pytest.raises(RejectedError) as error:
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert "-2010" in str(error.value)
 
@@ -291,7 +291,7 @@ def test_writes_are_not_retried_after_rate_limiting():
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
     with pytest.raises(RateLimitError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
 
@@ -333,7 +333,7 @@ def test_excessive_clock_drift_fails_closed():
     client = fx.client(transport, clock_instance=drift_clock)
 
     with pytest.raises(ClockDriftError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
 
 def test_a_large_but_compensated_offset_is_accepted():
@@ -345,7 +345,7 @@ def test_a_large_but_compensated_offset_is_accepted():
     )
     client = fx.client(transport, clock_instance=skewed)
 
-    order = client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    order = fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert order.client_order_id == CLIENT_ORDER_ID
     assert f"timestamp={fx.SERVER_TIME_MS + 1_400}" in transport.requests[-1].query
@@ -358,7 +358,7 @@ def test_an_implausible_offset_is_treated_as_a_broken_time_source():
     client = fx.client(transport, clock_instance=broken)
 
     with pytest.raises(ClockDriftError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
 
 def test_timestamp_rejection_resynchronizes_reads_once():
@@ -390,7 +390,7 @@ def test_timestamp_rejection_on_a_write_fails_closed_without_retry():
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
     with pytest.raises(ClockDriftError):
-        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
 

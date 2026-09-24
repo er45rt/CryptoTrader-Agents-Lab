@@ -21,6 +21,7 @@ __all__ = [
     "API_KEY_HEADER",
     "HttpRequest",
     "HttpResponse",
+    "PreSendTransportError",
     "RequestsTransport",
     "ScriptedTransport",
     "Transport",
@@ -37,6 +38,41 @@ class TransportError(BinanceTestnetError):
 
 class TransportTimeout(TransportError):
     """The request timed out: for a write this is an AMBIGUOUS outcome."""
+
+
+class PreSendTransportError(TransportError):
+    """The transport mechanically established that the request never reached the venue.
+
+    Strictly limited to failures raised while *establishing* the connection:
+
+    * DNS resolution failure;
+    * connection refused before any connection was established;
+    * connect timeout before any connection was established.
+
+    Everything else - TLS/SSL handshake errors, read or write timeouts, resets, aborted or
+    half-closed connections, remote disconnects, truncated responses and unknown socket failures -
+    is NOT a pre-send proof and must be treated as a post-send unknown outcome.
+    """
+
+    reason_code = "pre_send_connection_failure_proven"
+
+
+#: Cause-chain class names that mechanically prove a connection-establishment failure.
+#: ``NewConnectionError`` covers DNS resolution failures and refused connections; the name is
+#: matched on the exception *cause chain* rather than inferred from the outer requests class.
+_PRE_SEND_CAUSE_NAMES = frozenset({"NewConnectionError", "NameResolutionError"})
+
+
+def is_pre_send_connection_failure(exc: BaseException) -> bool:
+    """True only when the cause chain proves the connection was never established."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _PRE_SEND_CAUSE_NAMES:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 @dataclass(frozen=True)
@@ -120,9 +156,26 @@ class RequestsTransport:
                 url,
                 headers=dict(request.headers),
                 timeout=self.timeout_seconds,
+                # Redirects are never followed: following one could replay the API key header and
+                # the signature to another host, and for a write it would silently re-POST.
+                allow_redirects=False,
             )
+        except requests.exceptions.ConnectTimeout as exc:
+            # Connection establishment timed out: no request was transmitted.
+            raise PreSendTransportError(
+                "the connection attempt timed out before any request was transmitted."
+            ) from exc
         except requests.exceptions.Timeout as exc:
             raise TransportTimeout("the request timed out.") from exc
+        except requests.exceptions.ConnectionError as exc:
+            if is_pre_send_connection_failure(exc):
+                raise PreSendTransportError(
+                    "the connection could not be established (resolution/refused) before any "
+                    "request was transmitted."
+                ) from exc
+            # SSL/TLS handshake failures, aborted connections and remote disconnects prove nothing
+            # about whether request bytes were written.
+            raise TransportError(f"transport failure: {type(exc).__name__}") from exc
         except requests.exceptions.RequestException as exc:
             raise TransportError(f"transport failure: {type(exc).__name__}") from exc
 
