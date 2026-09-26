@@ -88,6 +88,24 @@ class SessionConfig:
         )
 
 
+def _strict_bool(value: object, field_name: str) -> bool:
+    """Parse a config boolean strictly. Reject anything except bool or 'true'/'false'.
+
+    bool("false") is True in Python; using bool() on untrusted config silently
+    corrupts boolean settings.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise PaperConfigError(
+        f"{field_name} must be a boolean or 'true'/'false'; got {value!r}."
+    )
+
 def load_session_config(config: Mapping[str, Any]) -> SessionConfig:
     """Build a :class:`SessionConfig` from an explicit mapping (unknown keys rejected)."""
     if not isinstance(config, Mapping):
@@ -111,8 +129,10 @@ def load_session_config(config: Mapping[str, Any]) -> SessionConfig:
             raise PaperConfigError("session_id must be a UUID.") from exc
 
     queue = QueueAwareSettings(
-        queue_position=bool(config.get("queue_position", True)),
-        liquidity_consumption=bool(config.get("liquidity_consumption", True)),
+        queue_position=_strict_bool(config.get("queue_position", True), "queue_position"),
+        liquidity_consumption=_strict_bool(
+            config.get("liquidity_consumption", True), "liquidity_consumption"
+        ),
         book_type=str(config.get("book_type", "L2_MBP")),
     )
 
@@ -122,8 +142,8 @@ def load_session_config(config: Mapping[str, Any]) -> SessionConfig:
         strategy_id=str(config["strategy_id"]),
         session_id=session_id or uuid4(),
         producer=str(config.get("producer", "application.paper")),
-        shadow_submits=bool(config.get("shadow_submits", False)),
-        queue_aware=bool(config.get("queue_aware", True)),
+        shadow_submits=_strict_bool(config.get("shadow_submits", False), "shadow_submits"),
+        queue_aware=_strict_bool(config.get("queue_aware", True), "queue_aware"),
         queue=queue,
         starting_equity_quote=str(config.get("starting_equity_quote", "100000")),
     )
