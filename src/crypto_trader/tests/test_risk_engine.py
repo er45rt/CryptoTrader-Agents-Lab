@@ -312,3 +312,13 @@ def test_risk_layer_has_no_llm_or_network_dependency():
 
     for token in ("crewai", "deepseek", "openai", "requests", "http", "socket"):
         assert token not in source, f"risk engine must not reference {token}"
+
+def test_future_risk_state_timestamp_is_rejected_when_freshness_is_configured():
+    engine = HardRiskEngine(limits(), max_state_age_seconds=5.0)
+    future_state = state(snapshot_ts=BASE + timedelta(seconds=10))
+
+    decision = engine.evaluate(request(), future_state, now=BASE)
+
+    assert decision.allowed is False
+    assert "risk_state_timestamp_in_future" in decision.reason_codes
+

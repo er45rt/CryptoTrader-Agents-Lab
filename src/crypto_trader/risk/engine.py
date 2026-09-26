@@ -132,21 +132,32 @@ class HardRiskEngine:
         def rule(rule_id: str, allowed: bool, reason_code: str, actual: Decimal, limit: Decimal, unit: str) -> None:
             results.append(RiskRuleResult(rule_id, allowed, reason_code, actual, limit, unit))
 
-        # 0. Stale risk-state input rejection (fail closed when enabled and state is too old).
+        # 0. Stale risk-state input rejection (fail closed when enabled and the state is too old,
+        # or implausibly timestamped in the future).
         if self._max_state_age_seconds is not None:
             if now is None or state.snapshot_ts is None:
                 rule("risk_state_freshness", False, "risk_state_timestamp_unavailable", Decimal(1), ZERO, "count")
             else:
                 age = (now - state.snapshot_ts).total_seconds()
-                stale = age > self._max_state_age_seconds
-                rule(
-                    "risk_state_freshness",
-                    not stale,
-                    "stale_risk_state" if stale else "risk_state_fresh",
-                    Decimal(str(round(age, 6))),
-                    Decimal(str(self._max_state_age_seconds)),
-                    "count",
-                )
+                if age < 0:
+                    rule(
+                        "risk_state_freshness",
+                        False,
+                        "risk_state_timestamp_in_future",
+                        Decimal(str(round(age, 6))),
+                        Decimal(str(self._max_state_age_seconds)),
+                        "count",
+                    )
+                else:
+                    stale = age > self._max_state_age_seconds
+                    rule(
+                        "risk_state_freshness",
+                        not stale,
+                        "stale_risk_state" if stale else "risk_state_fresh",
+                        Decimal(str(round(age, 6))),
+                        Decimal(str(self._max_state_age_seconds)),
+                        "count",
+                    )
 
         # 1. Trading halt state.
         rule(
