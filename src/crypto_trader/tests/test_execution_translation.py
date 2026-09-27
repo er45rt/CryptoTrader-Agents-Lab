@@ -233,3 +233,63 @@ def test_translation_refuses_to_guess_a_missing_timestamp():
 
     with pytest.raises(TranslationError):
         outbound.to_phase3_order_state_event(observation)
+
+def test_phase3_order_state_event_id_is_stable_for_same_logical_observation():
+    observation = ExecutionObservation(
+        order_reference="O-STABLE-1",
+        intent_id=uuid4(),
+        correlation_id=uuid4(),
+        symbol="ETHUSDT",
+        state=OrderLifecycleState.ACCEPTED,
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("1"),
+        ts_ns=TS_NS,
+    )
+
+    first = outbound.to_phase3_order_state_event(observation)
+    second = outbound.to_phase3_order_state_event(observation)
+
+    assert first.event_id == second.event_id
+    assert first == second
+
+
+def test_phase3_fill_event_id_is_stable_and_distinguishes_separate_fills():
+    intent_id = uuid4()
+    correlation_id = uuid4()
+    base = ExecutionObservation(
+        order_reference="O-STABLE-FILL",
+        intent_id=intent_id,
+        correlation_id=correlation_id,
+        symbol="ETHUSDT",
+        state=OrderLifecycleState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.5"),
+        remaining_quantity=Decimal("0.5"),
+        last_fill_quantity=Decimal("0.5"),
+        last_fill_price=Decimal("2700"),
+        fee=Decimal("0.01"),
+        fee_asset="USDT",
+        ts_ns=TS_NS,
+    )
+    later = ExecutionObservation(
+        order_reference=base.order_reference,
+        intent_id=intent_id,
+        correlation_id=correlation_id,
+        symbol=base.symbol,
+        state=OrderLifecycleState.FILLED,
+        filled_quantity=Decimal("1"),
+        remaining_quantity=Decimal("0"),
+        last_fill_quantity=Decimal("0.5"),
+        last_fill_price=Decimal("2700"),
+        fee=Decimal("0.01"),
+        fee_asset="USDT",
+        ts_ns=TS_NS + 1,
+    )
+
+    first = outbound.to_phase3_fill_event(base)
+    retry = outbound.to_phase3_fill_event(base)
+    second_fill = outbound.to_phase3_fill_event(later)
+
+    assert first.event_id == retry.event_id
+    assert first == retry
+    assert second_fill.event_id != first.event_id
+
