@@ -111,6 +111,20 @@ def test_gate_requires_a_resolved_policy():
         DecisionValidityGate(None)  # type: ignore[arg-type]
 
 
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_validity_request_rejects_non_finite_reference_price(bad):
+    with pytest.raises(ValidityConfigError):
+        request(price=bad)
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_market_observation_rejects_non_finite_price(bad):
+    with pytest.raises(MarketStateError):
+        observation(0.0, bad)
+
+
 # --- dispositions ---
 
 def test_accepts_a_fresh_intent_with_small_move():
