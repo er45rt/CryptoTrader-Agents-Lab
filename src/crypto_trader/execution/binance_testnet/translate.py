@@ -7,6 +7,7 @@ identities (``uuid5``) so replay is stable, and no venue/engine object ever esca
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID, uuid5
 
 from crypto_trader.events import (
@@ -113,7 +114,16 @@ def testnet_order_to_phase3_events(
             payload=OrderStateChangePayload(state=state, reason=terminal_reason),
         )
     ]
+    filled_so_far = Decimal("0")
     for index, fill in enumerate(order.fills):
+        # Binance responses are cumulative snapshots: a later refresh repeats old fills while the
+        # order-level remaining quantity has changed. Keep the established fill event identity
+        # (index + trade_id) for journal compatibility, but derive the payload's remaining quantity
+        # at THIS fill so re-emitting an old fill is byte-identical instead of conflicting.
+        filled_so_far += fill.quantity
+        remaining_after_fill = max(
+            Decimal("0"), order.original_quantity - filled_so_far
+        )
         events.append(
             ExecutionFillRecorded(
                 event_id=uuid5(
@@ -129,7 +139,7 @@ def testnet_order_to_phase3_events(
                     price=fill.price,
                     fee=fill.commission,
                     fee_asset=fill.commission_asset,
-                    remaining_quantity=order.remaining_quantity,
+                    remaining_quantity=remaining_after_fill,
                     liquidity="taker",
                 ),
             )
