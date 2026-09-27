@@ -22,7 +22,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -43,6 +45,21 @@ __all__ = [
 
 #: Schema version of the persisted ownership record (not of any event).
 OWNERSHIP_SCHEMA_VERSION = 1
+
+# In-process serialization complements the OS-level file lock below. Some file-lock APIs have
+# process-scoped semantics, so separate threads in one interpreter must also share a Python lock.
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _process_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _PROCESS_LOCKS_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
 
 
 class OwnerKind(str, Enum):
@@ -213,6 +230,43 @@ class OwnershipStore:
 
     # --- writes (explicit takeover only) ---
 
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        """Serialize ownership-sensitive operations across threads and local processes.
+
+        The lock file is separate from the atomic JSON record. Keeping it stable lets a runtime
+        hold the same exclusion window across "final fence check -> venue send", while takeover()
+        uses it to make read-increment-write of the fencing term linearizable.
+        """
+        lock_path = self._path.with_name(self._path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        process_lock = _process_lock(lock_path)
+
+        with process_lock:
+            with open(lock_path, "a+b") as stream:
+                if os.name == "nt":
+                    import msvcrt
+
+                    stream.seek(0, os.SEEK_END)
+                    if stream.tell() == 0:
+                        stream.write(b"\0")
+                        stream.flush()
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+                    try:
+                        yield
+                    finally:
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def takeover(
         self,
         *,
@@ -233,20 +287,21 @@ class OwnershipStore:
             raise OwnershipStateError("takeover requires a non-empty owner id.")
         if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
             raise OwnershipStateError("acquired_at must be timezone-aware.")
-        previous = self.read()
-        previous_owner = None if previous is None else previous.owner_id
-        term = 1 if previous is None else previous.term + 1
-        record = OwnershipRecord(
-            term=term,
-            owner_id=owner_id,
-            owner_kind=owner_kind,
-            acquired_at=acquired_at.astimezone(timezone.utc),
-            previous_owner_id=previous_owner,
-            reason_code=reason_code,
-            session_id=uuid4() if session_id is None else session_id,
-        )
-        self._write(record)
-        return record
+        with self.exclusive():
+            previous = self.read()
+            previous_owner = None if previous is None else previous.owner_id
+            term = 1 if previous is None else previous.term + 1
+            record = OwnershipRecord(
+                term=term,
+                owner_id=owner_id,
+                owner_kind=owner_kind,
+                acquired_at=acquired_at.astimezone(timezone.utc),
+                previous_owner_id=previous_owner,
+                reason_code=reason_code,
+                session_id=uuid4() if session_id is None else session_id,
+            )
+            self._write(record)
+            return record
 
     def _write(self, record: OwnershipRecord) -> None:
         payload = json.dumps(record.to_record(), indent=2, sort_keys=True)
@@ -280,6 +335,12 @@ class WriterGuard:
 
     def require_current(self) -> OwnershipRecord:
         return self._store.require_current(self._fence)
+
+    @contextmanager
+    def exclusive_current(self) -> Iterator[OwnershipRecord]:
+        """Hold the ownership exclusion lock while proving this writer remains current."""
+        with self._store.exclusive():
+            yield self._store.require_current(self._fence)
 
     def may_create_new_risk(self) -> bool:
         """True only when the token is still current AND the normal owner holds the lease."""
