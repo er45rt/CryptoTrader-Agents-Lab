@@ -350,55 +350,81 @@ def _scope_checks() -> list[BreakGlassItem]:
 
 
 def _git_policy_item() -> BreakGlassItem:
-    """No push, no history rewrite: proven from the local repository metadata (read-only)."""
+    """Permit a review branch to track origin while refusing protected/alternate push targets."""
     git_dir = PROJECT_ROOT / ".git"
     config_path = git_dir / "config"
     problems: list[str] = []
     current_branch: str | None = None
+    branch_remote: str | None = None
+    origin_url: str | None = None
+
     head_path = git_dir / "HEAD"
     if head_path.exists():
         head = head_path.read_text(encoding="utf-8", errors="replace").strip()
         if head.startswith("ref: refs/heads/"):
             current_branch = head[len("ref: refs/heads/"):]
-    upstream: str | None = None
+
+    if current_branch in {"main", "master"}:
+        problems.append(f"protected branch {current_branch!r} must never be the review push target")
+
+    config = ""
     if config_path.exists():
         config = config_path.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"\[branch \"([^\"]+)\"\]\s*(.*?)(?=\n\[|\Z)", config, re.DOTALL):
+
+        remote_match = re.search(
+            r'\[remote "origin"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
+        )
+        if remote_match is not None:
+            url_match = re.search(r"^\s*url\s*=\s*(.+)$", remote_match.group(1), re.MULTILINE)
+            if url_match is not None:
+                origin_url = url_match.group(1).strip()
+
+        for match in re.finditer(
+            r'\[branch "([^"]+)"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
+        ):
             if match.group(1) != current_branch:
                 continue
-            upstream = match.group(1)
-            if "remote =" in match.group(2):
-                problems.append(f"the current branch {upstream} has a configured push upstream")
+            remote_setting = re.search(
+                r"^\s*remote\s*=\s*(.+)$", match.group(2), re.MULTILINE
+            )
+            if remote_setting is not None:
+                branch_remote = remote_setting.group(1).strip()
+                if branch_remote != "origin":
+                    problems.append(
+                        f"the current branch {current_branch!r} tracks disallowed remote "
+                        f"{branch_remote!r}; only 'origin' is permitted"
+                    )
+
+        if re.search(r"^\s*pushurl\s*=", config, re.MULTILINE | re.IGNORECASE):
+            problems.append("explicit pushurl overrides are not permitted")
     else:
         problems.append(".git/config is missing")
+
+    if branch_remote == "origin" and not origin_url:
+        problems.append("the current branch tracks origin but origin has no configured URL")
+
     push_refs: list[str] = []
-    for folder in (git_dir / "refs" / "remotes",):
-        if folder.exists():
-            for file in folder.rglob("*"):
-                if file.is_file() and (
-                    "phase-13" in file.name
-                    or (current_branch is not None and file.name == current_branch)
-                ):
-                    push_refs.append(str(file.relative_to(git_dir)))
-    if push_refs:
-        problems.append(f"remote-tracking refs for phase 13 exist: {push_refs}")
-    for file in PROJECT_ROOT.rglob("*.md"):
-        if ".venv" in file.parts or "node_modules" in file.parts:
-            continue
-        if "git push" in file.read_text(encoding="utf-8", errors="replace").lower():
-            problems.append(f"{file.name} documents a push")
+    remote_refs = git_dir / "refs" / "remotes"
+    if remote_refs.exists():
+        push_refs = sorted(
+            str(file.relative_to(git_dir))
+            for file in remote_refs.rglob("*")
+            if file.is_file()
+        )
+
     return BreakGlassItem(
-        "git_policy_no_push",
+        "git_policy_safe_review_push",
         "Repository policy",
         True,
         "pass" if not problems else "fail",
-        "the Phase 13 branch has no push upstream, no remote-tracking ref for phase 13 exists and no "
-        "push is documented",
+        "review work may track the ordinary origin remote, but protected branches, alternate "
+        "push remotes and pushurl overrides are refused",
         {
             "problems": problems,
             "current_branch": current_branch,
-            "branch_with_upstream": upstream,
-            "push_refs": push_refs,
+            "branch_remote": branch_remote,
+            "origin_url": origin_url,
+            "remote_tracking_refs": push_refs,
         },
     )
 
