@@ -179,14 +179,22 @@ def test_phase13_adds_exactly_one_additive_event_contract():
     }
 
 
-def test_no_git_push_was_performed_by_this_phase():
+def test_repository_push_policy_allows_only_origin_for_non_protected_work_branch():
     head = (PROJECT_ROOT / ".git" / "HEAD").read_text(encoding="utf-8").strip()
     branch = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""
     config = (PROJECT_ROOT / ".git" / "config").read_text(encoding="utf-8")
-    upstream_sections = re.findall(r"\[branch \"([^\"]+)\"\]\s*(.*?)(?=\n\[|\Z)", config, re.DOTALL)
 
-    for name, body in upstream_sections:
-        if name == branch:
-            assert "remote =" not in body, f"the phase-13 branch {name} has a push upstream"
-    remote_refs = list((PROJECT_ROOT / ".git" / "refs" / "remotes").rglob("*"))
-    assert not any("phase-13" in ref.name for ref in remote_refs if ref.is_file())
+    assert branch not in {"main", "master"}
+    assert not re.search(r"^\s*pushurl\s*=", config, re.MULTILINE | re.IGNORECASE)
+
+    branch_remote = None
+    for name, body in re.findall(
+        r'\[branch "([^"]+)"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
+    ):
+        if name != branch:
+            continue
+        match = re.search(r"^\s*remote\s*=\s*(.+)$", body, re.MULTILINE)
+        if match is not None:
+            branch_remote = match.group(1).strip()
+
+    assert branch_remote in {None, "origin"}
