@@ -228,10 +228,19 @@ def test_same_inputs_and_history_produce_the_same_disposition():
 
 
 def test_replay_provider_advances_deterministically():
-    provider = ReplayMarketStateProvider([observation(0.0, "2700.00"), observation(1.0, "2701.00")])
+    provider = ReplayMarketStateProvider(
+        [
+            observation(0.0, "2700.00", reference="obs-0"),
+            observation(1.0, "2701.00", reference="obs-1"),
+        ]
+    )
 
-    assert provider.latest("ETHUSDT").market_reference == "obs-1"
+    assert provider.latest("ETHUSDT").market_reference == "obs-0"
     assert provider.advance("ETHUSDT").market_reference == "obs-1"
+    assert provider.latest("ETHUSDT").market_reference == "obs-1"
+    assert provider.advance("ETHUSDT") is None
+    assert provider.latest("ETHUSDT") is None
+    assert provider.advance("ETHUSDT") is None
     assert provider.latest("MISSING") is None
 
 
