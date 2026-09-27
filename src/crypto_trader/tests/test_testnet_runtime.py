@@ -187,6 +187,46 @@ def test_cancel_all_is_the_safety_lane_action(journal):
     assert len(cancel_events) == 2
 
 
+
+
+def test_refresh_reemits_prior_fills_without_event_id_conflict(journal):
+    """A cumulative venue snapshot must preserve the immutable payload of an older fill."""
+    first_fill = fx.fill(qty="0.00050000", trade_id=7)
+    second_fill = fx.fill(qty="0.00050000", trade_id=8)
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.order_response(
+                CLIENT_ORDER_ID,
+                status="PARTIALLY_FILLED",
+                executed_qty="0.00050000",
+                fills=(first_fill,),
+            ),
+            fx.order_response(
+                CLIENT_ORDER_ID,
+                status="FILLED",
+                executed_qty="0.00100000",
+                fills=(first_fill, second_fill),
+            ),
+        ]
+    )
+    instance = started_runtime(transport, journal=journal)
+
+    instance.submit(execution_request())
+    instance.refresh(CLIENT_ORDER_ID)
+
+    fill_events = [
+        event
+        for event in journal.read_range()
+        if event.event_type == EXECUTION_FILL_EVENT_TYPE
+    ]
+    assert len(fill_events) == 2
+    assert sorted(event.payload.remaining_quantity for event in fill_events) == [
+        Decimal("0"),
+        Decimal("0.00050000"),
+    ]
+
+
 # --- ambiguity ------------------------------------------------------------
 
 def test_ambiguous_submission_is_marked_pending_and_not_marked_failed(journal):
