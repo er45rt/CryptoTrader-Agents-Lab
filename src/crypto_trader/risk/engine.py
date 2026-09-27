@@ -208,9 +208,26 @@ class HardRiskEngine:
         # 4. Reduce-only behaviour (when active, only exposure-reducing orders are allowed).
         if limits.reduce_only_mode:
             position = state.position(request.symbol)
-            reduces = (position > 0 and request.side is Side.SELL) or (position < 0 and request.side is Side.BUY)
-            rule("reduce_only", reduces, "reduce_only_violation" if not reduces else "reduce_only_ok",
-                 ZERO if reduces else Decimal(1), ZERO, "count")
+            # "Reduce only" means the order must move the position toward zero WITHOUT crossing
+            # through zero into exposure on the opposite side. Checking direction alone is not
+            # sufficient: selling 2 units against a +1 long would flip to -1 short.
+            reduces = (
+                position > 0
+                and request.side is Side.SELL
+                and request.quantity <= position
+            ) or (
+                position < 0
+                and request.side is Side.BUY
+                and request.quantity <= abs(position)
+            )
+            rule(
+                "reduce_only",
+                reduces,
+                "reduce_only_violation" if not reduces else "reduce_only_ok",
+                ZERO if reduces else Decimal(1),
+                ZERO,
+                "count",
+            )
 
         # 5/6. Open orders and positions.
         rule("max_open_orders", state.open_orders < limits.max_open_orders,
