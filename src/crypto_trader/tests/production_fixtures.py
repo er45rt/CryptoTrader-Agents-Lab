@@ -18,6 +18,7 @@ from crypto_trader.breakglass import (
     parse_operator_command,
 )
 from crypto_trader.execution import (
+    ExecutionCapability,
     ExecutionObservation,
     ExecutionOrderType,
     ExecutionRequest,
@@ -214,6 +215,9 @@ def persist_safety_state(
 
 class RecordingExecutionPort:
     """Deterministic engine-independent execution port double (records, never networks)."""
+
+    #: Explicit Stage-3 capability: this double never writes to an external venue.
+    capability = ExecutionCapability.NON_WRITING
 
     def __init__(self, instrument: InstrumentSpec) -> None:
         self._instrument = instrument

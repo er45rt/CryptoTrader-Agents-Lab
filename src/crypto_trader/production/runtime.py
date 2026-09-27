@@ -36,6 +36,8 @@ from uuid import UUID, uuid4
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
 from crypto_trader.execution import (
+    DurableVenueWritePort,
+    ExecutionCapability,
     ExecutionOrderType,
     ExecutionPort,
     ExecutionRequest,
@@ -43,6 +45,7 @@ from crypto_trader.execution import (
     ExecutionSide,
     ExecutionTimeInForce,
     InstrumentSpec,
+    NonDurableExecutionError,
 )
 from crypto_trader.execution.binance_testnet import AmbiguousOrderError
 from crypto_trader.persistence import EventJournal
@@ -350,6 +353,26 @@ class ProductionRuntime:
         self._mainnet_base_url = mainnet_base_url
         self._owner_id = owner_id.strip()
         self._venue_sources = tuple(venue_sources)
+        # Stage 3 capability gate (construction-time; capability and journal are construction-time
+        # facts, so no later mutation can change this decision).
+        capability = self._resolve_execution_capability(execution)
+        self._capability = capability
+        self._durable_venue_writes = False
+        if capability.writes_to_venue:
+            if not isinstance(execution, DurableVenueWritePort):
+                raise NonDurableExecutionError(
+                    "the injected execution port declares venue writing but does not inherit the "
+                    "approved durable submission contract; refusing to construct a production "
+                    "runtime that could create venue risk without a durable attempt boundary."
+                )
+            attempt_journal = execution.durable_attempt_journal()
+            if attempt_journal is None or attempt_journal is not journal:
+                raise NonDurableExecutionError(
+                    "the injected venue-writing execution port is not wired to this runtime's own "
+                    "durable journal, so a submission-attempt marker could not be committed before "
+                    "the first send; refusing to construct the production runtime."
+                )
+            self._durable_venue_writes = True
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._producer = producer
@@ -628,7 +651,12 @@ class ProductionRuntime:
             time_in_force=preparation.time_in_force,
         )
         try:
-            reference = self._execution.submit(request)
+            # Venue-writing execution goes through the approved durable submission sequence
+            # (marker -> authorization -> one send). Non-writing execution keeps its own port.
+            if self._durable_venue_writes:
+                reference = self._execution.submit_durably(request)
+            else:
+                reference = self._execution.submit(request)
         except AmbiguousOrderError:
             # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
             self._last_outcome = "unknown_pending_reconciliation"
@@ -675,6 +703,43 @@ class ProductionRuntime:
         )
 
     # --- internals -----------------------------------------------------------
+
+    @staticmethod
+    def _resolve_execution_capability(execution: object) -> ExecutionCapability:
+        """Resolve the explicit execution capability, failing closed on anything unknown.
+
+        UNKNOWN CAPABILITY IS NEVER SAFE CAPABILITY: a missing, malformed, contradictory or
+        unsupported declaration is refused before the runtime can create venue risk. There is
+        deliberately no ``getattr(..., False)``-style permissive fallback.
+        """
+        declaration = getattr(execution, "capability", None)
+        if declaration is None:
+            legacy = getattr(execution, "writes_to_venue", None)
+            detail = "" if legacy is None else f" (legacy writes_to_venue={legacy!r})"
+            raise NonDurableExecutionError(
+                "the injected execution port has no explicit ExecutionCapability declaration"
+                + detail
+                + "; unknown capability is never treated as safe."
+            )
+        if not isinstance(declaration, ExecutionCapability):
+            raise NonDurableExecutionError(
+                f"the injected execution port declares a malformed capability {declaration!r}; "
+                "refusing to guess its venue-write semantics."
+            )
+        if isinstance(execution, DurableVenueWritePort):
+            if declaration is not ExecutionCapability.DURABLE_VENUE_WRITING:
+                raise NonDurableExecutionError(
+                    "the injected execution port inherits the approved durable submission "
+                    f"contract but declares capability {declaration.value!r}; refusing the "
+                    "contradictory declaration."
+                )
+            return declaration
+        if declaration is ExecutionCapability.VENUE_WRITING_UNPROVEN:
+            raise NonDurableExecutionError(
+                "the injected execution port declares venue writing without the approved durable "
+                "submission boundary; it can never be used for production execution."
+            )
+        return declaration
 
     def _blocked(
         self,

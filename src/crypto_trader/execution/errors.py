@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = [
     "EngineVersionError",
     "ExecutionBoundaryError",
+    "NonDurableExecutionError",
     "QueueAwareConfigurationError",
     "RuntimeStateError",
     "TranslationError",
@@ -17,6 +18,15 @@ __all__ = [
 
 class ExecutionBoundaryError(RuntimeError):
     """Base class for every execution-boundary failure."""
+
+
+class NonDurableExecutionError(ExecutionBoundaryError):
+    """Production execution may write to a venue but does not satisfy the approved durable contract.
+
+    Raised by the production runtime gate BEFORE any venue-write side effect: an execution port
+    whose capability is missing, malformed, or venue-writing without the approved durable
+    submission boundary must never be allowed to create venue risk.
+    """
 
 
 class UnsupportedExecutionRequestError(ExecutionBoundaryError):

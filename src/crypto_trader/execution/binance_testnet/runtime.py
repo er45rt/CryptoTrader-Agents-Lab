@@ -28,12 +28,15 @@ from crypto_trader.safety import SafetyController
 
 from ..errors import RuntimeStateError, UnsupportedExecutionRequestError
 from ..ports import (
+    DurableAttemptJournal,
+    DurableVenueWritePort,
     ExecutionObservation,
     ExecutionOrderType,
     ExecutionRequest,
     ExecutionRuntimeState,
     InstrumentSpec,
     OrderLifecycleState,
+    PreparedVenueWrite,
 )
 from .client import BinanceSpotTestnetClient, PreparedTestnetOrder
 from .errors import (
@@ -85,8 +88,16 @@ class TestnetVenueStateSource:
 
 
 @dataclass
-class TestnetOrderRuntime:
-    """The engine-independent execution port over the Spot Testnet client."""
+class TestnetOrderRuntime(DurableVenueWritePort):
+    """The engine-independent execution port over the Spot Testnet client.
+
+    Stage 3: this is the approved durable venue-writing port. It inherits
+    :class:`DurableVenueWritePort`, whose runtime-owned ``submit_durably`` sequence commits the
+    durable ``order.submission.attempted`` marker into the production runtime's own journal before
+    the single send, and binds the exact prepared write to that committed marker. The adapter
+    supplies only the hooks below, so the approved ordering cannot be bypassed by an implementation
+    error.
+    """
 
     client: BinanceSpotTestnetClient
     instrument: InstrumentSpec
@@ -124,18 +135,17 @@ class TestnetOrderRuntime:
         return f"ct-{intent_id.hex[:20]}"
 
     def submit(self, request: ExecutionRequest) -> str:
-        """Prepare, durably mark the attempt, then send exactly once.
+        """Delegate to the approved durable submission sequence (Stage 2 behaviour unchanged)."""
+        return self.submit_durably(request)
 
-        Sequence (Stage 2 invariant):
+    # --- the approved durable boundary hooks ---------------------------------
 
-        1. ``prepare_order`` - every locally rejectable step, read-only venue calls, rate/backoff
-           admission, the clock precondition, timestamp/recvWindow, signing and serialization;
-        2. commit the durable ``order.submission.attempted`` marker;
-        3. ``submit_prepared`` - the exact prepared request, one ``transport.send`` call maximum.
+    def durable_attempt_journal(self) -> DurableAttemptJournal | None:
+        """The durable journal this port commits its attempt marker into."""
+        return self.journal
 
-        Between a successful marker commit and the first venue-write network I/O there is no new
-        validation, rate admission, clock work, signing, identity generation or request rebuild.
-        """
+    def _prepare_durable_write(self, request: ExecutionRequest) -> PreparedVenueWrite:
+        """Every locally rejectable step, before the durable marker exists."""
         if self._state is not ExecutionRuntimeState.RUNNING:
             raise RuntimeStateError("the testnet runtime must be started before submitting.")
         request.validate_for(self.instrument)
@@ -165,7 +175,6 @@ class TestnetOrderRuntime:
             ),
         )
 
-        # 1. Prepare: all locally rejectable work happens before the durable marker exists.
         prepared = self.client.prepare_order(order_request)
 
         self._intents[client_order_id] = request.intent_id
@@ -175,14 +184,42 @@ class TestnetOrderRuntime:
             # The venue already knows this order: adopt it without a marker and without a POST.
             order = self.client.submit_prepared(prepared)
             self._record(order, correlation_id=request.correlation_id)
-            return client_order_id
+            return PreparedVenueWrite(handle=prepared, adopted_reference=client_order_id)
+        return PreparedVenueWrite(handle=prepared)
 
-        # 2. Durable attempt marker, committed BEFORE the first venue-write network I/O.
-        marker = self._commit_attempt_marker(prepared, request)
-        # Authorization happens ONLY after the append returned successfully, and it binds the
-        # committed marker to this exact prepared order (identity + economic anchors).
-        prepared = self.client._authorize_attempt(
-            prepared,
+    def _durable_attempt_event(
+        self, prepared: PreparedVenueWrite, request: ExecutionRequest
+    ) -> OrderSubmissionAttempted:
+        """Build the durable attempt marker for the exact prepared write."""
+        client_prepared = prepared.handle
+        assert isinstance(client_prepared, PreparedTestnetOrder)
+        return OrderSubmissionAttempted(
+            event_id=uuid4(),
+            occurred_at=self._now(),
+            correlation_id=request.correlation_id,
+            producer=self.producer,
+            order_id=deterministic_order_uuid(client_prepared.client_order_id),
+            symbol=client_prepared.symbol,
+            payload=OrderSubmissionAttemptPayload(
+                venue_reference=client_prepared.client_order_id,
+                intent_id=request.intent_id,
+                side=request.side.value,
+                order_type=request.order_type.value,
+                quantity=request.quantity,
+                limit_price=request.limit_price,
+                time_in_force=request.time_in_force.value,
+                venue_producer=PRODUCER,
+            ),
+        )
+
+    def _bind_durable_authorization(
+        self, prepared: PreparedVenueWrite, marker: object
+    ) -> PreparedVenueWrite:
+        """Bind the committed marker to the exact prepared write (after the append succeeded)."""
+        client_prepared = prepared.handle
+        assert isinstance(client_prepared, PreparedTestnetOrder)
+        authorized = self.client._authorize_attempt(
+            client_prepared,
             marker_event_id=marker.event_id,
             venue_reference=marker.payload.venue_reference,
             order_id=marker.order_id,
@@ -195,15 +232,22 @@ class TestnetOrderRuntime:
             limit_price=marker.payload.limit_price,
             time_in_force=marker.payload.time_in_force,
         )
-        self._pending_submissions[client_order_id] = request.correlation_id
+        self._pending_submissions[authorized.client_order_id] = marker.correlation_id
+        return PreparedVenueWrite(handle=authorized)
 
-        # 3. The exact prepared request; at most one POST attempt for this invocation.
+    def _send_authorized_write(
+        self, prepared: PreparedVenueWrite, request: ExecutionRequest
+    ) -> str:
+        """Send the authorized write exactly once and classify the outcome (Stage 2 semantics)."""
+        client_prepared = prepared.handle
+        assert isinstance(client_prepared, PreparedTestnetOrder)
+        client_order_id = client_prepared.client_order_id
         try:
-            order = self.client.submit_prepared(prepared)
+            order = self.client.submit_prepared(client_prepared)
         except PreSendTransportError as exc:
             # Proven not transmitted: record the resolution, never retry inside this call.
             self._journal_attempt_resolution(
-                prepared,
+                client_prepared,
                 request,
                 state=OrderLifecycleState.CANCELED,
                 reason=f"pre_send_failure_proven:{type(exc).__name__}",
@@ -213,7 +257,7 @@ class TestnetOrderRuntime:
         except VenueProtocolRejectionError as exc:
             # The venue refused the request before any order was created (-1021).
             self._journal_attempt_resolution(
-                prepared,
+                client_prepared,
                 request,
                 state=OrderLifecycleState.REJECTED,
                 reason=f"{type(exc).reason_code}:{type(exc).evidence_code}",
@@ -226,7 +270,7 @@ class TestnetOrderRuntime:
             raise
         except TestnetRejectedError as exc:
             self._journal_attempt_resolution(
-                prepared,
+                client_prepared,
                 request,
                 state=OrderLifecycleState.REJECTED,
                 reason=f"venue_order_rejected:{type(exc).__name__}",
@@ -236,40 +280,6 @@ class TestnetOrderRuntime:
         self._record(order, correlation_id=request.correlation_id)
         self._pending_submissions.pop(client_order_id, None)
         return client_order_id
-
-    def _commit_attempt_marker(
-        self, prepared: PreparedTestnetOrder, request: ExecutionRequest
-    ) -> OrderSubmissionAttempted:
-        """Durably record the submission attempt, or fail closed before any send."""
-        assert self.journal is not None
-        marker = OrderSubmissionAttempted(
-            event_id=uuid4(),
-            occurred_at=self._now(),
-            correlation_id=request.correlation_id,
-            producer=self.producer,
-            order_id=deterministic_order_uuid(prepared.client_order_id),
-            symbol=prepared.symbol,
-            payload=OrderSubmissionAttemptPayload(
-                venue_reference=prepared.client_order_id,
-                intent_id=request.intent_id,
-                side=request.side.value,
-                order_type=request.order_type.value,
-                quantity=request.quantity,
-                limit_price=request.limit_price,
-                time_in_force=request.time_in_force.value,
-                venue_producer=PRODUCER,
-            ),
-        )
-        # A journal failure propagates unchanged (the journal's own typed error): the caller must
-        # never reach ``submit_prepared`` without a committed marker.
-        self.journal.append(marker)
-        stored = self.journal.read_by_id(marker.event_id)
-        if stored is None or stored.event_type != marker.event_type:
-            raise AttemptJournalRequiredError(
-                "the durable attempt marker could not be read back after the append; refusing to "
-                "send any request."
-            )
-        return marker
 
     def _journal_attempt_resolution(
         self,

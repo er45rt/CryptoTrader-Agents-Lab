@@ -26,6 +26,7 @@ from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from ..errors import RuntimeStateError, UnsupportedExecutionRequestError
 from ..ports import (
+    ExecutionCapability,
     ExecutionObservation,
     ExecutionRequest,
     ExecutionRuntimeState,
@@ -99,6 +100,9 @@ class _TranslationStrategy(Strategy):
 
 class NautilusExecutionRuntime:
     """Hosts the Nautilus adapter behind the engine-independent execution port."""
+
+    #: Explicit Stage-3 capability: the offline simulator never writes to an external venue.
+    capability = ExecutionCapability.NON_WRITING
 
     def __init__(
         self,
