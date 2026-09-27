@@ -256,6 +256,33 @@ def test_open_order_and_position_counts_are_enforced():
     assert "max_open_positions_exceeded" in decision.reason_codes
 
 
+
+
+def test_existing_symbol_does_not_consume_a_new_position_slot_at_the_limit():
+    engine = HardRiskEngine(limits(max_open_positions=3))
+    at_limit = state(
+        open_positions=3,
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(request(quantity="0.1"), at_limit)
+
+    assert decision.allowed is True
+    position_rule = next(r for r in decision.rule_results if r.rule_id == "max_open_positions")
+    assert position_rule.actual == Decimal("3")
+
+
+def test_flat_symbol_consumes_a_new_position_slot():
+    engine = HardRiskEngine(limits(max_open_positions=3))
+    at_limit_elsewhere = state(open_positions=3)
+
+    decision = engine.evaluate(request(quantity="0.1"), at_limit_elsewhere)
+
+    assert decision.allowed is False
+    assert "max_open_positions_exceeded" in decision.reason_codes
+    position_rule = next(r for r in decision.rule_results if r.rule_id == "max_open_positions")
+    assert position_rule.actual == Decimal("4")
+
 def test_concentration_limit_uses_percent_of_equity():
     engine = HardRiskEngine(limits())
     crowded = state(symbol_exposure_quote={"ETHUSDT": Decimal("4500")})
