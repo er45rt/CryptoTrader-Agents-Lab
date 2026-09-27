@@ -230,12 +230,36 @@ class HardRiskEngine:
             )
 
         # 5/6. Open orders and positions.
-        rule("max_open_orders", state.open_orders < limits.max_open_orders,
-             "max_open_orders_exceeded" if state.open_orders >= limits.max_open_orders else "open_orders_ok",
-             Decimal(state.open_orders), Decimal(limits.max_open_orders), "count")
-        rule("max_open_positions", state.open_positions < limits.max_open_positions,
-             "max_open_positions_exceeded" if state.open_positions >= limits.max_open_positions else "open_positions_ok",
-             Decimal(state.open_positions), Decimal(limits.max_open_positions), "count")
+        # A submitted order consumes one open-order slot. A position slot is consumed only when
+        # the symbol is currently flat; increasing/reducing/flipping an existing symbol does not
+        # increase the number of concurrently open positions.
+        projected_open_orders = state.open_orders + 1
+        current_position = state.position(request.symbol)
+        projected_open_positions = state.open_positions + (1 if current_position == ZERO else 0)
+        rule(
+            "max_open_orders",
+            projected_open_orders <= limits.max_open_orders,
+            (
+                "max_open_orders_exceeded"
+                if projected_open_orders > limits.max_open_orders
+                else "open_orders_ok"
+            ),
+            Decimal(projected_open_orders),
+            Decimal(limits.max_open_orders),
+            "count",
+        )
+        rule(
+            "max_open_positions",
+            projected_open_positions <= limits.max_open_positions,
+            (
+                "max_open_positions_exceeded"
+                if projected_open_positions > limits.max_open_positions
+                else "open_positions_ok"
+            ),
+            Decimal(projected_open_positions),
+            Decimal(limits.max_open_positions),
+            "count",
+        )
 
         # 7. Order notional (quote currency).
         notional = request.notional
