@@ -39,6 +39,25 @@ def make_request(**overrides) -> ExecutionRequest:
     return ExecutionRequest.create(**fields)
 
 
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("price_precision", True),
+        ("size_precision", False),
+        ("price_precision", 2.5),
+        ("size_precision", "8"),
+        ("price_precision", -1),
+        ("size_precision", -1),
+    ],
+)
+def test_instrument_spec_rejects_invalid_precision_types(field, bad):
+    kwargs = {"symbol": "ETHUSDT", field: bad}
+    with pytest.raises(UnsupportedExecutionRequestError, match=field):
+        InstrumentSpec(**kwargs)
+
+
 # --- inbound ---
 
 def test_inbound_side_and_time_in_force_mapping_is_explicit():
