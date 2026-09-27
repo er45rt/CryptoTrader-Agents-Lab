@@ -290,6 +290,20 @@ class ExecutionRequest:
 
     def validate_for(self, instrument: InstrumentSpec) -> None:
         """Fail closed on anything the engine cannot represent faithfully."""
+        if not isinstance(self.intent_id, UUID) or not isinstance(self.correlation_id, UUID):
+            raise UnsupportedExecutionRequestError(
+                "intent_id and correlation_id must be UUIDs."
+            )
+        if not isinstance(self.side, ExecutionSide):
+            raise UnsupportedExecutionRequestError("side must be an ExecutionSide.")
+        if not isinstance(self.order_type, ExecutionOrderType):
+            raise UnsupportedExecutionRequestError(
+                "order_type must be an ExecutionOrderType."
+            )
+        if not isinstance(self.time_in_force, ExecutionTimeInForce):
+            raise UnsupportedExecutionRequestError(
+                "time_in_force must be an ExecutionTimeInForce."
+            )
         if self.symbol != instrument.symbol:
             raise UnsupportedExecutionRequestError(
                 f"request symbol {self.symbol!r} does not match the configured instrument "
