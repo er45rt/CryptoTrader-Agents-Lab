@@ -126,6 +126,14 @@ class HardRiskEngine:
         *,
         now: datetime | None = None,
     ) -> RiskDecision:
+        """Evaluate and, when allowed, admit the intent into the pending registry.
+
+        This is intentionally an admission operation rather than a side-effect-free query:
+        a successful evaluation reserves the intent identity so at-least-once redelivery of the
+        same intent is rejected as "duplicate_intent" and an opposite pending intent is rejected
+        as "conflicting_intent". Callers needing an independent what-if calculation must use an
+        independent registry instead of evaluating the same live admission state twice.
+        """
         limits = self._limits
         results: list[RiskRuleResult] = []
 
