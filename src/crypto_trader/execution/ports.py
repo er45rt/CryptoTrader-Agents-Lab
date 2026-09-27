@@ -295,8 +295,8 @@ class ExecutionRequest:
                 f"request symbol {self.symbol!r} does not match the configured instrument "
                 f"{instrument.symbol!r}."
             )
-        if not isinstance(self.quantity, Decimal):
-            raise UnsupportedExecutionRequestError("quantity must be a Decimal.")
+        if not isinstance(self.quantity, Decimal) or not self.quantity.is_finite():
+            raise UnsupportedExecutionRequestError("quantity must be a finite Decimal.")
         if self.quantity <= 0:
             raise UnsupportedExecutionRequestError("quantity must be greater than zero.")
         if -self.quantity.as_tuple().exponent > instrument.size_precision:
@@ -308,8 +308,14 @@ class ExecutionRequest:
         if self.order_type is ExecutionOrderType.LIMIT:
             if self.limit_price is None:
                 raise UnsupportedExecutionRequestError("limit orders require a limit_price.")
-            if not isinstance(self.limit_price, Decimal) or self.limit_price <= 0:
-                raise UnsupportedExecutionRequestError("limit_price must be a positive Decimal.")
+            if (
+                not isinstance(self.limit_price, Decimal)
+                or not self.limit_price.is_finite()
+                or self.limit_price <= 0
+            ):
+                raise UnsupportedExecutionRequestError(
+                    "limit_price must be a finite positive Decimal."
+                )
             if -self.limit_price.as_tuple().exponent > instrument.price_precision:
                 raise UnsupportedExecutionRequestError(
                     f"limit_price {self.limit_price} exceeds the instrument price precision "
