@@ -205,6 +205,7 @@ def live_context(tmp_path: Path):
         market_state=_live_market_state(client),
         limits=load_limits(LIVE_LIMITS),
         risk_state_provider=lambda now: _flat_risk_state(now),
+        risk_state_max_age_seconds=5.0,
         reconciliation_policy=load_recovery_policy({"policy_id": LIVE_POLICY_ID}),
         control=control,
         clock=_now,
