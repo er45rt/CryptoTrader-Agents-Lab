@@ -322,3 +322,18 @@ def test_future_risk_state_timestamp_is_rejected_when_freshness_is_configured():
     assert decision.allowed is False
     assert "risk_state_timestamp_in_future" in decision.reason_codes
 
+@pytest.mark.parametrize("field", ["reduce_only_mode", "trading_halted"])
+@pytest.mark.parametrize(
+    "value, expected",
+    [("true", True), ("false", False), (True, True), (False, False)],
+)
+def test_optional_risk_boolean_configuration_is_parsed_strictly(field, value, expected):
+    loaded = load_limits({**LIMIT_CONFIG, field: value})
+    assert getattr(loaded, field) is expected
+
+
+@pytest.mark.parametrize("field", ["reduce_only_mode", "trading_halted"])
+@pytest.mark.parametrize("value", ["yes", "no", "1", "0", "on", "off", "", 1, 0, None])
+def test_ambiguous_optional_risk_boolean_configuration_fails_closed(field, value):
+    with pytest.raises(RiskConfigError, match=field):
+        load_limits({**LIMIT_CONFIG, field: value})
