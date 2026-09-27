@@ -652,6 +652,15 @@ class ProductionRuntime:
                     # Venue-writing execution goes through the approved durable submission sequence
                     # (marker -> authorization -> one send). Non-writing execution keeps its port.
                     if self._durable_venue_writes:
+                        # Construction-time identity is necessary but not sufficient: an adapter
+                        # field could be rebound later. Re-prove that the durable marker still
+                        # lands in this runtime's authoritative journal at the instant of submit.
+                        attempt_journal = self._execution.durable_attempt_journal()
+                        if attempt_journal is not self._journal:
+                            raise NonDurableExecutionError(
+                                "the venue-writing execution port's durable journal binding changed "
+                                "after runtime construction; refusing to send any request."
+                            )
                         reference = self._execution.submit_durably(request)
                     else:
                         reference = self._execution.submit(request)
