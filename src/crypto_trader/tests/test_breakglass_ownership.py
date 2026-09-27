@@ -1,5 +1,8 @@
 """Phase 13: single-writer ownership, fencing tokens and explicit takeover semantics."""
 
+import multiprocessing
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -19,6 +22,21 @@ from crypto_trader.breakglass import (
 
 BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
+
+
+
+def _process_takeover(path: str, gate, queue, index: int) -> None:
+    """Spawn-safe helper used to prove fencing terms serialize across processes."""
+    local = OwnershipStore(path)
+    if not gate.wait(timeout=10):
+        raise RuntimeError("process takeover start gate timed out")
+    record = local.takeover(
+        owner_id=f"process-owner-{index}",
+        owner_kind=OwnerKind.EMERGENCY,
+        acquired_at=BASE,
+        reason_code="concurrency-regression",
+    )
+    queue.put(record.term)
 
 @pytest.fixture
 def store(tmp_path: Path) -> OwnershipStore:
@@ -173,3 +191,46 @@ def test_fence_rejects_impossible_values():
         WriterFence(term=-1, owner_id="x", owner_kind=OwnerKind.NORMAL)
     with pytest.raises(OwnershipStateError):
         WriterFence(term=1, owner_id="", owner_kind=OwnerKind.NORMAL)
+
+def test_concurrent_thread_takeovers_mint_unique_monotonic_terms(store):
+    workers = 16
+    gate = threading.Barrier(workers)
+
+    def claim(index: int) -> int:
+        gate.wait(timeout=10)
+        return store.takeover(
+            owner_id=f"thread-owner-{index}",
+            owner_kind=OwnerKind.EMERGENCY,
+            acquired_at=BASE,
+            reason_code="thread-concurrency-regression",
+        ).term
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        terms = list(pool.map(claim, range(workers)))
+
+    assert sorted(terms) == list(range(1, workers + 1))
+    assert store.require_fence().term == workers
+
+
+def test_concurrent_process_takeovers_mint_unique_monotonic_terms(tmp_path):
+    path = str(tmp_path / "process-ownership.json")
+    ctx = multiprocessing.get_context("spawn")
+    gate = ctx.Event()
+    queue = ctx.Queue()
+    workers = 6
+    processes = [
+        ctx.Process(target=_process_takeover, args=(path, gate, queue, index))
+        for index in range(workers)
+    ]
+
+    for process in processes:
+        process.start()
+    gate.set()
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+
+    terms = [queue.get(timeout=5) for _ in range(workers)]
+    assert sorted(terms) == list(range(1, workers + 1))
+    assert OwnershipStore(path).require_fence().term == workers
+
