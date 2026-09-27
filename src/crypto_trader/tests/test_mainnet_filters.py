@@ -111,3 +111,24 @@ def test_order_validation_uses_the_live_filters():
         parsed.validate_order(price=Decimal("27000.00"), quantity=Decimal("0.000001"))
     with pytest.raises(SymbolFilterError):
         parsed.validate_order(price=Decimal("100.00"), quantity=Decimal("0.00001"))
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_order_validation_rejects_non_finite_price_and_quantity(bad):
+    parsed = fx.filters()
+    value = Decimal(bad)
+
+    with pytest.raises(SymbolFilterError):
+        parsed.validate_order(price=value, quantity=Decimal("0.01"))
+    with pytest.raises(SymbolFilterError):
+        parsed.validate_order(price=Decimal("27000"), quantity=value)
+
+
+@pytest.mark.parametrize("field", ["baseAsset", "quoteAsset"])
+@pytest.mark.parametrize("bad", [None, "", 123])
+def test_filter_parser_requires_real_asset_identifiers(field, bad):
+    body = fx.exchange_info_body()
+    body["symbols"][0][field] = bad
+
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(body, "BTCUSDT")
+
