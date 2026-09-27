@@ -117,18 +117,19 @@ class LockedPilotEnvelope:
             raise LockedEnvelopeError("activation must remain an EnvelopeActivation.")
         if self.venue_scope != "SPOT":
             raise LockedEnvelopeError("the locked envelope is SPOT only.")
-        if any(
-            (
-                self.margin_allowed,
-                self.futures_allowed,
-                self.leverage_allowed,
-                self.borrowing_allowed,
-                self.withdrawals_allowed,
-            )
+        for name in (
+            "margin_allowed",
+            "futures_allowed",
+            "leverage_allowed",
+            "borrowing_allowed",
+            "withdrawals_allowed",
         ):
-            raise LockedEnvelopeError(
-                "the locked envelope forbids margin, futures, leverage, borrowing and withdrawals."
-            )
+            value = getattr(self, name)
+            if not isinstance(value, bool) or value:
+                raise LockedEnvelopeError(
+                    "the locked envelope requires every writable capability flag to be boolean "
+                    f"false; {name}={value!r} is refused."
+                )
 
     def to_record(self) -> dict[str, object]:
         """A JSON-able record. These values are future limits, NOT permission to trade."""
@@ -453,8 +454,8 @@ def realized_slippage_bps(
         ("reference_mid", reference_mid),
         ("average_fill_price", average_fill_price),
     ):
-        if not isinstance(value, Decimal) or value <= 0:
-            raise CanaryPolicyError(f"{name} must be a positive Decimal.")
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            raise CanaryPolicyError(f"{name} must be a finite positive Decimal.")
     if not isinstance(side, ExecutionSide):
         raise CanaryPolicyError("side must be an ExecutionSide.")
     raw = (average_fill_price - reference_mid) / reference_mid * TEN_THOUSAND
