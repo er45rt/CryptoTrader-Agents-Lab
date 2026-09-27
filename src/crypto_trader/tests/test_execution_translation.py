@@ -83,6 +83,24 @@ def test_execution_request_rejects_non_finite_quantity_and_limit_price(bad):
     with pytest.raises(UnsupportedExecutionRequestError):
         make_request(limit_price=Decimal(bad)).validate_for(INSTRUMENT)
 
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"side": "buy"}, "side"),
+        ({"order_type": "market", "limit_price": None}, "order_type"),
+        ({"time_in_force": "GTC"}, "time_in_force"),
+        ({"correlation_id": "not-a-uuid"}, "correlation_id"),
+        ({"intent_id": "not-a-uuid"}, "intent_id"),
+    ],
+)
+def test_execution_request_rejects_malformed_typed_fields(overrides, message):
+    request = make_request(**overrides)
+
+    with pytest.raises(UnsupportedExecutionRequestError, match=message):
+        request.validate_for(INSTRUMENT)
+
 def test_inbound_book_and_trade_translation_uses_public_types():
     from crypto_trader.execution import BookLevel, MarketBookUpdate, MarketTrade
 
