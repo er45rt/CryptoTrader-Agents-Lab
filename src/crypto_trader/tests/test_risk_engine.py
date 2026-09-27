@@ -158,6 +158,28 @@ def test_risk_state_snapshot_rejects_non_finite_or_ambiguous_values(overrides):
         state(**overrides)
 
 
+
+
+@pytest.mark.parametrize("field", ["max_drawdown_pct", "concentration_limit_pct"])
+@pytest.mark.parametrize("bad", ["100.0001", "101", "1000"])
+def test_percentage_limits_above_100_fail_closed(field, bad):
+    with pytest.raises(RiskConfigError):
+        load_limits({**LIMIT_CONFIG, field: bad})
+
+
+def test_risk_state_rejects_peak_equity_below_current_equity():
+    with pytest.raises(RiskStateError, match="peak_equity_quote"):
+        state(equity_quote=Decimal("10000"), peak_equity_quote=Decimal("9999"))
+
+
+def test_risk_state_rejects_gross_exposure_below_absolute_net_exposure():
+    with pytest.raises(RiskStateError, match="gross_exposure_quote"):
+        state(
+            gross_exposure_quote=Decimal("100"),
+            net_exposure_quote=Decimal("-101"),
+        )
+
+
 # --- boundary values (explicit units, Decimal only) ---
 
 def test_notional_exactly_at_the_limit_is_allowed_and_above_is_rejected():
