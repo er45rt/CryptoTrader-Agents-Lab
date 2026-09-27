@@ -79,6 +79,32 @@ def test_the_envelope_is_reference_only_and_is_not_trading_permission():
         )
 
 
+
+
+def test_locked_envelope_order_value_cannot_exceed_open_exposure_limit():
+    from crypto_trader.mainnet import LockedPilotEnvelope
+
+    with pytest.raises(LockedEnvelopeError, match="max_open_exposure_sar"):
+        LockedPilotEnvelope(
+            capital_envelope_sar=Decimal("300"),
+            max_order_value_sar=Decimal("151"),
+            max_open_exposure_sar=Decimal("150"),
+            daily_loss_halt_sar=Decimal("15"),
+            max_open_orders=2,
+            symbols=("BTCUSDT",),
+        )
+
+
+@pytest.mark.parametrize("field", ["max_spread_bps", "max_normal_slippage_bps", "absolute_price_bound_bps"])
+@pytest.mark.parametrize("bad", ["10000", "10001", "Infinity", "NaN"])
+def test_execution_price_rules_refuse_unbounded_basis_point_values(field, bad):
+    from crypto_trader.mainnet import ExecutionPriceRules
+
+    kwargs = {field: Decimal(bad)}
+    with pytest.raises(LockedEnvelopeError):
+        ExecutionPriceRules(**kwargs)
+
+
 # --- price rules -----------------------------------------------------------
 
 def test_the_price_rules_are_the_owner_approved_values():
