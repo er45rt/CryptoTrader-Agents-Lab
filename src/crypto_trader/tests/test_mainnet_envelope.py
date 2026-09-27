@@ -164,6 +164,22 @@ def test_a_price_beyond_the_absolute_bound_is_refused_at_entry_construction():
         )
 
 
+
+
+def test_canary_entry_refuses_symbols_outside_locked_envelope():
+    with pytest.raises(CanaryPolicyError, match="locked pilot envelope"):
+        build_canary_entry(
+            symbol="DOGEUSDT",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("1"),
+            limit_price=Decimal("1"),
+            reference_mid=Decimal("1"),
+            market_snapshot_id="snap-outside-envelope",
+            order_type="LIMIT",
+            time_in_force="FOK",
+        )
+
+
 # --- no chasing / single-use snapshots -------------------------------------
 
 def test_a_market_snapshot_can_never_be_reused():
