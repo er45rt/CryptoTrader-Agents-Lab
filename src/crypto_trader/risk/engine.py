@@ -48,10 +48,20 @@ class RiskRequest:
     order_type: str = "market"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.quantity, Decimal) or self.quantity <= 0:
-            raise RiskStateError("quantity must be a positive Decimal.")
-        if not isinstance(self.price, Decimal) or self.price <= 0:
-            raise RiskStateError("price must be a positive Decimal.")
+        if (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= 0
+        ):
+            raise RiskStateError("quantity must be a finite positive Decimal.")
+        if (
+            not isinstance(self.price, Decimal)
+            or not self.price.is_finite()
+            or self.price <= 0
+        ):
+            raise RiskStateError("price must be a finite positive Decimal.")
+        if not isinstance(self.side, Side):
+            raise RiskStateError("side must be a Side enum value.")
         if not self.symbol or not self.strategy_id:
             raise RiskStateError("symbol and strategy_id are required.")
 
