@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from crypto_trader.tests.production_fixtures import (
     limits,
     operator_command,
     persist_safety_state,
+    risk_state_provider,
 )
 
 
@@ -71,6 +72,53 @@ def test_production_intent_rejects_non_finite_economics(field, bad):
 def test_production_intent_rejects_non_enum_time_in_force():
     with pytest.raises(ProductionStateError, match="ExecutionTimeInForce"):
         intent(time_in_force="GTC")
+
+
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan"), True, "5"])
+def test_production_runtime_requires_explicit_finite_risk_state_freshness(
+    journal, state_dir, bad
+):
+    with pytest.raises(ProductionStateError, match="risk_state_max_age_seconds"):
+        build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=RecordingExecutionPort(INSTRUMENT),
+            risk_state_max_age_seconds=bad,
+        )
+
+
+def test_stale_risk_snapshot_blocks_production_intent_before_submission(journal, state_dir):
+    control, port, runtime = _started_runtime(
+        journal,
+        state_dir,
+        risk_state_source=risk_state_provider(BASE - timedelta(seconds=6)),
+        risk_state_max_age_seconds=5.0,
+    )
+    runtime.start()
+
+    preparation = runtime.prepare_intent(intent("stale-risk-state"))
+
+    assert preparation.approved is False
+    assert "stale_risk_state" in (preparation.blocked_reason_code or "")
+    assert port.submit_count == 0
+
+
+def test_future_risk_snapshot_blocks_production_intent_before_submission(journal, state_dir):
+    control, port, runtime = _started_runtime(
+        journal,
+        state_dir,
+        risk_state_source=risk_state_provider(BASE + timedelta(seconds=1)),
+        risk_state_max_age_seconds=5.0,
+    )
+    runtime.start()
+
+    preparation = runtime.prepare_intent(intent("future-risk-state"))
+
+    assert preparation.approved is False
+    assert "risk_state_timestamp_in_future" in (preparation.blocked_reason_code or "")
+    assert port.submit_count == 0
 
 
 # --- 1/2/3: startup ownership, exclusivity and fail-closed leases -----------------
