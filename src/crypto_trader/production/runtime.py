@@ -135,19 +135,33 @@ class ProductionIntent:
             raise ProductionStateError("an intent requires an ExecutionSide.")
         if not isinstance(self.order_type, ExecutionOrderType):
             raise ProductionStateError("an intent requires an ExecutionOrderType.")
-        if not isinstance(self.quantity, Decimal) or self.quantity <= 0:
-            raise ProductionStateError("an intent requires a positive Decimal quantity.")
-        if not isinstance(self.reference_price, Decimal) or self.reference_price <= 0:
+        if (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= 0
+        ):
+            raise ProductionStateError("an intent requires a finite positive Decimal quantity.")
+        if (
+            not isinstance(self.reference_price, Decimal)
+            or not self.reference_price.is_finite()
+            or self.reference_price <= 0
+        ):
             raise ProductionStateError(
-                "an intent requires a positive Decimal reference price: Hard Risk needs an "
+                "an intent requires a finite positive Decimal reference price: Hard Risk needs an "
                 "explicit price and never guesses one."
             )
         if self.order_type is ExecutionOrderType.LIMIT and (
-            not isinstance(self.limit_price, Decimal) or self.limit_price <= 0
+            not isinstance(self.limit_price, Decimal)
+            or not self.limit_price.is_finite()
+            or self.limit_price <= 0
         ):
-            raise ProductionStateError("a limit intent requires a positive Decimal limit price.")
+            raise ProductionStateError(
+                "a limit intent requires a finite positive Decimal limit price."
+            )
         if self.order_type is ExecutionOrderType.MARKET and self.limit_price is not None:
             raise ProductionStateError("a market intent must not carry a limit price.")
+        if not isinstance(self.time_in_force, ExecutionTimeInForce):
+            raise ProductionStateError("an intent requires an ExecutionTimeInForce.")
         for name in (
             "decision_started_at",
             "decision_completed_at",
