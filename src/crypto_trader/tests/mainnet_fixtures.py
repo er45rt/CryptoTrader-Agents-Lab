@@ -344,6 +344,7 @@ def pipeline(
         decision_source=decision_source or (lambda snapshot: intent()),
         limits=limits(),
         risk_state_provider=lambda now: risk_state(now=now),
+        risk_state_max_age_seconds=5.0,
         validity_gate=validity_gate(),
         reconciliation_policy=recovery_policy(),
         permission_check=permission_check or (lambda: restrictions()),
