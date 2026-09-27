@@ -515,17 +515,18 @@ class BreakGlassControl:
         else:
             reconciliation_reason = "reconciliation_required"
 
-        fence_term = self._ownership_store.next_term()
         # Fencing takeover happens BEFORE the journal append on purpose: if the process dies in
         # between, the normal writer is already locked out (fail closed) even though the command was
-        # not recorded yet, and the operator can simply re-deliver the same command_id.
-        self._ownership_store.takeover(
+        # not recorded yet, and the operator can simply re-deliver the same command_id. The term is
+        # taken from the committed ownership record, never from a pre-takeover read.
+        ownership = self._ownership_store.takeover(
             owner_id=f"emergency:{command.operator_label}",
             owner_kind=OwnerKind.EMERGENCY,
             acquired_at=delivered_at,
             reason_code=f"break_glass:{command.command_type.value}",
             session_id=session_id,
         )
+        fence_term = ownership.term
         recorded = self._append_records(
             command,
             controller,
@@ -776,14 +777,14 @@ class BreakGlassControl:
                     reason="kill switch released by the explicit operator restore",
                 )
             )
-        fence_term = self._ownership_store.next_term()
-        self._ownership_store.takeover(
+        ownership = self._ownership_store.takeover(
             owner_id=f"normal:{command.operator_label}",
             owner_kind=OwnerKind.NORMAL,
             acquired_at=delivered_at,
             reason_code="operator_restore_normal",
             session_id=epoch.session_id,
         )
+        fence_term = ownership.term
         event_ids = self._append_records(
             command,
             controller,
