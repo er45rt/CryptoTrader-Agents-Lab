@@ -136,8 +136,16 @@ def parse_symbol_filters(body: Any, symbol: str) -> SymbolFilters:
         if not isinstance(item, Mapping):
             raise SymbolFilterError(f"a {symbol} filter entry was malformed.")
         filter_type = item.get("filterType")
-        if isinstance(filter_type, str) and filter_type:
-            filters[filter_type] = item
+        if not isinstance(filter_type, str) or not filter_type:
+            raise SymbolFilterError(
+                f"a {symbol} filter entry has no valid filterType; refusing to ignore it."
+            )
+        if filter_type in filters:
+            raise SymbolFilterError(
+                f"the {symbol} exchangeInfo payload repeated {filter_type}; refusing ambiguous "
+                "filter rules."
+            )
+        filters[filter_type] = item
 
     price_filter = filters.get("PRICE_FILTER")
     lot_filter = filters.get("LOT_SIZE")
