@@ -66,15 +66,20 @@ class ReplayMarketStateProvider:
         series = self._by_symbol.get(symbol)
         if not series:
             return None
-        return series[min(self._index.get(symbol, 0), len(series) - 1)]
+        position = self._index.get(symbol, 0)
+        if position >= len(series):
+            return None
+        return series[position]
 
     def advance(self, symbol: str) -> MarketObservation | None:
-        """Advance the deterministic pointer for one symbol (no wall-clock influence)."""
+        """Advance one replay position; exhaustion is explicit instead of repeating the tail."""
         series = self._by_symbol.get(symbol)
         if not series:
             return None
-        position = min(self._index.get(symbol, 0) + 1, len(series) - 1)
+        position = self._index.get(symbol, 0) + 1
         self._index[symbol] = position
+        if position >= len(series):
+            return None
         return series[position]
 
 
