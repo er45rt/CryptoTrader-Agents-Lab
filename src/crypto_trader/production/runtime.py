@@ -31,6 +31,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -324,6 +325,7 @@ class ProductionRuntime:
         market_state: MarketStateProvider,
         limits: RiskLimits,
         risk_state_provider: Callable[[datetime], RiskStateSnapshot],
+        risk_state_max_age_seconds: float,
         reconciliation_policy: ReconciliationPolicy,
         environment: str | TradingEnvironment | None = None,
         mainnet_authorized: bool = False,
@@ -350,6 +352,16 @@ class ProductionRuntime:
             )
         if not callable(risk_state_provider):
             raise ProductionStateError("the production runtime requires a risk-state provider.")
+        if (
+            isinstance(risk_state_max_age_seconds, bool)
+            or not isinstance(risk_state_max_age_seconds, (int, float))
+            or not math.isfinite(float(risk_state_max_age_seconds))
+            or risk_state_max_age_seconds <= 0
+        ):
+            raise ProductionStateError(
+                "the production runtime requires an explicit finite positive "
+                "risk_state_max_age_seconds."
+            )
         if not isinstance(owner_id, str) or not owner_id.strip():
             raise ProductionStateError("the production runtime requires a non-empty owner id.")
 
@@ -361,6 +373,7 @@ class ProductionRuntime:
         self._market_state = market_state
         self._limits = limits
         self._risk_state_provider = risk_state_provider
+        self._risk_state_max_age_seconds = float(risk_state_max_age_seconds)
         self._reconciliation_policy = reconciliation_policy
         self._requested_environment = environment
         self._mainnet_authorized = mainnet_authorized
@@ -592,7 +605,9 @@ class ProductionRuntime:
 
         # Stage 2: deterministic Hard Risk, under the CURRENT persisted safety mode.
         engine = HardRiskEngine(
-            risk_limits_for_safety(controller, self._limits), pending=self._pending
+            risk_limits_for_safety(controller, self._limits),
+            pending=self._pending,
+            max_state_age_seconds=self._risk_state_max_age_seconds,
         )
         decision = engine.evaluate(
             RiskRequest(
