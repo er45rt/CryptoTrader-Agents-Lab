@@ -61,10 +61,21 @@ class RiskLimits:
     def __post_init__(self) -> None:
         if not self.limits_version:
             raise RiskConfigError("limits_version is required.")
-        for name in (*_REQUIRED_DECIMAL_QUOTE, *_REQUIRED_DECIMAL_PCT):
+        for name in _REQUIRED_DECIMAL_QUOTE:
             value = getattr(self, name)
             if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
                 raise RiskConfigError(f"{name} must be a finite positive Decimal.")
+        for name in _REQUIRED_DECIMAL_PCT:
+            value = getattr(self, name)
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value <= 0
+                or value > Decimal("100")
+            ):
+                raise RiskConfigError(
+                    f"{name} must be a finite Decimal percentage in the interval (0, 100]."
+                )
         for name in _REQUIRED_INT:
             value = getattr(self, name)
             if not isinstance(value, int) or value <= 0:
