@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -105,8 +106,15 @@ class HardRiskEngine:
     ) -> None:
         if not isinstance(limits, RiskLimits):
             raise RiskConfigError("a resolved RiskLimits rule set is required (fail closed).")
-        if max_state_age_seconds is not None and max_state_age_seconds <= 0:
-            raise RiskConfigError("max_state_age_seconds must be > 0 when configured.")
+        if max_state_age_seconds is not None and (
+            isinstance(max_state_age_seconds, bool)
+            or not isinstance(max_state_age_seconds, (int, float))
+            or not math.isfinite(float(max_state_age_seconds))
+            or max_state_age_seconds <= 0
+        ):
+            raise RiskConfigError(
+                "max_state_age_seconds must be a finite number > 0 when configured."
+            )
         self._limits = limits
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._max_state_age_seconds = max_state_age_seconds
