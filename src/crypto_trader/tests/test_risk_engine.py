@@ -116,6 +116,48 @@ def test_engine_requires_resolved_limits():
         HardRiskEngine(None)  # type: ignore[arg-type]
 
 
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_risk_request_rejects_non_finite_quantity_or_price(bad):
+    with pytest.raises(RiskStateError):
+        request(quantity=bad)
+    with pytest.raises(RiskStateError):
+        request(price=bad)
+
+
+def test_risk_request_rejects_string_side_instead_of_enum():
+    with pytest.raises(RiskStateError, match="side"):
+        RiskRequest(
+            correlation_id=uuid4(),
+            symbol="ETHUSDT",
+            side="buy",  # type: ignore[arg-type]
+            quantity=Decimal("1"),
+            price=Decimal("2700"),
+            strategy_id="s1",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"equity_quote": Decimal("Infinity")},
+        {"peak_equity_quote": Decimal("NaN")},
+        {"gross_exposure_quote": Decimal("Infinity")},
+        {"realized_pnl_quote": Decimal("NaN")},
+        {"net_exposure_quote": Decimal("-Infinity")},
+        {"open_orders": True},
+        {"open_positions": False},
+        {"symbol_exposure_quote": {"ETHUSDT": Decimal("Infinity")}},
+        {"strategy_exposure_quote": {"s1": Decimal("NaN")}},
+        {"position_quantity": {"ETHUSDT": Decimal("Infinity")}},
+    ],
+)
+def test_risk_state_snapshot_rejects_non_finite_or_ambiguous_values(overrides):
+    with pytest.raises(RiskStateError):
+        state(**overrides)
+
+
 # --- boundary values (explicit units, Decimal only) ---
 
 def test_notional_exactly_at_the_limit_is_allowed_and_above_is_rejected():
