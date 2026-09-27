@@ -129,6 +129,11 @@ REQUIRED_OPERATOR_RECORD_FIELDS: tuple[str, ...] = (
     "reason_code",
 )
 
+# Project-specific review push allow-list. A repository transfer intentionally fails this audit
+# until the owner updates the policy explicitly.
+EXPECTED_REVIEW_ORIGIN_REPO = "er45rt/cryptotrader-agents-lab"
+
+
 REQUIRED_DOCUMENTED_PHRASES: tuple[str, ...] = (
     "operator command",
     "break-glass",
@@ -400,8 +405,24 @@ def _git_policy_item() -> BreakGlassItem:
     else:
         problems.append(".git/config is missing")
 
-    if branch_remote == "origin" and not origin_url:
-        problems.append("the current branch tracks origin but origin has no configured URL")
+    if branch_remote == "origin":
+        if not origin_url:
+            problems.append("the current branch tracks origin but origin has no configured URL")
+        else:
+            normalized = origin_url.strip().lower().rstrip("/")
+            if normalized.endswith(".git"):
+                normalized = normalized[:-4]
+            if normalized.startswith("git@github.com:"):
+                normalized = normalized[len("git@github.com:"):]
+            elif "github.com/" in normalized:
+                normalized = normalized.split("github.com/", 1)[1]
+            else:
+                normalized = ""
+            if normalized != EXPECTED_REVIEW_ORIGIN_REPO:
+                problems.append(
+                    f"origin points to disallowed repository {origin_url!r}; expected "
+                    f"{EXPECTED_REVIEW_ORIGIN_REPO!r}"
+                )
 
     push_refs: list[str] = []
     remote_refs = git_dir / "refs" / "remotes"
