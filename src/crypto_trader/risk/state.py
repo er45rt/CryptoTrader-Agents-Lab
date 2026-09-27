@@ -72,6 +72,14 @@ class RiskStateSnapshot:
                     raise RiskStateError(f"{name} keys must be non-empty strings.")
                 if not isinstance(value, Decimal) or not value.is_finite():
                     raise RiskStateError(f"{name} values must be finite Decimals.")
+        if self.peak_equity_quote < self.equity_quote:
+            raise RiskStateError(
+                "peak_equity_quote must be greater than or equal to equity_quote."
+            )
+        if self.gross_exposure_quote < abs(self.net_exposure_quote):
+            raise RiskStateError(
+                "gross_exposure_quote must be greater than or equal to abs(net_exposure_quote)."
+            )
         if self.snapshot_ts is not None and (
             self.snapshot_ts.tzinfo is None or self.snapshot_ts.utcoffset() is None
         ):
