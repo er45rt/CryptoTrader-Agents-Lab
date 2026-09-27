@@ -630,16 +630,6 @@ class ProductionRuntime:
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
         now = self._now()
-        try:
-            # The last thing that happens before the venue call. Never cached, never skipped.
-            check = self._fence.authorize_new_risk(
-                now=now, correlation_id=preparation.correlation_id
-            )
-        except ProductionSafetyBlockedError as exc:
-            self._last_refusal = str(exc)
-            raise
-
-        self._last_fence = check
         request = ExecutionRequest(
             intent_id=preparation.intent_id,
             correlation_id=preparation.correlation_id,
@@ -651,15 +641,26 @@ class ProductionRuntime:
             time_in_force=preparation.time_in_force,
         )
         try:
-            # Venue-writing execution goes through the approved durable submission sequence
-            # (marker -> authorization -> one send). Non-writing execution keeps its own port.
-            if self._durable_venue_writes:
-                reference = self._execution.submit_durably(request)
-            else:
-                reference = self._execution.submit(request)
-        except AmbiguousOrderError:
-            # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
-            self._last_outcome = "unknown_pending_reconciliation"
+            # Hold the shared ownership exclusion from the final, fresh fence check through the
+            # single venue send. A break-glass/competing takeover therefore linearizes either
+            # strictly before this authorization (and blocks it) or strictly after the send.
+            with self._fence.submission_guard(
+                now=now, correlation_id=preparation.correlation_id
+            ) as check:
+                self._last_fence = check
+                try:
+                    # Venue-writing execution goes through the approved durable submission sequence
+                    # (marker -> authorization -> one send). Non-writing execution keeps its port.
+                    if self._durable_venue_writes:
+                        reference = self._execution.submit_durably(request)
+                    else:
+                        reference = self._execution.submit(request)
+                except AmbiguousOrderError:
+                    # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
+                    self._last_outcome = "unknown_pending_reconciliation"
+                    raise
+        except ProductionSafetyBlockedError as exc:
+            self._last_refusal = str(exc)
             raise
         self._last_outcome = "submitted"
         self._last_refusal = None
