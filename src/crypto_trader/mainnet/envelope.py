@@ -109,6 +109,10 @@ class LockedPilotEnvelope:
             raise LockedEnvelopeError("the envelope requires at least one symbol.")
         if self.max_order_value_sar > self.capital_envelope_sar:
             raise LockedEnvelopeError("max_order_value_sar cannot exceed the capital envelope.")
+        if self.max_order_value_sar > self.max_open_exposure_sar:
+            raise LockedEnvelopeError(
+                "max_order_value_sar cannot exceed max_open_exposure_sar."
+            )
         if self.max_open_exposure_sar > self.capital_envelope_sar:
             raise LockedEnvelopeError("max_open_exposure_sar cannot exceed the capital envelope.")
         if self.daily_loss_halt_sar > self.capital_envelope_sar:
@@ -196,8 +200,15 @@ class ExecutionPriceRules:
             "absolute_price_bound_bps",
         ):
             value = getattr(self, name)
-            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
-                raise LockedEnvelopeError(f"{name} must be a finite positive Decimal.")
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value <= 0
+                or value >= TEN_THOUSAND
+            ):
+                raise LockedEnvelopeError(
+                    f"{name} must be a finite basis-point value in the interval (0, 10000)."
+                )
         if self.max_normal_slippage_bps > self.absolute_price_bound_bps:
             raise LockedEnvelopeError(
                 "the normal slippage allowance cannot exceed the absolute price bound."
