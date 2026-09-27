@@ -146,11 +146,20 @@ class SoakState:
                     else datetime.fromisoformat(str(payload["last_heartbeat"]))
                 ),
                 planned_restarts=int(payload.get("planned_restarts", 0)),
-                journal_deterministic=bool(payload.get("journal_deterministic", False)),
+                journal_deterministic=_strict_persisted_bool(
+                    payload.get("journal_deterministic", False),
+                    name="journal_deterministic",
+                ),
                 counters=SoakCounters.from_record(payload),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise MainnetError(f"the persisted soak state is not usable: {exc}") from exc
+
+
+def _strict_persisted_bool(value: object, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise MainnetError(f"persisted {name} must be a boolean.")
+    return value
 
 
 class SoakStateStore:
@@ -310,7 +319,12 @@ class SoakRecorder:
             )
         )
         return self._commit(
-            replace(state, soak_start_time=self._now(), counters=counters)
+            replace(
+                state,
+                soak_start_time=self._now(),
+                journal_deterministic=False,
+                counters=counters,
+            )
         )
 
     def resume(self, *, planned: bool) -> SoakState:
@@ -321,8 +335,10 @@ class SoakRecorder:
         return self.note_manual_intervention()
 
     def set_journal_deterministic(self, value: bool) -> SoakState:
+        if not isinstance(value, bool):
+            raise MainnetConfigError("journal_deterministic must be a boolean.")
         state = self.state()
-        return self._commit(replace(state, journal_deterministic=bool(value)))
+        return self._commit(replace(state, journal_deterministic=value))
 
     def snapshot(self) -> dict[str, object]:
         state = self.state()
