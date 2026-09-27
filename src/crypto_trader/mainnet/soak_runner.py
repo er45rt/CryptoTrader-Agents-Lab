@@ -206,6 +206,7 @@ def _build_pipeline(client: MainnetReadOnlyClient, journal, state_dir: Path, rec
         decision_source=_decision_source(client, client.exchange_info(SYMBOL)),
         limits=fx.limits(),
         risk_state_provider=lambda now: fx.risk_state(now=now),
+        risk_state_max_age_seconds=5.0,
         validity_gate=fx.validity_gate(),
         reconciliation_policy=fx.recovery_policy(),
         permission_check=client.verify_read_only_permissions,
