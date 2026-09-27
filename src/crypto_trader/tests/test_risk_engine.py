@@ -269,6 +269,33 @@ def test_reduce_only_mode_blocks_exposure_increasing_orders():
     assert reducing.allowed is True
 
 
+
+
+def test_reduce_only_rejects_oversized_order_that_would_flip_long_to_short():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    long_state = state(position_quantity={"ETHUSDT": Decimal("1")})
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="1.1"),
+        long_state,
+    )
+
+    assert decision.allowed is False
+    assert "reduce_only_violation" in decision.reason_codes
+
+
+def test_reduce_only_rejects_oversized_order_that_would_flip_short_to_long():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    short_state = state(position_quantity={"ETHUSDT": Decimal("-1")})
+
+    decision = engine.evaluate(
+        request(side=Side.BUY, quantity="1.1"),
+        short_state,
+    )
+
+    assert decision.allowed is False
+    assert "reduce_only_violation" in decision.reason_codes
+
 def test_duplicate_and_conflicting_intents_are_rejected():
     pending = PendingIntentRegistry()
     engine = HardRiskEngine(limits(), pending=pending)
