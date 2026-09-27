@@ -301,6 +301,10 @@ class CanaryEntryOrder:
     def __post_init__(self) -> None:
         if not isinstance(self.symbol, str) or not self.symbol:
             raise CanaryPolicyError("a canary entry requires a symbol.")
+        if self.symbol not in LOCKED_PILOT_ENVELOPE.symbols:
+            raise CanaryPolicyError(
+                f"symbol {self.symbol!r} is outside the locked pilot envelope."
+            )
         if not isinstance(self.side, ExecutionSide):
             raise CanaryPolicyError("side must be an ExecutionSide.")
         for name in ("quantity", "limit_price", "reference_mid"):
