@@ -270,10 +270,23 @@ def _run(args: argparse.Namespace, state_dir: Path, logger: JsonLineLogger) -> i
 
     recorder = SoakRecorder(store, clock=_now)
     resumed = store.exists()
-    if resumed and args.planned_restart:
-        recorder.resume(planned=True)
-        logger.write("planned_restart_recorded", "planned restart/recovery exercise recorded")
-    recorder.set_journal_deterministic(False)  # persist soak_start_time + heartbeat immediately
+    if resumed:
+        if args.planned_restart:
+            recorder.resume(planned=True)
+            logger.write("planned_restart_recorded", "planned restart/recovery exercise recorded")
+        else:
+            # A persisted state with no explicit planned-restart declaration means the previous
+            # process did not complete an operator-declared restart sequence. Count that gap as an
+            # unplanned interruption and reset the 72h qualification window fail-closed.
+            recorder.resume(planned=False)
+            logger.write(
+                "unplanned_restart_recorded",
+                "existing soak state resumed without --planned-restart; continuous window reset",
+            )
+    else:
+        # First launch: materialize the durable state and heartbeat immediately. Do not use this
+        # path on resumes because resume() already persists the correct planned/unplanned semantics.
+        recorder.set_journal_deterministic(False)
 
     pid_path.write_text(
         json.dumps(
