@@ -400,3 +400,15 @@ def test_report_is_a_run_report_instance(journal):
     )
 
     assert isinstance(session.run(), RunReport)
+
+def test_shadow_submission_mode_requires_a_simulator(journal):
+    cfg = fx.config(TradingMode.SHADOW, shadow_submits=True)
+    with pytest.raises(PaperStateError, match="requires an execution simulator"):
+        fx.session(
+            journal,
+            mode=TradingMode.SHADOW,
+            decisions=fx.scripted(fx.buy_decision()),
+            data_feed=fx.feed("2700.00"),
+            simulator=None,
+            cfg=cfg,
+        )
