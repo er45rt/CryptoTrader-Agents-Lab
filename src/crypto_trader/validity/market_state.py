@@ -38,8 +38,12 @@ class MarketObservation:
             value = getattr(self, field_name)
             if value.tzinfo is None or value.utcoffset() is None:
                 raise MarketStateError(f"{field_name} must be timezone-aware.")
-        if not isinstance(self.price, Decimal) or self.price <= 0:
-            raise MarketStateError("market observation price must be a positive Decimal.")
+        if (
+            not isinstance(self.price, Decimal)
+            or not self.price.is_finite()
+            or self.price <= 0
+        ):
+            raise MarketStateError("market observation price must be a finite positive Decimal.")
         if not self.market_reference:
             raise MarketStateError("market observation requires a reference.")
         if self.local_ingest_ts < self.market_event_ts:
