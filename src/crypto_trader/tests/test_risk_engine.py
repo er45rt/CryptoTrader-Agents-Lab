@@ -98,6 +98,19 @@ def test_invalid_limit_values_fail_closed(bad):
         load_limits({**LIMIT_CONFIG, "max_order_notional_quote": bad})
 
 
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_non_finite_risk_limits_fail_closed(bad):
+    with pytest.raises(RiskConfigError):
+        load_limits({**LIMIT_CONFIG, "max_order_notional_quote": bad})
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), True, "5"])
+def test_non_finite_or_ambiguous_risk_state_freshness_window_fails_closed(bad):
+    with pytest.raises(RiskConfigError, match="max_state_age_seconds"):
+        HardRiskEngine(limits(), max_state_age_seconds=bad)  # type: ignore[arg-type]
+
 def test_engine_requires_resolved_limits():
     with pytest.raises(RiskConfigError):
         HardRiskEngine(None)  # type: ignore[arg-type]
