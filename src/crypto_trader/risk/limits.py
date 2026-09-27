@@ -80,6 +80,19 @@ def _decimal(value: Any, *, name: str) -> Decimal:
         raise RiskConfigError(f"{name} must be a decimal number.") from exc
 
 
+def _strict_bool(value: object, *, name: str) -> bool:
+    """Accept only real booleans or explicit 'true'/'false' strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise RiskConfigError(f"{name} must be a boolean or 'true'/'false'; got {value!r}.")
+
+
 def load_limits(config: Mapping[str, Any]) -> RiskLimits:
     """Build the rule set from explicit configuration, failing closed on anything missing."""
     if not isinstance(config, Mapping):
@@ -106,6 +119,10 @@ def load_limits(config: Mapping[str, Any]) -> RiskLimits:
         limits_version=str(config["limits_version"]),
         **decimals,
         **integers,
-        reduce_only_mode=bool(config.get("reduce_only_mode", False)),
-        trading_halted=bool(config.get("trading_halted", False)),
+        reduce_only_mode=_strict_bool(
+            config.get("reduce_only_mode", False), name="reduce_only_mode"
+        ),
+        trading_halted=_strict_bool(
+            config.get("trading_halted", False), name="trading_halted"
+        ),
     )
