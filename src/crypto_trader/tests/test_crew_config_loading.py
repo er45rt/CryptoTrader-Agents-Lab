@@ -5,7 +5,12 @@ from collections.abc import Mapping
 from crypto_trader.crew import CryptoTraderCrew
 
 
-def test_crewbase_resolves_yaml_config_paths_to_mappings():
+def test_crewbase_resolves_yaml_config_paths_to_mappings(monkeypatch):
+    # CrewBase loads YAML before it maps task/agent references. Disable only that later mapping
+    # here so this regression proof needs no API keys, tool construction, or network-capable LLMs.
+    monkeypatch.setattr(CryptoTraderCrew, "map_all_agent_variables", lambda self: None)
+    monkeypatch.setattr(CryptoTraderCrew, "map_all_task_variables", lambda self: None)
+
     instance = CryptoTraderCrew(verbose=False)
 
     assert isinstance(instance.agents_config, Mapping)
