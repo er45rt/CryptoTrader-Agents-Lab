@@ -98,8 +98,10 @@ class TradingSession:
     _risk_cache: tuple[tuple[str, bool], HardRiskEngine] | None = None
 
     def __post_init__(self) -> None:
-        if self.config.mode is TradingMode.PAPER and self.simulator is None:
-            raise PaperStateError("paper mode requires an execution simulator.")
+        if self.config.places_simulated_orders and self.simulator is None:
+            raise PaperStateError(
+                "a session configured to place simulated orders requires an execution simulator."
+            )
 
     # --- resume support ---
 
