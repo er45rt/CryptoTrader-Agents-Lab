@@ -300,6 +300,33 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
         assert markers[0].payload.venue_reference == reference
 
 
+
+
+def test_durable_journal_rebinding_after_construction_is_refused_before_send(tmp_path):
+    intent_obj = production_intent("stage3-rebound-journal")
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    with (
+        SQLiteEventJournal(tmp_path / "journal.db") as journal,
+        SQLiteEventJournal(tmp_path / "foreign.db") as foreign,
+    ):
+        port = OrderRuntime(client=fx.client(transport), instrument=INSTRUMENT, journal=journal)
+        port.client.clock.synchronize(fx.SERVER_TIME_MS)
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=tmp_path / "state",
+            execution=port,
+        )
+        runtime.start()
+
+        # Simulate accidental/malicious mutable rebinding after the constructor's identity check.
+        port.journal = foreign
+
+        with pytest.raises(NonDurableExecutionError, match="journal binding changed"):
+            runtime.execute_intent(intent_obj)
+
+        assert [item for item in transport.requests if item.method == "POST"] == []
+        assert foreign.count() == 0
+
 def test_non_writing_implementations_are_explicitly_classified(tmp_path):
     assert InMemoryExecutionPort.capability is ExecutionCapability.NON_WRITING
     assert RecordingExecutionPort.capability is ExecutionCapability.NON_WRITING
