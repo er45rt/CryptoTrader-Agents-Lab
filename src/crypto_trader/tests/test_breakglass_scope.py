@@ -198,3 +198,19 @@ def test_repository_push_policy_allows_only_origin_for_non_protected_work_branch
             branch_remote = match.group(1).strip()
 
     assert branch_remote in {None, "origin"}
+
+    if branch_remote == "origin":
+        remote = re.search(
+            r'\[remote "origin"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
+        )
+        assert remote is not None
+        url = re.search(r"^\s*url\s*=\s*(.+)$", remote.group(1), re.MULTILINE)
+        assert url is not None
+        normalized = url.group(1).strip().lower().rstrip("/")
+        if normalized.endswith(".git"):
+            normalized = normalized[:-4]
+        if normalized.startswith("git@github.com:"):
+            normalized = normalized[len("git@github.com:"):]
+        elif "github.com/" in normalized:
+            normalized = normalized.split("github.com/", 1)[1]
+        assert normalized == "er45rt/cryptotrader-agents-lab"
