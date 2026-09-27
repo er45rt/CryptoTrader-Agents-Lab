@@ -74,6 +74,15 @@ def test_inbound_refuses_unrepresentable_precision():
         inbound.to_quantity(Decimal("1.123456789"), INSTRUMENT)
 
 
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_execution_request_rejects_non_finite_quantity_and_limit_price(bad):
+    with pytest.raises(UnsupportedExecutionRequestError):
+        make_request(quantity=Decimal(bad)).validate_for(INSTRUMENT)
+    with pytest.raises(UnsupportedExecutionRequestError):
+        make_request(limit_price=Decimal(bad)).validate_for(INSTRUMENT)
+
 def test_inbound_book_and_trade_translation_uses_public_types():
     from crypto_trader.execution import BookLevel, MarketBookUpdate, MarketTrade
 
