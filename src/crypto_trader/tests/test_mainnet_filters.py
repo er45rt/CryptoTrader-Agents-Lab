@@ -132,3 +132,20 @@ def test_filter_parser_requires_real_asset_identifiers(field, bad):
     with pytest.raises(SymbolFilterError):
         parse_symbol_filters(body, "BTCUSDT")
 
+def test_filter_parser_rejects_missing_filter_type_entry():
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"].append({"minQty": "0.001"})
+
+    with pytest.raises(SymbolFilterError, match="filterType"):
+        parse_symbol_filters(body, "BTCUSDT")
+
+
+def test_filter_parser_rejects_duplicate_filter_type():
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"].append(
+        {"filterType": "LOT_SIZE", "stepSize": "0.1", "minQty": "0.1", "maxQty": "10"}
+    )
+
+    with pytest.raises(SymbolFilterError, match="repeated LOT_SIZE"):
+        parse_symbol_filters(body, "BTCUSDT")
+
