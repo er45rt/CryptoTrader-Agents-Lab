@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -305,3 +308,61 @@ def test_no_concurrent_normal_and_emergency_writer_can_create_new_risk(journal, 
             hasattr(venue_class, name)
             for name in ("submit", "place_order", "create_order", "new_order", "execute_trade")
         )
+
+def test_takeover_cannot_land_between_final_fence_check_and_submit(journal, state_dir):
+    class BlockingExecutionPort(RecordingExecutionPort):
+        def __init__(self):
+            super().__init__(INSTRUMENT)
+            self.entered_submit = threading.Event()
+            self.release_submit = threading.Event()
+
+        def submit(self, request):
+            self.entered_submit.set()
+            if not self.release_submit.wait(timeout=10):
+                raise RuntimeError("test submit release timed out")
+            return super().submit(request)
+
+    control = control_for(journal, state_dir)
+    port = BlockingExecutionPort()
+    runtime = build_runtime(
+        journal=journal,
+        state_dir=state_dir,
+        execution=port,
+        control=control,
+    )
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("linearized-submit"))
+    assert preparation.approved is True
+
+    takeover_started = threading.Event()
+
+    def takeover():
+        takeover_started.set()
+        return control.ownership_store.takeover(
+            owner_id="emergency:concurrency-test",
+            owner_kind=OwnerKind.EMERGENCY,
+            acquired_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+            reason_code="concurrency-regression",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submit_future = pool.submit(runtime.submit_prepared, preparation)
+        assert port.entered_submit.wait(timeout=5)
+
+        takeover_future = pool.submit(takeover)
+        assert takeover_started.wait(timeout=5)
+        # The takeover must be waiting on the ownership exclusion while the already-authorized
+        # send is in flight; otherwise a newer fence could land inside the check/send window.
+        threading.Event().wait(0.1)
+        assert takeover_future.done() is False
+
+        port.release_submit.set()
+        submitted = submit_future.result(timeout=5)
+        takeover_record = takeover_future.result(timeout=5)
+
+    assert submitted.fence_term == 1
+    assert port.submit_count == 1
+    assert takeover_record.term == 2
+    assert takeover_record.owner_kind is OwnerKind.EMERGENCY
+    assert control.ownership_store.require_fence().term == 2
+
