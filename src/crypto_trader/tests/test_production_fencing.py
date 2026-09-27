@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,20 @@ def _started_runtime(journal, state_dir, **overrides):
         **overrides,
     )
     return control, port, runtime
+
+
+
+
+@pytest.mark.parametrize("field", ["quantity", "reference_price", "limit_price"])
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_production_intent_rejects_non_finite_economics(field, bad):
+    with pytest.raises(ProductionStateError):
+        intent(**{field: Decimal(bad)})
+
+
+def test_production_intent_rejects_non_enum_time_in_force():
+    with pytest.raises(ProductionStateError, match="ExecutionTimeInForce"):
+        intent(time_in_force="GTC")
 
 
 # --- 1/2/3: startup ownership, exclusivity and fail-closed leases -----------------
