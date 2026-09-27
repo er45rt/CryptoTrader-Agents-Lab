@@ -243,8 +243,12 @@ class InstrumentSpec:
             raise UnsupportedExecutionRequestError(
                 f"symbol must be an uppercase market symbol such as ETHUSDT; got {self.symbol!r}."
             )
-        if self.price_precision < 0 or self.size_precision < 0:
-            raise UnsupportedExecutionRequestError("precision values must be non-negative.")
+        for name in ("price_precision", "size_precision"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise UnsupportedExecutionRequestError(
+                    f"{name} must be a non-negative integer."
+                )
 
 
 @dataclass(frozen=True)
