@@ -42,6 +42,7 @@ ENGINE_STATUS_TO_STATE: dict[str, OrderLifecycleState] = {
 }
 
 _ORDER_UUID_NAMESPACE = UUID("6f2c1e2a-9a1e-4c7f-9a6c-2f1b6d4e5a10")
+_EVENT_UUID_NAMESPACE = UUID("8f3b7a14-2d6e-4d4f-9a1c-7b2e5c8d9011")
 
 PHASE3_PRODUCER = "infrastructure.nautilus"
 
@@ -150,7 +151,19 @@ def to_phase3_order_state_event(
     """Translate an observation into the Phase 3 ``order.state.changed`` contract."""
     if observation.state is None:
         raise TranslationError("observation has no lifecycle state to publish.")
+    event_key = "|".join(
+        (
+            str(observation.correlation_id),
+            str(observation.intent_id),
+            observation.order_reference,
+            "state",
+            observation.state.value,
+            str(observation.ts_ns),
+            "" if sequence_number is None else str(sequence_number),
+        )
+    )
     return OrderStateChanged(
+        event_id=uuid5(_EVENT_UUID_NAMESPACE, event_key),
         occurred_at=_occurred_at(observation.ts_ns),
         correlation_id=observation.correlation_id,
         producer=observation.producer,
@@ -165,7 +178,22 @@ def to_phase3_fill_event(observation: ExecutionObservation) -> ExecutionFillReco
     """Translate a fill observation into the Phase 3 ``execution.fill.recorded`` contract."""
     if observation.last_fill_quantity is None or observation.last_fill_price is None:
         raise TranslationError("observation is not a fill; cannot publish a fill event.")
+    event_key = "|".join(
+        (
+            str(observation.correlation_id),
+            str(observation.intent_id),
+            observation.order_reference,
+            "fill",
+            str(observation.ts_ns),
+            str(observation.last_fill_quantity),
+            str(observation.last_fill_price),
+            str(observation.remaining_quantity),
+            str(observation.fee if observation.fee is not None else Decimal("0")),
+            observation.fee_asset or "",
+        )
+    )
     return ExecutionFillRecorded(
+        event_id=uuid5(_EVENT_UUID_NAMESPACE, event_key),
         occurred_at=_occurred_at(observation.ts_ns),
         correlation_id=observation.correlation_id,
         producer=observation.producer,
