@@ -485,3 +485,25 @@ def test_safety_timestamps_are_normalized_to_utc(journal):
     decoded = journal.read_by_id(event_ids[0])
 
     assert decoded.occurred_at.utcoffset() == timedelta(0)
+
+def test_engaged_kill_switch_blocks_risk_even_if_mode_is_normal():
+    """The independent kill-switch bit is authoritative even under a nominal NORMAL mode."""
+    state = SafetyController(
+        correlation_id=SESSION,
+        _mode=SafetyMode.NORMAL,
+        _kill_switch_engaged=True,
+        _reason_code="synthetic_inconsistent_normal",
+        _reason="regression proof that kill switch dominates mode",
+    )
+
+    assert state.allow_new_risk() is False
+    assert state.allow_exposure_increase() is False
+    assert state.requires_cancel_open() is True
+
+    scaled = risk_limits_for_safety(state, load_limits(LIMIT_CONFIG))
+    decision = HardRiskEngine(scaled).evaluate(risk_request(), risk_state(), now=BASE)
+
+    assert scaled.trading_halted is True
+    assert decision.allowed is False
+    assert "trading_halted" in decision.reason_codes
+

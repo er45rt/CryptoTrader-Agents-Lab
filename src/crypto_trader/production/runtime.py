@@ -31,6 +31,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -135,19 +136,33 @@ class ProductionIntent:
             raise ProductionStateError("an intent requires an ExecutionSide.")
         if not isinstance(self.order_type, ExecutionOrderType):
             raise ProductionStateError("an intent requires an ExecutionOrderType.")
-        if not isinstance(self.quantity, Decimal) or self.quantity <= 0:
-            raise ProductionStateError("an intent requires a positive Decimal quantity.")
-        if not isinstance(self.reference_price, Decimal) or self.reference_price <= 0:
+        if (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= 0
+        ):
+            raise ProductionStateError("an intent requires a finite positive Decimal quantity.")
+        if (
+            not isinstance(self.reference_price, Decimal)
+            or not self.reference_price.is_finite()
+            or self.reference_price <= 0
+        ):
             raise ProductionStateError(
-                "an intent requires a positive Decimal reference price: Hard Risk needs an "
+                "an intent requires a finite positive Decimal reference price: Hard Risk needs an "
                 "explicit price and never guesses one."
             )
         if self.order_type is ExecutionOrderType.LIMIT and (
-            not isinstance(self.limit_price, Decimal) or self.limit_price <= 0
+            not isinstance(self.limit_price, Decimal)
+            or not self.limit_price.is_finite()
+            or self.limit_price <= 0
         ):
-            raise ProductionStateError("a limit intent requires a positive Decimal limit price.")
+            raise ProductionStateError(
+                "a limit intent requires a finite positive Decimal limit price."
+            )
         if self.order_type is ExecutionOrderType.MARKET and self.limit_price is not None:
             raise ProductionStateError("a market intent must not carry a limit price.")
+        if not isinstance(self.time_in_force, ExecutionTimeInForce):
+            raise ProductionStateError("an intent requires an ExecutionTimeInForce.")
         for name in (
             "decision_started_at",
             "decision_completed_at",
@@ -310,6 +325,7 @@ class ProductionRuntime:
         market_state: MarketStateProvider,
         limits: RiskLimits,
         risk_state_provider: Callable[[datetime], RiskStateSnapshot],
+        risk_state_max_age_seconds: float,
         reconciliation_policy: ReconciliationPolicy,
         environment: str | TradingEnvironment | None = None,
         mainnet_authorized: bool = False,
@@ -336,6 +352,16 @@ class ProductionRuntime:
             )
         if not callable(risk_state_provider):
             raise ProductionStateError("the production runtime requires a risk-state provider.")
+        if (
+            isinstance(risk_state_max_age_seconds, bool)
+            or not isinstance(risk_state_max_age_seconds, (int, float))
+            or not math.isfinite(float(risk_state_max_age_seconds))
+            or risk_state_max_age_seconds <= 0
+        ):
+            raise ProductionStateError(
+                "the production runtime requires an explicit finite positive "
+                "risk_state_max_age_seconds."
+            )
         if not isinstance(owner_id, str) or not owner_id.strip():
             raise ProductionStateError("the production runtime requires a non-empty owner id.")
 
@@ -347,6 +373,7 @@ class ProductionRuntime:
         self._market_state = market_state
         self._limits = limits
         self._risk_state_provider = risk_state_provider
+        self._risk_state_max_age_seconds = float(risk_state_max_age_seconds)
         self._reconciliation_policy = reconciliation_policy
         self._requested_environment = environment
         self._mainnet_authorized = mainnet_authorized
@@ -578,7 +605,9 @@ class ProductionRuntime:
 
         # Stage 2: deterministic Hard Risk, under the CURRENT persisted safety mode.
         engine = HardRiskEngine(
-            risk_limits_for_safety(controller, self._limits), pending=self._pending
+            risk_limits_for_safety(controller, self._limits),
+            pending=self._pending,
+            max_state_age_seconds=self._risk_state_max_age_seconds,
         )
         decision = engine.evaluate(
             RiskRequest(
@@ -630,16 +659,6 @@ class ProductionRuntime:
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
         now = self._now()
-        try:
-            # The last thing that happens before the venue call. Never cached, never skipped.
-            check = self._fence.authorize_new_risk(
-                now=now, correlation_id=preparation.correlation_id
-            )
-        except ProductionSafetyBlockedError as exc:
-            self._last_refusal = str(exc)
-            raise
-
-        self._last_fence = check
         request = ExecutionRequest(
             intent_id=preparation.intent_id,
             correlation_id=preparation.correlation_id,
@@ -651,15 +670,35 @@ class ProductionRuntime:
             time_in_force=preparation.time_in_force,
         )
         try:
-            # Venue-writing execution goes through the approved durable submission sequence
-            # (marker -> authorization -> one send). Non-writing execution keeps its own port.
-            if self._durable_venue_writes:
-                reference = self._execution.submit_durably(request)
-            else:
-                reference = self._execution.submit(request)
-        except AmbiguousOrderError:
-            # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
-            self._last_outcome = "unknown_pending_reconciliation"
+            # Hold the shared ownership exclusion from the final, fresh fence check through the
+            # single venue send. A break-glass/competing takeover therefore linearizes either
+            # strictly before this authorization (and blocks it) or strictly after the send.
+            with self._fence.submission_guard(
+                now=now, correlation_id=preparation.correlation_id
+            ) as check:
+                self._last_fence = check
+                try:
+                    # Venue-writing execution goes through the approved durable submission sequence
+                    # (marker -> authorization -> one send). Non-writing execution keeps its port.
+                    if self._durable_venue_writes:
+                        # Construction-time identity is necessary but not sufficient: an adapter
+                        # field could be rebound later. Re-prove that the durable marker still
+                        # lands in this runtime's authoritative journal at the instant of submit.
+                        attempt_journal = self._execution.durable_attempt_journal()
+                        if attempt_journal is not self._journal:
+                            raise NonDurableExecutionError(
+                                "the venue-writing execution port's durable journal binding changed "
+                                "after runtime construction; refusing to send any request."
+                            )
+                        reference = self._execution.submit_durably(request)
+                    else:
+                        reference = self._execution.submit(request)
+                except AmbiguousOrderError:
+                    # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
+                    self._last_outcome = "unknown_pending_reconciliation"
+                    raise
+        except ProductionSafetyBlockedError as exc:
+            self._last_refusal = str(exc)
             raise
         self._last_outcome = "submitted"
         self._last_refusal = None

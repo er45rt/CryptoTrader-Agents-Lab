@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -18,6 +22,7 @@ from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import ProductionStartupError, ProductionStateError
 from crypto_trader.safety import SafetyMode
 from crypto_trader.tests.production_fixtures import (
+    BASE,
     INSTRUMENT,
     RecordingExecutionPort,
     build_runtime,
@@ -26,6 +31,7 @@ from crypto_trader.tests.production_fixtures import (
     limits,
     operator_command,
     persist_safety_state,
+    risk_state_provider,
 )
 
 
@@ -53,6 +59,67 @@ def _started_runtime(journal, state_dir, **overrides):
         **overrides,
     )
     return control, port, runtime
+
+
+
+
+@pytest.mark.parametrize("field", ["quantity", "reference_price", "limit_price"])
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_production_intent_rejects_non_finite_economics(field, bad):
+    with pytest.raises(ProductionStateError):
+        intent(**{field: Decimal(bad)})
+
+
+def test_production_intent_rejects_non_enum_time_in_force():
+    with pytest.raises(ProductionStateError, match="ExecutionTimeInForce"):
+        intent(time_in_force="GTC")
+
+
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan"), True, "5"])
+def test_production_runtime_requires_explicit_finite_risk_state_freshness(
+    journal, state_dir, bad
+):
+    with pytest.raises(ProductionStateError, match="risk_state_max_age_seconds"):
+        build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=RecordingExecutionPort(INSTRUMENT),
+            risk_state_max_age_seconds=bad,
+        )
+
+
+def test_stale_risk_snapshot_blocks_production_intent_before_submission(journal, state_dir):
+    control, port, runtime = _started_runtime(
+        journal,
+        state_dir,
+        risk_state_source=risk_state_provider(BASE - timedelta(seconds=6)),
+        risk_state_max_age_seconds=5.0,
+    )
+    runtime.start()
+
+    preparation = runtime.prepare_intent(intent("stale-risk-state"))
+
+    assert preparation.approved is False
+    assert "stale_risk_state" in (preparation.blocked_reason_code or "")
+    assert port.submit_count == 0
+
+
+def test_future_risk_snapshot_blocks_production_intent_before_submission(journal, state_dir):
+    control, port, runtime = _started_runtime(
+        journal,
+        state_dir,
+        risk_state_source=risk_state_provider(BASE + timedelta(seconds=1)),
+        risk_state_max_age_seconds=5.0,
+    )
+    runtime.start()
+
+    preparation = runtime.prepare_intent(intent("future-risk-state"))
+
+    assert preparation.approved is False
+    assert "risk_state_timestamp_in_future" in (preparation.blocked_reason_code or "")
+    assert port.submit_count == 0
 
 
 # --- 1/2/3: startup ownership, exclusivity and fail-closed leases -----------------
@@ -305,3 +372,56 @@ def test_no_concurrent_normal_and_emergency_writer_can_create_new_risk(journal, 
             hasattr(venue_class, name)
             for name in ("submit", "place_order", "create_order", "new_order", "execute_trade")
         )
+
+def test_takeover_cannot_land_between_final_fence_check_and_submit(journal, state_dir):
+    class BlockingExecutionPort(RecordingExecutionPort):
+        def __init__(self):
+            super().__init__(INSTRUMENT)
+            self.entered_submit = threading.Event()
+            self.takeover_started = threading.Event()
+            self.takeover_done = threading.Event()
+
+        def submit(self, request):
+            self.entered_submit.set()
+            assert self.takeover_started.wait(timeout=5)
+            # The takeover thread is now trying to mint a new term. While this send is inside the
+            # submission guard it must remain blocked on the shared ownership exclusion.
+            threading.Event().wait(0.1)
+            assert self.takeover_done.is_set() is False
+            return super().submit(request)
+
+    control = control_for(journal, state_dir)
+    port = BlockingExecutionPort()
+    runtime = build_runtime(
+        journal=journal,
+        state_dir=state_dir,
+        execution=port,
+        control=control,
+    )
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("linearized-submit"))
+    assert preparation.approved is True
+
+    def takeover():
+        assert port.entered_submit.wait(timeout=5)
+        port.takeover_started.set()
+        try:
+            return control.ownership_store.takeover(
+                owner_id="emergency:concurrency-test",
+                owner_kind=OwnerKind.EMERGENCY,
+                acquired_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+                reason_code="concurrency-regression",
+            )
+        finally:
+            port.takeover_done.set()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        takeover_future = pool.submit(takeover)
+        submitted = runtime.submit_prepared(preparation)
+        takeover_record = takeover_future.result(timeout=5)
+
+    assert submitted.fence_term == 1
+    assert port.submit_count == 1
+    assert takeover_record.term == 2
+    assert takeover_record.owner_kind is OwnerKind.EMERGENCY
+    assert control.ownership_store.require_fence().term == 2

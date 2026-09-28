@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,6 +94,59 @@ def test_start_refuses_while_a_break_glass_epoch_is_open(journal, state_dir, tmp
     with pytest.raises(DryRunError):
         pipeline.start()
     assert control.status().new_risk_permitted is False
+
+
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan"), True, "5"])
+def test_dryrun_requires_explicit_finite_risk_state_freshness(
+    journal, state_dir, tmp_path, bad
+):
+    with pytest.raises(DryRunError, match="risk_state_max_age_seconds"):
+        _pipeline(
+            journal,
+            state_dir,
+            tmp_path,
+            risk_state_max_age_seconds=bad,
+        )
+
+
+def test_stale_risk_snapshot_is_would_reject(journal, state_dir, tmp_path):
+    pipeline = _pipeline(
+        journal,
+        state_dir,
+        tmp_path,
+        risk_state_source=lambda now: fx.risk_state(
+            now=now - timedelta(seconds=6)
+        ),
+        risk_state_max_age_seconds=5.0,
+    )
+    pipeline.start()
+
+    result = pipeline.run_cycle()
+
+    assert result.disposition is DryRunDisposition.WOULD_REJECT
+    assert "stale_risk_state" in result.reason_code
+    assert pipeline.gate.mutation_attempts == 0
+
+
+def test_future_risk_snapshot_is_would_reject(journal, state_dir, tmp_path):
+    pipeline = _pipeline(
+        journal,
+        state_dir,
+        tmp_path,
+        risk_state_source=lambda now: fx.risk_state(
+            now=now + timedelta(seconds=1)
+        ),
+        risk_state_max_age_seconds=5.0,
+    )
+    pipeline.start()
+
+    result = pipeline.run_cycle()
+
+    assert result.disposition is DryRunDisposition.WOULD_REJECT
+    assert "risk_state_timestamp_in_future" in result.reason_code
+    assert pipeline.gate.mutation_attempts == 0
 
 
 # --- the complete pipeline --------------------------------------------------

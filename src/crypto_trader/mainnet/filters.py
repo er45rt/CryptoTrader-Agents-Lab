@@ -84,10 +84,10 @@ class SymbolFilters:
             raise SymbolFilterError(
                 f"{self.symbol} is not trading (status={self.status!r}); refusing to plan an order."
             )
-        if not isinstance(price, Decimal) or price <= 0:
-            raise SymbolFilterError("price must be a positive Decimal.")
-        if not isinstance(quantity, Decimal) or quantity <= 0:
-            raise SymbolFilterError("quantity must be a positive Decimal.")
+        if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
+            raise SymbolFilterError("price must be a finite positive Decimal.")
+        if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
+            raise SymbolFilterError("quantity must be a finite positive Decimal.")
         if self.tick_size > 0 and price % self.tick_size != 0:
             raise SymbolFilterError(
                 f"price {price} violates the {self.symbol} tick size {self.tick_size}."
@@ -136,8 +136,16 @@ def parse_symbol_filters(body: Any, symbol: str) -> SymbolFilters:
         if not isinstance(item, Mapping):
             raise SymbolFilterError(f"a {symbol} filter entry was malformed.")
         filter_type = item.get("filterType")
-        if isinstance(filter_type, str) and filter_type:
-            filters[filter_type] = item
+        if not isinstance(filter_type, str) or not filter_type:
+            raise SymbolFilterError(
+                f"a {symbol} filter entry has no valid filterType; refusing to ignore it."
+            )
+        if filter_type in filters:
+            raise SymbolFilterError(
+                f"the {symbol} exchangeInfo payload repeated {filter_type}; refusing ambiguous "
+                "filter rules."
+            )
+        filters[filter_type] = item
 
     price_filter = filters.get("PRICE_FILTER")
     lot_filter = filters.get("LOT_SIZE")
@@ -168,11 +176,18 @@ def parse_symbol_filters(body: Any, symbol: str) -> SymbolFilters:
     if max_quantity > 0 and max_quantity < min_quantity:
         raise SymbolFilterError(f"the {symbol} max quantity is below its minimum quantity.")
 
+    base_asset = entry.get("baseAsset")
+    quote_asset = entry.get("quoteAsset")
+    if not isinstance(base_asset, str) or not base_asset:
+        raise SymbolFilterError(f"the {symbol} base asset was missing or malformed.")
+    if not isinstance(quote_asset, str) or not quote_asset:
+        raise SymbolFilterError(f"the {symbol} quote asset was missing or malformed.")
+
     return SymbolFilters(
         symbol=symbol,
         status=status,
-        base_asset=str(entry.get("baseAsset", "")),
-        quote_asset=str(entry.get("quoteAsset", "")),
+        base_asset=base_asset,
+        quote_asset=quote_asset,
         tick_size=tick_size,
         step_size=step_size,
         min_quantity=min_quantity,

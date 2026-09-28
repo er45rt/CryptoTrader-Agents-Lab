@@ -42,16 +42,44 @@ class RiskStateSnapshot:
     def __post_init__(self) -> None:
         for name in ("equity_quote", "peak_equity_quote", "gross_exposure_quote"):
             value = getattr(self, name)
-            if not isinstance(value, Decimal) or value < 0:
-                raise RiskStateError(f"{name} must be a non-negative Decimal.")
-        if not isinstance(self.realized_pnl_quote, Decimal):
-            raise RiskStateError("realized_pnl_quote must be a Decimal.")
-        if not isinstance(self.net_exposure_quote, Decimal):
-            raise RiskStateError("net_exposure_quote must be a Decimal (signed).")
+            if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+                raise RiskStateError(f"{name} must be a finite non-negative Decimal.")
+        if (
+            not isinstance(self.realized_pnl_quote, Decimal)
+            or not self.realized_pnl_quote.is_finite()
+        ):
+            raise RiskStateError("realized_pnl_quote must be a finite Decimal.")
+        if (
+            not isinstance(self.net_exposure_quote, Decimal)
+            or not self.net_exposure_quote.is_finite()
+        ):
+            raise RiskStateError("net_exposure_quote must be a finite Decimal (signed).")
         for name in ("open_orders", "open_positions"):
             value = getattr(self, name)
-            if not isinstance(value, int) or value < 0:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise RiskStateError(f"{name} must be a non-negative integer.")
+
+        for name in (
+            "symbol_exposure_quote",
+            "strategy_exposure_quote",
+            "position_quantity",
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, Mapping):
+                raise RiskStateError(f"{name} must be a mapping.")
+            for key, value in values.items():
+                if not isinstance(key, str) or not key:
+                    raise RiskStateError(f"{name} keys must be non-empty strings.")
+                if not isinstance(value, Decimal) or not value.is_finite():
+                    raise RiskStateError(f"{name} values must be finite Decimals.")
+        if self.peak_equity_quote < self.equity_quote:
+            raise RiskStateError(
+                "peak_equity_quote must be greater than or equal to equity_quote."
+            )
+        if self.gross_exposure_quote < abs(self.net_exposure_quote):
+            raise RiskStateError(
+                "gross_exposure_quote must be greater than or equal to abs(net_exposure_quote)."
+            )
         if self.snapshot_ts is not None and (
             self.snapshot_ts.tzinfo is None or self.snapshot_ts.utcoffset() is None
         ):

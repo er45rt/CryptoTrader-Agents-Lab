@@ -38,8 +38,12 @@ class MarketObservation:
             value = getattr(self, field_name)
             if value.tzinfo is None or value.utcoffset() is None:
                 raise MarketStateError(f"{field_name} must be timezone-aware.")
-        if not isinstance(self.price, Decimal) or self.price <= 0:
-            raise MarketStateError("market observation price must be a positive Decimal.")
+        if (
+            not isinstance(self.price, Decimal)
+            or not self.price.is_finite()
+            or self.price <= 0
+        ):
+            raise MarketStateError("market observation price must be a finite positive Decimal.")
         if not self.market_reference:
             raise MarketStateError("market observation requires a reference.")
         if self.local_ingest_ts < self.market_event_ts:
@@ -66,15 +70,20 @@ class ReplayMarketStateProvider:
         series = self._by_symbol.get(symbol)
         if not series:
             return None
-        return series[min(self._index.get(symbol, 0), len(series) - 1)]
+        position = self._index.get(symbol, 0)
+        if position >= len(series):
+            return None
+        return series[position]
 
     def advance(self, symbol: str) -> MarketObservation | None:
-        """Advance the deterministic pointer for one symbol (no wall-clock influence)."""
+        """Advance one replay position; exhaustion is explicit instead of repeating the tail."""
         series = self._by_symbol.get(symbol)
         if not series:
             return None
-        position = min(self._index.get(symbol, 0) + 1, len(series) - 1)
+        position = self._index.get(symbol, 0) + 1
         self._index[symbol] = position
+        if position >= len(series):
+            return None
         return series[position]
 
 

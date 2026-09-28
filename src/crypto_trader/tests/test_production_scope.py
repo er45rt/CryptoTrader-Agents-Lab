@@ -119,15 +119,19 @@ def test_the_production_environment_defaults_to_testnet_and_production_is_disabl
 
 
 def test_the_final_fence_is_revalidated_immediately_before_the_venue_call():
-    """Structural proof that a submission cannot skip the final safety/fence check."""
+    """Structural proof that the venue call lives inside the linearized submission guard."""
     source = (PRODUCTION_DIR / "runtime.py").read_text(encoding="utf-8")
     submit_body = source.split("def submit_prepared", 1)[1].split("\n    def ", 1)[0]
-    fence_index = submit_body.index("authorize_new_risk")
+    fence_source = (PRODUCTION_DIR / "fence.py").read_text(encoding="utf-8")
+
+    guard_index = submit_body.index("submission_guard")
     venue_index = submit_body.index("_execution.submit(")
 
-    assert fence_index < venue_index
+    assert guard_index < venue_index
     assert submit_body.count("_execution.submit(") == 1
     assert source.count("_execution.submit(") == 1, "the venue call must exist only in the fenced path"
+    assert "def submission_guard" in fence_source
+    assert "authorize_new_risk" in fence_source.split("def submission_guard", 1)[1]
 
 
 def test_phase14_adds_no_event_contract():

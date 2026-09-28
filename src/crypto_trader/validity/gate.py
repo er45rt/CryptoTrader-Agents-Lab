@@ -65,8 +65,12 @@ class ValidityRequest:
             value = getattr(self, name)
             if value is not None and (value.tzinfo is None or value.utcoffset() is None):
                 raise ValidityConfigError(f"{name} must be timezone-aware.")
-        if not isinstance(self.reference_price, Decimal) or self.reference_price <= 0:
-            raise ValidityConfigError("reference_price must be a positive Decimal.")
+        if (
+            not isinstance(self.reference_price, Decimal)
+            or not self.reference_price.is_finite()
+            or self.reference_price <= 0
+        ):
+            raise ValidityConfigError("reference_price must be a finite positive Decimal.")
 
 
 @dataclass(frozen=True)

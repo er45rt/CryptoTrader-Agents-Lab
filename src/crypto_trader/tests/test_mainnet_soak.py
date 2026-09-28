@@ -161,3 +161,43 @@ def test_a_corrupt_soak_state_fails_closed(tmp_path):
 
     with pytest.raises(MainnetError):
         store.load()
+
+def test_manual_intervention_invalidates_prior_journal_determinism_evidence(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.set_journal_deterministic(True)
+    assert recorder.state().journal_deterministic is True
+
+    after = recorder.note_manual_intervention()
+
+    assert after.journal_deterministic is False
+    assert "journal_replay_determinism_not_confirmed" in recorder.exit_criteria()[1]
+
+
+def test_planned_restart_preserves_journal_determinism_evidence(tmp_path):
+    recorder = _recorder(tmp_path)
+    recorder.set_journal_deterministic(True)
+
+    after = recorder.resume(planned=True)
+
+    assert after.journal_deterministic is True
+
+
+@pytest.mark.parametrize("bad", ["true", "false", 1, 0, None])
+def test_persisted_journal_determinism_rejects_non_boolean_values(tmp_path, bad):
+    import json
+
+    store = SoakStateStore(tmp_path / "soak.json")
+    payload = SoakState(soak_start_time=fx.BASE).to_record()
+    payload["journal_deterministic"] = bad
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MainnetError, match="journal_deterministic"):
+        store.load()
+
+
+def test_set_journal_deterministic_rejects_truthy_non_boolean(tmp_path):
+    recorder = _recorder(tmp_path)
+
+    with pytest.raises(Exception, match="journal_deterministic"):
+        recorder.set_journal_deterministic("false")  # type: ignore[arg-type]
+

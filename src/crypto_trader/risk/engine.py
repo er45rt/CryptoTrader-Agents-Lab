@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -47,10 +48,20 @@ class RiskRequest:
     order_type: str = "market"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.quantity, Decimal) or self.quantity <= 0:
-            raise RiskStateError("quantity must be a positive Decimal.")
-        if not isinstance(self.price, Decimal) or self.price <= 0:
-            raise RiskStateError("price must be a positive Decimal.")
+        if (
+            not isinstance(self.quantity, Decimal)
+            or not self.quantity.is_finite()
+            or self.quantity <= 0
+        ):
+            raise RiskStateError("quantity must be a finite positive Decimal.")
+        if (
+            not isinstance(self.price, Decimal)
+            or not self.price.is_finite()
+            or self.price <= 0
+        ):
+            raise RiskStateError("price must be a finite positive Decimal.")
+        if not isinstance(self.side, Side):
+            raise RiskStateError("side must be a Side enum value.")
         if not self.symbol or not self.strategy_id:
             raise RiskStateError("symbol and strategy_id are required.")
 
@@ -105,8 +116,15 @@ class HardRiskEngine:
     ) -> None:
         if not isinstance(limits, RiskLimits):
             raise RiskConfigError("a resolved RiskLimits rule set is required (fail closed).")
-        if max_state_age_seconds is not None and max_state_age_seconds <= 0:
-            raise RiskConfigError("max_state_age_seconds must be > 0 when configured.")
+        if max_state_age_seconds is not None and (
+            isinstance(max_state_age_seconds, bool)
+            or not isinstance(max_state_age_seconds, (int, float))
+            or not math.isfinite(float(max_state_age_seconds))
+            or max_state_age_seconds <= 0
+        ):
+            raise RiskConfigError(
+                "max_state_age_seconds must be a finite number > 0 when configured."
+            )
         self._limits = limits
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._max_state_age_seconds = max_state_age_seconds
@@ -126,6 +144,14 @@ class HardRiskEngine:
         *,
         now: datetime | None = None,
     ) -> RiskDecision:
+        """Evaluate and, when allowed, admit the intent into the pending registry.
+
+        This is intentionally an admission operation rather than a side-effect-free query:
+        a successful evaluation reserves the intent identity so at-least-once redelivery of the
+        same intent is rejected as "duplicate_intent" and an opposite pending intent is rejected
+        as "conflicting_intent". Callers needing an independent what-if calculation must use an
+        independent registry instead of evaluating the same live admission state twice.
+        """
         limits = self._limits
         results: list[RiskRuleResult] = []
 
@@ -182,17 +208,58 @@ class HardRiskEngine:
         # 4. Reduce-only behaviour (when active, only exposure-reducing orders are allowed).
         if limits.reduce_only_mode:
             position = state.position(request.symbol)
-            reduces = (position > 0 and request.side is Side.SELL) or (position < 0 and request.side is Side.BUY)
-            rule("reduce_only", reduces, "reduce_only_violation" if not reduces else "reduce_only_ok",
-                 ZERO if reduces else Decimal(1), ZERO, "count")
+            # "Reduce only" means the order must move the position toward zero WITHOUT crossing
+            # through zero into exposure on the opposite side. Checking direction alone is not
+            # sufficient: selling 2 units against a +1 long would flip to -1 short.
+            reduces = (
+                position > 0
+                and request.side is Side.SELL
+                and request.quantity <= position
+            ) or (
+                position < 0
+                and request.side is Side.BUY
+                and request.quantity <= abs(position)
+            )
+            rule(
+                "reduce_only",
+                reduces,
+                "reduce_only_violation" if not reduces else "reduce_only_ok",
+                ZERO if reduces else Decimal(1),
+                ZERO,
+                "count",
+            )
 
         # 5/6. Open orders and positions.
-        rule("max_open_orders", state.open_orders < limits.max_open_orders,
-             "max_open_orders_exceeded" if state.open_orders >= limits.max_open_orders else "open_orders_ok",
-             Decimal(state.open_orders), Decimal(limits.max_open_orders), "count")
-        rule("max_open_positions", state.open_positions < limits.max_open_positions,
-             "max_open_positions_exceeded" if state.open_positions >= limits.max_open_positions else "open_positions_ok",
-             Decimal(state.open_positions), Decimal(limits.max_open_positions), "count")
+        # A submitted order consumes one open-order slot. A position slot is consumed only when
+        # the symbol is currently flat; increasing/reducing/flipping an existing symbol does not
+        # increase the number of concurrently open positions.
+        projected_open_orders = state.open_orders + 1
+        current_position = state.position(request.symbol)
+        projected_open_positions = state.open_positions + (1 if current_position == ZERO else 0)
+        rule(
+            "max_open_orders",
+            projected_open_orders <= limits.max_open_orders,
+            (
+                "max_open_orders_exceeded"
+                if projected_open_orders > limits.max_open_orders
+                else "open_orders_ok"
+            ),
+            Decimal(projected_open_orders),
+            Decimal(limits.max_open_orders),
+            "count",
+        )
+        rule(
+            "max_open_positions",
+            projected_open_positions <= limits.max_open_positions,
+            (
+                "max_open_positions_exceeded"
+                if projected_open_positions > limits.max_open_positions
+                else "open_positions_ok"
+            ),
+            Decimal(projected_open_positions),
+            Decimal(limits.max_open_positions),
+            "count",
+        )
 
         # 7. Order notional (quote currency).
         notional = request.notional

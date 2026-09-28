@@ -98,8 +98,10 @@ class TradingSession:
     _risk_cache: tuple[tuple[str, bool], HardRiskEngine] | None = None
 
     def __post_init__(self) -> None:
-        if self.config.mode is TradingMode.PAPER and self.simulator is None:
-            raise PaperStateError("paper mode requires an execution simulator.")
+        if self.config.places_simulated_orders and self.simulator is None:
+            raise PaperStateError(
+                "a session configured to place simulated orders requires an execution simulator."
+            )
 
     # --- resume support ---
 
@@ -133,6 +135,10 @@ class TradingSession:
 
         records: list[DecisionRecord] = []
         requests: list[ExecutionRequest] = []
+        # Risk is evaluated for the whole decision batch before simulated fills are applied.
+        # Keep an explicit reservation for every previously-approved intent so later decisions
+        # cannot each pass against the same stale pre-simulation ledger.
+        risk_reservations: list[RiskRequest] = []
         validity_counts: dict[str, int] = {}
         risk_counts: dict[str, int] = {}
         stale: list[str] = []
@@ -157,6 +163,7 @@ class TradingSession:
                 market_state=market_state,
                 ledger=ledger,
                 requests=requests,
+                risk_reservations=risk_reservations,
                 safety_events=safety_events,
             )
             records.append(record)
@@ -193,7 +200,8 @@ class TradingSession:
             "SIMULATED ACCOUNTING: not a performance claim and not a safety certification.",
             "L2 MBP cannot reveal hidden/iceberg liquidity; true venue queue rank is unknown.",
             "Dynamic latency customization is PARTIAL in 1.231.0 (static per-command only).",
-            "The decision pass precedes the simulated pass, so fills land after the decisions.",
+            "The decision pass precedes the simulated pass; approved intents reserve risk "
+            "immediately so later decisions cannot over-commit pre-fill limits.",
         )
         return RunReport(
             session_id=self.config.session_id,
@@ -236,6 +244,7 @@ class TradingSession:
         market_state: ReplayMarketStateProvider,
         ledger: PositionLedger,
         requests: list[ExecutionRequest],
+        risk_reservations: list[RiskRequest],
         safety_events: list[str],
     ) -> DecisionRecord:
         base: dict[str, Any] = {
@@ -286,9 +295,10 @@ class TradingSession:
             )
 
         safety_events.append(self.safety.mode.value)
+        risk_request = self._risk_request(observation, decision, intent_id)
         risk = self._risk_engine().evaluate(
-            self._risk_request(observation, decision, intent_id),
-            self._risk_state(ledger, observation, now),
+            risk_request,
+            self._risk_state(ledger, observation, now, risk_reservations),
             now=now,
         )
         self._record_risk(risk, now)
@@ -304,6 +314,10 @@ class TradingSession:
                 risk_reason_codes=tuple(risk.reason_codes),
                 submission="blocked_by_safety" if blocked_by_safety else "stopped_by_risk",
             )
+
+        # Reserve the approved exposure immediately. Simulation/fills happen after the decision
+        # pass, so without this reservation multiple intents could over-commit the same limits.
+        risk_reservations.append(risk_request)
 
         request = self._execution_request(observation, decision, intent_id)
         if self.config.mode is TradingMode.SHADOW and not self.config.shadow_submits:
@@ -427,21 +441,42 @@ class TradingSession:
         )
 
     def _risk_state(
-        self, ledger: PositionLedger, observation: MarketObservation, now: datetime
+        self,
+        ledger: PositionLedger,
+        observation: MarketObservation,
+        now: datetime,
+        reservations: Sequence[RiskRequest],
     ) -> RiskStateSnapshot:
         position = ledger.position(self.config.symbol)
-        value = position.quantity * observation.price
+        position_value = position.quantity * observation.price
         equity = ledger.starting_equity_quote + ledger.realized_pnl_quote()
+
+        pending_gross = _ZERO
+        pending_net = _ZERO
+        pending_symbol = _ZERO
+        pending_strategy = _ZERO
+        for reservation in reservations:
+            pending_gross += reservation.notional
+            pending_net += reservation.signed_notional
+            if reservation.symbol == self.config.symbol:
+                pending_symbol += reservation.signed_notional
+            if reservation.strategy_id == self.config.strategy_id:
+                pending_strategy += reservation.signed_notional
+
         return RiskStateSnapshot(
             equity_quote=equity,
             peak_equity_quote=max(equity, ledger.starting_equity_quote),
             realized_pnl_quote=ledger.realized_pnl_quote(),
-            gross_exposure_quote=abs(value),
-            net_exposure_quote=value,
-            open_orders=0,
+            gross_exposure_quote=abs(position_value) + pending_gross,
+            net_exposure_quote=position_value + pending_net,
+            open_orders=len(reservations),
             open_positions=0 if position.is_flat else 1,
-            symbol_exposure_quote={self.config.symbol: value},
-            strategy_exposure_quote={self.config.strategy_id: value},
+            symbol_exposure_quote={
+                self.config.symbol: position_value + pending_symbol
+            },
+            strategy_exposure_quote={
+                self.config.strategy_id: position_value + pending_strategy
+            },
             position_quantity={self.config.symbol: position.quantity},
             snapshot_ts=now,
         )

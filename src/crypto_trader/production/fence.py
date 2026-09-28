@@ -19,6 +19,8 @@ new risk right now?".
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -91,6 +93,19 @@ class ProductionFence:
     @property
     def fence_term(self) -> int:
         return self._guard.fence.term
+
+    @contextmanager
+    def submission_guard(
+        self, *, now: datetime, correlation_id=None
+    ) -> Iterator[FenceCheck]:
+        """Linearize the final fence check and the caller's venue send against takeovers.
+
+        The caller must perform exactly one submission inside this context. An ownership takeover
+        cannot mint a newer fencing term until the context exits, eliminating the check/send TOCTOU
+        window. Once the send has begun, a later takeover is ordered after that submission.
+        """
+        with self._guard.exclusive_current():
+            yield self.authorize_new_risk(now=now, correlation_id=correlation_id)
 
     def authorize_new_risk(self, *, now: datetime, correlation_id=None) -> FenceCheck:
         """Authorize one new-risk submission, or raise (never returns a cached approval)."""

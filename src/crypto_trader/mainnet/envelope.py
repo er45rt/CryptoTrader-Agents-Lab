@@ -97,26 +97,43 @@ class LockedPilotEnvelope:
             "daily_loss_halt_sar",
         ):
             value = getattr(self, name)
-            if not isinstance(value, Decimal) or value <= 0:
-                raise LockedEnvelopeError(f"{name} must be a positive Decimal.")
-        if not isinstance(self.max_open_orders, int) or self.max_open_orders <= 0:
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise LockedEnvelopeError(f"{name} must be a finite positive Decimal.")
+        if (
+            isinstance(self.max_open_orders, bool)
+            or not isinstance(self.max_open_orders, int)
+            or self.max_open_orders <= 0
+        ):
             raise LockedEnvelopeError("max_open_orders must be a positive integer.")
         if not self.symbols or not all(isinstance(item, str) and item for item in self.symbols):
             raise LockedEnvelopeError("the envelope requires at least one symbol.")
+        if self.max_order_value_sar > self.capital_envelope_sar:
+            raise LockedEnvelopeError("max_order_value_sar cannot exceed the capital envelope.")
+        if self.max_order_value_sar > self.max_open_exposure_sar:
+            raise LockedEnvelopeError(
+                "max_order_value_sar cannot exceed max_open_exposure_sar."
+            )
+        if self.max_open_exposure_sar > self.capital_envelope_sar:
+            raise LockedEnvelopeError("max_open_exposure_sar cannot exceed the capital envelope.")
+        if self.daily_loss_halt_sar > self.capital_envelope_sar:
+            raise LockedEnvelopeError("daily_loss_halt_sar cannot exceed the capital envelope.")
+        if not isinstance(self.activation, EnvelopeActivation):
+            raise LockedEnvelopeError("activation must remain an EnvelopeActivation.")
         if self.venue_scope != "SPOT":
             raise LockedEnvelopeError("the locked envelope is SPOT only.")
-        if any(
-            (
-                self.margin_allowed,
-                self.futures_allowed,
-                self.leverage_allowed,
-                self.borrowing_allowed,
-                self.withdrawals_allowed,
-            )
+        for name in (
+            "margin_allowed",
+            "futures_allowed",
+            "leverage_allowed",
+            "borrowing_allowed",
+            "withdrawals_allowed",
         ):
-            raise LockedEnvelopeError(
-                "the locked envelope forbids margin, futures, leverage, borrowing and withdrawals."
-            )
+            value = getattr(self, name)
+            if not isinstance(value, bool) or value:
+                raise LockedEnvelopeError(
+                    "the locked envelope requires every writable capability flag to be boolean "
+                    f"false; {name}={value!r} is refused."
+                )
 
     def to_record(self) -> dict[str, object]:
         """A JSON-able record. These values are future limits, NOT permission to trade."""
@@ -183,8 +200,15 @@ class ExecutionPriceRules:
             "absolute_price_bound_bps",
         ):
             value = getattr(self, name)
-            if not isinstance(value, Decimal) or value <= 0:
-                raise LockedEnvelopeError(f"{name} must be a positive Decimal.")
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value <= 0
+                or value >= TEN_THOUSAND
+            ):
+                raise LockedEnvelopeError(
+                    f"{name} must be a finite basis-point value in the interval (0, 10000)."
+                )
         if self.max_normal_slippage_bps > self.absolute_price_bound_bps:
             raise LockedEnvelopeError(
                 "the normal slippage allowance cannot exceed the absolute price bound."
@@ -209,8 +233,8 @@ EXECUTION_PRICE_RULES = ExecutionPriceRules()
 def spread_bps(best_bid: Decimal, best_ask: Decimal) -> Decimal:
     """Top-of-book spread in basis points."""
     for name, value in (("best_bid", best_bid), ("best_ask", best_ask)):
-        if not isinstance(value, Decimal) or value <= 0:
-            raise CanaryPolicyError(f"{name} must be a positive Decimal.")
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            raise CanaryPolicyError(f"{name} must be a finite positive Decimal.")
     if best_ask < best_bid:
         raise CanaryPolicyError("the top of book is crossed; refusing to evaluate the spread.")
     mid = (best_bid + best_ask) / Decimal(2)
@@ -236,8 +260,12 @@ def absolute_bound_price(
     rules: ExecutionPriceRules = EXECUTION_PRICE_RULES,
 ) -> Decimal:
     """The furthest price a future order may ever carry, relative to the reference mid."""
-    if not isinstance(reference_mid, Decimal) or reference_mid <= 0:
-        raise CanaryPolicyError("reference_mid must be a positive Decimal.")
+    if (
+        not isinstance(reference_mid, Decimal)
+        or not reference_mid.is_finite()
+        or reference_mid <= 0
+    ):
+        raise CanaryPolicyError("reference_mid must be a finite positive Decimal.")
     if not isinstance(side, ExecutionSide):
         raise CanaryPolicyError("side must be an ExecutionSide.")
     delta = reference_mid * rules.absolute_price_bound_bps / TEN_THOUSAND
@@ -251,6 +279,12 @@ def require_within_absolute_bound(
     rules: ExecutionPriceRules = EXECUTION_PRICE_RULES,
 ) -> None:
     """Fail closed when a hypothetical limit price breaches the catastrophic execution ceiling."""
+    if (
+        not isinstance(limit_price, Decimal)
+        or not limit_price.is_finite()
+        or limit_price <= 0
+    ):
+        raise CanaryPolicyError("limit_price must be a finite positive Decimal.")
     bound = absolute_bound_price(reference_mid, side, rules)
     if side is ExecutionSide.BUY and limit_price > bound:
         raise CanaryPolicyError(
@@ -274,6 +308,31 @@ class CanaryEntryOrder:
     market_snapshot_id: str
     order_type: str = CANARY_ENTRY_ORDER_TYPE
     time_in_force: str = CANARY_ENTRY_TIME_IN_FORCE
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.symbol, str) or not self.symbol:
+            raise CanaryPolicyError("a canary entry requires a symbol.")
+        if self.symbol not in LOCKED_PILOT_ENVELOPE.symbols:
+            raise CanaryPolicyError(
+                f"symbol {self.symbol!r} is outside the locked pilot envelope."
+            )
+        if not isinstance(self.side, ExecutionSide):
+            raise CanaryPolicyError("side must be an ExecutionSide.")
+        for name in ("quantity", "limit_price", "reference_mid"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise CanaryPolicyError(f"{name} must be a finite positive Decimal.")
+        if not isinstance(self.market_snapshot_id, str) or not self.market_snapshot_id.strip():
+            raise CanaryPolicyError("a market snapshot id is required.")
+        if self.order_type != CANARY_ENTRY_ORDER_TYPE:
+            raise CanaryPolicyError(
+                f"the canary entry policy requires {CANARY_ENTRY_ORDER_TYPE}."
+            )
+        if self.time_in_force != CANARY_ENTRY_TIME_IN_FORCE:
+            raise CanaryPolicyError(
+                f"the canary entry policy requires {CANARY_ENTRY_TIME_IN_FORCE}."
+            )
+        require_within_absolute_bound(self.reference_mid, self.limit_price, self.side)
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -315,10 +374,14 @@ def build_canary_entry(
             f"the canary entry policy requires {CANARY_ENTRY_TIME_IN_FORCE}; {normalised_tif!r} is "
             "refused (no IOC, no GTC, no fallback)."
         )
-    if not isinstance(quantity, Decimal) or quantity <= 0:
-        raise CanaryPolicyError("quantity must be a positive Decimal.")
-    if not isinstance(limit_price, Decimal) or limit_price <= 0:
-        raise CanaryPolicyError("limit_price must be a positive Decimal.")
+    if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
+        raise CanaryPolicyError("quantity must be a finite positive Decimal.")
+    if (
+        not isinstance(limit_price, Decimal)
+        or not limit_price.is_finite()
+        or limit_price <= 0
+    ):
+        raise CanaryPolicyError("limit_price must be a finite positive Decimal.")
     if not market_snapshot_id:
         raise CanaryPolicyError("a market snapshot id is required.")
     require_within_absolute_bound(reference_mid, limit_price, side)
@@ -374,6 +437,19 @@ class FillSlippageRecord:
     realized_slippage_bps: Decimal
     side: ExecutionSide
 
+    def __post_init__(self) -> None:
+        for name in ("reference_mid", "limit_price", "average_fill_price"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise CanaryPolicyError(f"{name} must be a finite positive Decimal.")
+        if (
+            not isinstance(self.realized_slippage_bps, Decimal)
+            or not self.realized_slippage_bps.is_finite()
+        ):
+            raise CanaryPolicyError("realized_slippage_bps must be a finite Decimal.")
+        if not isinstance(self.side, ExecutionSide):
+            raise CanaryPolicyError("side must be an ExecutionSide.")
+
     def to_record(self) -> dict[str, object]:
         return {
             "reference_mid": str(self.reference_mid),
@@ -393,8 +469,8 @@ def realized_slippage_bps(
         ("reference_mid", reference_mid),
         ("average_fill_price", average_fill_price),
     ):
-        if not isinstance(value, Decimal) or value <= 0:
-            raise CanaryPolicyError(f"{name} must be a positive Decimal.")
+        if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+            raise CanaryPolicyError(f"{name} must be a finite positive Decimal.")
     if not isinstance(side, ExecutionSide):
         raise CanaryPolicyError("side must be an ExecutionSide.")
     raw = (average_fill_price - reference_mid) / reference_mid * TEN_THOUSAND
@@ -424,7 +500,11 @@ def classify_execution_sample(completed_fills: int) -> str:
     Fewer than the minimum is ``INSUFFICIENT_EXECUTION_SAMPLE``: not a system failure, and it never
     widens the 15 bps allowance automatically. Any parameter change needs explicit owner review.
     """
-    if not isinstance(completed_fills, int) or completed_fills < 0:
+    if (
+        isinstance(completed_fills, bool)
+        or not isinstance(completed_fills, int)
+        or completed_fills < 0
+    ):
         raise CanaryPolicyError("completed_fills must be a non-negative integer.")
     if completed_fills < MIN_FOK_FILLS_FOR_OWNER_REVIEW:
         return INSUFFICIENT_EXECUTION_SAMPLE

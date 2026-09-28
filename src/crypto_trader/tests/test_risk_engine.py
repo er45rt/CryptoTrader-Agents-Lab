@@ -98,9 +98,86 @@ def test_invalid_limit_values_fail_closed(bad):
         load_limits({**LIMIT_CONFIG, "max_order_notional_quote": bad})
 
 
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_non_finite_risk_limits_fail_closed(bad):
+    with pytest.raises(RiskConfigError):
+        load_limits({**LIMIT_CONFIG, "max_order_notional_quote": bad})
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), True, "5"])
+def test_non_finite_or_ambiguous_risk_state_freshness_window_fails_closed(bad):
+    with pytest.raises(RiskConfigError, match="max_state_age_seconds"):
+        HardRiskEngine(limits(), max_state_age_seconds=bad)  # type: ignore[arg-type]
+
 def test_engine_requires_resolved_limits():
     with pytest.raises(RiskConfigError):
         HardRiskEngine(None)  # type: ignore[arg-type]
+
+
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_risk_request_rejects_non_finite_quantity_or_price(bad):
+    with pytest.raises(RiskStateError):
+        request(quantity=bad)
+    with pytest.raises(RiskStateError):
+        request(price=bad)
+
+
+def test_risk_request_rejects_string_side_instead_of_enum():
+    with pytest.raises(RiskStateError, match="side"):
+        RiskRequest(
+            correlation_id=uuid4(),
+            symbol="ETHUSDT",
+            side="buy",  # type: ignore[arg-type]
+            quantity=Decimal("1"),
+            price=Decimal("2700"),
+            strategy_id="s1",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"equity_quote": Decimal("Infinity")},
+        {"peak_equity_quote": Decimal("NaN")},
+        {"gross_exposure_quote": Decimal("Infinity")},
+        {"realized_pnl_quote": Decimal("NaN")},
+        {"net_exposure_quote": Decimal("-Infinity")},
+        {"open_orders": True},
+        {"open_positions": False},
+        {"symbol_exposure_quote": {"ETHUSDT": Decimal("Infinity")}},
+        {"strategy_exposure_quote": {"s1": Decimal("NaN")}},
+        {"position_quantity": {"ETHUSDT": Decimal("Infinity")}},
+    ],
+)
+def test_risk_state_snapshot_rejects_non_finite_or_ambiguous_values(overrides):
+    with pytest.raises(RiskStateError):
+        state(**overrides)
+
+
+
+
+@pytest.mark.parametrize("field", ["max_drawdown_pct", "concentration_limit_pct"])
+@pytest.mark.parametrize("bad", ["100.0001", "101", "1000"])
+def test_percentage_limits_above_100_fail_closed(field, bad):
+    with pytest.raises(RiskConfigError):
+        load_limits({**LIMIT_CONFIG, field: bad})
+
+
+def test_risk_state_rejects_peak_equity_below_current_equity():
+    with pytest.raises(RiskStateError, match="peak_equity_quote"):
+        state(equity_quote=Decimal("10000"), peak_equity_quote=Decimal("9999"))
+
+
+def test_risk_state_rejects_gross_exposure_below_absolute_net_exposure():
+    with pytest.raises(RiskStateError, match="gross_exposure_quote"):
+        state(
+            gross_exposure_quote=Decimal("100"),
+            net_exposure_quote=Decimal("-101"),
+        )
 
 
 # --- boundary values (explicit units, Decimal only) ---
@@ -179,6 +256,33 @@ def test_open_order_and_position_counts_are_enforced():
     assert "max_open_positions_exceeded" in decision.reason_codes
 
 
+
+
+def test_existing_symbol_does_not_consume_a_new_position_slot_at_the_limit():
+    engine = HardRiskEngine(limits(max_open_positions=3))
+    at_limit = state(
+        open_positions=3,
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(request(quantity="0.1"), at_limit)
+
+    assert decision.allowed is True
+    position_rule = next(r for r in decision.rule_results if r.rule_id == "max_open_positions")
+    assert position_rule.actual == Decimal("3")
+
+
+def test_flat_symbol_consumes_a_new_position_slot():
+    engine = HardRiskEngine(limits(max_open_positions=3))
+    at_limit_elsewhere = state(open_positions=3)
+
+    decision = engine.evaluate(request(quantity="0.1"), at_limit_elsewhere)
+
+    assert decision.allowed is False
+    assert "max_open_positions_exceeded" in decision.reason_codes
+    position_rule = next(r for r in decision.rule_results if r.rule_id == "max_open_positions")
+    assert position_rule.actual == Decimal("4")
+
 def test_concentration_limit_uses_percent_of_equity():
     engine = HardRiskEngine(limits())
     crowded = state(symbol_exposure_quote={"ETHUSDT": Decimal("4500")})
@@ -213,6 +317,33 @@ def test_reduce_only_mode_blocks_exposure_increasing_orders():
     assert "reduce_only_violation" in increasing.reason_codes
     assert reducing.allowed is True
 
+
+
+
+def test_reduce_only_rejects_oversized_order_that_would_flip_long_to_short():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    long_state = state(position_quantity={"ETHUSDT": Decimal("1")})
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="1.1"),
+        long_state,
+    )
+
+    assert decision.allowed is False
+    assert "reduce_only_violation" in decision.reason_codes
+
+
+def test_reduce_only_rejects_oversized_order_that_would_flip_short_to_long():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    short_state = state(position_quantity={"ETHUSDT": Decimal("-1")})
+
+    decision = engine.evaluate(
+        request(side=Side.BUY, quantity="1.1"),
+        short_state,
+    )
+
+    assert decision.allowed is False
+    assert "reduce_only_violation" in decision.reason_codes
 
 def test_duplicate_and_conflicting_intents_are_rejected():
     pending = PendingIntentRegistry()
@@ -322,3 +453,18 @@ def test_future_risk_state_timestamp_is_rejected_when_freshness_is_configured():
     assert decision.allowed is False
     assert "risk_state_timestamp_in_future" in decision.reason_codes
 
+@pytest.mark.parametrize("field", ["reduce_only_mode", "trading_halted"])
+@pytest.mark.parametrize(
+    "value, expected",
+    [("true", True), ("false", False), (True, True), (False, False)],
+)
+def test_optional_risk_boolean_configuration_is_parsed_strictly(field, value, expected):
+    loaded = load_limits({**LIMIT_CONFIG, field: value})
+    assert getattr(loaded, field) is expected
+
+
+@pytest.mark.parametrize("field", ["reduce_only_mode", "trading_halted"])
+@pytest.mark.parametrize("value", ["yes", "no", "1", "0", "on", "off", "", 1, 0, None])
+def test_ambiguous_optional_risk_boolean_configuration_fails_closed(field, value):
+    with pytest.raises(RiskConfigError, match=field):
+        load_limits({**LIMIT_CONFIG, field: value})

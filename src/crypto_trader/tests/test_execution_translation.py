@@ -39,6 +39,25 @@ def make_request(**overrides) -> ExecutionRequest:
     return ExecutionRequest.create(**fields)
 
 
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("price_precision", True),
+        ("size_precision", False),
+        ("price_precision", 2.5),
+        ("size_precision", "8"),
+        ("price_precision", -1),
+        ("size_precision", -1),
+    ],
+)
+def test_instrument_spec_rejects_invalid_precision_types(field, bad):
+    kwargs = {"symbol": "ETHUSDT", field: bad}
+    with pytest.raises(UnsupportedExecutionRequestError, match=field):
+        InstrumentSpec(**kwargs)
+
+
 # --- inbound ---
 
 def test_inbound_side_and_time_in_force_mapping_is_explicit():
@@ -73,6 +92,33 @@ def test_inbound_refuses_unrepresentable_precision():
     with pytest.raises(UnsupportedExecutionRequestError):
         inbound.to_quantity(Decimal("1.123456789"), INSTRUMENT)
 
+
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_execution_request_rejects_non_finite_quantity_and_limit_price(bad):
+    with pytest.raises(UnsupportedExecutionRequestError):
+        make_request(quantity=Decimal(bad)).validate_for(INSTRUMENT)
+    with pytest.raises(UnsupportedExecutionRequestError):
+        make_request(limit_price=Decimal(bad)).validate_for(INSTRUMENT)
+
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"side": "buy"}, "side"),
+        ({"order_type": "market", "limit_price": None}, "order_type"),
+        ({"time_in_force": "GTC"}, "time_in_force"),
+        ({"correlation_id": "not-a-uuid"}, "correlation_id"),
+        ({"intent_id": "not-a-uuid"}, "intent_id"),
+    ],
+)
+def test_execution_request_rejects_malformed_typed_fields(overrides, message):
+    request = make_request(**overrides)
+
+    with pytest.raises(UnsupportedExecutionRequestError, match=message):
+        request.validate_for(INSTRUMENT)
 
 def test_inbound_book_and_trade_translation_uses_public_types():
     from crypto_trader.execution import BookLevel, MarketBookUpdate, MarketTrade
@@ -233,3 +279,63 @@ def test_translation_refuses_to_guess_a_missing_timestamp():
 
     with pytest.raises(TranslationError):
         outbound.to_phase3_order_state_event(observation)
+
+def test_phase3_order_state_event_id_is_stable_for_same_logical_observation():
+    observation = ExecutionObservation(
+        order_reference="O-STABLE-1",
+        intent_id=uuid4(),
+        correlation_id=uuid4(),
+        symbol="ETHUSDT",
+        state=OrderLifecycleState.ACCEPTED,
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal("1"),
+        ts_ns=TS_NS,
+    )
+
+    first = outbound.to_phase3_order_state_event(observation)
+    second = outbound.to_phase3_order_state_event(observation)
+
+    assert first.event_id == second.event_id
+    assert first == second
+
+
+def test_phase3_fill_event_id_is_stable_and_distinguishes_separate_fills():
+    intent_id = uuid4()
+    correlation_id = uuid4()
+    base = ExecutionObservation(
+        order_reference="O-STABLE-FILL",
+        intent_id=intent_id,
+        correlation_id=correlation_id,
+        symbol="ETHUSDT",
+        state=OrderLifecycleState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.5"),
+        remaining_quantity=Decimal("0.5"),
+        last_fill_quantity=Decimal("0.5"),
+        last_fill_price=Decimal("2700"),
+        fee=Decimal("0.01"),
+        fee_asset="USDT",
+        ts_ns=TS_NS,
+    )
+    later = ExecutionObservation(
+        order_reference=base.order_reference,
+        intent_id=intent_id,
+        correlation_id=correlation_id,
+        symbol=base.symbol,
+        state=OrderLifecycleState.FILLED,
+        filled_quantity=Decimal("1"),
+        remaining_quantity=Decimal("0"),
+        last_fill_quantity=Decimal("0.5"),
+        last_fill_price=Decimal("2700"),
+        fee=Decimal("0.01"),
+        fee_asset="USDT",
+        ts_ns=TS_NS + 1,
+    )
+
+    first = outbound.to_phase3_fill_event(base)
+    retry = outbound.to_phase3_fill_event(base)
+    second_fill = outbound.to_phase3_fill_event(later)
+
+    assert first.event_id == retry.event_id
+    assert first == retry
+    assert second_fill.event_id != first.event_id
+

@@ -400,3 +400,64 @@ def test_report_is_a_run_report_instance(journal):
     )
 
     assert isinstance(session.run(), RunReport)
+
+def test_shadow_submission_mode_requires_a_simulator(journal):
+    cfg = fx.config(TradingMode.SHADOW, shadow_submits=True)
+    with pytest.raises(PaperStateError, match="requires an execution simulator"):
+        fx.session(
+            journal,
+            mode=TradingMode.SHADOW,
+            decisions=fx.scripted(fx.buy_decision()),
+            data_feed=fx.feed("2700.00"),
+            simulator=None,
+            cfg=cfg,
+        )
+
+def test_paper_batch_reserves_approved_exposure_before_simulation(journal):
+    """Two individually-valid orders must not over-commit one shared pre-fill risk limit."""
+    session = fx.session(
+        journal,
+        decisions=fx.scripted(
+            fx.buy_decision(quantity="1.1", limit_price="2700.00"),
+            fx.buy_decision(quantity="1.1", limit_price="2700.00"),
+        ),
+        data_feed=fx.feed("2700.00", "2700.00"),
+        simulator=ScriptedSimulationRunner(),
+        limits_override=fx.limits(
+            max_symbol_exposure_quote="5000",
+            max_gross_exposure_quote="50000",
+            max_net_exposure_quote="30000",
+            max_strategy_exposure_quote="40000",
+        ),
+    )
+
+    report = session.run()
+
+    assert [record.submission for record in report.decisions] == [
+        "submitted_to_simulator",
+        "stopped_by_risk",
+    ]
+    assert "max_symbol_exposure_exceeded" in report.decisions[1].risk_reason_codes
+    assert len(report.orders) == 1
+    assert len(report.fills) == 1
+
+
+def test_paper_batch_counts_prior_approved_intents_as_open_orders(journal):
+    session = fx.session(
+        journal,
+        decisions=fx.scripted(
+            fx.buy_decision(quantity="0.1", limit_price="2700.00"),
+            fx.buy_decision(quantity="0.1", limit_price="2700.00"),
+        ),
+        data_feed=fx.feed("2700.00", "2700.00"),
+        simulator=ScriptedSimulationRunner(),
+        limits_override=fx.limits(max_open_orders=1),
+    )
+
+    report = session.run()
+
+    assert report.decisions[0].submission == "submitted_to_simulator"
+    assert report.decisions[1].submission == "stopped_by_risk"
+    assert "max_open_orders_exceeded" in report.decisions[1].risk_reason_codes
+    assert len(report.orders) == 1
+

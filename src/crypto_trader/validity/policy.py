@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import math
 from typing import Any
 
 from .errors import ValidityConfigError
@@ -29,12 +30,28 @@ class ValidityPolicy:
     def __post_init__(self) -> None:
         if not self.policy_id:
             raise ValidityConfigError("policy_id is required.")
-        if self.max_age_seconds <= 0:
-            raise ValidityConfigError("max_age_seconds must be greater than zero.")
-        if not isinstance(self.max_market_move_bps, Decimal) or self.max_market_move_bps <= 0:
-            raise ValidityConfigError("max_market_move_bps must be a positive Decimal.")
-        if self.valid_until_seconds is not None and self.valid_until_seconds <= 0:
-            raise ValidityConfigError("valid_until_seconds must be greater than zero when set.")
+        if (
+            isinstance(self.max_age_seconds, bool)
+            or not isinstance(self.max_age_seconds, (int, float))
+            or not math.isfinite(float(self.max_age_seconds))
+            or self.max_age_seconds <= 0
+        ):
+            raise ValidityConfigError("max_age_seconds must be a finite number greater than zero.")
+        if (
+            not isinstance(self.max_market_move_bps, Decimal)
+            or not self.max_market_move_bps.is_finite()
+            or self.max_market_move_bps <= 0
+        ):
+            raise ValidityConfigError("max_market_move_bps must be a finite positive Decimal.")
+        if self.valid_until_seconds is not None and (
+            isinstance(self.valid_until_seconds, bool)
+            or not isinstance(self.valid_until_seconds, (int, float))
+            or not math.isfinite(float(self.valid_until_seconds))
+            or self.valid_until_seconds <= 0
+        ):
+            raise ValidityConfigError(
+                "valid_until_seconds must be a finite number greater than zero when set."
+            )
 
 
 def load_policy(config: Mapping[str, Any]) -> ValidityPolicy:

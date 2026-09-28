@@ -243,8 +243,12 @@ class InstrumentSpec:
             raise UnsupportedExecutionRequestError(
                 f"symbol must be an uppercase market symbol such as ETHUSDT; got {self.symbol!r}."
             )
-        if self.price_precision < 0 or self.size_precision < 0:
-            raise UnsupportedExecutionRequestError("precision values must be non-negative.")
+        for name in ("price_precision", "size_precision"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise UnsupportedExecutionRequestError(
+                    f"{name} must be a non-negative integer."
+                )
 
 
 @dataclass(frozen=True)
@@ -290,13 +294,27 @@ class ExecutionRequest:
 
     def validate_for(self, instrument: InstrumentSpec) -> None:
         """Fail closed on anything the engine cannot represent faithfully."""
+        if not isinstance(self.intent_id, UUID) or not isinstance(self.correlation_id, UUID):
+            raise UnsupportedExecutionRequestError(
+                "intent_id and correlation_id must be UUIDs."
+            )
+        if not isinstance(self.side, ExecutionSide):
+            raise UnsupportedExecutionRequestError("side must be an ExecutionSide.")
+        if not isinstance(self.order_type, ExecutionOrderType):
+            raise UnsupportedExecutionRequestError(
+                "order_type must be an ExecutionOrderType."
+            )
+        if not isinstance(self.time_in_force, ExecutionTimeInForce):
+            raise UnsupportedExecutionRequestError(
+                "time_in_force must be an ExecutionTimeInForce."
+            )
         if self.symbol != instrument.symbol:
             raise UnsupportedExecutionRequestError(
                 f"request symbol {self.symbol!r} does not match the configured instrument "
                 f"{instrument.symbol!r}."
             )
-        if not isinstance(self.quantity, Decimal):
-            raise UnsupportedExecutionRequestError("quantity must be a Decimal.")
+        if not isinstance(self.quantity, Decimal) or not self.quantity.is_finite():
+            raise UnsupportedExecutionRequestError("quantity must be a finite Decimal.")
         if self.quantity <= 0:
             raise UnsupportedExecutionRequestError("quantity must be greater than zero.")
         if -self.quantity.as_tuple().exponent > instrument.size_precision:
@@ -308,8 +326,14 @@ class ExecutionRequest:
         if self.order_type is ExecutionOrderType.LIMIT:
             if self.limit_price is None:
                 raise UnsupportedExecutionRequestError("limit orders require a limit_price.")
-            if not isinstance(self.limit_price, Decimal) or self.limit_price <= 0:
-                raise UnsupportedExecutionRequestError("limit_price must be a positive Decimal.")
+            if (
+                not isinstance(self.limit_price, Decimal)
+                or not self.limit_price.is_finite()
+                or self.limit_price <= 0
+            ):
+                raise UnsupportedExecutionRequestError(
+                    "limit_price must be a finite positive Decimal."
+                )
             if -self.limit_price.as_tuple().exponent > instrument.price_precision:
                 raise UnsupportedExecutionRequestError(
                     f"limit_price {self.limit_price} exceeds the instrument price precision "

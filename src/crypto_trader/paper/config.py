@@ -67,9 +67,9 @@ class SessionConfig:
             raise PaperConfigError("producer is required.")
         if not isinstance(self.shadow_submits, bool) or not isinstance(self.queue_aware, bool):
             raise PaperConfigError("shadow_submits and queue_aware must be booleans.")
-        if self.mode is TradingMode.PAPER and not self.queue_aware:
+        if self.places_simulated_orders and not self.queue_aware:
             raise PaperConfigError(
-                "paper mode requires queue-aware simulation "
+                "any session that places simulated orders requires queue-aware simulation "
                 "(queue_position=True, liquidity_consumption=True, book_type=L2_MBP)."
             )
         if self.queue_aware:

@@ -325,10 +325,13 @@ def pipeline(
     permission_check=None,
     filters_provider=None,
     quote_provider=None,
+    risk_state_source=None,
+    risk_state_max_age_seconds: float = 5.0,
     client_instance: MainnetReadOnlyClient | None = None,
     control: BreakGlassControl | None = None,
     soak_instance: SoakRecorder | None = None,
     when: datetime = BASE,
+    clock_fn=None,
 ) -> MainnetDryRunPipeline:
     # A client-backed pipeline reads its filters/top-of-book from the client unless overridden.
     if filters_provider is None and client_instance is None:
@@ -342,7 +345,8 @@ def pipeline(
         market_state=market or market_state(),
         decision_source=decision_source or (lambda snapshot: intent()),
         limits=limits(),
-        risk_state_provider=lambda now: risk_state(now=now),
+        risk_state_provider=risk_state_source or (lambda now: risk_state(now=now)),
+        risk_state_max_age_seconds=risk_state_max_age_seconds,
         validity_gate=validity_gate(),
         reconciliation_policy=recovery_policy(),
         permission_check=permission_check or (lambda: restrictions()),
@@ -352,7 +356,7 @@ def pipeline(
         quote_provider=quote_provider,
         soak=soak_instance or soak(tmp_path, when=when),
         control=control,
-        clock=lambda: when,
+        clock=clock_fn or (lambda: when),
     )
 
 

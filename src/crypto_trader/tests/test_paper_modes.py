@@ -145,6 +145,36 @@ def test_session_config_accepts_an_explicit_session_id():
     assert config.session_id == SESSION
 
 
+
+
+def test_shadow_submission_mode_refuses_to_disable_queue_aware_simulation():
+    with pytest.raises(PaperConfigError):
+        load_session_config(
+            {
+                "mode": "shadow",
+                "symbol": "ETHUSDT",
+                "strategy_id": "s1",
+                "shadow_submits": True,
+                "queue_aware": False,
+            }
+        )
+
+
+def test_quiet_shadow_mode_may_disable_queue_aware_simulation_because_it_places_nothing():
+    config = load_session_config(
+        {
+            "mode": "shadow",
+            "symbol": "ETHUSDT",
+            "strategy_id": "s1",
+            "shadow_submits": False,
+            "queue_aware": False,
+        }
+    )
+
+    assert config.places_simulated_orders is False
+    assert config.queue_aware is False
+
+
 # --- feeds ----------------------------------------------------------------
 
 def test_frozen_feed_rejects_out_of_order_observations():

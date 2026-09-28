@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,7 @@ class MainnetDryRunPipeline:
         decision_source: Callable[[MarketObservation], ProductionIntent | None],
         limits: RiskLimits,
         risk_state_provider: Callable[[datetime], RiskStateSnapshot],
+        risk_state_max_age_seconds: float,
         validity_gate: DecisionValidityGate,
         reconciliation_policy: ReconciliationPolicy,
         permission_check: Callable[[], ApiRestrictions],
@@ -217,6 +219,16 @@ class MainnetDryRunPipeline:
             raise DryRunError("the dry-run pipeline requires the hard no-submit gate.")
         if not callable(risk_state_provider):
             raise DryRunError("the dry-run pipeline requires a risk-state provider.")
+        if (
+            isinstance(risk_state_max_age_seconds, bool)
+            or not isinstance(risk_state_max_age_seconds, (int, float))
+            or not math.isfinite(float(risk_state_max_age_seconds))
+            or risk_state_max_age_seconds <= 0
+        ):
+            raise DryRunError(
+                "the dry-run pipeline requires an explicit finite positive "
+                "risk_state_max_age_seconds."
+            )
         self._journal = journal
         self._state_dir = Path(state_dir)
         self._instrument = instrument
@@ -224,6 +236,7 @@ class MainnetDryRunPipeline:
         self._decision_source = decision_source
         self._limits = limits
         self._risk_state_provider = risk_state_provider
+        self._risk_state_max_age_seconds = float(risk_state_max_age_seconds)
         self._validity_gate = validity_gate
         self._reconciliation_policy = reconciliation_policy
         self._permission_check = permission_check
@@ -447,7 +460,9 @@ class MainnetDryRunPipeline:
 
         # Deterministic Hard Risk (Phase 7), under the CURRENT persisted safety mode.
         engine = HardRiskEngine(
-            risk_limits_for_safety(controller, self._limits), pending=self._pending
+            risk_limits_for_safety(controller, self._limits),
+            pending=self._pending,
+            max_state_age_seconds=self._risk_state_max_age_seconds,
         )
         decision = engine.evaluate(
             RiskRequest(

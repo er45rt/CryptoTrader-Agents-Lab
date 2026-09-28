@@ -79,9 +79,50 @@ def test_policy_configuration_fails_closed(config):
         load_policy(config)
 
 
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"policy_id": "p", "max_age_seconds": "inf", "max_market_move_bps": "15"},
+        {"policy_id": "p", "max_age_seconds": "nan", "max_market_move_bps": "15"},
+        {"policy_id": "p", "max_age_seconds": 3, "max_market_move_bps": "Infinity"},
+        {"policy_id": "p", "max_age_seconds": 3, "max_market_move_bps": "NaN"},
+        {
+            "policy_id": "p",
+            "max_age_seconds": 3,
+            "max_market_move_bps": "15",
+            "valid_until_seconds": "inf",
+        },
+        {
+            "policy_id": "p",
+            "max_age_seconds": 3,
+            "max_market_move_bps": "15",
+            "valid_until_seconds": "nan",
+        },
+    ],
+)
+def test_non_finite_validity_thresholds_fail_closed(config):
+    with pytest.raises(ValidityConfigError):
+        load_policy(config)
+
 def test_gate_requires_a_resolved_policy():
     with pytest.raises(ValidityConfigError):
         DecisionValidityGate(None)  # type: ignore[arg-type]
+
+
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_validity_request_rejects_non_finite_reference_price(bad):
+    with pytest.raises(ValidityConfigError):
+        request(price=bad)
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_market_observation_rejects_non_finite_price(bad):
+    with pytest.raises(MarketStateError):
+        observation(0.0, bad)
 
 
 # --- dispositions ---
@@ -228,10 +269,19 @@ def test_same_inputs_and_history_produce_the_same_disposition():
 
 
 def test_replay_provider_advances_deterministically():
-    provider = ReplayMarketStateProvider([observation(0.0, "2700.00"), observation(1.0, "2701.00")])
+    provider = ReplayMarketStateProvider(
+        [
+            observation(0.0, "2700.00", reference="obs-0"),
+            observation(1.0, "2701.00", reference="obs-1"),
+        ]
+    )
 
-    assert provider.latest("ETHUSDT").market_reference == "obs-1"
+    assert provider.latest("ETHUSDT").market_reference == "obs-0"
     assert provider.advance("ETHUSDT").market_reference == "obs-1"
+    assert provider.latest("ETHUSDT").market_reference == "obs-1"
+    assert provider.advance("ETHUSDT") is None
+    assert provider.latest("ETHUSDT") is None
+    assert provider.advance("ETHUSDT") is None
     assert provider.latest("MISSING") is None
 
 

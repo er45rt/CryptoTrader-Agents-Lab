@@ -79,6 +79,32 @@ def test_the_envelope_is_reference_only_and_is_not_trading_permission():
         )
 
 
+
+
+def test_locked_envelope_order_value_cannot_exceed_open_exposure_limit():
+    from crypto_trader.mainnet import LockedPilotEnvelope
+
+    with pytest.raises(LockedEnvelopeError, match="max_open_exposure_sar"):
+        LockedPilotEnvelope(
+            capital_envelope_sar=Decimal("300"),
+            max_order_value_sar=Decimal("151"),
+            max_open_exposure_sar=Decimal("150"),
+            daily_loss_halt_sar=Decimal("15"),
+            max_open_orders=2,
+            symbols=("BTCUSDT",),
+        )
+
+
+@pytest.mark.parametrize("field", ["max_spread_bps", "max_normal_slippage_bps", "absolute_price_bound_bps"])
+@pytest.mark.parametrize("bad", ["10000", "10001", "Infinity", "NaN"])
+def test_execution_price_rules_refuse_unbounded_basis_point_values(field, bad):
+    from crypto_trader.mainnet import ExecutionPriceRules
+
+    kwargs = {field: Decimal(bad)}
+    with pytest.raises(LockedEnvelopeError):
+        ExecutionPriceRules(**kwargs)
+
+
 # --- price rules -----------------------------------------------------------
 
 def test_the_price_rules_are_the_owner_approved_values():
@@ -164,6 +190,22 @@ def test_a_price_beyond_the_absolute_bound_is_refused_at_entry_construction():
         )
 
 
+
+
+def test_canary_entry_refuses_symbols_outside_locked_envelope():
+    with pytest.raises(CanaryPolicyError, match="locked pilot envelope"):
+        build_canary_entry(
+            symbol="DOGEUSDT",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("1"),
+            limit_price=Decimal("1"),
+            reference_mid=Decimal("1"),
+            market_snapshot_id="snap-outside-envelope",
+            order_type="LIMIT",
+            time_in_force="FOK",
+        )
+
+
 # --- no chasing / single-use snapshots -------------------------------------
 
 def test_a_market_snapshot_can_never_be_reused():
@@ -213,6 +255,120 @@ def test_the_future_canary_sample_rule_classifies_without_widening_anything():
     assert classify_execution_sample(5) != INSUFFICIENT_EXECUTION_SAMPLE
     with pytest.raises(CanaryPolicyError):
         classify_execution_sample(-1)
+
+
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "-Infinity", "NaN"])
+def test_future_canary_rejects_non_finite_envelope_and_price_values(bad):
+    from crypto_trader.mainnet import ExecutionPriceRules, LockedPilotEnvelope
+
+    value = Decimal(bad)
+    with pytest.raises(LockedEnvelopeError):
+        LockedPilotEnvelope(
+            capital_envelope_sar=value,
+            max_order_value_sar=Decimal("50"),
+            max_open_exposure_sar=Decimal("150"),
+            daily_loss_halt_sar=Decimal("15"),
+            max_open_orders=2,
+            symbols=("BTCUSDT",),
+        )
+    with pytest.raises(LockedEnvelopeError):
+        ExecutionPriceRules(max_spread_bps=value)
+    with pytest.raises(CanaryPolicyError):
+        spread_bps(value, Decimal("27000"))
+    with pytest.raises(CanaryPolicyError):
+        absolute_bound_price(value, ExecutionSide.BUY)
+    with pytest.raises(CanaryPolicyError):
+        build_canary_entry(
+            symbol="BTCUSDT",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("0.001"),
+            limit_price=value,
+            reference_mid=Decimal("27000"),
+            market_snapshot_id="snap-x",
+            order_type="LIMIT",
+            time_in_force="FOK",
+        )
+    with pytest.raises(CanaryPolicyError):
+        realized_slippage_bps(Decimal("27000"), value, ExecutionSide.BUY)
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("max_open_orders", True),
+        ("margin_allowed", 0),
+        ("futures_allowed", ""),
+        ("leverage_allowed", None),
+    ],
+)
+def test_locked_envelope_rejects_ambiguous_capability_and_count_types(field, bad):
+    from crypto_trader.mainnet import LockedPilotEnvelope
+
+    kwargs = {
+        "capital_envelope_sar": Decimal("300"),
+        "max_order_value_sar": Decimal("50"),
+        "max_open_exposure_sar": Decimal("150"),
+        "daily_loss_halt_sar": Decimal("15"),
+        "max_open_orders": 2,
+        "symbols": ("BTCUSDT",),
+        field: bad,
+    }
+    with pytest.raises(LockedEnvelopeError):
+        LockedPilotEnvelope(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_order_value_sar", "301"),
+        ("max_open_exposure_sar", "301"),
+        ("daily_loss_halt_sar", "301"),
+    ],
+)
+def test_locked_envelope_components_cannot_exceed_capital(field, value):
+    from crypto_trader.mainnet import LockedPilotEnvelope
+
+    kwargs = {
+        "capital_envelope_sar": Decimal("300"),
+        "max_order_value_sar": Decimal("50"),
+        "max_open_exposure_sar": Decimal("150"),
+        "daily_loss_halt_sar": Decimal("15"),
+        "max_open_orders": 2,
+        "symbols": ("BTCUSDT",),
+    }
+    kwargs[field] = Decimal(value)
+    with pytest.raises(LockedEnvelopeError):
+        LockedPilotEnvelope(**kwargs)
+
+
+def test_direct_canary_entry_construction_cannot_bypass_limit_fok_or_price_bound():
+    with pytest.raises(CanaryPolicyError):
+        CanaryEntryOrder(
+            symbol="BTCUSDT",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("0.001"),
+            limit_price=Decimal("27000"),
+            reference_mid=Decimal("27000"),
+            market_snapshot_id="snap-direct",
+            order_type="MARKET",
+            time_in_force="FOK",
+        )
+    with pytest.raises(CanaryPolicyError):
+        CanaryEntryOrder(
+            symbol="BTCUSDT",
+            side=ExecutionSide.BUY,
+            quantity=Decimal("0.001"),
+            limit_price=Decimal("28000"),
+            reference_mid=Decimal("27000"),
+            market_snapshot_id="snap-direct",
+        )
+
+
+def test_execution_sample_count_rejects_boolean():
+    with pytest.raises(CanaryPolicyError):
+        classify_execution_sample(True)
 
 
 # --- documented limitations ------------------------------------------------
