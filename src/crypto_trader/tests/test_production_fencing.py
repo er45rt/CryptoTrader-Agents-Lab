@@ -22,6 +22,7 @@ from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import ProductionStartupError, ProductionStateError
 from crypto_trader.safety import SafetyMode
 from crypto_trader.tests.production_fixtures import (
+    BASE,
     INSTRUMENT,
     RecordingExecutionPort,
     build_runtime,
