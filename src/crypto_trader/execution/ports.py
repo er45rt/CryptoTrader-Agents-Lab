@@ -178,9 +178,13 @@ class DurableVenueWritePort(ABC):
                 "the durable venue-write boundary requires a durable attempt journal; none is "
                 "available, so no request may be sent."
             )
+        from crypto_trader.events import OrderSubmissionAttempted
+
+        if not isinstance(marker, OrderSubmissionAttempted):
+            raise NonDurableExecutionError("the durable marker must be an OrderSubmissionAttempted")
         journal.append(marker)
-        event_id = getattr(marker, "event_id", None)
-        if event_id is None or journal.read_by_id(event_id) is None:
+        stored = journal.read_by_id(marker.event_id)
+        if not isinstance(stored, OrderSubmissionAttempted) or stored != marker:
             raise NonDurableExecutionError(
                 "the durable submission-attempt marker could not be read back after the append; "
                 "refusing to send any request."

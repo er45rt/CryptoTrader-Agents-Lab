@@ -45,6 +45,7 @@ from crypto_trader.execution import (
 from crypto_trader.persistence import EventJournal
 from crypto_trader.risk import (
     HardRiskEngine,
+    PendingIntent,
     PendingIntentRegistry,
     RiskDecision,
     RiskLimits,
@@ -94,12 +95,14 @@ class TradingSession:
     safety: SafetyController
     simulator: ExecutionSimulator | None = None
     recovery_run: Any | None = None
+    # Reserve approved exposure until the deferred simulation pass resolves it.
+    _reservations: dict[UUID, tuple[Side, Decimal, Decimal]] = field(default_factory=dict)
     _pending: PendingIntentRegistry = field(default_factory=PendingIntentRegistry)
     _risk_cache: tuple[tuple[str, bool], HardRiskEngine] | None = None
 
     def __post_init__(self) -> None:
-        if self.config.mode is TradingMode.PAPER and self.simulator is None:
-            raise PaperStateError("paper mode requires an execution simulator.")
+        if self.config.places_simulated_orders and self.simulator is None:
+            raise PaperStateError("simulated order submission requires an execution simulator.")
 
     # --- resume support ---
 
@@ -123,6 +126,27 @@ class TradingSession:
             raise PaperStateError("start_index must be within the feed.")
 
         ledger = PositionLedger(Decimal(self.config.starting_equity_quote))
+        self._reservations = {}
+        self._pending = PendingIntentRegistry()
+        self._risk_cache = None
+        prior_intents = {
+            _stable_id(str(self.config.session_id), entry.market_reference, "intent")
+            for entry in entries[:start_index]
+        }
+        # Retain prior approvals on resume. The batch decision pass has no synchronous fill
+        # feedback, so reservations are conservatively retained until a separate reconciliation.
+        for event in self.journal.read_by_correlation(self.config.session_id):
+            if event.event_type != "risk.evaluation.recorded":
+                continue
+            payload = event.payload
+            if payload.intent_id in prior_intents and payload.decision == "allowed":
+                self._reservations[payload.intent_id] = (
+                    Side(payload.side), payload.quantity, payload.price
+                )
+                self._pending.register(PendingIntent(
+                    intent_id=payload.intent_id, symbol=payload.symbol,
+                    strategy_id=self.config.strategy_id, side=Side(payload.side),
+                ))
         # The market-state provider walks the same frozen sequence, so validity never sees a
         # future observation when it evaluates an intent.
         market_state = ReplayMarketStateProvider(
@@ -159,6 +183,7 @@ class TradingSession:
                 requests=requests,
                 safety_events=safety_events,
             )
+            market_state.advance(self.config.symbol)
             records.append(record)
             if record.validity_disposition is not None:
                 key = record.validity_disposition
@@ -275,7 +300,6 @@ class TradingSession:
             notes=observation.market_reference,
             event_id=_stable_id(str(intent_id), "validity"),
         )
-        market_state.advance(self.config.symbol)
         if validity.disposition.value != "accepted":
             return DecisionRecord(
                 **base,
@@ -305,6 +329,9 @@ class TradingSession:
                 submission="blocked_by_safety" if blocked_by_safety else "stopped_by_risk",
             )
 
+        self._reservations[intent_id] = (
+            risk.side, risk.quantity, max(risk.price, observation.price)
+        )
         request = self._execution_request(observation, decision, intent_id)
         if self.config.mode is TradingMode.SHADOW and not self.config.shadow_submits:
             return DecisionRecord(
@@ -430,19 +457,29 @@ class TradingSession:
         self, ledger: PositionLedger, observation: MarketObservation, now: datetime
     ) -> RiskStateSnapshot:
         position = ledger.position(self.config.symbol)
-        value = position.quantity * observation.price
+        reserved_quantity = sum(
+            quantity if side is Side.BUY else -quantity
+            for side, quantity, _ in self._reservations.values()
+        )
+        value = position.quantity * observation.price + sum(
+            quantity * max(price, observation.price) * (1 if side is Side.BUY else -1)
+            for side, quantity, price in self._reservations.values()
+        )
         equity = ledger.starting_equity_quote + ledger.realized_pnl_quote()
         return RiskStateSnapshot(
             equity_quote=equity,
             peak_equity_quote=max(equity, ledger.starting_equity_quote),
             realized_pnl_quote=ledger.realized_pnl_quote(),
-            gross_exposure_quote=abs(value),
+            gross_exposure_quote=abs(position.quantity * observation.price) + sum(
+                quantity * max(price, observation.price)
+                for _, quantity, price in self._reservations.values()
+            ),
             net_exposure_quote=value,
-            open_orders=0,
-            open_positions=0 if position.is_flat else 1,
+            open_orders=len(self._reservations),
+            open_positions=0 if position.is_flat and not self._reservations else 1,
             symbol_exposure_quote={self.config.symbol: value},
             strategy_exposure_quote={self.config.strategy_id: value},
-            position_quantity={self.config.symbol: position.quantity},
+            position_quantity={self.config.symbol: position.quantity + reserved_quantity},
             snapshot_ts=now,
         )
 

@@ -57,7 +57,10 @@ class BoundedPendingIntents:
         evicted: list[ValidityRequest] = []
         for item in self._items:
             age = (now_utc - item.request.market_event_ts.astimezone(timezone.utc)).total_seconds()
-            if age > policy.max_age_seconds:
+            # A future-dated market event is malformed/clock-skewed evidence, not a fresh intent.
+            # Fail closed exactly as the validity gate does instead of letting negative age bypass
+            # stale eviction and occupy pending capacity indefinitely.
+            if age < 0 or age > policy.max_age_seconds:
                 evicted.append(item.request)
             else:
                 kept.append(item)

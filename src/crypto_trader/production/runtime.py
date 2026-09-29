@@ -353,8 +353,7 @@ class ProductionRuntime:
         self._mainnet_base_url = mainnet_base_url
         self._owner_id = owner_id.strip()
         self._venue_sources = tuple(venue_sources)
-        # Stage 3 capability gate (construction-time; capability and journal are construction-time
-        # facts, so no later mutation can change this decision).
+        # Stage 3 capability gate; mutable wiring is checked again at submission.
         capability = self._resolve_execution_capability(execution)
         self._capability = capability
         self._durable_venue_writes = False
@@ -617,7 +616,11 @@ class ProductionRuntime:
         )
 
     def submit_prepared(self, preparation: IntentPreparation) -> ProductionSubmitResult:
-        """The final fence check, immediately followed by the venue submission."""
+        """Atomically authorize and submit relative to operator takeover."""
+        with self._control.ownership_store.exclusive(purpose="submission"):
+            return self._submit_prepared_locked(preparation)
+
+    def _submit_prepared_locked(self, preparation: IntentPreparation) -> ProductionSubmitResult:
         self._require_running()
         if not isinstance(preparation, IntentPreparation):
             raise ProductionStateError("submit_prepared expects an IntentPreparation.")
@@ -629,6 +632,11 @@ class ProductionRuntime:
         if self._fence is None:
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
+        capability = self._resolve_execution_capability(self._execution)
+        if capability is not self._capability:
+            raise NonDurableExecutionError("execution capability changed after construction")
+        if self._durable_venue_writes and self._execution.durable_attempt_journal() is not self._journal:
+            raise NonDurableExecutionError("execution journal changed after construction")
         now = self._now()
         try:
             # The last thing that happens before the venue call. Never cached, never skipped.
@@ -654,7 +662,7 @@ class ProductionRuntime:
             # Venue-writing execution goes through the approved durable submission sequence
             # (marker -> authorization -> one send). Non-writing execution keeps its own port.
             if self._durable_venue_writes:
-                reference = self._execution.submit_durably(request)
+                reference = DurableVenueWritePort.submit_durably(self._execution, request)
             else:
                 reference = self._execution.submit(request)
         except AmbiguousOrderError:

@@ -52,6 +52,7 @@ from .translate import (
     PRODUCER,
     deterministic_order_uuid,
     lifecycle_state_name,
+    legacy_fill_event_ids,
     testnet_order_to_phase3_events,
 )
 
@@ -408,8 +409,37 @@ class TestnetOrderRuntime(DurableVenueWritePort):
     def _record(self, order: TestnetOrder, *, correlation_id: UUID | None) -> None:
         correlation = correlation_id or UUID(int=0)
         events = testnet_order_to_phase3_events(order, correlation_id=correlation)
-        for event in events:
+        historical_fills = []
+        if self.journal is not None and order.fills:
+            historical_fills = [event for event in self.journal.read_range()
+                                if event.order_id == deterministic_order_uuid(order.client_order_id)
+                                and event.event_type == "execution.fill.recorded"]
+        for index, event in enumerate(events):
             if self.journal is not None:
+                existing = self.journal.read_by_id(event.event_id)
+                if existing is None and event.event_type == "execution.fill.recorded":
+                    trade_id = order.fills[index - 1].trade_id
+                    candidates = legacy_fill_event_ids(
+                        order.client_order_id, trade_id, len(historical_fills)
+                    )
+                    matches = [item for item in historical_fills if item.event_id in candidates]
+                    if len(matches) > 1:
+                        raise RuntimeStateError("legacy journal contains duplicate trade identities")
+                    existing = matches[0] if matches else None
+                if existing is not None:
+                    if (existing.event_type, existing.order_id, existing.symbol, existing.producer) != (
+                        event.event_type, event.order_id, event.symbol, event.producer
+                    ):
+                        raise RuntimeStateError("conflicting identity for a recorded venue event")
+                    # Repeated polling may change snapshot metadata, never trade economics.
+                    fields = ("quantity", "price", "fee", "fee_asset", "liquidity")
+                    if event.event_type == "execution.fill.recorded":
+                        if any(getattr(existing.payload, key) != getattr(event.payload, key)
+                               for key in fields):
+                            raise RuntimeStateError("conflicting economics for a recorded venue trade")
+                    elif existing.payload != event.payload:
+                        raise RuntimeStateError("conflicting payload for a recorded venue state")
+                    event = existing
                 self.journal.append(event)
             self._journaled.append(event)
         intent_id = self._intents.get(order.client_order_id)

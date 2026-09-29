@@ -8,7 +8,10 @@ withdrawal, no liquidation, no secret, no LLM dependency and no repository-side 
 import re
 from pathlib import Path
 
+import pytest
+
 import crypto_trader.breakglass as breakglass_package
+from crypto_trader.breakglass.audit import run_break_glass_audit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = PROJECT_ROOT / "src" / "crypto_trader"
@@ -179,14 +182,26 @@ def test_phase13_adds_exactly_one_additive_event_contract():
     }
 
 
-def test_no_git_push_was_performed_by_this_phase():
-    head = (PROJECT_ROOT / ".git" / "HEAD").read_text(encoding="utf-8").strip()
-    branch = head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else ""
-    config = (PROJECT_ROOT / ".git" / "config").read_text(encoding="utf-8")
-    upstream_sections = re.findall(r"\[branch \"([^\"]+)\"\]\s*(.*?)(?=\n\[|\Z)", config, re.DOTALL)
+def test_breakglass_audit_does_not_mutate_repository_metadata(tmp_path):
+    def snapshot() -> dict[str, bytes]:
+        git_dir = PROJECT_ROOT / ".git"
+        if not git_dir.is_dir():
+            pytest.skip("repository metadata snapshot requires a standard .git directory")
+        files = [
+            git_dir / "HEAD",
+            git_dir / "config",
+            git_dir / "index",
+            git_dir / "packed-refs",
+        ]
+        refs_dir = git_dir / "refs"
+        if refs_dir.exists():
+            files.extend(path for path in refs_dir.rglob("*") if path.is_file())
+        return {
+            str(path.relative_to(PROJECT_ROOT)): path.read_bytes()
+            for path in files
+            if path.is_file()
+        }
 
-    for name, body in upstream_sections:
-        if name == branch:
-            assert "remote =" not in body, f"the phase-13 branch {name} has a push upstream"
-    remote_refs = list((PROJECT_ROOT / ".git" / "refs" / "remotes").rglob("*"))
-    assert not any("phase-13" in ref.name for ref in remote_refs if ref.is_file())
+    before = snapshot()
+    run_break_glass_audit(tmp_path / "audit")
+    assert snapshot() == before

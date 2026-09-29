@@ -67,7 +67,7 @@ class SessionConfig:
             raise PaperConfigError("producer is required.")
         if not isinstance(self.shadow_submits, bool) or not isinstance(self.queue_aware, bool):
             raise PaperConfigError("shadow_submits and queue_aware must be booleans.")
-        if self.mode is TradingMode.PAPER and not self.queue_aware:
+        if self.places_simulated_orders and not self.queue_aware:
             raise PaperConfigError(
                 "paper mode requires queue-aware simulation "
                 "(queue_position=True, liquidity_consumption=True, book_type=L2_MBP)."
@@ -78,7 +78,7 @@ class SessionConfig:
             equity = Decimal(str(self.starting_equity_quote))
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise PaperConfigError("starting_equity_quote must be a positive number string.") from exc
-        if equity <= 0:
+        if not equity.is_finite() or equity <= 0:
             raise PaperConfigError("starting_equity_quote must be a positive number string.")
 
     @property

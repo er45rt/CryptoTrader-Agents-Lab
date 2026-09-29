@@ -331,19 +331,20 @@ class BreakGlassControl:
         Refused while a break-glass epoch is open: after an emergency takeover the normal runtime may
         not simply help itself to the lease again.
         """
-        epoch = self.load_epoch()
-        if epoch is not None and epoch.is_open:
-            raise BreakGlassActiveError(
-                f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
-                "the trading-state lease until an operator restore completes."
+        with self._ownership_store.exclusive():
+            epoch = self.load_epoch()
+            if epoch is not None and epoch.is_open:
+                raise BreakGlassActiveError(
+                    f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
+                    "the trading-state lease until an operator restore completes."
+                )
+            record = self._ownership_store.takeover(
+                owner_id=owner_id,
+                owner_kind=OwnerKind.NORMAL,
+                acquired_at=self._now(),
+                reason_code=reason_code,
             )
-        record = self._ownership_store.takeover(
-            owner_id=owner_id,
-            owner_kind=OwnerKind.NORMAL,
-            acquired_at=self._now(),
-            reason_code=reason_code,
-        )
-        return WriterGuard(self._ownership_store, record.fence)
+            return WriterGuard(self._ownership_store, record.fence)
 
     def status(self) -> BreakGlassStatus:
         """Read-only posture. Never writes, never mutates, never silently repairs anything."""
@@ -414,7 +415,11 @@ class BreakGlassControl:
     # --- the single ingress ---------------------------------------------------
 
     def handle(self, command: OperatorCommand) -> OperatorCommandOutcome:
-        """Apply one validated operator command deterministically (or refuse it, fail-closed)."""
+        """Serialize the complete operator transaction against normal submission."""
+        with self._ownership_store.exclusive():
+            return self._handle_locked(command)
+
+    def _handle_locked(self, command: OperatorCommand) -> OperatorCommandOutcome:
         if not isinstance(command, OperatorCommand):
             raise BreakGlassConfigError("handle() expects a validated OperatorCommand.")
         delivered_at = self._now()

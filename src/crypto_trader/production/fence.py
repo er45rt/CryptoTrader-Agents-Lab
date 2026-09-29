@@ -2,8 +2,8 @@
 
 This is the last check before a venue submission, and it is deliberately un-cacheable:
 every call re-reads the authoritative journal, the persisted safety state and the current
-ownership record. Nothing about a previous authorization is remembered, so there is no stale
-authorization window.
+ownership record. ProductionRuntime holds the ownership operation lock from this check through
+submission; a check on its own is only a snapshot, never a concurrency guarantee.
 
 Order of the checks (fail closed at the first failure):
 

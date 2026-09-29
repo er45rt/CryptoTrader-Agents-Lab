@@ -22,6 +22,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import sqlite3
+import threading
+from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,6 +46,13 @@ __all__ = [
 
 #: Schema version of the persisted ownership record (not of any event).
 OWNERSHIP_SCHEMA_VERSION = 1
+
+# One local lock per canonical store path, plus a SQLite writer lock for other processes.
+# The lock database contains no trading data. It must stay beside the ownership record.
+_LOCKS_GUARD = threading.Lock()
+_LOCKS: dict[str, threading.RLock] = {}
+_HELD_LOCKS = threading.local()
+_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 class OwnerKind(str, Enum):
@@ -158,6 +168,53 @@ class OwnershipStore:
     def path(self) -> Path:
         return self._path
 
+    @contextmanager
+    def exclusive(self, *, purpose: str = "control"):
+        """Serialize ownership/control changes with final authorization through submission.
+
+        OS-backed SQLite locking covers independent processes; RLock covers separate store
+        instances in one process. Lock failures refuse the operation. A takeover cannot re-enter
+        a submission callback. Emergency control waits for an already-admitted send to finish;
+        once takeover completes, no older writer can begin a send.
+        """
+        record_path = self._path.resolve()
+        lock_path = record_path.with_name(record_path.name + ".lock.db")
+        key = os.path.normcase(str(lock_path))
+        with _LOCKS_GUARD:
+            local_lock = _LOCKS.setdefault(key, threading.RLock())
+        if not local_lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
+            raise OwnershipStateError("ownership operation lock timed out; refusing mutation")
+        connection = None
+        active = getattr(_HELD_LOCKS, "active", None)
+        if active is None:
+            active = _HELD_LOCKS.active = {}
+        try:
+            if key in active:
+                if active[key] == "submission" or purpose == "submission":
+                    raise OwnershipStateError("ownership mutation cannot re-enter a submission")
+                yield
+                return
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(str(lock_path), timeout=_LOCK_TIMEOUT_SECONDS)
+                connection.execute("BEGIN IMMEDIATE")
+            except (OSError, sqlite3.Error) as exc:
+                raise OwnershipStateError("ownership operation lock unavailable; refusing mutation") from exc
+            active[key] = purpose
+            try:
+                yield
+            finally:
+                del active[key]
+        finally:
+            try:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            finally:
+                local_lock.release()
+
     # --- reads ---
 
     def read(self) -> OwnershipRecord | None:
@@ -227,26 +284,27 @@ class OwnershipStore:
         Every token minted before this call becomes stale, which is exactly how the normal writer is
         prevented from trading concurrently with emergency control.
         """
-        if owner_kind not in (OwnerKind.NORMAL, OwnerKind.EMERGENCY):
-            raise OwnershipStateError("takeover requires an OwnerKind.")
-        if not isinstance(owner_id, str) or not owner_id.strip():
-            raise OwnershipStateError("takeover requires a non-empty owner id.")
-        if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
-            raise OwnershipStateError("acquired_at must be timezone-aware.")
-        previous = self.read()
-        previous_owner = None if previous is None else previous.owner_id
-        term = 1 if previous is None else previous.term + 1
-        record = OwnershipRecord(
-            term=term,
-            owner_id=owner_id,
-            owner_kind=owner_kind,
-            acquired_at=acquired_at.astimezone(timezone.utc),
-            previous_owner_id=previous_owner,
-            reason_code=reason_code,
-            session_id=uuid4() if session_id is None else session_id,
-        )
-        self._write(record)
-        return record
+        with self.exclusive(purpose="takeover"):
+            if owner_kind not in (OwnerKind.NORMAL, OwnerKind.EMERGENCY):
+                raise OwnershipStateError("takeover requires an OwnerKind.")
+            if not isinstance(owner_id, str) or not owner_id.strip():
+                raise OwnershipStateError("takeover requires a non-empty owner id.")
+            if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
+                raise OwnershipStateError("acquired_at must be timezone-aware.")
+            previous = self.read()
+            previous_owner = None if previous is None else previous.owner_id
+            term = 1 if previous is None else previous.term + 1
+            record = OwnershipRecord(
+                term=term,
+                owner_id=owner_id,
+                owner_kind=owner_kind,
+                acquired_at=acquired_at.astimezone(timezone.utc),
+                previous_owner_id=previous_owner,
+                reason_code=reason_code,
+                session_id=uuid4() if session_id is None else session_id,
+            )
+            self._write(record)
+            return record
 
     def _write(self, record: OwnershipRecord) -> None:
         payload = json.dumps(record.to_record(), indent=2, sort_keys=True)

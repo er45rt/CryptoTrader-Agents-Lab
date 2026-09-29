@@ -63,11 +63,11 @@ class RiskLimits:
             raise RiskConfigError("limits_version is required.")
         for name in (*_REQUIRED_DECIMAL_QUOTE, *_REQUIRED_DECIMAL_PCT):
             value = getattr(self, name)
-            if not isinstance(value, Decimal) or value <= 0:
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
                 raise RiskConfigError(f"{name} must be a positive Decimal.")
         for name in _REQUIRED_INT:
             value = getattr(self, name)
-            if not isinstance(value, int) or value <= 0:
+            if type(value) is not int or value <= 0:
                 raise RiskConfigError(f"{name} must be a positive integer.")
         if not isinstance(self.reduce_only_mode, bool) or not isinstance(self.trading_halted, bool):
             raise RiskConfigError("reduce_only_mode and trading_halted must be booleans.")
@@ -102,6 +102,9 @@ def load_limits(config: Mapping[str, Any]) -> RiskLimits:
         name: _decimal(config[name], name=name)
         for name in (*_REQUIRED_DECIMAL_QUOTE, *_REQUIRED_DECIMAL_PCT)
     }
+    for name in _OPTIONAL_BOOL:
+        if name in config and not isinstance(config[name], bool):
+            raise RiskConfigError(f"{name} must be a boolean.")
     return RiskLimits(
         limits_version=str(config["limits_version"]),
         **decimals,
