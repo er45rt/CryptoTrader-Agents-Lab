@@ -15,7 +15,11 @@ from crypto_trader.breakglass import (
     StaleWriterFenceError,
 )
 from crypto_trader.persistence import SQLiteEventJournal
-from crypto_trader.production import ProductionStartupError, ProductionStateError
+from crypto_trader.production import (
+    ProductionSafetyBlockedError,
+    ProductionStartupError,
+    ProductionStateError,
+)
 from crypto_trader.safety import SafetyMode
 from crypto_trader.tests.production_fixtures import (
     INSTRUMENT,
@@ -143,6 +147,44 @@ def test_a_non_normal_halt_posture_also_refuses_startup(journal, state_dir):
 
     assert "halt_new_risk" in str(raised.value)
     assert port.submit_count == 0
+
+
+@pytest.mark.parametrize("kill_switch_engaged", [False, True])
+def test_final_fence_distinguishes_normal_mode_kill_switch_state(
+    journal, state_dir, kill_switch_engaged
+):
+    control, port, runtime = _started_runtime(journal, state_dir)
+    report = runtime.start()
+    preparation = runtime.prepare_intent(intent(f"normal-kill-switch-{kill_switch_engaged}"))
+
+    assert preparation.approved is True
+    assert port.submit_count == 0
+
+    persist_safety_state(
+        state_dir,
+        mode="normal",
+        kill_switch_engaged=kill_switch_engaged,
+        sequence=2,
+    )
+    load = control.load_safety_state()
+    assert load.source == "state_file"
+    assert load.forced_fail_closed is False
+    assert load.controller.mode is SafetyMode.NORMAL
+    assert load.controller.kill_switch_engaged is kill_switch_engaged
+    ownership = control.ownership_store.require_fence()
+    assert ownership.owner_kind is OwnerKind.NORMAL
+    assert ownership.owner_id == report.owner_id
+    assert ownership.term == report.fence_term
+
+    if kill_switch_engaged:
+        with pytest.raises(ProductionSafetyBlockedError, match=r"^kill_switch_engaged:"):
+            runtime.submit_prepared(preparation)
+        assert port.submit_count == 0
+    else:
+        result = runtime.submit_prepared(preparation)
+        assert result.fence.kill_switch_engaged is False
+        assert result.fence.safety_mode == "normal"
+        assert port.submit_count == 1
 
 
 # --- 6/7/8: takeover invalidates a running writer --------------------------------
