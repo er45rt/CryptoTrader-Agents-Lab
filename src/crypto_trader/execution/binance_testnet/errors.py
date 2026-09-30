@@ -19,6 +19,7 @@ __all__ = [
     "TestnetSymbolError",
     "TestnetRejectedError",
     "UnsafeTestnetAccountError",
+    "UnsupportedOrderTypeError",
     "VenueProtocolRejectionError",
 ]
 
@@ -80,6 +81,10 @@ class TestnetRejectedError(BinanceTestnetError):
 
 class UnsafeTestnetAccountError(BinanceTestnetError):
     """The testnet account has unsafe permissions (for example withdrawals are enabled)."""
+
+
+class UnsupportedOrderTypeError(BinanceTestnetError):
+    """A venue-writing order type has no approved fail-closed validation contract."""
 
 
 class AttemptJournalRequiredError(BinanceTestnetError):

@@ -45,6 +45,7 @@ from .errors import (
     TestnetRejectedError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
+    UnsupportedOrderTypeError,
     VenueProtocolRejectionError,
 )
 from .models import (
@@ -119,6 +120,7 @@ __all__ = [
     "TransportError",
     "TransportTimeout",
     "UnsafeTestnetAccountError",
+    "UnsupportedOrderTypeError",
     "VenueProtocolRejectionError",
     "WithdrawalPolicy",
     "assert_no_mainnet_reference",

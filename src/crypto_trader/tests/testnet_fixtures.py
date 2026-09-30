@@ -132,6 +132,7 @@ def exchange_info_response(
     tick: str = "0.01",
     step: str = "0.00001",
     min_qty: str = "0.00001",
+    max_qty: str = "9000.00000000",
     min_notional: str = "5",
 ) -> HttpResponse:
     return response(
@@ -145,7 +146,12 @@ def exchange_info_response(
                     "quoteAsset": "USDT",
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": tick},
-                        {"filterType": "LOT_SIZE", "stepSize": step, "minQty": min_qty},
+                        {
+                            "filterType": "LOT_SIZE",
+                            "stepSize": step,
+                            "minQty": min_qty,
+                            "maxQty": max_qty,
+                        },
                         {"filterType": "NOTIONAL", "minNotional": min_notional},
                     ],
                 }

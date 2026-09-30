@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
+from ..exchange_filters import ExchangeSymbolFilters
 from ..ports import ExecutionObservation, OrderLifecycleState
 
 __all__ = [
@@ -193,33 +194,16 @@ def format_decimal(value: Decimal) -> str:
 
 
 @dataclass(frozen=True)
-class TestnetSymbolRules:
-    """Trading rules for one symbol, as reported by ``exchangeInfo``."""
+class TestnetSymbolRules(ExchangeSymbolFilters):
+    """Compatibility view over the shared fail-closed exchange filter contract."""
 
-    symbol: str
-    base_asset: str
-    quote_asset: str
-    price_tick: Decimal
-    quantity_step: Decimal
-    min_quantity: Decimal = ZERO
-    min_notional: Decimal = ZERO
-    status: str = "TRADING"
+    @property
+    def price_tick(self) -> Decimal:
+        return self.tick_size
 
-    def quantity_is_valid(self, quantity: Decimal) -> bool:
-        """True when the quantity satisfies step size and minimum (no rounding performed)."""
-        if quantity < self.min_quantity:
-            return False
-        if self.quantity_step > 0 and quantity % self.quantity_step != 0:
-            return False
-        return True
-
-    def price_is_valid(self, price: Decimal) -> bool:
-        if self.price_tick > 0 and price % self.price_tick != 0:
-            return False
-        return price > 0
-
-    def notional_is_valid(self, quantity: Decimal, price: Decimal) -> bool:
-        return quantity * price >= self.min_notional
+    @property
+    def quantity_step(self) -> Decimal:
+        return self.step_size
 
 
 def utc_from_ms(value: int | None) -> datetime | None:

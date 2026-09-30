@@ -10,9 +10,11 @@ from crypto_trader.execution.binance_testnet import (
     RateLimitBanError,
     RateLimitError,
     ScriptedTransport,
+    UnsupportedOrderTypeError,
     WithdrawalPolicy,
     TransportTimeout,
 )
+from crypto_trader.execution.binance_testnet import TestnetOrderRequest as OrderRequest
 from crypto_trader.execution.binance_testnet import TestnetSymbolError as SymbolError
 from crypto_trader.execution.binance_testnet import TestnetRejectedError as RejectedError
 from crypto_trader.execution.binance_testnet import UnsafeTestnetAccountError as UnsafeAccountError
@@ -213,6 +215,57 @@ def test_order_validation_never_rounds():
 
     with pytest.raises(SymbolError):
         fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID, quantity="0.00150000"))
+
+
+def test_valid_limit_fok_prepares_through_shared_filters():
+    transport = ScriptedTransport(responses=[fx.exchange_info_response()])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    request = OrderRequest(
+        client_order_id=CLIENT_ORDER_ID,
+        symbol=fx.SYMBOL,
+        side="BUY",
+        order_type="LIMIT",
+        quantity=Decimal("0.00100000"),
+        price=Decimal("27000.00"),
+        time_in_force="FOK",
+    )
+
+    prepared = client.prepare_order(request)
+
+    assert prepared.requires_write is True
+    assert "timeInForce=FOK" in prepared.request.query
+    assert not [item for item in transport.requests if item.method == "POST"]
+
+
+def test_market_venue_write_is_rejected_before_any_request():
+    client = fx.client(ScriptedTransport(responses=[]))
+    request = OrderRequest(
+        client_order_id=CLIENT_ORDER_ID,
+        symbol=fx.SYMBOL,
+        side="BUY",
+        order_type="MARKET",
+        quantity=Decimal("0.00100000"),
+    )
+
+    with pytest.raises(UnsupportedOrderTypeError):
+        client.prepare_order(request)
+
+    assert client.transport.requests == []
+
+
+def test_verify_environment_fails_closed_on_incomplete_exchange_info():
+    malformed = fx.exchange_info_response()
+    malformed.body["symbols"][0]["filters"][1].pop("maxQty")
+    transport = ScriptedTransport(
+        responses=[fx.time_response(), malformed, fx.account_response()]
+    )
+    client = fx.client(transport)
+
+    with pytest.raises(SymbolError):
+        client.verify_environment()
+
+    assert fx.request_paths(transport) == ["/api/v3/time", "/api/v3/exchangeInfo"]
 
 
 # --- ambiguity / retries / rate limits -------------------------------------

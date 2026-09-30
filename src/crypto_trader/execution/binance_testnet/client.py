@@ -24,6 +24,11 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
+from ..exchange_filters import (
+    ExchangeFilterValidationError,
+    parse_exchange_filters,
+    validate_limit_order,
+)
 from ..ports import OrderLifecycleState
 from .clock import TestnetClock
 from .credentials import TestnetCredentials
@@ -37,6 +42,7 @@ from .errors import (
     TestnetRejectedError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
+    UnsupportedOrderTypeError,
     VenueProtocolRejectionError,
 )
 from .models import (
@@ -280,23 +286,20 @@ class BinanceSpotTestnetClient:
         body = self._request(
             PATH_EXCHANGE_INFO, {"symbol": target}, weight=_WEIGHT_EXCHANGE_INFO, is_write=False
         )
-        symbols = body.get("symbols") if isinstance(body, Mapping) else None
-        if not symbols:
-            raise TestnetSymbolError(f"symbol {target!r} was not found on the testnet exchange.")
-        entry = symbols[0]
-        filters = {item["filterType"]: item for item in entry.get("filters", [])}
-        price_filter = filters.get("PRICE_FILTER", {})
-        lot_filter = filters.get("LOT_SIZE", {})
-        notional_filter = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
+        try:
+            parsed = parse_exchange_filters(body, target)
+        except ExchangeFilterValidationError as exc:
+            raise TestnetSymbolError(str(exc)) from exc
         self._rules = TestnetSymbolRules(
-            symbol=str(entry.get("symbol", target)),
-            base_asset=str(entry.get("baseAsset", "")),
-            quote_asset=str(entry.get("quoteAsset", "")),
-            price_tick=Decimal(str(price_filter.get("tickSize", "0.00000001"))),
-            quantity_step=Decimal(str(lot_filter.get("stepSize", "0.00000001"))),
-            min_quantity=Decimal(str(lot_filter.get("minQty", "0"))),
-            min_notional=Decimal(str(notional_filter.get("minNotional", "0"))),
-            status=str(entry.get("status", "UNKNOWN")),
+            symbol=parsed.symbol,
+            status=parsed.status,
+            base_asset=parsed.base_asset,
+            quote_asset=parsed.quote_asset,
+            tick_size=parsed.tick_size,
+            step_size=parsed.step_size,
+            min_quantity=parsed.min_quantity,
+            max_quantity=parsed.max_quantity,
+            min_notional=parsed.min_notional,
         )
         return self._rules
 
@@ -330,24 +333,18 @@ class BinanceSpotTestnetClient:
                 existing=replace(current, deduplicated=True),
             )
 
-        rules = self.symbol_rules(request.symbol)
-        if not rules.quantity_is_valid(request.quantity):
-            raise TestnetSymbolError(
-                f"quantity {format_decimal(request.quantity)} violates the {request.symbol} step "
-                f"size {format_decimal(rules.quantity_step)}; the adapter never rounds quantities."
+        if request.order_type == "MARKET":
+            raise UnsupportedOrderTypeError(
+                "MARKET venue writes are disabled until an explicit Binance market-notional "
+                "validation contract is implemented."
             )
-        if request.order_type == "LIMIT":
-            assert request.price is not None
-            if not rules.price_is_valid(request.price):
-                raise TestnetSymbolError(
-                    f"price {format_decimal(request.price)} violates the {request.symbol} tick size "
-                    f"{format_decimal(rules.price_tick)}; the adapter never rounds prices."
-                )
-            if not rules.notional_is_valid(request.quantity, request.price):
-                raise TestnetSymbolError(
-                    f"order notional is below the {request.symbol} minimum "
-                    f"{format_decimal(rules.min_notional)}."
-                )
+
+        rules = self.symbol_rules(request.symbol)
+        assert request.price is not None
+        try:
+            validate_limit_order(rules, price=request.price, quantity=request.quantity)
+        except ExchangeFilterValidationError as exc:
+            raise TestnetSymbolError(str(exc)) from exc
 
         params: dict[str, object] = {
             "symbol": request.symbol,
