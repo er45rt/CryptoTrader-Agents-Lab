@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from decimal import ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 
 import pytest
@@ -98,7 +98,9 @@ def _resting_limit_request(client, *, side: str = "BUY") -> SpotOrderRequest:
     tick = rules.price_tick.normalize()
     step = rules.quantity_step.normalize()
 
-    raw_price = (market / 2) if side == "BUY" else (market * 2)
+    # Keep resting prices inside the venue's percent-price band, as in the other live tests.
+    offset = Decimal("0.9") if side == "BUY" else Decimal("1.1")
+    raw_price = market * offset
     price = ((raw_price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick).quantize(tick)
 
     minimum_quantity = max(rules.min_notional / price, rules.min_quantity)
