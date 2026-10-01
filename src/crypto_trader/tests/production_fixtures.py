@@ -310,3 +310,11 @@ def testnet_runtime(
         control=control,
     )
     return runtime, port
+
+
+def startup_responses(*, can_withdraw=False, can_trade=True):
+    """Offline G6 collection (time/openOrders), then execution environment checks."""
+    from crypto_trader.tests import testnet_fixtures as fx
+    return [fx.time_response(), fx.open_orders_response(), *fx.environment_responses(
+        can_withdraw=can_withdraw, can_trade=can_trade,
+    )]

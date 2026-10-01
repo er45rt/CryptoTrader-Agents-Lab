@@ -31,6 +31,7 @@ from crypto_trader.execution.binance_testnet import ScriptedTransport
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.tests import testnet_fixtures as fx
+from crypto_trader.tests.production_fixtures import INSTRUMENT as PRODUCTION_INSTRUMENT, startup_responses
 from crypto_trader.tests.production_fixtures import (
     RecordingExecutionPort,
     build_runtime,
@@ -271,14 +272,14 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
     reference = f"ct-{intent_obj.intent_id.hex[:20]}"
     transport = ScriptedTransport(
         responses=[
-            *fx.environment_responses(),
+            *startup_responses(),
             fx.order_response(reference, status="NEW"),
         ]
     )
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
     with SQLiteEventJournal(tmp_path / "journal.db") as journal:
-        port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+        port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
         runtime = build_runtime(journal=journal, state_dir=tmp_path / "state", execution=port)
 
         assert port.capability is ExecutionCapability.DURABLE_VENUE_WRITING

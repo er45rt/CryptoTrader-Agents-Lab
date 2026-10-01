@@ -29,6 +29,7 @@ _AUTHORIZED_MODULES = {
     "rate_limit.py",
     "runtime.py",
     "signing.py",
+    "startup.py",
     "transport.py",
     "translate.py",
 }

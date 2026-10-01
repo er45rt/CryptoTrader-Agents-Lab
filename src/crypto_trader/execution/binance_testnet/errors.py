@@ -79,6 +79,10 @@ class TestnetRejectedError(BinanceTestnetError):
     """The venue rejected the request deterministically (a real, non-ambiguous outcome)."""
 
 
+class OrderNotFoundError(TestnetRejectedError):
+    """A signed order read returned HTTP 400 with integer Binance code -2013."""
+
+
 class UnsafeTestnetAccountError(BinanceTestnetError):
     """The testnet account has unsafe permissions (for example withdrawals are enabled)."""
 

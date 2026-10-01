@@ -207,12 +207,13 @@ def test_soak_restart_requires_new_determinism_evidence_without_erasing_history(
 def test_durable_boundary_rejects_changed_wiring_or_marker(tmp_path,monkeypatch,mutation):
     from crypto_trader.execution import NonDurableExecutionError,ExecutionCapability
     from crypto_trader.tests import testnet_fixtures as tfx
-    from crypto_trader.tests.production_fixtures import build_runtime,intent
+    from crypto_trader.tests.production_fixtures import build_runtime,intent,INSTRUMENT,startup_responses
     target=intent('review-wiring')
     reference=f'ct-{target.intent_id.hex[:20]}'
-    transport=ScriptedTransport(responses=[*tfx.environment_responses(),tfx.order_response(reference,status='NEW')])
+    transport=ScriptedTransport(responses=[*startup_responses(),tfx.order_response(reference,status='NEW')])
     with SQLiteEventJournal(tmp_path/'journal.db') as journal, SQLiteEventJournal(tmp_path/'other.db') as other:
         port=runtime(transport,journal=journal)
+        port.instrument=INSTRUMENT
         production=build_runtime(journal=journal,state_dir=tmp_path/'state',execution=port)
         production.start()
         preparation=production.prepare_intent(target)

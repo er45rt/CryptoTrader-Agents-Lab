@@ -471,3 +471,75 @@ def test_reconnect_reverifies_endpoint_clock_and_permissions():
     assert fx.request_paths(transport).count("/api/v3/time") == 2
     assert fx.request_paths(transport).count("/api/v3/account") == 2
     assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+# G6: strict startup reads preserve the raw evidence boundary and never adopt a cache.
+@pytest.mark.parametrize("body", [None, {}, "", "[]", 0, False, {"orders": []}])
+def test_startup_open_orders_rejects_non_list_empty_bodies(body):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([fx.response(200, body)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_open_orders(fx.SYMBOL)
+    assert client._orders == {}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("symbol", "ETHUSDT"), ("clientOrderId", "other"), ("clientOrderId", None),
+    ("orderId", None), ("orderId", True), ("status", None), ("status", "UNKNOWN"),
+    ("origQty", None), ("executedQty", None), ("origQty", "NaN"),
+    ("executedQty", "Infinity"), ("origQty", "-1"), ("executedQty", "-1"),
+    ("executedQty", "2"), ("executedQty", "0.0001"),
+])
+def test_startup_status_rejects_invalid_identity_status_and_quantity(field, value):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    body = dict(fx.order_response(CLIENT_ORDER_ID).body)
+    body[field] = value
+    client = fx.client(ScriptedTransport([fx.response(200, body)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_order_status(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert client._orders == {}
+
+
+@pytest.mark.parametrize("status,original,executed", [
+    ("FILLED", "1", "0.9"), ("PARTIALLY_FILLED", "1", "0"),
+    ("PARTIALLY_FILLED", "1", "1"), ("NEW", "0", "0"),
+])
+def test_startup_status_rejects_inconsistent_quantities(status, original, executed):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([fx.order_response(
+        CLIENT_ORDER_ID, status=status, orig_qty=original, executed_qty=executed,
+    )]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_order_status(fx.SYMBOL, CLIENT_ORDER_ID)
+
+
+@pytest.mark.parametrize("http,code,absent", [
+    (400, -2013, True), (401, -2013, False), (403, -2013, False),
+    (400, "-2013", False), (400, -2013.0, False), (400, -2010, False),
+    (302, -2013, False), (400, True, False),
+])
+def test_startup_exact_order_absence_is_typed_only_for_the_approved_read(http, code, absent):
+    from crypto_trader.execution.binance_testnet.errors import OrderNotFoundError
+    transport = ScriptedTransport([fx.response(http, {"code": code, "msg": "missing"})])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(RejectedError) as caught:
+        client.startup_order_status(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert isinstance(caught.value, OrderNotFoundError) is absent
+    assert not transport.requests[0].is_write
+    assert client._orders == {}
+
+
+def test_startup_valid_reads_are_signed_and_leave_client_cache_untouched():
+    transport = ScriptedTransport([
+        fx.open_orders_response(CLIENT_ORDER_ID),
+        fx.order_response("another", status="FILLED", executed_qty="0.00100000"),
+    ])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    assert client.startup_open_orders(fx.SYMBOL)[0].client_order_id == CLIENT_ORDER_ID
+    assert client.startup_order_status(fx.SYMBOL, "another").status == "FILLED"
+    assert client._orders == {}
+    assert all(r.method == "GET" and "signature=" in r.query for r in transport.requests)

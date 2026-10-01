@@ -39,6 +39,7 @@ from .errors import (
     BinanceTestnetError,
     ClockDriftError,
     RateLimitError,
+    OrderNotFoundError,
     TestnetRejectedError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
@@ -663,6 +664,72 @@ class BinanceSpotTestnetClient:
             self._orders[order.client_order_id] = order
         return orders
 
+    def startup_open_orders(self, symbol: str) -> tuple[TestnetOrder, ...]:
+        """Strict signed startup evidence; never adopts orders into the client cache."""
+        body = self._request(
+            PATH_OPEN_ORDERS, {"symbol": symbol}, weight=_WEIGHT_READ_OPEN_ORDERS,
+            is_write=False, signed=True,
+        )
+        if not isinstance(body, list):
+            raise BinanceTestnetError("startup openOrders must return a list.")
+        orders = tuple(self._parse_startup_order(item, symbol) for item in body)
+        if any(order.status not in {"NEW", "PARTIALLY_FILLED", "PENDING_CANCEL"} for order in orders):
+            raise BinanceTestnetError("startup openOrders returned a terminal order.")
+        return orders
+
+    def startup_order_status(self, symbol: str, reference: str) -> TestnetOrder:
+        """Strict targeted read, with exact request identity and typed negative evidence."""
+        body = self._request(
+            PATH_ORDER, {"symbol": symbol, "origClientOrderId": reference},
+            weight=_WEIGHT_READ_ORDER, is_write=False, signed=True,
+            classify_order_absence=True,
+        )
+        return self._parse_startup_order(body, symbol, reference)
+
+    def _parse_startup_order(
+        self, body: Any, symbol: str, reference: str | None = None,
+    ) -> TestnetOrder:
+        if not isinstance(body, Mapping):
+            raise BinanceTestnetError("startup order evidence must be an object.")
+        identity = body.get("clientOrderId")
+        status = body.get("status")
+        venue_id = body.get("orderId")
+        if (
+            not isinstance(identity, str) or not identity.strip()
+            or (reference is not None and identity != reference)
+            or body.get("symbol") != symbol
+            or not isinstance(status, str) or status not in STATUS_TO_STATE
+            or type(venue_id) is not int or venue_id <= 0
+        ):
+            raise BinanceTestnetError("startup order identity, symbol or status is invalid.")
+        quantities = []
+        for name in ("origQty", "executedQty"):
+            value = body.get(name)
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                raise BinanceTestnetError("startup order quantities are missing or malformed.")
+            try:
+                parsed = Decimal(str(value))
+            except InvalidOperation as exc:
+                raise BinanceTestnetError("startup order quantity is malformed.") from exc
+            if not parsed.is_finite() or parsed < 0:
+                raise BinanceTestnetError("startup order quantity is not finite/nonnegative.")
+            quantities.append(parsed)
+        original, executed = quantities
+        if (
+            original <= 0 or executed > original
+            or (status == "FILLED" and executed != original)
+            or (status == "NEW" and executed != 0)
+            or (status == "PARTIALLY_FILLED" and not 0 < executed < original)
+        ):
+            raise BinanceTestnetError("startup order status/quantities are inconsistent.")
+        # Construct only the reconciliation fields; ancillary legacy defaults cannot hide
+        # missing identity/status/quantity evidence or clamp inconsistent quantities.
+        return TestnetOrder(
+            symbol=symbol, client_order_id=identity, venue_order_id=str(venue_id),
+            status=status, state=STATUS_TO_STATE[status], original_quantity=original,
+            executed_quantity=executed,
+        )
+
     def cancel_all_open_orders(self, symbol: str) -> tuple[TestnetOrder, ...]:
         """Cancel every open order for ``symbol`` (the Safety Lane cancel-all action)."""
         results: list[TestnetOrder] = []
@@ -705,6 +772,7 @@ class BinanceSpotTestnetClient:
         is_write: bool,
         signed: bool = False,
         method: str | None = None,
+        classify_order_absence: bool = False,
     ) -> Any:
         assert self.budget is not None
         attempt = 0
@@ -774,6 +842,14 @@ class BinanceSpotTestnetClient:
                 self._sleep(self.retry.delay_for_attempt(attempt))
                 continue
 
+            if (
+                classify_order_absence and not is_write and resolved_method == "GET"
+                and path == PATH_ORDER and response.status_code == 400
+                and isinstance(response.body, Mapping)
+                and type(response.body.get("code")) is int
+                and response.body["code"] == -2013
+            ):
+                raise OrderNotFoundError("the signed order read confirmed order absence (-2013).")
             code, message = self._error_of(response)
             if code == CODE_TIMESTAMP_OUTSIDE_RECV_WINDOW:
                 if is_write:

@@ -27,6 +27,9 @@ selected explicitly and refused while disabled.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,6 +38,10 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
+from crypto_trader.events import (
+    ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    EXECUTION_FILL_EVENT_TYPE,
+)
 from crypto_trader.execution import (
     DurableVenueWritePort,
     ExecutionCapability,
@@ -48,8 +55,13 @@ from crypto_trader.execution import (
     NonDurableExecutionError,
 )
 from crypto_trader.execution.binance_testnet import AmbiguousOrderError
+from crypto_trader.execution.binance_testnet.startup import (
+    BinanceStartupCollector, StartupEvidenceError,
+)
 from crypto_trader.persistence import EventJournal
+from crypto_trader.recovery.journaling import reconciliation_events
 from crypto_trader.recovery import (
+    OrderStateReconstructor,
     ReconciliationEngine,
     ReconciliationPolicy,
     RestartRecovery,
@@ -101,6 +113,81 @@ _SIDE_TO_RISK = {
     ExecutionSide.BUY: RiskSide.BUY,
     ExecutionSide.SELL: RiskSide.SELL,
 }
+
+
+def canonical_event(event) -> str:
+    # Concrete models preserve payload fields, envelope identity and explicit nulls.
+    return json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class JournalView:
+    contents: tuple[tuple[UUID, str], ...]
+    required_references: tuple[str, ...]
+    state_references: tuple[str, ...]
+    fingerprint: str
+
+    @classmethod
+    def capture(cls, journal, symbol: str) -> JournalView:
+        events = journal.read_range()
+        rebuilt = OrderStateReconstructor()
+        for event in events:
+            if event.event_type in {
+                ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+                EXECUTION_FILL_EVENT_TYPE,
+            } and event.symbol != symbol:
+                raise StartupEvidenceError("writing startup requires a dedicated single-symbol journal.")
+            rebuilt.handle(event)
+        states = rebuilt.states()
+        if any(state.symbol != symbol for state in states) or any(
+            anchor.symbol != symbol for anchor in rebuilt.attempt_anchor_map().values()
+        ):
+            raise StartupEvidenceError("reconstructed journal scope does not match the instrument.")
+        contents = tuple((event.event_id, canonical_event(event)) for event in events)
+        if len({identity for identity, _ in contents}) != len(contents):
+            raise StartupEvidenceError("journal identities are not unique.")
+        return cls(
+            contents=contents,
+            required_references=tuple(sorted(
+                state.order_reference for state in states
+                if state.submission_attempted and not state.is_terminal
+            )),
+            state_references=tuple(sorted(state.order_reference for state in states)),
+            fingerprint=hashlib.sha256(json.dumps(
+                [value for _, value in contents], separators=(",", ":"),
+            ).encode()).hexdigest(),
+        )
+
+    def require_stable(self, journal, *, symbol, run=None, now=None, producer=None, correlation=None):
+        current = JournalView.capture(journal, symbol)
+        allowed = ()
+        if run is not None:
+            ids = tuple(run.journaled_event_ids)
+            baseline_ids = {identity for identity, _ in self.contents}
+            if len(ids) != 3 or len(set(ids)) != 3 or baseline_ids.intersection(ids):
+                raise StartupEvidenceError("recovery event identities are invalid.")
+            expected = reconciliation_events(
+                run.report, occurred_at=now, producer=producer,
+                correlation_id=correlation, event_ids=ids,
+            )
+            allowed = tuple((event.event_id, canonical_event(event)) for event in expected)
+            actual = dict(current.contents)
+            if any(actual.get(identity) != value for identity, value in allowed):
+                raise StartupEvidenceError("recovery pass additions do not match this run.")
+        allowed_ids = {identity for identity, _ in allowed}
+        if tuple(item for item in current.contents if item[0] not in allowed_ids) != self.contents:
+            raise StartupEvidenceError("journal changed during startup evidence collection/recovery.")
+        if (
+            current.required_references != self.required_references
+            or current.state_references != self.state_references
+        ):
+            raise StartupEvidenceError("journal-derived query coverage changed during startup.")
+        if run is not None and tuple(sorted(
+            state.order_reference for state in run.rebuilt_states
+        )) != self.state_references:
+            raise StartupEvidenceError("recovery reconstructed a different journal view.")
+        if run is not None and any(state.symbol != symbol for state in run.rebuilt_states):
+            raise StartupEvidenceError("recovery rebuilt another symbol.")
 
 
 @dataclass(frozen=True)
@@ -261,6 +348,7 @@ class ProductionStartupReport:
     started_at: datetime
     journaled_event_ids: tuple[UUID, ...] = ()
     notes: tuple[str, ...] = ()
+    venue_evidence: dict[str, object] | None = None
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -275,6 +363,7 @@ class ProductionStartupReport:
             "started_at": self.started_at.astimezone(timezone.utc).isoformat(),
             "journaled_event_ids": [str(event_id) for event_id in self.journaled_event_ids],
             "notes": list(self.notes),
+            "venue_evidence": self.venue_evidence,
         }
 
 
@@ -441,94 +530,145 @@ class ProductionRuntime:
     # --- lifecycle -----------------------------------------------------------
 
     def start(self, *, correlation_id: UUID | None = None) -> ProductionStartupReport:
-        """Fail-closed startup: environment, posture, recovery, then claim the normal lease."""
+        """Writing startup claims first, then proves current signed venue/recovery evidence."""
         if self._state is ExecutionRuntimeState.RUNNING:
             raise ProductionStateError("the production runtime is already running.")
-        now = self._now()
-        run_id = correlation_id or uuid4()
-
-        # 1. Environment first: a disabled production environment is refused before anything else.
-        decision = resolve_environment(
-            self._requested_environment,
-            mainnet_authorized=self._mainnet_authorized,
-            mainnet_base_url=self._mainnet_base_url,
-        )
-
-        # 2. Persisted safety state: a normal trading writer requires a normal posture.
-        load = self._control.load_safety_state()
-        self._require_startup_posture(load.controller)
-
-        # 3. Journal/recovery state: unresolved orders block new risk.
-        reconstructed, _rebuild = reconstruct_order_states(self._journal)
-        local_states = reconstructed.states()
-        recovery = RestartRecovery(
-            engine=ReconciliationEngine(self._reconciliation_policy),
-            journal=self._journal,
-            venue_sources=list(self._venue_sources)
-            or [StaticVenueStateSource(entries=(), name="production.no-venue-evidence")],
-            producer=self._producer,
-        )
-        run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
-        if not run.report.is_fully_resolved:
-            self._last_refusal = "recovery_required"
-            raise ProductionRecoveryRequiredError(
-                "startup refused: order state is not fully reconciled (unresolved: "
-                f"{sorted(run.report.unresolved_orders)}); new risk stays blocked until evidence "
-                "resolves it through Phase 8 reconciliation."
-            )
-
-        # 4. Claim the single authoritative normal writer lease (a fresh fencing term).
+        self._startup = None
+        self._environment = self._guard = self._fence = self._last_fence = None
+        self._last_outcome = self._last_refusal = None
+        execution_started = False
+        phase = "environment"
         try:
-            guard = self._control.claim_normal_writer(
-                owner_id=self._owner_id, reason_code="production_runtime_started"
+            now = self._now()
+            run_id = correlation_id or uuid4()
+            nonce = uuid4()  # Caller correlation identity never supplies freshness.
+            decision = resolve_environment(
+                self._requested_environment, mainnet_authorized=self._mainnet_authorized,
+                mainnet_base_url=self._mainnet_base_url,
             )
-        except BreakGlassError as exc:
-            self._last_refusal = "writer_lease_unavailable"
-            raise ProductionStateError(
-                "startup refused: the normal writer lease could not be claimed "
-                f"({type(exc).__name__}): {exc}"
-            ) from exc
+            phase = "startup_posture"
+            load = self._control.load_safety_state()
+            self._require_startup_posture(load.controller)
+            phase = "execution_context"
+            capability = self._resolve_execution_capability(self._execution)
+            if capability is not self._capability:
+                raise NonDurableExecutionError("execution capability changed before startup.")
+            writing = capability.writes_to_venue
+            collector = None
+            if writing:
+                if self._execution.durable_attempt_journal() is not self._journal:
+                    raise NonDurableExecutionError("execution startup journal wiring changed.")
+                if self._venue_sources:
+                    raise StartupEvidenceError("writing startup refuses caller-supplied venue sources.")
+                collector = BinanceStartupCollector(
+                    self._execution, journal=self._journal,
+                    instrument=self._instrument, endpoint=decision.base_url,
+                )
 
-        # 5. Bind the fence to the held token and prove it is current before serving traffic.
-        fence = ProductionFence(
-            control=self._control,
-            guard=guard,
-            owner_id=self._owner_id,
-            environment=decision.environment,
-        )
-        check = fence.authorize_new_risk(now=now, correlation_id=run_id)
+            def claim():
+                try:
+                    return self._control.claim_normal_writer(
+                        owner_id=self._owner_id, reason_code="production_runtime_started",
+                    )
+                except BreakGlassError as exc:
+                    self._last_refusal = "writer_lease_unavailable"
+                    raise ProductionStateError("startup refused: normal writer lease unavailable.") from exc
 
-        # 6. Start the execution boundary. For the Spot Testnet adapter this verifies the endpoint,
-        #    the clock and the account's least-privilege permissions (trading enabled, withdrawals
-        #    unavailable) BEFORE any order can be attempted; a failure here leaves the runtime
-        #    stopped with no traffic.
-        try:
+            guard = fence = view = batch = None
+            if writing:
+                phase = "writer_claim"
+                guard = claim()
+                fence = ProductionFence(
+                    control=self._control, guard=guard, owner_id=self._owner_id,
+                    environment=decision.environment,
+                )
+                fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                phase = "venue_evidence"
+                view = JournalView.capture(self._journal, self._instrument.symbol)
+                batch = collector.collect(
+                    nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
+                )
+                # The ownership lock is deliberately not held during network I/O.
+                fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                source = collector.validate(batch, nonce=nonce, fence_term=fence.fence_term, view=view)
+                view.require_stable(self._journal, symbol=self._instrument.symbol)
+                sources = [source]
+                local_states = None  # Preserve conflicts and immutable durable attempt anchors.
+            else:
+                # Explicit NON_WRITING ports retain their offline behavior.
+                reconstructed, _ = reconstruct_order_states(self._journal)
+                local_states = reconstructed.states()
+                sources = list(self._venue_sources) or [
+                    StaticVenueStateSource(entries=(), name="production.no-venue-evidence")
+                ]
+            phase = "recovery"
+            recovery = RestartRecovery(
+                engine=ReconciliationEngine(self._reconciliation_policy), journal=self._journal,
+                venue_sources=sources, producer=self._producer,
+            )
+            run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
+            if not run.report.is_fully_resolved or run.requires_halt_new_risk or not run.may_resume_trading:
+                self._last_refusal = "recovery_required"
+                raise ProductionRecoveryRequiredError(
+                    "startup refused: unresolved order state requires recovery: "
+                    f"{sorted(run.report.unresolved_orders)}"
+                )
+            if not writing:
+                guard = claim()
+                fence = ProductionFence(
+                    control=self._control, guard=guard, owner_id=self._owner_id,
+                    environment=decision.environment,
+                )
+
+            def verify_evidence():
+                if writing:
+                    if (self._execution is not collector.execution or self._venue_sources
+                        or self._instrument != collector.instrument):
+                        raise StartupEvidenceError("production execution/source wiring changed during startup.")
+                    if self._resolve_execution_capability(self._execution) is not capability:
+                        raise StartupEvidenceError("execution capability changed during startup.")
+                    collector.validate(batch, nonce=nonce, fence_term=fence.fence_term, view=view)
+                    view.require_stable(
+                        self._journal, symbol=self._instrument.symbol, run=run, now=now,
+                        producer=self._producer, correlation=run_id,
+                    )
+
+            phase = "post_recovery_evidence"
+            verify_evidence()
+            check = fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+            phase = "execution_boundary_start_failed"
+            execution_started = True
             self._execution.start()
-        except Exception as exc:  # noqa: BLE001 - the typed error is re-raised unchanged
-            self._last_refusal = f"execution_boundary_start_failed:{type(exc).__name__}"
+            phase = "final_startup_evidence"
+            # Serialize final publication with takeover, without locking the venue reads.
+            with self._control.ownership_store.exclusive(purpose="submission"):
+                verify_evidence()
+                check = fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                if self._execution.state() is not ExecutionRuntimeState.RUNNING:
+                    raise ProductionStartupError("execution boundary did not become running.")
+                self._environment, self._guard, self._fence = decision, guard, fence
+                self._last_fence = check
+                self._startup = ProductionStartupReport(
+                    environment=decision.environment.value, base_url=decision.base_url,
+                    owner_id=self._owner_id, fence_term=check.fence_term,
+                    safety_mode=check.safety_mode, safety_state_source=check.safety_state_source,
+                    recovered_orders=len(run.rebuilt_states), reconciliation_state=run.recovery_state,
+                    started_at=check.checked_at, journaled_event_ids=tuple(run.journaled_event_ids),
+                    notes=decision.notes, venue_evidence=None if batch is None else batch.summary(),
+                )
+                self._state = ExecutionRuntimeState.RUNNING
+            return self._startup
+        except Exception as exc:
+            self._state = ExecutionRuntimeState.STOPPED
+            self._startup = None
+            if self._last_refusal is None:
+                self._last_refusal = f"{phase}:{type(exc).__name__}"
+            if execution_started:
+                try:
+                    self._execution.stop()
+                except Exception:
+                    pass  # Best effort only; never undo another writer's lease.
             raise
-
-        self._environment = decision
-        self._guard = guard
-        self._fence = fence
-        self._last_fence = check
-        self._last_outcome = None
-        self._last_refusal = None
-        self._state = ExecutionRuntimeState.RUNNING
-        self._startup = ProductionStartupReport(
-            environment=decision.environment.value,
-            base_url=decision.base_url,
-            owner_id=self._owner_id,
-            fence_term=check.fence_term,
-            safety_mode=check.safety_mode,
-            safety_state_source=check.safety_state_source,
-            recovered_orders=len(local_states),
-            reconciliation_state=run.recovery_state,
-            started_at=now,
-            journaled_event_ids=tuple(run.journaled_event_ids),
-            notes=decision.notes,
-        )
-        return self._startup
 
     def stop(self) -> None:
         """Stop serving. The held lease record stays on disk; a restart takes a fresh term."""

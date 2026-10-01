@@ -26,6 +26,7 @@ from crypto_trader.recovery import reconstruct_order_states
 from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.production_fixtures import (
     INSTRUMENT,
+    startup_responses,
     build_runtime,
     control_for,
     intent,
@@ -67,7 +68,7 @@ def _wired(journal, state_dir, transport, *, control=None):
 def test_testnet_execution_flows_through_the_production_runtime(journal, state_dir):
     intent_obj = intent("testnet-flow-1")
     transport = fx.ScriptedTransport(
-        [*fx.environment_responses(), fx.order_response(_reference_for(intent_obj))]
+        [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
     )
     runtime, port, _client = _wired(journal, state_dir, transport)
 
@@ -94,7 +95,7 @@ def test_testnet_execution_flows_through_the_production_runtime(journal, state_d
 
 def test_an_ambiguous_submit_stays_unknown_pending_reconciliation(journal, state_dir):
     transport = fx.ScriptedTransport(
-        [*fx.environment_responses(), TransportTimeout("the write outcome is unknown")]
+        [*startup_responses(), TransportTimeout("the write outcome is unknown")]
     )
     runtime, port, _client = _wired(journal, state_dir, transport)
     runtime.start()
@@ -114,7 +115,7 @@ def test_an_ambiguous_submit_stays_unknown_pending_reconciliation(journal, state
 # --- 16: the withdrawal-disabled invariant still fails closed ----------------------
 
 def test_a_withdrawal_capable_key_is_refused_before_any_order(journal, state_dir):
-    transport = fx.ScriptedTransport(fx.environment_responses(can_withdraw=True))
+    transport = fx.ScriptedTransport(startup_responses(can_withdraw=True))
     runtime, _port, _client = _wired(journal, state_dir, transport)
 
     with pytest.raises(UnsafeTestnetAccountError):
@@ -130,7 +131,7 @@ def test_a_withdrawal_capable_key_is_refused_before_any_order(journal, state_dir
 def test_no_credential_value_leaks_into_records_or_the_journal(journal, state_dir):
     intent_obj = intent("secret-leak-1")
     transport = fx.ScriptedTransport(
-        [*fx.environment_responses(), fx.order_response(_reference_for(intent_obj))]
+        [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
     )
     runtime, port, client = _wired(journal, state_dir, transport)
     runtime.start()
@@ -170,7 +171,7 @@ def _deterministic_run(root: Path):
     intent_obj = intent("determinism-1")
     with SQLiteEventJournal(journal_path) as journal:
         transport = fx.ScriptedTransport(
-            [*fx.environment_responses(), fx.order_response(_reference_for(intent_obj))]
+            [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
         )
         client = fx.client(transport)
         control = control_for(journal, state_dir)
@@ -217,7 +218,7 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
     reference = _reference_for(intent_obj)
     transport = fx.ScriptedTransport(
         [
-            *fx.environment_responses(),
+            *startup_responses(),
             fx.order_response(reference, status="NEW"),
             fx.time_response(),
             fx.account_response(),
