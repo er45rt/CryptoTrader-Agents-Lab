@@ -638,8 +638,37 @@ class BinanceSpotTestnetClient:
             signed=True,
             method="DELETE",
         )
-        order = self._parse_order(body)
-        self._orders[order.client_order_id] = order
+        try:
+            if not isinstance(body, Mapping):
+                raise BinanceTestnetError("cancel response must be an object.")
+            original_id = body.get("origClientOrderId")
+            cancel_id = body.get("clientOrderId")
+            venue_id = body.get("orderId")
+            if (
+                not isinstance(original_id, str) or original_id != client_order_id
+                or not original_id.strip()
+                or not isinstance(cancel_id, str) or not cancel_id.strip()
+                or type(venue_id) is not int or venue_id <= 0
+                or body.get("symbol") != symbol
+                or body.get("status") != "CANCELED"
+                or (existing is not None and existing.symbol != symbol)
+                or (
+                    existing is not None and existing.venue_order_id is not None
+                    and existing.venue_order_id != str(venue_id)
+                )
+            ):
+                raise BinanceTestnetError("cancel response identity, symbol or status is invalid.")
+            # Reuse strict quantity validation, with the original identity, before parsing
+            # ancillary fields. Binance's clientOrderId identifies the cancellation itself.
+            canonical_body = dict(body, clientOrderId=client_order_id)
+            self._parse_startup_order(canonical_body, symbol, client_order_id)
+            order = self._parse_order(canonical_body)
+        except BinanceTestnetError as exc:
+            raise AmbiguousOrderError(
+                "the cancel response was malformed or contradictory; the outcome is unknown "
+                "and the cancellation is not retried."
+            ) from exc
+        self._orders[client_order_id] = order
         return order
 
     def order_status(self, symbol: str, client_order_id: str) -> TestnetOrder:

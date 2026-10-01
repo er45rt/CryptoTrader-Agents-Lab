@@ -176,7 +176,7 @@ def test_cancel_order_returns_the_canceled_state_and_is_idempotent():
         responses=[
             fx.exchange_info_response(),
             fx.order_response(CLIENT_ORDER_ID, status="NEW"),
-            fx.order_response(CLIENT_ORDER_ID, status="CANCELED"),
+            fx.cancel_response(CLIENT_ORDER_ID),
         ]
     )
     client = fx.client(transport)
@@ -187,17 +187,86 @@ def test_cancel_order_returns_the_canceled_state_and_is_idempotent():
     again = client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
 
     assert canceled.state.value == "canceled"
+    assert canceled.client_order_id == CLIENT_ORDER_ID
+    assert canceled.venue_order_id == "42"
+    assert client._orders[CLIENT_ORDER_ID] is canceled
+    assert "venue-generated-cancel-id" not in client._orders
     assert again.state.value == "canceled"
     deletes = [item for item in transport.requests if item.method == "DELETE"]
     assert len(deletes) == 1, "canceling an already-terminal order must not hit the venue again"
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("field,value", [
+    ("origClientOrderId", None), ("origClientOrderId", "other-order"),
+    ("origClientOrderId", 123), ("origClientOrderId", ""),
+    ("clientOrderId", None), ("clientOrderId", 123), ("clientOrderId", " "),
+    ("orderId", None), ("orderId", True), ("orderId", "42"),
+    ("orderId", 0), ("orderId", -1),
+    ("symbol", "ETHUSDT"), ("symbol", None),
+    ("status", "NEW"), ("status", "FILLED"), ("status", None),
+    ("origQty", None), ("executedQty", "NaN"), ("executedQty", "2"),
+])
+def test_cancel_rejects_malformed_or_contradictory_response_without_retry(cached, field, value):
+    body = dict(fx.cancel_response(CLIENT_ORDER_ID).body)
+    if value is None:
+        body.pop(field)
+    else:
+        body[field] = value
+    responses = [fx.order_response(CLIENT_ORDER_ID)] if cached else []
+    transport = ScriptedTransport(responses=[*responses, fx.response(200, body)])
+    client = fx.client(transport, retries=3)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    if cached:
+        client.order_status(fx.SYMBOL, CLIENT_ORDER_ID)
+    before = dict(client._orders)
+    with pytest.raises(AmbiguousOrderError):
+        client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert client._orders == before
+    assert len([request for request in transport.requests if request.method == "DELETE"]) == 1
+
+
+@pytest.mark.parametrize("body", [None, [], "invalid"])
+def test_cancel_rejects_non_object_payload_without_retry(body):
+    transport = ScriptedTransport(responses=[fx.response(200, body)])
+    client = fx.client(transport, retries=3)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(AmbiguousOrderError):
+        client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert len(transport.requests) == 1
+    assert client._orders == {}
+
+
+def test_cancel_rejects_a_different_cached_venue_identity():
+    transport = ScriptedTransport(responses=[
+        fx.order_response(CLIENT_ORDER_ID), fx.cancel_response(CLIENT_ORDER_ID, order_id=99),
+    ])
+    client = fx.client(transport, retries=3)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    original = client.order_status(fx.SYMBOL, CLIENT_ORDER_ID)
+    with pytest.raises(AmbiguousOrderError):
+        client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert client._orders == {CLIENT_ORDER_ID: original}
+    assert len([request for request in transport.requests if request.method == "DELETE"]) == 1
+
+
+def test_cancel_without_a_local_cache_preserves_original_identity():
+    transport = ScriptedTransport(responses=[fx.cancel_response(CLIENT_ORDER_ID)])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    canceled = client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID)
+    assert canceled.client_order_id == CLIENT_ORDER_ID
+    assert canceled.venue_order_id == "42"
+    assert client.cancel_order(fx.SYMBOL, CLIENT_ORDER_ID) is canceled
+    assert len(transport.requests) == 1
 
 
 def test_cancel_all_open_orders_cancels_every_open_order():
     transport = ScriptedTransport(
         responses=[
             fx.open_orders_response("ct-a", "ct-b"),
-            fx.order_response("ct-a", status="CANCELED"),
-            fx.order_response("ct-b", status="CANCELED"),
+            fx.cancel_response("ct-a", order_id=100),
+            fx.cancel_response("ct-b", order_id=101),
         ]
     )
     client = fx.client(transport)

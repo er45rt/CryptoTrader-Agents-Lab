@@ -217,6 +217,16 @@ def order_response(
     )
 
 
+def cancel_response(
+    original_id: str, *, cancel_client_id: str = "venue-generated-cancel-id",
+    order_id: int = 42,
+) -> HttpResponse:
+    """DELETE carries the original identity separately from the cancellation identity."""
+    body = dict(order_response(cancel_client_id, status="CANCELED", order_id=order_id).body)
+    body["origClientOrderId"] = original_id
+    return response(200, body)
+
+
 def fill(
     price: str = "27000.00",
     qty: str = "0.00050000",

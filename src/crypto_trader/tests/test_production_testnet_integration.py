@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from uuid import UUID
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,7 @@ from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as Order
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.recovery import reconstruct_order_states
 from crypto_trader.tests import testnet_fixtures as fx
+from crypto_trader.tests.test_production_live_testnet import _require_reconciliation_closure
 from crypto_trader.tests.production_fixtures import (
     INSTRUMENT,
     startup_responses,
@@ -222,8 +224,10 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
             fx.order_response(reference, status="NEW"),
             fx.time_response(),
             fx.account_response(),
-            fx.open_orders_response(reference),
-            fx.order_response(reference, status="CANCELED"),
+            fx.response(200, [fx.order_response(reference, status="NEW").body]),
+            fx.cancel_response(reference),
+            fx.order_response(reference, status="CANCELED"),  # explicit terminal lookup
+            fx.order_response(reference, status="CANCELED"),  # reconciliation evidence
         ]
     )
     client = fx.client(transport)
@@ -234,7 +238,8 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
         journal=journal, state_dir=state_dir, execution=port, control=control
     )
     runtime.start()
-    assert runtime.execute_intent(intent_obj).submitted is True
+    submitted = runtime.execute_intent(intent_obj)
+    assert submitted.submitted is True
 
     outcome = control.handle(operator_command("cancel_open", seed="cancel-open-emergency"))
 
@@ -244,6 +249,42 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
     assert runtime.status()["new_risk_permitted"] is False
     assert any(request.method == "DELETE" for request in transport.requests)
 
+    terminal = client.order_status(fx.SYMBOL, reference)
+    assert terminal.client_order_id == reference
+    assert terminal.status == "CANCELED"
+    assert terminal.venue_order_id == "42"
+    reconstructed, _ = reconstruct_order_states(journal)
+    states = reconstructed.states()
+    assert len(states) == 1
+    assert states[0].order_reference == reference
+    assert states[0].state.value == "canceled"
+    _require_reconciliation_closure(control)
+    assert runtime.status()["new_risk_permitted"] is True
+    assert len([request for request in transport.requests if request.method == "DELETE"]) == 1
+    assert len([request for request in transport.requests if request.method == "POST"]) == 1
+
+    # A fresh halt preserves the existing refusal check below, without a new order.
+    control.handle(operator_command("halt_new_risk", seed="closure-rehalt"))
+
     blocked = runtime.execute_intent(intent("cancel-open-2"))
     assert blocked.submitted is False
     assert "trading_halted" in (blocked.blocked_reason_code or "")
+
+
+@pytest.mark.parametrize("status,reason", [
+    ("pending", "UNKNOWN_PENDING_RECONCILIATION"),
+    ("resolved", "UNKNOWN_PENDING_RECONCILIATION"),
+])
+def test_live_closure_assertions_fail_before_acknowledgement_on_unknown(status, reason):
+    commands = []
+
+    class UnresolvedControl:
+        def handle(self, command):
+            commands.append(command.command_type.value)
+            return SimpleNamespace(
+                accepted=True, reconciliation_status=status, reason_code=reason,
+            )
+
+    with pytest.raises(AssertionError):
+        _require_reconciliation_closure(UnresolvedControl())
+    assert commands == ["reconcile"]

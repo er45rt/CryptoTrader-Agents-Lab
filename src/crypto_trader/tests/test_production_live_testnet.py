@@ -261,8 +261,12 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
 
     assert outcome.submitted is True, "the production runtime did not submit the testnet order"
     reference = outcome.submission.order_reference
-    resting = {order.client_order_id for order in client.open_orders(SYMBOL)}
+    resting_orders = client.open_orders(SYMBOL)
+    resting = {order.client_order_id for order in resting_orders}
     assert reference in resting, "the submitted testnet order is not resting at the venue"
+    original_venue_id = next(
+        order.venue_order_id for order in resting_orders if order.client_order_id == reference
+    )
 
     # A second intent is approved by validity + Hard Risk, then the operator takes over.
     market, limit_price, quantity = _resting_limit_terms(client)
@@ -284,13 +288,11 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
     assert runtime.status()["new_risk_permitted"] is False
 
     # Reconciliation + acknowledgement are mandatory before normal can be restored.
-    control.handle(_command("reconcile", seed="live-reconcile", reason="reconcile after emergency"))
-    if control.status().reconciliation_status == "resolved":
-        control.handle(_command("acknowledge", seed="live-ack", reason="operator acknowledgement"))
-        restored = control.handle(
-            _command("restore_normal", seed="live-restore", reason="restore normal")
-        )
-        assert restored.accepted
+    terminal = client.order_status(SYMBOL, reference)
+    assert terminal.client_order_id == reference
+    assert terminal.status == "CANCELED"
+    assert terminal.venue_order_id == original_venue_id
+    _require_reconciliation_closure(control)
 
     rendered = json.dumps(
         {
@@ -306,6 +308,29 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
     ):
         if secret:
             assert secret not in rendered, "a credential value reached an observable surface"
+
+
+def _require_reconciliation_closure(control):
+    """A live gate cannot pass by skipping unresolved reconciliation and recovery."""
+    reconciled = control.handle(
+        _command("reconcile", seed="live-reconcile", reason="reconcile after emergency")
+    )
+    assert reconciled.accepted
+    assert reconciled.reconciliation_status == "resolved"
+    assert reconciled.reason_code == "reconciliation_resolved"
+    assert control.status().reconciliation_status == "resolved"
+    assert control.status().reconciliation_reason_code == "reconciliation_resolved"
+    acknowledged = control.handle(
+        _command("acknowledge", seed="live-ack", reason="operator acknowledgement")
+    )
+    assert acknowledged.accepted
+    assert control.status().operator_acknowledgement_pending is False
+    restored = control.handle(
+        _command("restore_normal", seed="live-restore", reason="restore normal")
+    )
+    assert restored.accepted
+    assert control.status().safety_mode == "normal"
+    assert control.status().new_risk_permitted is True
 
 
 def test_live_new_risk_after_takeover_is_refused_by_the_runtime(live_context):

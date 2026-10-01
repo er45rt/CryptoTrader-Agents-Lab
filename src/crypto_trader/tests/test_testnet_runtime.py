@@ -170,8 +170,8 @@ def test_cancel_all_is_the_safety_lane_action(journal):
         responses=[
             *fx.environment_responses(),
             fx.open_orders_response("ct-a", "ct-b"),
-            fx.order_response("ct-a", status="CANCELED"),
-            fx.order_response("ct-b", status="CANCELED"),
+            fx.cancel_response("ct-a", order_id=100),
+            fx.cancel_response("ct-b", order_id=101),
         ]
     )
     instance = started_runtime(transport, journal=journal)
