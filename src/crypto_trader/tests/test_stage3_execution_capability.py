@@ -30,12 +30,17 @@ from crypto_trader.execution import (
 from crypto_trader.execution.binance_testnet import ScriptedTransport
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.production import ProductionStateError
 from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.production_fixtures import INSTRUMENT as PRODUCTION_INSTRUMENT, startup_responses
 from crypto_trader.tests.production_fixtures import (
     RecordingExecutionPort,
     build_runtime,
+    canonical_risk_refresh_responses,
+    canonical_test_risk_source,
+    control_for,
     intent as production_intent,
+    seed_canonical_equity_root,
 )
 
 INSTRUMENT = InstrumentSpec(symbol="BTCUSDT", base_currency="BTC", starting_balance="100000 USDT")
@@ -265,7 +270,51 @@ def test_contradictory_capability_on_the_durable_contract_is_refused(tmp_path):
     assert port.venue_writes == 0
 
 
-# --- 8/9: the approved durable path is accepted and behaves durably ---------------
+# --- 8/9: venue-writing risk binding is canonical and exact ------------------------
+
+def test_venue_writing_runtime_refuses_noncanonical_risk_provider(tmp_path):
+    client = fx.client(ScriptedTransport([]))
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
+        with pytest.raises(ProductionStateError, match="canonical ProductionRiskStateSource"):
+            build_runtime(journal=journal, state_dir=tmp_path / "state", execution=port)
+
+
+@pytest.mark.parametrize("mismatch", ["client", "journal", "control"])
+def test_venue_writing_runtime_refuses_mismatched_canonical_risk_binding(tmp_path, mismatch):
+    client = fx.client(ScriptedTransport([]))
+    other_client = fx.client(ScriptedTransport([]))
+    with (
+        SQLiteEventJournal(tmp_path / "journal.db") as journal,
+        SQLiteEventJournal(tmp_path / "other.db") as other_journal,
+    ):
+        state_dir = tmp_path / "state"
+        control = control_for(journal, state_dir)
+        port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
+        source_client = other_client if mismatch == "client" else client
+        source_journal = other_journal if mismatch == "journal" else journal
+        source_control = (
+            control_for(journal, tmp_path / "other-state")
+            if mismatch == "control"
+            else control
+        )
+        risk_source = canonical_test_risk_source(
+            journal=source_journal,
+            control=source_control,
+            client=source_client,
+        )
+
+        with pytest.raises(ProductionStateError, match="not bound"):
+            build_runtime(
+                journal=journal,
+                state_dir=state_dir,
+                execution=port,
+                control=control,
+                risk_state_source=risk_source,
+            )
+
+
+# --- 10/11: the approved durable path is accepted and behaves durably --------------
 
 def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(tmp_path):
     intent_obj = production_intent("stage3-durable")
@@ -273,6 +322,7 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
     transport = ScriptedTransport(
         responses=[
             *startup_responses(),
+            *canonical_risk_refresh_responses(),
             fx.order_response(reference, status="NEW"),
         ]
     )
@@ -280,7 +330,19 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
     client.clock.synchronize(fx.SERVER_TIME_MS)
     with SQLiteEventJournal(tmp_path / "journal.db") as journal:
         port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
-        runtime = build_runtime(journal=journal, state_dir=tmp_path / "state", execution=port)
+        state_dir = tmp_path / "state"
+        seed_canonical_equity_root(journal)
+        control = control_for(journal, state_dir)
+        risk_source = canonical_test_risk_source(
+            journal=journal, control=control, client=client
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+        )
 
         assert port.capability is ExecutionCapability.DURABLE_VENUE_WRITING
         assert isinstance(port, DurableVenueWritePort)
@@ -299,6 +361,45 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
         ]
         assert len(markers) == 1
         assert markers[0].payload.venue_reference == reference
+
+
+
+def test_submit_rechecks_canonical_risk_client_binding(tmp_path):
+    target = production_intent("stage3-risk-binding-recheck")
+    reference = f"ct-{target.intent_id.hex[:20]}"
+    transport = ScriptedTransport(
+        responses=[
+            *startup_responses(),
+            *canonical_risk_refresh_responses(),
+            fx.order_response(reference, status="NEW"),
+        ]
+    )
+    client = fx.client(transport)
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        state_dir = tmp_path / "state"
+        seed_canonical_equity_root(journal)
+        control = control_for(journal, state_dir)
+        port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
+        risk_source = canonical_test_risk_source(
+            journal=journal, control=control, client=client
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+        )
+        runtime.start()
+        preparation = runtime.prepare_intent(target)
+        assert preparation.approved
+
+        risk_source._client = fx.client(ScriptedTransport([]))
+
+        with pytest.raises(ProductionStateError, match="not bound"):
+            runtime.submit_prepared(preparation)
+
+        assert not [request for request in transport.requests if request.method == "POST"]
 
 
 def test_non_writing_implementations_are_explicitly_classified(tmp_path):

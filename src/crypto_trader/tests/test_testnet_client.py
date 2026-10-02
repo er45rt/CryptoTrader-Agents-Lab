@@ -1,5 +1,6 @@
 """Phase 11: Spot Testnet client behaviour under realistic failure modes."""
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -870,6 +871,43 @@ def test_startup_account_snapshot_rejects_duplicate_required_asset_entries():
         client.startup_account_snapshot("USDT")
 
 
+
+def test_startup_account_snapshot_rejects_malformed_foreign_balance():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"].append({"asset": "BNB", "free": "NaN", "locked": "0"})
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with pytest.raises(BinanceTestnetError, match="BNB free"):
+        client.startup_account_snapshot("BTC", "USDT")
+
+
+def test_startup_account_snapshot_rejects_duplicate_foreign_asset_entries():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"].extend([
+        {"asset": "BNB", "free": "0", "locked": "0"},
+        {"asset": "BNB", "free": "1", "locked": "0"},
+    ])
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with pytest.raises(BinanceTestnetError, match="duplicate"):
+        client.startup_account_snapshot("BTC", "USDT")
+
+
+def test_startup_account_snapshot_strictly_validates_but_does_not_value_foreign_assets():
+    response = fx.account_response()
+    response.body["balances"].append({"asset": "BNB", "free": "2.5", "locked": "0.1"})
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    snapshot = client.startup_account_snapshot("BTC", "USDT")
+
+    assert [balance.asset for balance in snapshot.balances] == ["BTC", "USDT"]
+
+
 @pytest.mark.parametrize("assets", [(), ("btc",), (" BTC",), ("BTC", "BTC")])
 def test_startup_account_snapshot_rejects_noncanonical_asset_requests(assets):
     from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
@@ -975,3 +1013,72 @@ def test_fill_event_identity_is_single_canonical_pinned_vector():
     assert canonical_fill_event_id("ct-test", "7") == expected_fill
     assert deterministic_fill_event_uuid("ct-test", "7") == expected_fill
     assert venue_trade_event_id("BTCUSDT", "42", "7") == expected_trade
+
+
+def test_startup_mark_evidence_is_strict_timestamped_and_cache_free():
+    from crypto_trader.execution.binance_testnet import MarkEvidence
+
+    transport = ScriptedTransport([fx.price_response("27000.00"), fx.price_response("27001.00")])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    first = client.startup_mark_evidence(fx.SYMBOL)
+    second = client.startup_mark_evidence(fx.SYMBOL)
+
+    assert isinstance(first, MarkEvidence)
+    assert first.symbol == fx.SYMBOL
+    assert first.price == Decimal("27000.00")
+    assert second.price == Decimal("27001.00")
+    assert first.observed_at == datetime.fromtimestamp(fx.SERVER_TIME_MS / 1000, tz=timezone.utc)
+    assert first.reference == f"binance.ticker.price:{fx.SYMBOL}"
+    assert len(transport.requests) == 2
+    assert all(request.method == "GET" for request in transport.requests)
+    assert all("/api/v3/ticker/price" in request.url for request in transport.requests)
+
+
+@pytest.mark.parametrize("body", [
+    None,
+    {"symbol": "ETHUSDT", "price": "27000.00"},
+    {"symbol": fx.SYMBOL},
+    {"symbol": fx.SYMBOL, "price": 27000},
+    {"symbol": fx.SYMBOL, "price": " 27000 "},
+    {"symbol": fx.SYMBOL, "price": "1e4"},
+    {"symbol": fx.SYMBOL, "price": "NaN"},
+    {"symbol": fx.SYMBOL, "price": "0"},
+])
+def test_startup_mark_evidence_rejects_malformed_or_mismatched_payload(body):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+
+    client = fx.client(ScriptedTransport([fx.response(200, body)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with pytest.raises(BinanceTestnetError):
+        client.startup_mark_evidence(fx.SYMBOL)
+
+
+@pytest.mark.parametrize("symbol", ["btcUSDT", " BTCUSDT", "BTC-USDT", "BT CUSDT", ""])
+def test_startup_mark_evidence_rejects_noncanonical_symbol_without_network(symbol):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+
+    transport = ScriptedTransport([])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with pytest.raises(BinanceTestnetError):
+        client.startup_mark_evidence(symbol)
+
+    assert transport.requests == []
+
+
+def test_venue_account_snapshot_rejects_update_time_after_fetch_time():
+    from crypto_trader.execution.binance_testnet import VenueAccountSnapshot, VenueAssetBalance
+
+    with pytest.raises(ValueError, match="updateTime cannot be later"):
+        VenueAccountSnapshot(
+            venue_account_id="123",
+            venue_update_time_ms=fx.SERVER_TIME_MS + 1,
+            fetched_at=datetime.fromtimestamp(fx.SERVER_TIME_MS / 1000, tz=timezone.utc),
+            balances=(
+                VenueAssetBalance(asset="BTC", free=Decimal("1"), locked=Decimal("0")),
+            ),
+        )

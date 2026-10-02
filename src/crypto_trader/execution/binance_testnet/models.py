@@ -21,6 +21,7 @@ __all__ = [
     "VenueTrade",
     "VenueAssetBalance",
     "VenueAccountSnapshot",
+    "MarkEvidence",
     "TestnetOrder",
     "TestnetOrderRequest",
     "TestnetSymbolRules",
@@ -153,6 +154,14 @@ class VenueAccountSnapshot:
             or self.fetched_at.utcoffset().total_seconds() != 0
         ):
             raise ValueError("fetched_at must be timezone-aware UTC.")
+        try:
+            venue_updated_at = datetime.fromtimestamp(
+                self.venue_update_time_ms / 1000, tz=timezone.utc
+            )
+        except (OSError, OverflowError, ValueError) as exc:
+            raise ValueError("venue_update_time_ms cannot be represented as UTC time.") from exc
+        if venue_updated_at > self.fetched_at:
+            raise ValueError("venue account updateTime cannot be later than fetched_at.")
         if not isinstance(self.balances, tuple):
             raise ValueError("balances must be an immutable tuple.")
         if not self.balances or any(not isinstance(item, VenueAssetBalance) for item in self.balances):
@@ -169,6 +178,37 @@ class VenueAccountSnapshot:
 
 
 @dataclass(frozen=True)
+class MarkEvidence:
+    """Strict timestamped market mark for production risk/equity evidence."""
+
+    symbol: str
+    price: Decimal
+    observed_at: datetime
+    reference: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.symbol, str)
+            or not self.symbol.isascii()
+            or self.symbol != self.symbol.upper()
+            or not self.symbol.isalnum()
+        ):
+            raise ValueError("mark symbol must be an uppercase ASCII alphanumeric code.")
+        if not isinstance(self.price, Decimal) or not self.price.is_finite() or self.price <= ZERO:
+            raise ValueError("mark price must be a positive finite Decimal.")
+        if not isinstance(self.observed_at, datetime):
+            raise ValueError("mark observed_at must be a datetime.")
+        if (
+            self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() is None
+            or self.observed_at.utcoffset().total_seconds() != 0
+        ):
+            raise ValueError("mark observed_at must be timezone-aware UTC.")
+        if not isinstance(self.reference, str) or not self.reference.strip():
+            raise ValueError("mark evidence requires a non-empty reference.")
+
+
+@dataclass(frozen=True)
 class TestnetOrder:
     """The venue's view of one order, in our vocabulary."""
 
@@ -177,6 +217,7 @@ class TestnetOrder:
     venue_order_id: str | None
     state: OrderLifecycleState
     status: str
+    side: str | None = None
     original_quantity: Decimal = ZERO
     executed_quantity: Decimal = ZERO
     cummulative_quote_quantity: Decimal = ZERO

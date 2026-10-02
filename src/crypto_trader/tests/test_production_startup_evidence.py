@@ -20,7 +20,8 @@ from crypto_trader.production import ProductionRecoveryRequiredError
 from crypto_trader.recovery import StaticVenueStateSource
 from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.production_fixtures import (
-    INSTRUMENT, build_runtime, startup_responses, RecordingExecutionPort,
+    INSTRUMENT, RecordingExecutionPort, build_runtime, canonical_test_risk_source,
+    control_for, startup_responses,
 )
 from crypto_trader.tests.test_recovery_submission_attempt import (
     attempt_event, state_event, CLIENT_ORDER_ID,
@@ -37,8 +38,12 @@ def wired(journal, tmp_path, responses=(), **kwargs):
     transport = fx.ScriptedTransport(list(responses))
     client = fx.client(transport, retries=1)
     port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+    state_dir = tmp_path / "state"
+    control = control_for(journal, state_dir)
+    risk_source = canonical_test_risk_source(journal=journal, control=control, client=client)
     production = build_runtime(
-        journal=journal, state_dir=tmp_path / "state", execution=port, **kwargs,
+        journal=journal, state_dir=state_dir, execution=port, control=control,
+        risk_state_source=risk_source, **kwargs,
     )
     return production, port, client, transport
 

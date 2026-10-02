@@ -33,7 +33,7 @@ import re
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -94,6 +94,7 @@ from .errors import (
     ProductionStateError,
 )
 from .fence import FenceCheck, ProductionFence
+from .risk_state import ProductionRiskStateSource
 
 _STRATEGY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 
@@ -409,7 +410,7 @@ class ProductionRuntime:
         validity_gate: DecisionValidityGate,
         market_state: MarketStateProvider,
         limits: RiskLimits,
-        risk_state_provider: Callable[[datetime], RiskStateSnapshot],
+        risk_state_provider: Callable[[datetime], RiskStateSnapshot] | ProductionRiskStateSource,
         reconciliation_policy: ReconciliationPolicy,
         environment: str | TradingEnvironment | None = None,
         mainnet_authorized: bool = False,
@@ -474,6 +475,7 @@ class ProductionRuntime:
             self._durable_venue_writes = True
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._pending = pending if pending is not None else PendingIntentRegistry()
+        self._issued_preparations: dict[UUID, tuple[IntentPreparation, datetime]] = {}
         self._producer = producer
         self._control = (
             control
@@ -485,6 +487,8 @@ class ProductionRuntime:
                 clock=self._clock,
             )
         )
+        if self._durable_venue_writes:
+            self._require_canonical_risk_binding()
         self._state = ExecutionRuntimeState.STOPPED
         self._environment: EnvironmentDecision | None = None
         self._fence: ProductionFence | None = None
@@ -667,6 +671,10 @@ class ProductionRuntime:
                     started_at=check.checked_at, journaled_event_ids=tuple(run.journaled_event_ids),
                     notes=decision.notes, venue_evidence=None if batch is None else batch.summary(),
                 )
+                # A successful fully-resolved startup supersedes any in-memory reservation from
+                # the previous run; durable journal/venue state is authoritative after recovery.
+                self._pending.clear()
+                self._issued_preparations.clear()
                 self._state = ExecutionRuntimeState.RUNNING
             return self._startup
         except Exception as exc:
@@ -695,13 +703,23 @@ class ProductionRuntime:
         capacity_available: bool = True,
         latest_scope_intent_id: UUID | None = None,
     ) -> IntentPreparation:
-        """Run validity then Hard Risk. Contacts no venue and grants no trading authority."""
+        """Run validity then canonical Hard Risk; writing mode refreshes read-only venue evidence."""
         self._require_running()
         if not isinstance(intent, ProductionIntent):
             raise ProductionStateError("prepare_intent expects a ProductionIntent.")
         now = self._now()
+        self._expire_preparations(now)
         controller = self._control.load_safety_state().controller
         stages: list[str] = []
+        if not controller.allow_new_risk():
+            stages.append("safety:blocked")
+            return self._blocked(
+                intent,
+                stages,
+                "trading_halted",
+                controller,
+                now,
+            )
 
         # Stage 1: deterministic decision validity / staleness.
         validity = self._validity_gate.evaluate(
@@ -728,8 +746,24 @@ class ProductionRuntime:
 
         # Stage 2: deterministic Hard Risk, under the CURRENT persisted safety mode.
         engine = HardRiskEngine(
-            risk_limits_for_safety(controller, self._limits), pending=self._pending
+            risk_limits_for_safety(controller, self._limits),
+            pending=self._pending,
+            include_pending_reservations=self._durable_venue_writes,
+            enforce_attributed_inventory=self._durable_venue_writes,
         )
+        if isinstance(self._risk_state_provider, ProductionRiskStateSource):
+            if self._guard is None:
+                raise ProductionStateError(
+                    "canonical risk state requires the active runtime writer guard."
+                )
+            risk_state, risk_now = self._risk_state_provider(
+                now,
+                guard=self._guard,
+                correlation_id=intent.correlation_id,
+            )
+        else:
+            risk_state = self._risk_state_provider(now)
+            risk_now = now
         decision = engine.evaluate(
             RiskRequest(
                 correlation_id=intent.correlation_id,
@@ -741,8 +775,8 @@ class ProductionRuntime:
                 intent_id=intent.intent_id,
                 order_type=intent.order_type.value,
             ),
-            self._risk_state_provider(now),
-            now=now,
+            risk_state,
+            now=risk_now,
         )
         stages.append("risk:allowed" if decision.allowed else "risk:blocked")
         if not decision.allowed:
@@ -750,7 +784,7 @@ class ProductionRuntime:
 
         # Stage 3 is the fence, and it happens in submit_prepared immediately before the venue call.
         stages.append("safety:fence_deferred_to_submit")
-        return IntentPreparation(
+        preparation = IntentPreparation(
             intent_id=intent.intent_id,
             correlation_id=intent.correlation_id,
             symbol=intent.symbol,
@@ -766,6 +800,11 @@ class ProductionRuntime:
             safety_mode=controller.mode.value,
             prepared_at=now,
         )
+        self._issued_preparations[intent.intent_id] = (
+            preparation,
+            self._preparation_expiry(intent),
+        )
+        return preparation
 
     def submit_prepared(self, preparation: IntentPreparation) -> ProductionSubmitResult:
         """Atomically authorize and submit relative to operator takeover."""
@@ -781,22 +820,42 @@ class ProductionRuntime:
                 "the intent was not approved "
                 f"({preparation.blocked_reason_code}); nothing is submitted."
             )
+        issued = self._issued_preparations.get(preparation.intent_id)
+        if issued is None or issued[0] is not preparation:
+            raise ProductionStateError(
+                "submit_prepared requires the exact unused preparation issued by this runtime."
+            )
+        now = self._now()
+        if now > issued[1]:
+            self._release_preparation(preparation.intent_id)
+            raise ProductionStateError("the issued preparation expired before submission.")
         if self._fence is None:
+            self._release_preparation(preparation.intent_id)
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
-        capability = self._resolve_execution_capability(self._execution)
-        if capability is not self._capability:
-            raise NonDurableExecutionError("execution capability changed after construction")
-        if self._durable_venue_writes and self._execution.durable_attempt_journal() is not self._journal:
-            raise NonDurableExecutionError("execution journal changed after construction")
-        now = self._now()
+        try:
+            capability = self._resolve_execution_capability(self._execution)
+            if capability is not self._capability:
+                raise NonDurableExecutionError("execution capability changed after construction")
+            if (
+                self._durable_venue_writes
+                and self._execution.durable_attempt_journal() is not self._journal
+            ):
+                raise NonDurableExecutionError("execution journal changed after construction")
+            if self._durable_venue_writes:
+                self._require_canonical_risk_binding()
+        except Exception:
+            self._release_preparation(preparation.intent_id)
+            raise
         try:
             # The last thing that happens before the venue call. Never cached, never skipped.
             check = self._fence.authorize_new_risk(
                 now=now, correlation_id=preparation.correlation_id
             )
-        except ProductionSafetyBlockedError as exc:
-            self._last_refusal = str(exc)
+        except Exception as exc:
+            if isinstance(exc, ProductionSafetyBlockedError):
+                self._last_refusal = str(exc)
+            self._release_preparation(preparation.intent_id)
             raise
 
         self._last_fence = check
@@ -820,8 +879,13 @@ class ProductionRuntime:
                 reference = self._execution.submit(request)
         except AmbiguousOrderError:
             # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
+            # Keep the reservation until a resolved recovery/startup supersedes the unknown state.
             self._last_outcome = "unknown_pending_reconciliation"
             raise
+        except Exception:
+            self._release_preparation(preparation.intent_id)
+            raise
+        self._release_preparation(preparation.intent_id)
         self._last_outcome = "submitted"
         self._last_refusal = None
         return ProductionSubmitResult(
@@ -864,6 +928,56 @@ class ProductionRuntime:
         )
 
     # --- internals -----------------------------------------------------------
+
+    def _preparation_expiry(self, intent: ProductionIntent) -> datetime:
+        policy = self._validity_gate.policy
+        deadlines = [
+            intent.market_event_ts.astimezone(timezone.utc)
+            + timedelta(seconds=policy.max_age_seconds)
+        ]
+        if intent.valid_until is not None:
+            deadlines.append(intent.valid_until.astimezone(timezone.utc))
+        if policy.valid_until_seconds is not None:
+            deadlines.append(
+                intent.decision_completed_at.astimezone(timezone.utc)
+                + timedelta(seconds=policy.valid_until_seconds)
+            )
+        return min(deadlines)
+
+    def _release_preparation(self, intent_id: UUID) -> None:
+        self._issued_preparations.pop(intent_id, None)
+        self._pending.remove(intent_id)
+
+    def _expire_preparations(self, now: datetime) -> None:
+        expired = [
+            intent_id
+            for intent_id, (_preparation, expires_at) in self._issued_preparations.items()
+            if now > expires_at
+        ]
+        for intent_id in expired:
+            self._release_preparation(intent_id)
+
+    def _require_canonical_risk_binding(self) -> ProductionRiskStateSource:
+        """Fail closed unless venue writes and canonical risk evidence share one authority path."""
+        source = self._risk_state_provider
+        if type(source) is not ProductionRiskStateSource:
+            raise ProductionStateError(
+                "venue-writing production requires the canonical ProductionRiskStateSource."
+            )
+        execution_client = getattr(self._execution, "client", None)
+        if (
+            execution_client is None
+            or source._client is not execution_client
+            or source._journal is not self._journal
+            or source._control is not self._control
+            or source._instrument != self._instrument
+            or source._environment != source._client.venue_label
+        ):
+            raise ProductionStateError(
+                "canonical risk source is not bound to this runtime's execution client, journal, "
+                "control, instrument and environment."
+            )
+        return source
 
     @staticmethod
     def _resolve_execution_capability(execution: object) -> ExecutionCapability:

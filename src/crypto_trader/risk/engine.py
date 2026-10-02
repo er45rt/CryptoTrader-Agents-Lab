@@ -102,14 +102,20 @@ class HardRiskEngine:
         *,
         pending: PendingIntentRegistry | None = None,
         max_state_age_seconds: float | None = None,
+        include_pending_reservations: bool = False,
+        enforce_attributed_inventory: bool = False,
     ) -> None:
         if not isinstance(limits, RiskLimits):
             raise RiskConfigError("a resolved RiskLimits rule set is required (fail closed).")
         if max_state_age_seconds is not None and max_state_age_seconds <= 0:
             raise RiskConfigError("max_state_age_seconds must be > 0 when configured.")
+        if type(include_pending_reservations) is not bool or type(enforce_attributed_inventory) is not bool:
+            raise RiskConfigError("pending reservation and attributed inventory modes must be booleans.")
         self._limits = limits
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._max_state_age_seconds = max_state_age_seconds
+        self._include_pending_reservations = include_pending_reservations
+        self._enforce_attributed_inventory = enforce_attributed_inventory
 
     @property
     def limits(self) -> RiskLimits:
@@ -179,6 +185,20 @@ class HardRiskEngine:
         rule("conflicting_intent", conflict is None, "conflicting_intent" if conflict else "no_conflict",
              Decimal(1) if conflict else ZERO, ZERO, "count")
 
+        pending_count = len(self._pending) if self._include_pending_reservations else 0
+        pending_gross = (
+            self._pending.reserved_gross_notional()
+            if self._include_pending_reservations else ZERO
+        )
+        pending_symbol = (
+            self._pending.reserved_notional(symbol=request.symbol)
+            if self._include_pending_reservations else ZERO
+        )
+        pending_strategy = (
+            self._pending.reserved_notional(strategy_id=request.strategy_id)
+            if self._include_pending_reservations else ZERO
+        )
+
         # 4. Reduce-only behaviour (when active, only exposure-reducing orders are allowed).
         if limits.reduce_only_mode:
             position = state.position(request.symbol)
@@ -186,10 +206,12 @@ class HardRiskEngine:
             rule("reduce_only", reduces, "reduce_only_violation" if not reduces else "reduce_only_ok",
                  ZERO if reduces else Decimal(1), ZERO, "count")
 
-        # 5/6. Open orders and positions.
-        rule("max_open_orders", state.open_orders < limits.max_open_orders,
-             "max_open_orders_exceeded" if state.open_orders >= limits.max_open_orders else "open_orders_ok",
-             Decimal(state.open_orders), Decimal(limits.max_open_orders), "count")
+        # 5/6. Open orders and positions. Approved-but-not-yet-journaled production intents
+        # reserve one future order slot until submission resolves.
+        projected_open_orders = state.open_orders + pending_count + 1
+        rule("max_open_orders", projected_open_orders <= limits.max_open_orders,
+             "max_open_orders_exceeded" if projected_open_orders > limits.max_open_orders else "open_orders_ok",
+             Decimal(projected_open_orders), Decimal(limits.max_open_orders), "count")
         rule("max_open_positions", state.open_positions < limits.max_open_positions,
              "max_open_positions_exceeded" if state.open_positions >= limits.max_open_positions else "open_positions_ok",
              Decimal(state.open_positions), Decimal(limits.max_open_positions), "count")
@@ -200,25 +222,65 @@ class HardRiskEngine:
              "max_order_notional_exceeded" if notional > limits.max_order_notional_quote else "order_notional_ok",
              notional, limits.max_order_notional_quote, "quote_currency")
 
-        # 8/9. Projected symbol and strategy exposure (quote currency).
-        projected_symbol = abs(state.symbol_exposure(request.symbol) + request.signed_notional)
+        # 8/9. Projected symbol and strategy exposure (quote currency). Pending production
+        # reservations are added conservatively by magnitude so an unjournaled approval can never
+        # cancel a durable exposure and create a false allowance.
+        projected_symbol = (
+            abs(state.symbol_exposure(request.symbol)) + pending_symbol + notional
+            if self._include_pending_reservations
+            else abs(state.symbol_exposure(request.symbol) + request.signed_notional)
+        )
         rule("max_symbol_exposure", projected_symbol <= limits.max_symbol_exposure_quote,
              "max_symbol_exposure_exceeded" if projected_symbol > limits.max_symbol_exposure_quote else "symbol_exposure_ok",
              projected_symbol, limits.max_symbol_exposure_quote, "quote_currency")
-        projected_strategy = abs(state.strategy_exposure(request.strategy_id) + request.signed_notional)
+        projected_strategy = (
+            abs(state.strategy_exposure(request.strategy_id)) + pending_strategy + notional
+            if self._include_pending_reservations
+            else abs(state.strategy_exposure(request.strategy_id) + request.signed_notional)
+        )
         rule("max_strategy_exposure", projected_strategy <= limits.max_strategy_exposure_quote,
              "max_strategy_exposure_exceeded" if projected_strategy > limits.max_strategy_exposure_quote else "strategy_exposure_ok",
              projected_strategy, limits.max_strategy_exposure_quote, "quote_currency")
 
         # 10/11. Gross and net exposure (conservative deterministic projections).
-        projected_gross = state.gross_exposure_quote + notional
+        projected_gross = state.gross_exposure_quote + pending_gross + notional
         rule("max_gross_exposure", projected_gross <= limits.max_gross_exposure_quote,
              "max_gross_exposure_exceeded" if projected_gross > limits.max_gross_exposure_quote else "gross_exposure_ok",
              projected_gross, limits.max_gross_exposure_quote, "quote_currency")
-        projected_net = abs(state.net_exposure_quote + request.signed_notional)
+        projected_net = (
+            abs(state.net_exposure_quote) + pending_gross + notional
+            if self._include_pending_reservations
+            else abs(state.net_exposure_quote + request.signed_notional)
+        )
         rule("max_net_exposure", projected_net <= limits.max_net_exposure_quote,
              "max_net_exposure_exceeded" if projected_net > limits.max_net_exposure_quote else "net_exposure_ok",
              projected_net, limits.max_net_exposure_quote, "quote_currency")
+
+        if self._enforce_attributed_inventory and request.side is Side.SELL:
+            reserved_sell = (
+                self._pending.reserved_sell_quantity(
+                    symbol=request.symbol, strategy_id=request.strategy_id
+                )
+                if self._include_pending_reservations else ZERO
+            )
+            available_quantity = state.strategy_position(request.strategy_id)
+            projected_sell_quantity = (
+                state.strategy_open_sell(request.strategy_id)
+                + reserved_sell
+                + request.quantity
+            )
+            rule(
+                "attributed_inventory",
+                projected_sell_quantity <= available_quantity,
+                (
+                    "insufficient_attributed_inventory"
+                    if projected_sell_quantity > available_quantity
+                    else "attributed_inventory_ok"
+                ),
+                projected_sell_quantity,
+                available_quantity,
+                "base_quantity",
+            )
 
         # 12. Loss limit (quote currency; loss expressed as a positive magnitude).
         loss = max(ZERO, -state.realized_pnl_quote)
@@ -260,6 +322,8 @@ class HardRiskEngine:
                     symbol=request.symbol,
                     strategy_id=request.strategy_id,
                     side=request.side,
+                    quantity=request.quantity,
+                    notional=request.notional,
                 )
             )
 

@@ -146,6 +146,8 @@ class TradingSession:
                 self._pending.register(PendingIntent(
                     intent_id=payload.intent_id, symbol=payload.symbol,
                     strategy_id=self.config.strategy_id, side=Side(payload.side),
+                    quantity=payload.quantity,
+                    notional=payload.quantity * payload.price,
                 ))
         # The market-state provider walks the same frozen sequence, so validity never sees a
         # future observation when it evaluates an intent.

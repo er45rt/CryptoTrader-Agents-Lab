@@ -21,6 +21,7 @@ _AUTHORIZED_MODULES = {
     "errors.py",
     "equity.py",
     "fence.py",
+    "risk_state.py",
     "runtime.py",
 }
 

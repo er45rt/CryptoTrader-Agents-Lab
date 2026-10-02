@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from crypto_trader.production import (
 )
 from crypto_trader.safety import SafetyMode
 from crypto_trader.tests.production_fixtures import (
+    BASE,
     INSTRUMENT,
     RecordingExecutionPort,
     build_runtime,
@@ -88,7 +91,55 @@ def test_a_second_normal_writer_cannot_be_authoritative_at_the_same_time(journal
     with pytest.raises(StaleWriterFenceError):
         runtime.submit_prepared(preparation)
     assert port.submit_count == 0
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
     assert control.ownership_store.require_fence().owner_id == "normal:second-runtime"
+
+
+def test_submit_prepared_rejects_forged_object_but_keeps_real_issued_preparation(
+    journal, state_dir
+):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("forged-preparation"))
+    forged = replace(preparation)
+
+    with pytest.raises(ProductionStateError, match="exact unused preparation"):
+        runtime.submit_prepared(forged)
+
+    assert port.submit_count == 0
+    assert len(runtime._pending) == 1
+    result = runtime.submit_prepared(preparation)
+    assert result.intent_id == preparation.intent_id
+    assert port.submit_count == 1
+    assert len(runtime._pending) == 0
+
+
+def test_submit_prepared_is_one_time_only(journal, state_dir):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("one-time-preparation"))
+
+    runtime.submit_prepared(preparation)
+
+    with pytest.raises(ProductionStateError, match="exact unused preparation"):
+        runtime.submit_prepared(preparation)
+    assert port.submit_count == 1
+    assert len(runtime._pending) == 0
+
+
+def test_expired_preparation_is_refused_and_releases_reservation(journal, state_dir):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("expired-preparation"))
+    runtime._clock = lambda: BASE + timedelta(seconds=61)
+
+    with pytest.raises(ProductionStateError, match="expired before submission"):
+        runtime.submit_prepared(preparation)
+
+    assert port.submit_count == 0
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
 
 
 def test_an_absent_writer_lease_refuses_writes_and_new_risk(journal, state_dir):

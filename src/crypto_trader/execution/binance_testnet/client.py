@@ -58,6 +58,7 @@ from .models import (
     VenueTrade,
     VenueAssetBalance,
     VenueAccountSnapshot,
+    MarkEvidence,
     TestnetOrder,
     TestnetOrderRequest,
     TestnetSymbolRules,
@@ -158,6 +159,7 @@ _WEIGHT_READ_OPEN_ORDERS = 3
 _WEIGHT_READ_MY_TRADES_WITH_ORDER = 5
 _WEIGHT_ACCOUNT = 20
 _ACCOUNT_BALANCE_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+_MARK_PRICE_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _WEIGHT_EXCHANGE_INFO = 20
 _WEIGHT_WRITE = 1
 
@@ -223,6 +225,43 @@ class BinanceSpotTestnetClient:
         if price is None:
             raise BinanceTestnetError("the testnet price response was not understood.")
         return Decimal(str(price))
+
+    def startup_mark_evidence(self, symbol: str) -> MarkEvidence:
+        """Strict timestamped mark evidence for production equity/risk state."""
+        if (
+            not isinstance(symbol, str)
+            or not symbol
+            or symbol != symbol.strip()
+            or symbol != symbol.upper()
+            or not symbol.isascii()
+            or not symbol.isalnum()
+        ):
+            raise BinanceTestnetError(
+                "startup mark symbol must be an uppercase ASCII alphanumeric string."
+            )
+        body = self._request(PATH_PRICE, {"symbol": symbol}, weight=1, is_write=False)
+        if not isinstance(body, Mapping):
+            raise BinanceTestnetError("startup mark evidence must be an object.")
+        if body.get("symbol") != symbol:
+            raise BinanceTestnetError("startup mark evidence symbol does not match the request.")
+        raw = body.get("price")
+        if not isinstance(raw, str) or not _MARK_PRICE_RE.fullmatch(raw):
+            raise BinanceTestnetError("startup mark price is missing or malformed.")
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise BinanceTestnetError("startup mark price is malformed.") from exc
+        if not value.is_finite() or value <= 0:
+            raise BinanceTestnetError("startup mark price must be a positive finite Decimal.")
+        observed_at = utc_from_ms(self.clock.timestamp_ms())
+        if observed_at is None:
+            raise BinanceTestnetError("startup mark observation time could not be represented.")
+        return MarkEvidence(
+            symbol=symbol,
+            price=value,
+            observed_at=observed_at,
+            reference=f"binance.ticker.price:{symbol}",
+        )
 
     def account_snapshot(self, *, asset: str | None = None) -> TestnetAccountState:
         body = self._request(PATH_ACCOUNT, {}, weight=_WEIGHT_ACCOUNT, is_write=False, signed=True)
@@ -290,14 +329,23 @@ class BinanceSpotTestnetClient:
             raise BinanceTestnetError("startup account balances must be a list.")
 
         parsed: dict[str, VenueAssetBalance] = {}
+        seen_assets: set[str] = set()
         for entry in balances:
             if not isinstance(entry, Mapping):
                 raise BinanceTestnetError("startup account balance entries must be objects.")
             name = entry.get("asset")
-            if name not in requested:
-                continue
-            if not isinstance(name, str) or name in parsed:
-                raise BinanceTestnetError("startup account contains duplicate or malformed assets.")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name != name.strip()
+                or name != name.upper()
+                or not name.isascii()
+                or not name.isalnum()
+            ):
+                raise BinanceTestnetError("startup account contains a malformed asset code.")
+            if name in seen_assets:
+                raise BinanceTestnetError("startup account contains duplicate asset entries.")
+            seen_assets.add(name)
             values: list[Decimal] = []
             for field_name in ("free", "locked"):
                 raw = entry.get(field_name)
@@ -316,7 +364,9 @@ class BinanceSpotTestnetClient:
                         f"startup account {name} {field_name} balance must be finite and nonnegative."
                     )
                 values.append(value)
-            parsed[name] = VenueAssetBalance(asset=name, free=values[0], locked=values[1])
+            balance = VenueAssetBalance(asset=name, free=values[0], locked=values[1])
+            if name in requested:
+                parsed[name] = balance
 
         missing = [asset for asset in requested if asset not in parsed]
         if missing:
@@ -959,12 +1009,14 @@ class BinanceSpotTestnetClient:
         identity = body.get("clientOrderId")
         status = body.get("status")
         venue_id = body.get("orderId")
+        side = body.get("side")
         if (
             not isinstance(identity, str) or not identity.strip()
             or (reference is not None and identity != reference)
             or body.get("symbol") != symbol
             or not isinstance(status, str) or status not in STATUS_TO_STATE
             or type(venue_id) is not int or venue_id <= 0
+            or side not in {"BUY", "SELL"}
         ):
             raise BinanceTestnetError("startup order identity, symbol or status is invalid.")
         quantities = []
@@ -980,6 +1032,15 @@ class BinanceSpotTestnetClient:
                 raise BinanceTestnetError("startup order quantity is not finite/nonnegative.")
             quantities.append(parsed)
         original, executed = quantities
+        raw_price = body.get("price")
+        if not isinstance(raw_price, str):
+            raise BinanceTestnetError("startup order price is missing or malformed.")
+        try:
+            order_price = Decimal(raw_price)
+        except InvalidOperation as exc:
+            raise BinanceTestnetError("startup order price is malformed.") from exc
+        if not order_price.is_finite() or order_price < 0:
+            raise BinanceTestnetError("startup order price is not finite/nonnegative.")
         raw_quote = body.get("cummulativeQuoteQty")
         if not isinstance(raw_quote, str):
             raise BinanceTestnetError("startup order cumulative quote quantity is missing or malformed.")
@@ -1003,8 +1064,9 @@ class BinanceSpotTestnetClient:
         # missing identity/status/quantity evidence or clamp inconsistent quantities.
         return TestnetOrder(
             symbol=symbol, client_order_id=identity, venue_order_id=str(venue_id),
-            status=status, state=STATUS_TO_STATE[status], original_quantity=original,
-            executed_quantity=executed, cummulative_quote_quantity=cumulative_quote,
+            status=status, state=STATUS_TO_STATE[status], side=side, price=order_price,
+            original_quantity=original, executed_quantity=executed,
+            cummulative_quote_quantity=cumulative_quote,
         )
 
     def cancel_all_open_orders(self, symbol: str) -> tuple[TestnetOrder, ...]:

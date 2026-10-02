@@ -47,9 +47,11 @@ from crypto_trader.execution.binance_testnet import TestnetClock as SpotClock
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import (
     ProductionIntent,
+    ProductionRiskStateSource,
     ProductionRuntime,
     resolve_environment,
 )
+from crypto_trader.production.equity import AccountEquityBaselineWriter
 from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.risk import load_limits
 from crypto_trader.validity import (
@@ -188,6 +190,34 @@ def live_context(tmp_path: Path):
         reconciliation_policy=load_recovery_policy({"policy_id": LIVE_POLICY_ID}),
         clock=_now,
     )
+    market_state = _live_market_state(client)
+    client.synchronize_clock()
+    venue_account_id = client.startup_account_snapshot(
+        INSTRUMENT.base_currency, INSTRUMENT.quote_currency
+    ).venue_account_id
+    AccountEquityBaselineWriter(
+        journal=journal,
+        control=control,
+        client=client,
+        market_state=market_state,
+        instrument=INSTRUMENT,
+        environment=client.venue_label,
+        venue_account_id=venue_account_id,
+        max_account_age_seconds=30,
+        max_mark_age_seconds=30,
+        clock=_now,
+        owner_id="normal:production-live-baseline",
+    ).create()
+    risk_source = ProductionRiskStateSource(
+        journal=journal,
+        control=control,
+        client=client,
+        instrument=INSTRUMENT,
+        environment=client.venue_label,
+        venue_account_id=venue_account_id,
+        max_account_age_seconds=30,
+        max_mark_age_seconds=30,
+    )
     runtime = ProductionRuntime(
         journal=journal,
         state_dir=state_dir,
@@ -202,9 +232,9 @@ def live_context(tmp_path: Path):
                 }
             )
         ),
-        market_state=_live_market_state(client),
+        market_state=market_state,
         limits=load_limits(LIVE_LIMITS),
-        risk_state_provider=lambda now: _flat_risk_state(now),
+        risk_state_provider=risk_source,
         reconciliation_policy=load_recovery_policy({"policy_id": LIVE_POLICY_ID}),
         control=control,
         clock=_now,
@@ -219,21 +249,6 @@ def live_context(tmp_path: Path):
         port.stop()
     finally:
         journal.close()
-
-
-def _flat_risk_state(now: datetime):
-    from crypto_trader.risk import RiskStateSnapshot
-
-    return RiskStateSnapshot(
-        equity_quote=Decimal("100000"),
-        peak_equity_quote=Decimal("100000"),
-        realized_pnl_quote=Decimal("0"),
-        gross_exposure_quote=Decimal("0"),
-        net_exposure_quote=Decimal("0"),
-        open_orders=0,
-        open_positions=0,
-        snapshot_ts=now,
-    )
 
 
 def test_live_runtime_claims_the_normal_lease_and_verifies_the_testnet_venue(live_context):

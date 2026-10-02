@@ -7,6 +7,9 @@ double, so no credential value is used and no network request is made.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 from types import SimpleNamespace
@@ -15,6 +18,7 @@ import pytest
 
 from crypto_trader.events import ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
 from crypto_trader.breakglass import BinanceSpotTestnetEmergencyControl
+from crypto_trader.execution import ExecutionSide
 from crypto_trader.execution.binance_testnet import (
     SPOT_TESTNET_REST_BASE,
     AmbiguousOrderError,
@@ -23,16 +27,22 @@ from crypto_trader.execution.binance_testnet import (
 )
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import SQLiteEventJournal
-from crypto_trader.production import ProductionStateError
+from crypto_trader.production import ProductionRiskStateSource, ProductionStateError
+from crypto_trader.production.equity import AccountEquityBaselineWriter
 from crypto_trader.recovery import reconstruct_order_states
+from crypto_trader.validity import MarketObservation, ReplayMarketStateProvider
 from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.test_production_live_testnet import _require_reconciliation_closure
 from crypto_trader.tests.production_fixtures import (
+    BASE,
     INSTRUMENT,
     startup_responses,
     build_runtime,
+    clock,
     control_for,
     intent,
+    limits as production_limits,
+    market_state,
     operator_command,
 )
 
@@ -57,11 +67,75 @@ def _reference_for(intent_obj) -> str:
     return f"ct-{intent_obj.intent_id.hex[:20]}"
 
 
-def _wired(journal, state_dir, transport, *, control=None):
-    client = fx.client(transport)
-    port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+def _flat_account_response():
+    response = fx.account_response()
+    for balance in response.body["balances"]:
+        if balance["asset"] == "BTC":
+            balance["free"] = "0"
+    return response
+
+
+def _risk_refresh_responses():
+    return [
+        fx.time_response(),
+        fx.open_orders_response(),
+        _flat_account_response(),
+        fx.price_response("27000.00"),
+        fx.open_orders_response(),
+    ]
+
+
+def _wired(
+    journal, state_dir, transport, *, control=None, port=None, client=None, limits_value=None
+):
+    client = client or fx.client(transport)
+    port = port or OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+    active_control = control or control_for(journal, state_dir)
+    evidence_now = datetime.fromtimestamp(fx.SERVER_TIME_MS / 1000, tz=timezone.utc)
+
+    # G5b production writing requires one durable account-equity root and a canonical source.
+    baseline_transport = fx.ScriptedTransport([
+        fx.time_response(), fx.open_orders_response(), _flat_account_response(), fx.open_orders_response(),
+    ])
+    baseline_client = fx.client(baseline_transport)
+    AccountEquityBaselineWriter(
+        journal=journal,
+        control=active_control,
+        client=baseline_client,
+        market_state=ReplayMarketStateProvider([
+            MarketObservation(
+                symbol=INSTRUMENT.symbol,
+                price=Decimal("27000"),
+                market_event_ts=evidence_now,
+                local_ingest_ts=evidence_now,
+                market_reference="integration-baseline-mark",
+                sequence=1,
+            )
+        ]),
+        instrument=INSTRUMENT,
+        environment="binance-spot-testnet",
+        venue_account_id="123456789",
+        max_account_age_seconds=5,
+        max_mark_age_seconds=5,
+        clock=clock(evidence_now),
+    ).create()
+
+    # Venue-writing G5b risk evidence must come from the exact same authenticated client
+    # that can submit the order. Insert the read-only refresh immediately after startup evidence.
+    transport.responses[5:5] = _risk_refresh_responses()
+    risk_source = ProductionRiskStateSource(
+        journal=journal,
+        control=active_control,
+        client=client,
+        instrument=INSTRUMENT,
+        environment="binance-spot-testnet",
+        venue_account_id="123456789",
+        max_account_age_seconds=13 * 60 * 60,
+        max_mark_age_seconds=13 * 60 * 60,
+    )
     runtime = build_runtime(
-        journal=journal, state_dir=state_dir, execution=port, control=control
+        journal=journal, state_dir=state_dir, execution=port, control=active_control,
+        risk_state_source=risk_source, limits_value=limits_value,
     )
     return runtime, port, client
 
@@ -82,6 +156,64 @@ def test_invalid_strategy_id_is_rejected_before_any_attempt_or_post(journal, sta
     assert [request for request in transport.requests if request.is_write] == []
 
 
+def test_unattributed_sell_is_blocked_before_any_venue_write(journal, state_dir):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, _client = _wired(journal, state_dir, transport)
+    runtime.start()
+
+    outcome = runtime.execute_intent(
+        intent(
+            "unattributed-sell",
+            side=ExecutionSide.SELL,
+            quantity=Decimal("0.001"),
+        )
+    )
+
+    assert outcome.submitted is False
+    assert "insufficient_attributed_inventory" in (outcome.blocked_reason_code or "")
+    assert not [request for request in transport.requests if request.method == "POST"]
+    assert len(runtime._pending) == 0
+
+
+@pytest.mark.parametrize(
+    "limit_field,reason_code",
+    [
+        ("max_symbol_exposure_quote", "max_symbol_exposure_exceeded"),
+        ("max_strategy_exposure_quote", "max_strategy_exposure_exceeded"),
+        ("max_gross_exposure_quote", "max_gross_exposure_exceeded"),
+        ("max_net_exposure_quote", "max_net_exposure_exceeded"),
+    ],
+)
+def test_second_prepare_accounts_for_first_pending_reservation(
+    journal, state_dir, limit_field, reason_code
+):
+    transport = fx.ScriptedTransport([
+        *startup_responses(),
+        *_risk_refresh_responses(),
+    ])
+    resolved_limits = replace(
+        production_limits(),
+        **{limit_field: Decimal("400")},
+    )
+    runtime, _port, _client = _wired(
+        journal, state_dir, transport, limits_value=resolved_limits
+    )
+    runtime.start()
+
+    first = runtime.prepare_intent(
+        intent("reservation-first", quantity=Decimal("0.01"))
+    )
+    second = runtime.prepare_intent(
+        intent("reservation-second", quantity=Decimal("0.01"))
+    )
+
+    assert first.approved is True
+    assert second.approved is False
+    assert reason_code in (second.blocked_reason_code or "")
+    assert len(runtime._pending) == 1
+    assert not [request for request in transport.requests if request.method == "POST"]
+
+
 def test_testnet_execution_flows_through_the_production_runtime(journal, state_dir):
     intent_obj = intent("testnet-flow-1")
     transport = fx.ScriptedTransport(
@@ -99,7 +231,7 @@ def test_testnet_execution_flows_through_the_production_runtime(journal, state_d
     assert outcome.submitted is True
     assert outcome.submission is not None
     assert outcome.submission.order_reference == _reference_for(intent_obj)
-    assert outcome.submission.fence_term == 1
+    assert outcome.submission.fence_term == report.fence_term
     assert outcome.submission.safety_mode == "normal"
     assert outcome.submission.environment == "testnet"
     assert port.observations()
@@ -110,6 +242,8 @@ def test_testnet_execution_flows_through_the_production_runtime(journal, state_d
     assert attempts[0].strategy_id == intent_obj.strategy_id
     writes = [request for request in transport.requests if request.is_write]
     assert len(writes) == 1
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
 
 
 # --- 13: ambiguity is preserved, never retried -------------------------------------
@@ -131,6 +265,8 @@ def test_an_ambiguous_submit_stays_unknown_pending_reconciliation(journal, state
         state for state in port.local_states() if state.submission_attempted and state.is_open
     ]
     assert pending, "the ambiguous submission must stay pending for reconciliation"
+    assert len(runtime._pending) == 1
+    assert len(runtime._issued_preparations) == 1
 
 
 # --- 16: the withdrawal-disabled invariant still fails closed ----------------------
@@ -194,12 +330,7 @@ def _deterministic_run(root: Path):
         transport = fx.ScriptedTransport(
             [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
         )
-        client = fx.client(transport)
-        control = control_for(journal, state_dir)
-        port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
-        runtime = build_runtime(
-            journal=journal, state_dir=state_dir, execution=port, control=control
-        )
+        runtime, port, client = _wired(journal, state_dir, transport)
         runtime.start(correlation_id=START_CORRELATION_ID)
         runtime.execute_intent(intent_obj)
 
@@ -254,8 +385,8 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
     port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
     venue = BinanceSpotTestnetEmergencyControl(client=client, runtime=port)
     control = control_for(journal, state_dir, venue=venue)
-    runtime = build_runtime(
-        journal=journal, state_dir=state_dir, execution=port, control=control
+    runtime, port, client = _wired(
+        journal, state_dir, transport, control=control, port=port, client=client
     )
     runtime.start()
     submitted = runtime.execute_intent(intent_obj)

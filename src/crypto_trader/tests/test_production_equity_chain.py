@@ -202,7 +202,7 @@ def test_equity_chain_refuses_rebaseline_scope_change(journal):
         load(journal)
 
 
-def test_equity_chain_refuses_rebaseline_that_lowers_high_water_mark(journal):
+def test_equity_chain_accepts_rebaseline_that_resets_high_water_mark_lower(journal):
     journal.append(equity_event(
         event_id=ROOT_ID, kind="baseline", equity="32000", quote_balance="2000",
         baseline_id=ROOT_ID, previous_id=None, seconds=0,
@@ -211,8 +211,11 @@ def test_equity_chain_refuses_rebaseline_that_lowers_high_water_mark(journal):
         event_id=REBASE_ID, kind="rebaseline", equity="31000", quote_balance="1000",
         baseline_id=REBASE_ID, previous_id=ROOT_ID, seconds=1,
     ))
-    with pytest.raises(ProductionStateError, match="cannot lower"):
-        load(journal)
+
+    state = load(journal)
+
+    assert state.baseline_event_id == REBASE_ID
+    assert state.peak_equity_quote == Decimal("31000")
 
 
 def test_equity_chain_refuses_fence_term_regression(journal):
@@ -288,3 +291,62 @@ def test_equity_chain_refuses_time_regression_even_if_source_returns_insertion_o
 
     with pytest.raises(ProductionStateError, match="time moved backwards"):
         load(InsertionOrderJournal())
+
+
+def test_peak_after_rebaseline_uses_new_baseline_identity(journal):
+    next_peak = UUID("10000000-0000-4000-8000-000000000004")
+    journal.append(equity_event(
+        event_id=ROOT_ID, kind="baseline", equity="32000", quote_balance="2000",
+        baseline_id=ROOT_ID, previous_id=None, seconds=0,
+    ))
+    journal.append(equity_event(
+        event_id=REBASE_ID, kind="rebaseline", equity="31000", quote_balance="1000",
+        baseline_id=REBASE_ID, previous_id=ROOT_ID, seconds=1,
+    ))
+    journal.append(equity_event(
+        event_id=next_peak, kind="peak", equity="31500", quote_balance="1500",
+        baseline_id=REBASE_ID, previous_id=REBASE_ID, seconds=2,
+    ))
+
+    state = load(journal)
+
+    assert state.baseline_event_id == REBASE_ID
+    assert state.last_event_id == next_peak
+    assert state.peak_equity_quote == Decimal("31500")
+
+
+def test_peak_preserves_original_active_root_accounting_inputs(journal):
+    journal.append(equity_event(
+        event_id=ROOT_ID, kind="baseline", equity="31000", quote_balance="1000",
+        baseline_id=ROOT_ID, previous_id=None, seconds=0,
+    ))
+    journal.append(equity_event(
+        event_id=PEAK_ID, kind="peak", equity="31500", quote_balance="1500",
+        baseline_id=ROOT_ID, previous_id=ROOT_ID, seconds=1,
+    ))
+
+    state = load(journal)
+
+    assert state.root_occurred_at == BASE
+    assert state.root_base_balance == Decimal("1")
+    assert state.root_quote_balance == Decimal("1000")
+    assert state.root_mark_price == Decimal("30000")
+    assert state.root_mark_reference == f"market:{SYMBOL}:0"
+
+
+def test_rebaseline_becomes_new_active_root_accounting_inputs(journal):
+    journal.append(equity_event(
+        event_id=ROOT_ID, kind="baseline", equity="32000", quote_balance="2000",
+        baseline_id=ROOT_ID, previous_id=None, seconds=0,
+    ))
+    journal.append(equity_event(
+        event_id=REBASE_ID, kind="rebaseline", equity="31000", quote_balance="1000",
+        baseline_id=REBASE_ID, previous_id=ROOT_ID, seconds=2,
+    ))
+
+    state = load(journal)
+
+    assert state.root_occurred_at == BASE + timedelta(seconds=2)
+    assert state.root_base_balance == Decimal("1")
+    assert state.root_quote_balance == Decimal("1000")
+    assert state.root_mark_reference == f"market:{SYMBOL}:2"

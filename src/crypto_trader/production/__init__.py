@@ -41,6 +41,7 @@ from .errors import (
 )
 from .fence import FenceCheck, ProductionFence
 from .equity import EquityChainState, load_equity_chain
+from .risk_state import ProductionRiskStateSource, derive_risk_state
 from .backfill import TradeBackfillMaintenanceWriter, TradeBackfillWriteReport
 from .runtime import (
     PRODUCTION_PRODUCER,
@@ -70,6 +71,7 @@ __all__ = [
     "ProductionFenceError",
     "ProductionIntent",
     "ProductionRecoveryRequiredError",
+    "ProductionRiskStateSource",
     "ProductionRuntime",
     "ProductionRuntimeError",
     "ProductionSafetyBlockedError",
@@ -81,6 +83,7 @@ __all__ = [
     "TradeBackfillWriteReport",
     "TradingEnvironment",
     "assert_endpoint_matches_environment",
+    "derive_risk_state",
     "endpoint_for",
     "load_equity_chain",
     "parse_environment",

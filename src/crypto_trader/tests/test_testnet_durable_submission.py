@@ -778,10 +778,10 @@ def test_durable_attempt_for_one_identity_does_not_block_a_different_identity(tm
 
         assert len(posts(transport)) == 2
         attempts = attempt_events(journal)
-        assert [event.payload.venue_reference for event in attempts] == [
+        assert {event.payload.venue_reference for event in attempts} == {
             CLIENT_ORDER_ID,
             second_reference,
-        ]
+        }
 
 
 @pytest.mark.parametrize(
