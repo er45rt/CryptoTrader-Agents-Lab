@@ -40,6 +40,7 @@ from .errors import (
     ProductionStateError,
 )
 from .fence import FenceCheck, ProductionFence
+from .equity import EquityChainState, load_equity_chain
 from .runtime import (
     PRODUCTION_PRODUCER,
     IntentPreparation,
@@ -58,6 +59,7 @@ __all__ = [
     "PRODUCTION_PRODUCER",
     "EnvironmentDecision",
     "EnvironmentEndpointMismatchError",
+    "EquityChainState",
     "FenceCheck",
     "IntentPreparation",
     "MainnetDisabledError",
@@ -77,6 +79,7 @@ __all__ = [
     "TradingEnvironment",
     "assert_endpoint_matches_environment",
     "endpoint_for",
+    "load_equity_chain",
     "parse_environment",
     "production_control",
     "resolve_environment",

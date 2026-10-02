@@ -980,11 +980,23 @@ class BinanceSpotTestnetClient:
                 raise BinanceTestnetError("startup order quantity is not finite/nonnegative.")
             quantities.append(parsed)
         original, executed = quantities
+        raw_quote = body.get("cummulativeQuoteQty")
+        if not isinstance(raw_quote, str):
+            raise BinanceTestnetError("startup order cumulative quote quantity is missing or malformed.")
+        try:
+            cumulative_quote = Decimal(raw_quote)
+        except InvalidOperation as exc:
+            raise BinanceTestnetError("startup order cumulative quote quantity is malformed.") from exc
+        if not cumulative_quote.is_finite() or cumulative_quote < 0:
+            raise BinanceTestnetError(
+                "startup order cumulative quote quantity is not finite/nonnegative."
+            )
         if (
             original <= 0 or executed > original
             or (status == "FILLED" and executed != original)
             or (status == "NEW" and executed != 0)
             or (status == "PARTIALLY_FILLED" and not 0 < executed < original)
+            or ((executed == 0) != (cumulative_quote == 0))
         ):
             raise BinanceTestnetError("startup order status/quantities are inconsistent.")
         # Construct only the reconciliation fields; ancillary legacy defaults cannot hide
@@ -992,7 +1004,7 @@ class BinanceSpotTestnetClient:
         return TestnetOrder(
             symbol=symbol, client_order_id=identity, venue_order_id=str(venue_id),
             status=status, state=STATUS_TO_STATE[status], original_quantity=original,
-            executed_quantity=executed,
+            executed_quantity=executed, cummulative_quote_quantity=cumulative_quote,
         )
 
     def cancel_all_open_orders(self, symbol: str) -> tuple[TestnetOrder, ...]:

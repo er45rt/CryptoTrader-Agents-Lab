@@ -18,6 +18,7 @@ _AUTHORIZED_MODULES = {
     "__init__.py",
     "environment.py",
     "errors.py",
+    "equity.py",
     "fence.py",
     "runtime.py",
 }

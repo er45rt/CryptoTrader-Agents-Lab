@@ -959,3 +959,19 @@ def test_strict_account_models_reject_invalid_direct_construction():
             venue_account_id="123", venue_update_time_ms=1,
             fetched_at=datetime(2026, 1, 1, tzinfo=timezone.utc), balances=[good]
         )
+
+
+def test_fill_event_identity_is_single_canonical_pinned_vector():
+    from uuid import UUID
+    from crypto_trader.execution.binance_testnet.translate import (
+        canonical_fill_event_id,
+        deterministic_fill_event_uuid,
+        venue_trade_event_id,
+    )
+
+    expected_fill = UUID("517535ff-b400-53a4-9733-5dff33160d69")
+    expected_trade = UUID("f6eb7f37-045d-5f90-b67e-5f7bef78150f")
+
+    assert canonical_fill_event_id("ct-test", "7") == expected_fill
+    assert deterministic_fill_event_uuid("ct-test", "7") == expected_fill
+    assert venue_trade_event_id("BTCUSDT", "42", "7") == expected_trade

@@ -199,10 +199,15 @@ def order_response(
     orig_qty: str = "0.00100000",
     executed_qty: str = "0",
     price: str = "27000.00",
-    cummulative_quote: str = "0",
+    cummulative_quote: str | None = None,
     fills: tuple[dict[str, str], ...] = (),
     transact_time: int = SERVER_TIME_MS,
 ) -> HttpResponse:
+    cumulative = (
+        cummulative_quote
+        if cummulative_quote is not None
+        else str(Decimal(price) * Decimal(executed_qty))
+    )
     return response(
         200,
         {
@@ -213,7 +218,7 @@ def order_response(
             "price": price,
             "origQty": orig_qty,
             "executedQty": executed_qty,
-            "cummulativeQuoteQty": cummulative_quote,
+            "cummulativeQuoteQty": cumulative,
             "status": status,
             "timeInForce": "GTC",
             "type": "LIMIT",
@@ -312,7 +317,7 @@ def open_orders_response(
                 "price": "27000.00",
                 "origQty": "0.00100000",
                 "executedQty": executed_qty,
-                "cummulativeQuoteQty": "0",
+                "cummulativeQuoteQty": str(Decimal("27000.00") * Decimal(executed_qty)),
                 "status": status,
                 "timeInForce": "GTC",
                 "type": "LIMIT",

@@ -22,7 +22,10 @@ from .models import TestnetOrder
 
 __all__ = [
     "PRODUCER",
+    "canonical_fill_event_id",
+    "venue_trade_event_id",
     "deterministic_order_uuid",
+    "deterministic_fill_event_uuid",
     "lifecycle_state_name",
     "testnet_order_to_phase3_events",
     "to_local_order_state",
@@ -55,11 +58,30 @@ def legacy_fill_event_ids(client_order_id: str, trade_id: str, count: int) -> se
             for index in range(count)}
 
 
+def canonical_fill_event_id(client_order_id: str, trade_id: str) -> UUID:
+    """Stable fill identity used by all post-migration Binance fill writers."""
+    if not client_order_id or not trade_id:
+        raise ValueError("client order id and venue trade id are required.")
+    return uuid5(_ORDER_NAMESPACE, f"{client_order_id}:trade:{trade_id}")
+
+
+def venue_trade_event_id(symbol: str, venue_order_id: str, trade_id: str) -> UUID:
+    """Stable identity for one venue trade metadata record."""
+    if not symbol or not venue_order_id or not trade_id:
+        raise ValueError("symbol, venue order id and venue trade id are required.")
+    return uuid5(_ORDER_NAMESPACE, f"{symbol}:venue-trade:{venue_order_id}:{trade_id}")
+
+
 def deterministic_order_uuid(client_order_id: str) -> UUID:
     """Stable mapping from the client order id (the idempotency key) to a domain order id."""
     if not client_order_id:
         raise ValueError("a client order id is required.")
     return uuid5(_ORDER_NAMESPACE, client_order_id)
+
+
+def deterministic_fill_event_uuid(client_order_id: str, trade_id: str) -> UUID:
+    """Backward-compatible alias for :func:`canonical_fill_event_id`."""
+    return canonical_fill_event_id(client_order_id, trade_id)
 
 
 def lifecycle_state_name(state: OrderLifecycleState) -> OrderStateName:
@@ -135,9 +157,7 @@ def testnet_order_to_phase3_events(
             raise ValueError("a stable venue trade id is required to journal a fill.")
         events.append(
             ExecutionFillRecorded(
-                event_id=uuid5(
-                    _ORDER_NAMESPACE, f"{order.client_order_id}:trade:{fill.trade_id}"
-                ),
+                event_id=deterministic_fill_event_uuid(order.client_order_id, fill.trade_id),
                 occurred_at=stamp,
                 correlation_id=correlation_id,
                 producer=PRODUCER,

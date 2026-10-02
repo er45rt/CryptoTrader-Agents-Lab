@@ -64,7 +64,13 @@ from .models import (
 from .rate_limit import RateLimitBudget, RetryPolicy, TokenBucket
 from .runtime import TestnetOrderRuntime, TestnetVenueStateSource
 from .signing import redact_query_string, sign_query_string, signed_query_string
-from .translate import PRODUCER, deterministic_order_uuid, testnet_order_to_phase3_events
+from .translate import (
+    PRODUCER,
+    canonical_fill_event_id,
+    deterministic_order_uuid,
+    testnet_order_to_phase3_events,
+    venue_trade_event_id,
+)
 from .transport import (
     API_KEY_HEADER,
     HttpRequest,
@@ -131,7 +137,9 @@ __all__ = [
     "WithdrawalPolicy",
     "assert_no_mainnet_reference",
     "credentials_from_environment",
+    "canonical_fill_event_id",
     "deterministic_order_uuid",
+    "venue_trade_event_id",
     "format_decimal",
     "is_testnet_host",
     "normalize_credential_value",
