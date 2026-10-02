@@ -21,6 +21,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -28,11 +29,13 @@ from uuid import UUID
 
 from crypto_trader.events import EventEnvelope, EventRegistry, decode_event, get_default_registry
 
-from .errors import EventIdConflictError, JournalSchemaError
+from .errors import EventIdConflictError, JournalRevisionMismatchError, JournalSchemaError
 
 __all__ = [
     "JOURNAL_SCHEMA_VERSION",
+    "ConditionalAppendResult",
     "EventJournal",
+    "JournalRevision",
     "SQLiteEventJournal",
 ]
 
@@ -72,6 +75,58 @@ CREATE INDEX IF NOT EXISTS idx_events_causation ON events (causation_id);
 """
 
 
+@dataclass(frozen=True)
+class JournalRevision:
+    """Exact append-only journal revision derived from stored payload bytes."""
+
+    entries: tuple[tuple[UUID, str], ...]
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple):
+            raise ValueError("journal revision entries must be an immutable tuple.")
+        event_ids = tuple(event_id for event_id, _digest in self.entries)
+        if len(set(event_ids)) != len(event_ids):
+            raise ValueError("journal revision event identities must be unique.")
+        if tuple(sorted(event_ids, key=str)) != event_ids:
+            raise ValueError("journal revision entries must be sorted by event_id.")
+        for event_id, digest in self.entries:
+            if not isinstance(event_id, UUID):
+                raise ValueError("journal revision event ids must be UUID values.")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+            ):
+                raise ValueError("journal revision payload digests must be lowercase SHA-256 hex.")
+        if self.fingerprint != _revision_fingerprint(self.entries):
+            raise ValueError("journal revision fingerprint does not match its entries.")
+
+    @property
+    def event_ids(self) -> tuple[UUID, ...]:
+        return tuple(event_id for event_id, _digest in self.entries)
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+
+@dataclass(frozen=True)
+class ConditionalAppendResult:
+    """Evidence from one revision-checked atomic append transaction."""
+
+    inserted: int
+    before: JournalRevision
+    after: JournalRevision
+
+
+def _revision_fingerprint(entries: Sequence[tuple[UUID, str]]) -> str:
+    material = tuple((str(event_id), digest) for event_id, digest in entries)
+    return hashlib.sha256(
+        json.dumps(material, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 @runtime_checkable
 class EventJournal(Protocol):
     """The storage abstraction the application depends on (no SQLite types leak out)."""
@@ -79,6 +134,16 @@ class EventJournal(Protocol):
     def append(self, event: EventEnvelope) -> bool: ...
 
     def append_batch(self, events: Sequence[EventEnvelope]) -> int: ...
+
+    def revision(self) -> JournalRevision: ...
+
+    def append_batch_if_revision(
+        self,
+        events: Sequence[EventEnvelope],
+        *,
+        expected: JournalRevision,
+        require_all_new: bool = False,
+    ) -> ConditionalAppendResult: ...
 
     def read_by_id(self, event_id: UUID) -> EventEnvelope | None: ...
 
@@ -161,6 +226,39 @@ class SQLiteEventJournal:
     def journal_mode(self) -> str:
         return str(self._conn.execute("PRAGMA journal_mode;").fetchone()[0])
 
+    def _revision_locked(self) -> JournalRevision:
+        rows = self._conn.execute(
+            "SELECT event_id, payload_json, payload_sha256 FROM events ORDER BY event_id ASC"
+        ).fetchall()
+        entries: list[tuple[UUID, str]] = []
+        for row in rows:
+            payload_json = str(row["payload_json"])
+            actual = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            stored = str(row["payload_sha256"])
+            if actual != stored:
+                raise JournalSchemaError(
+                    f"journal payload hash mismatch for event_id {row['event_id']}."
+                )
+            try:
+                event_id = UUID(str(row["event_id"]))
+            except (TypeError, ValueError) as exc:
+                raise JournalSchemaError(
+                    f"journal event_id is malformed: {row['event_id']!r}."
+                ) from exc
+            entries.append((event_id, actual))
+        normalized = tuple(entries)
+        try:
+            return JournalRevision(
+                entries=normalized,
+                fingerprint=_revision_fingerprint(normalized),
+            )
+        except ValueError as exc:
+            raise JournalSchemaError("journal revision metadata is malformed.") from exc
+
+    def revision(self) -> JournalRevision:
+        """Return an exact-byte revision for the current append-only journal."""
+        return self._revision_locked()
+
     # --- writes ---
 
     def append(self, event: EventEnvelope) -> bool:
@@ -235,6 +333,95 @@ class SQLiteEventJournal:
         except sqlite3.Error as exc:  # pragma: no cover - transaction rolled back above
             raise JournalSchemaError(f"journal batch failed: {exc}") from exc
         return inserted
+
+    def append_batch_if_revision(
+        self,
+        events: Sequence[EventEnvelope],
+        *,
+        expected: JournalRevision,
+        require_all_new: bool = False,
+    ) -> ConditionalAppendResult:
+        """Atomically compare the exact journal revision and append one reviewed batch.
+
+        BEGIN IMMEDIATE serializes the revision check with every SQLite writer. If the journal
+        changed after planning, nothing is written. The returned after revision is computed
+        inside the same transaction as the insert.
+        """
+        if not isinstance(expected, JournalRevision):
+            raise JournalSchemaError("conditional append requires a JournalRevision.")
+
+        rows = []
+        digests: dict[str, str] = {}
+        event_ids: list[str] = []
+        for event in events:
+            payload_json = event.to_json()
+            digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            event_id = str(event.event_id)
+            if event_id in digests:
+                raise JournalSchemaError(
+                    f"conditional append batch contains duplicate event_id {event_id}."
+                )
+            digests[event_id] = digest
+            event_ids.append(event_id)
+            rows.append(self._row_for(event, payload_json, digest))
+
+        if self._conn.in_transaction:
+            raise JournalSchemaError(
+                "conditional append refuses to start inside an existing transaction."
+            )
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            before = self._revision_locked()
+            if before != expected:
+                raise JournalRevisionMismatchError(
+                    "journal revision changed before the conditional append."
+                )
+
+            if digests:
+                placeholders = ",".join("?" for _ in digests)
+                existing = self._conn.execute(
+                    f"SELECT event_id, payload_sha256 FROM events WHERE event_id IN ({placeholders})",
+                    tuple(event_ids),
+                ).fetchall()
+                for record in existing:
+                    if record["payload_sha256"] != digests[record["event_id"]]:
+                        raise EventIdConflictError(UUID(record["event_id"]))
+                if require_all_new and existing:
+                    raise JournalSchemaError(
+                        "conditional append requires every event id to be new."
+                    )
+
+            inserted = 0
+            for row in rows:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, event_type, schema_version, occurred_at_ns, occurred_at_iso,
+                        correlation_id, causation_id, producer, strategy_id, order_id, symbol,
+                        sequence_number, payload_json, payload_sha256, ingested_at_iso
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO NOTHING
+                    """,
+                    row,
+                )
+                inserted += cursor.rowcount
+
+            after = self._revision_locked()
+            self._conn.commit()
+            return ConditionalAppendResult(inserted=inserted, before=before, after=after)
+        except (JournalRevisionMismatchError, EventIdConflictError, JournalSchemaError):
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise JournalSchemaError(f"conditional journal batch failed: {exc}") from exc
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def _row_for(self, event: EventEnvelope, payload_json: str, digest: str) -> tuple:
         return (

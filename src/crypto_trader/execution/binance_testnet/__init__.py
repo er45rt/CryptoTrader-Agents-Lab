@@ -15,6 +15,13 @@ Scope: authenticated **Spot Testnet** only.
 Testnet success never authorizes mainnet trading.
 """
 
+from .backfill import (
+    BackfillEvent,
+    TradeBackfillPlan,
+    plan_trade_backfill,
+    trade_backfill_plan_fingerprint,
+    trade_backfill_source_revision,
+)
 from .client import BinanceSpotTestnetClient, PreparedTestnetOrder, WithdrawalPolicy
 from .clock import MAX_ABS_CLOCK_OFFSET_MS, MAX_RECV_WINDOW_MS, TestnetClock
 from .credentials import (
@@ -44,6 +51,7 @@ from .errors import (
     TestnetEndpointError,
     TestnetRejectedError,
     TestnetSymbolError,
+    TradeBackfillError,
     UnsafeTestnetAccountError,
     UnsupportedOrderTypeError,
     VenueProtocolRejectionError,
@@ -89,6 +97,7 @@ __all__ = [
     "API_SECRET_ENV_VAR",
     "AmbiguousOrderError",
     "AttemptJournalRequiredError",
+    "BackfillEvent",
     "BinanceSpotTestnetClient",
     "BinanceTestnetError",
     "ClockDriftError",
@@ -127,6 +136,8 @@ __all__ = [
     "TestnetSymbolError",
     "TestnetSymbolRules",
     "TestnetVenueStateSource",
+    "TradeBackfillError",
+    "TradeBackfillPlan",
     "TokenBucket",
     "Transport",
     "TransportError",
@@ -143,9 +154,12 @@ __all__ = [
     "format_decimal",
     "is_testnet_host",
     "normalize_credential_value",
+    "plan_trade_backfill",
     "redact_query_string",
     "require_testnet_base_url",
     "sign_query_string",
     "signed_query_string",
     "testnet_order_to_phase3_events",
+    "trade_backfill_plan_fingerprint",
+    "trade_backfill_source_revision",
 ]

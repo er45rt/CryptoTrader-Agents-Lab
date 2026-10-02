@@ -17,6 +17,7 @@ __all__ = [
     "TestnetCredentialsRequiredError",
     "TestnetEndpointError",
     "TestnetSymbolError",
+    "TradeBackfillError",
     "TestnetRejectedError",
     "UnsafeTestnetAccountError",
     "UnsupportedOrderTypeError",
@@ -102,3 +103,7 @@ class AttemptJournalRequiredError(BinanceTestnetError):
 
 class TestnetSymbolError(BinanceTestnetError):
     """The instrument is missing or its trading rules cannot be satisfied without rounding."""
+
+
+class TradeBackfillError(BinanceTestnetError):
+    """Authoritative venue trade evidence cannot be reconciled with durable fill history."""

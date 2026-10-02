@@ -800,3 +800,80 @@ def test_a_snapshot_preserves_the_stale_skip_counter(tmp_path):
     anchors = restored.attempt_anchors(CLIENT_ORDER_ID)
     assert anchors is not None and anchors.quantity == ORIGINAL
     assert restored.state_for(CLIENT_ORDER_ID).state is OrderStateName.CANCELED
+
+
+def test_authoritative_late_fills_after_filled_state_refine_quantities_without_state_regression(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("filled", index=1, producer=VENUE_PRODUCER),
+            fill_event("0.40000000", index=2, remaining="0.60000000", producer=VENUE_PRODUCER),
+            fill_event("0.60000000", index=3, remaining="0", producer=VENUE_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.FILLED
+    assert state.filled_quantity == ORIGINAL
+    assert state.remaining_quantity == 0
+    assert reconstructor.conflicts() == {}
+    assert reconstructor.late_fill_refinements == 2
+
+
+def test_filled_late_fill_without_remaining_quantity_stays_fenced(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("filled", index=1, producer=VENUE_PRODUCER),
+            fill_event("0.40000000", index=2, remaining=None, producer=VENUE_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.FILLED
+    assert state.filled_quantity == 0
+    assert reconstructor.conflicts()[CLIENT_ORDER_ID] == (
+        "late_fill_without_remaining_quantity_evidence",
+    )
+
+
+def test_filled_late_fill_with_inconsistent_quantity_evidence_stays_fenced(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("filled", index=1, producer=VENUE_PRODUCER),
+            fill_event("0.40000000", index=2, remaining="0.50000000", producer=VENUE_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.FILLED
+    assert state.filled_quantity == 0
+    assert reconstructor.conflicts()[CLIENT_ORDER_ID] == (
+        "inconsistent_terminal_fill_quantities",
+    )
+
+
+def test_filled_late_fill_from_local_producer_stays_fenced(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("filled", index=1, producer=VENUE_PRODUCER),
+            fill_event("0.40000000", index=2, remaining="0.60000000", producer=LOCAL_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.FILLED
+    assert state.filled_quantity == 0
+    assert reconstructor.conflicts()[CLIENT_ORDER_ID] == (
+        "non_authoritative_fill_on_terminal_order",
+    )

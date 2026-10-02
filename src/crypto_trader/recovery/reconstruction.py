@@ -409,11 +409,6 @@ class OrderStateReconstructor(IdempotentConsumer):
         if not provenance.is_authoritative_venue:
             self._record_conflict(reference, "non_authoritative_fill_on_terminal_order")
             return
-        if current.state is _FILLED:
-            if filled == current.filled_quantity:
-                return
-            self._record_conflict(reference, "filled_is_absorbing")
-            return
         if current.state is OrderStateName.REJECTED:
             # A rejected order was never executed; a historical fill cannot prove the current
             # venue state, so the contradiction stays fenced.
@@ -423,18 +418,19 @@ class OrderStateReconstructor(IdempotentConsumer):
             # A terminal refinement must stay auditable from durable facts alone.
             self._record_conflict(reference, "terminal_refinement_without_original_quantity")
             return
-        if filled == original and remaining != 0:
-            self._record_conflict(reference, "inconsistent_terminal_fill_quantities")
-            return
         if payload.remaining_quantity is None:
             # Without the reported remaining quantity the previous executed quantity could not be
             # derived from durable facts alone, so the late fill would not be auditable.
             self._record_conflict(reference, "late_fill_without_remaining_quantity_evidence")
             return
-        # CANCELED / EXPIRED with a late fill: the lifecycle stays terminal, the executed quantity
-        # advances monotonically, and the durable fill event is the audit trail
-        # (previous = Q - remaining - quantity, new = Q - remaining). No fence release follows
-        # from the quantity change alone.
+        if filled + remaining != original:
+            self._record_conflict(reference, "inconsistent_terminal_fill_quantities")
+            return
+        # FILLED / CANCELED / EXPIRED may all receive authoritative historical fill details after
+        # the lifecycle fact itself. Keep the authoritative terminal lifecycle unchanged while the
+        # quantity detail advances monotonically. In particular, a FILLED state may temporarily
+        # carry a non-zero remaining quantity while an atomic backfill batch is replayed; the final
+        # replay proof must still reach the venue's executed quantity exactly.
         self._states[reference] = replace(
             current, filled_quantity=filled, remaining_quantity=remaining
         )

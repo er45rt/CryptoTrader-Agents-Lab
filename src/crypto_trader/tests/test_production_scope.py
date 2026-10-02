@@ -16,6 +16,7 @@ PRODUCTION_DIR = PACKAGE_DIR / "production"
 
 _AUTHORIZED_MODULES = {
     "__init__.py",
+    "backfill.py",
     "environment.py",
     "errors.py",
     "equity.py",

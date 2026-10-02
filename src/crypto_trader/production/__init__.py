@@ -41,6 +41,7 @@ from .errors import (
 )
 from .fence import FenceCheck, ProductionFence
 from .equity import EquityChainState, load_equity_chain
+from .backfill import TradeBackfillMaintenanceWriter, TradeBackfillWriteReport
 from .runtime import (
     PRODUCTION_PRODUCER,
     IntentPreparation,
@@ -76,6 +77,8 @@ __all__ = [
     "ProductionStartupReport",
     "ProductionStateError",
     "ProductionSubmitResult",
+    "TradeBackfillMaintenanceWriter",
+    "TradeBackfillWriteReport",
     "TradingEnvironment",
     "assert_endpoint_matches_environment",
     "endpoint_for",
