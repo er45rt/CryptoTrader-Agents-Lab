@@ -41,7 +41,7 @@ from uuid import UUID, uuid4
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
 from crypto_trader.events import (
     ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
-    EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE,
+    EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
 )
 from crypto_trader.execution import (
     DurableVenueWritePort,
@@ -137,7 +137,7 @@ class JournalView:
         for event in events:
             if event.event_type in {
                 ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
-                EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE,
+                EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
             } and event.symbol != symbol:
                 raise StartupEvidenceError("writing startup requires a dedicated single-symbol journal.")
             rebuilt.handle(event)

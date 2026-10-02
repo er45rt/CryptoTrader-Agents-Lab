@@ -33,6 +33,8 @@ Additive contracts added by later phases (existing schemas unchanged):
     stable venue-facing client order identity and the immutable economic anchors
 13. ``venue.trade.recorded``           (G4 production-ledger reader compatibility) - immutable
     venue trade metadata linked to one existing execution.fill.recorded event
+14. ``account.equity.recorded``        (G5b canonical risk-state prerequisite) - durable account
+    equity baseline/rebaseline roots and observed high-water-mark updates
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ __all__ = [
     "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
     "VENUE_TRADE_EVENT_TYPE",
+    "ACCOUNT_EQUITY_EVENT_TYPE",
     "VALIDITY_EVENT_TYPE",
     "StrategyDecisionPayload",
     "TradeIntentPayload",
@@ -75,6 +78,8 @@ __all__ = [
     "ExecutionFillRecorded",
     "VenueTradeRecordPayload",
     "VenueTradeRecorded",
+    "AccountEquityRecordPayload",
+    "AccountEquityRecorded",
     "RecoveryStateChanged",
     "V1_CONTRACTS",
     "ValidityDisposition",
@@ -110,6 +115,8 @@ ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE = "order.submission.attempted"
 EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
 #: G4 additive contract: immutable venue trade metadata linked to one fill event.
 VENUE_TRADE_EVENT_TYPE = "venue.trade.recorded"
+#: G5b additive contract: durable account-equity baseline / peak chain.
+ACCOUNT_EQUITY_EVENT_TYPE = "account.equity.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
 #: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
 VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
@@ -440,6 +447,100 @@ class VenueTradeRecorded(DomainEvent):
         if self.occurred_at != self.payload.trade_time:
             raise ValueError("venue trade occurred_at must equal the venue trade time.")
         return self
+
+
+# --- 5c. Account equity baseline / peak chain (G5b) ----------------------
+
+class AccountEquityRecordPayload(EventPayload):
+    """Durable account-equity chain root or high-water-mark update."""
+
+    kind: Literal["baseline", "peak", "rebaseline"]
+    environment: str = Field(min_length=1, max_length=128)
+    venue_account_id: str = Field(min_length=1, max_length=128)
+    base_asset: str = Field(min_length=1, max_length=32)
+    quote_asset: str = Field(min_length=1, max_length=32)
+    base_balance: Decimal = Field(ge=0)
+    quote_balance: Decimal = Field(ge=0)
+    mark_price: Decimal = Field(gt=0)
+    mark_reference: str = Field(min_length=1, max_length=256)
+    mark_event_ts: datetime
+    equity_quote: Decimal = Field(gt=0)
+    peak_equity_quote: Decimal = Field(gt=0)
+    baseline_event_id: UUID
+    previous_event_id: UUID | None = None
+    fence_term: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("environment", "mark_reference", "reason")
+    @classmethod
+    def _equity_text_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("account equity text fields must not be blank.")
+        return value
+
+    @field_validator("venue_account_id")
+    @classmethod
+    def _canonical_account_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isdigit() or value.startswith("0"):
+            raise ValueError("venue_account_id must be a canonical positive ASCII integer.")
+        return value
+
+    @field_validator("base_asset", "quote_asset")
+    @classmethod
+    def _canonical_asset(cls, value: str) -> str:
+        if not value.isascii() or value != value.upper() or not value.isalnum():
+            raise ValueError("account equity assets must be uppercase ASCII alphanumeric codes.")
+        return value
+
+    @field_validator("mark_event_ts")
+    @classmethod
+    def _mark_time_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("mark_event_ts must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _equity_invariants(self) -> "AccountEquityRecordPayload":
+        if self.base_asset == self.quote_asset:
+            raise ValueError("base_asset and quote_asset must differ.")
+        expected_equity = self.base_balance * self.mark_price + self.quote_balance
+        if self.equity_quote != expected_equity:
+            raise ValueError("equity_quote must equal base_balance * mark_price + quote_balance.")
+        if self.peak_equity_quote != self.equity_quote:
+            raise ValueError("each equity-chain observation must record peak equal to observed equity.")
+        if self.kind == "baseline" and self.previous_event_id is not None:
+            raise ValueError("baseline cannot have a previous_event_id.")
+        if self.kind in {"peak", "rebaseline"} and self.previous_event_id is None:
+            raise ValueError("peak and rebaseline require previous_event_id.")
+        return self
+
+
+class AccountEquityRecorded(DomainEvent):
+    """One durable account-equity baseline, rebaseline or peak observation."""
+
+    event_type: Literal["account.equity.recorded"] = ACCOUNT_EQUITY_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: AccountEquityRecordPayload
+
+    @model_validator(mode="after")
+    def _require_equity_chain_identity(self) -> "AccountEquityRecorded":
+        if self.symbol is None:
+            raise ValueError("account equity records require symbol on the envelope.")
+        if self.symbol != f"{self.payload.base_asset}{self.payload.quote_asset}":
+            raise ValueError("account equity envelope symbol must match base_asset + quote_asset.")
+        if self.payload.previous_event_id == self.event_id:
+            raise ValueError("account equity previous_event_id cannot self-link to event_id.")
+        if self.payload.mark_event_ts > self.occurred_at:
+            raise ValueError("account equity mark_event_ts cannot be later than occurred_at.")
+        if self.kind_is_root and self.payload.baseline_event_id != self.event_id:
+            raise ValueError("baseline_event_id must equal event_id for a chain root.")
+        if not self.kind_is_root and self.payload.baseline_event_id == self.event_id:
+            raise ValueError("peak events cannot identify themselves as the baseline.")
+        return self
+
+    @property
+    def kind_is_root(self) -> bool:
+        return self.payload.kind in {"baseline", "rebaseline"}
 
 
 # --- 6. Recovery / reconciliation -----------------------------------------
@@ -787,6 +888,7 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     OrderSubmissionAttempted,
     ExecutionFillRecorded,
     VenueTradeRecorded,
+    AccountEquityRecorded,
     RecoveryStateChanged,
     ValidityDispositionRecorded,
     RiskEvaluationRecorded,

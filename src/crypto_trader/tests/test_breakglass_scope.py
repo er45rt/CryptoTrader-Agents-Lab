@@ -174,6 +174,7 @@ def test_phase13_adds_exactly_one_additive_event_contract():
         "order.submission.attempted",
         "execution.fill.recorded",
         "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

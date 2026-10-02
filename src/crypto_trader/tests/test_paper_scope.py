@@ -158,6 +158,7 @@ def test_paper_adds_no_new_event_contract():
         "order.submission.attempted",
         "execution.fill.recorded",
         "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

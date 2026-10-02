@@ -223,6 +223,7 @@ def test_phase15_adds_exactly_one_additive_stream_lifecycle_contract():
         "order.submission.attempted",
         "execution.fill.recorded",
         "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

@@ -19,6 +19,8 @@ __all__ = [
     "TestnetEnvironment",
     "TestnetFill",
     "VenueTrade",
+    "VenueAssetBalance",
+    "VenueAccountSnapshot",
     "TestnetOrder",
     "TestnetOrderRequest",
     "TestnetSymbolRules",
@@ -97,6 +99,73 @@ class VenueTrade:
     trade_time: datetime
     is_buyer: bool
     is_maker: bool
+
+
+@dataclass(frozen=True)
+class VenueAssetBalance:
+    """One strictly parsed account balance used for production accounting evidence."""
+
+    asset: str
+    free: Decimal
+    locked: Decimal
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.asset, str)
+            or not self.asset.isascii()
+            or self.asset != self.asset.upper()
+            or not self.asset.isalnum()
+        ):
+            raise ValueError("venue asset must be an uppercase ASCII alphanumeric code.")
+        for value in (self.free, self.locked):
+            if not isinstance(value, Decimal) or not value.is_finite() or value < ZERO:
+                raise ValueError("venue balances must be finite nonnegative Decimal values.")
+
+    @property
+    def total(self) -> Decimal:
+        return self.free + self.locked
+
+
+@dataclass(frozen=True)
+class VenueAccountSnapshot:
+    """A strict non-secret account snapshot for canonical production risk state."""
+
+    venue_account_id: str
+    venue_update_time_ms: int
+    fetched_at: datetime
+    balances: tuple[VenueAssetBalance, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.venue_account_id, str)
+            or not self.venue_account_id.isascii()
+            or not self.venue_account_id.isdigit()
+            or self.venue_account_id.startswith("0")
+        ):
+            raise ValueError("venue_account_id must be a canonical positive ASCII integer.")
+        if type(self.venue_update_time_ms) is not int or self.venue_update_time_ms <= 0:
+            raise ValueError("venue_update_time_ms must be a positive integer.")
+        if not isinstance(self.fetched_at, datetime):
+            raise ValueError("fetched_at must be a datetime.")
+        if (
+            self.fetched_at.tzinfo is None
+            or self.fetched_at.utcoffset() is None
+            or self.fetched_at.utcoffset().total_seconds() != 0
+        ):
+            raise ValueError("fetched_at must be timezone-aware UTC.")
+        if not isinstance(self.balances, tuple):
+            raise ValueError("balances must be an immutable tuple.")
+        if not self.balances or any(not isinstance(item, VenueAssetBalance) for item in self.balances):
+            raise ValueError("balances must contain at least one VenueAssetBalance.")
+        assets = tuple(item.asset for item in self.balances)
+        if len(set(assets)) != len(assets):
+            raise ValueError("venue account balances must contain unique assets.")
+
+    def balance(self, asset: str) -> VenueAssetBalance:
+        matches = tuple(item for item in self.balances if item.asset == asset)
+        if len(matches) != 1:
+            raise KeyError(asset)
+        return matches[0]
 
 
 @dataclass(frozen=True)

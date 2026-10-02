@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 import math
+import re
 import time
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -55,6 +56,8 @@ from .models import (
     TestnetEnvironment,
     TestnetFill,
     VenueTrade,
+    VenueAssetBalance,
+    VenueAccountSnapshot,
     TestnetOrder,
     TestnetOrderRequest,
     TestnetSymbolRules,
@@ -153,6 +156,8 @@ PATH_PRICE = "/api/v3/ticker/price"
 _WEIGHT_READ_ORDER = 2
 _WEIGHT_READ_OPEN_ORDERS = 3
 _WEIGHT_READ_MY_TRADES_WITH_ORDER = 5
+_WEIGHT_ACCOUNT = 20
+_ACCOUNT_BALANCE_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _WEIGHT_EXCHANGE_INFO = 20
 _WEIGHT_WRITE = 1
 
@@ -220,7 +225,7 @@ class BinanceSpotTestnetClient:
         return Decimal(str(price))
 
     def account_snapshot(self, *, asset: str | None = None) -> TestnetAccountState:
-        body = self._request(PATH_ACCOUNT, {}, weight=10, is_write=False, signed=True)
+        body = self._request(PATH_ACCOUNT, {}, weight=_WEIGHT_ACCOUNT, is_write=False, signed=True)
         if not isinstance(body, Mapping):
             raise BinanceTestnetError("the testnet account response was not understood.")
         balances = body.get("balances") or []
@@ -242,6 +247,90 @@ class BinanceSpotTestnetClient:
             locked_balance=locked,
             asset=asset,
             venue_label=self.venue_label,
+        )
+
+    def startup_account_snapshot(self, *assets: str) -> VenueAccountSnapshot:
+        """Strict signed account evidence for the explicitly requested assets."""
+        if not assets:
+            raise BinanceTestnetError("startup account snapshot requires at least one asset.")
+        requested: list[str] = []
+        for asset in assets:
+            if (
+                not isinstance(asset, str)
+                or not asset
+                or asset != asset.strip()
+                or asset != asset.upper()
+                or not asset.isascii()
+                or not asset.isalnum()
+            ):
+                raise BinanceTestnetError(
+                    "startup account assets must be uppercase ASCII alphanumeric strings."
+                )
+            if asset in requested:
+                raise BinanceTestnetError("startup account assets must be unique.")
+            requested.append(asset)
+
+        body = self._request(
+            PATH_ACCOUNT,
+            {"omitZeroBalances": "false"},
+            weight=_WEIGHT_ACCOUNT,
+            is_write=False,
+            signed=True,
+        )
+        if not isinstance(body, Mapping):
+            raise BinanceTestnetError("startup account evidence must be an object.")
+        uid = body.get("uid")
+        update_time = body.get("updateTime")
+        balances = body.get("balances")
+        if type(uid) is not int or uid <= 0:
+            raise BinanceTestnetError("startup account uid is missing or malformed.")
+        if type(update_time) is not int or update_time <= 0:
+            raise BinanceTestnetError("startup account updateTime is missing or malformed.")
+        if not isinstance(balances, list):
+            raise BinanceTestnetError("startup account balances must be a list.")
+
+        parsed: dict[str, VenueAssetBalance] = {}
+        for entry in balances:
+            if not isinstance(entry, Mapping):
+                raise BinanceTestnetError("startup account balance entries must be objects.")
+            name = entry.get("asset")
+            if name not in requested:
+                continue
+            if not isinstance(name, str) or name in parsed:
+                raise BinanceTestnetError("startup account contains duplicate or malformed assets.")
+            values: list[Decimal] = []
+            for field_name in ("free", "locked"):
+                raw = entry.get(field_name)
+                if not isinstance(raw, str) or not _ACCOUNT_BALANCE_RE.fullmatch(raw):
+                    raise BinanceTestnetError(
+                        f"startup account {name} {field_name} balance is missing or malformed."
+                    )
+                try:
+                    value = Decimal(raw)
+                except InvalidOperation as exc:
+                    raise BinanceTestnetError(
+                        f"startup account {name} {field_name} balance is malformed."
+                    ) from exc
+                if not value.is_finite() or value < 0:
+                    raise BinanceTestnetError(
+                        f"startup account {name} {field_name} balance must be finite and nonnegative."
+                    )
+                values.append(value)
+            parsed[name] = VenueAssetBalance(asset=name, free=values[0], locked=values[1])
+
+        missing = [asset for asset in requested if asset not in parsed]
+        if missing:
+            raise BinanceTestnetError(
+                "startup account is missing required asset balance(s): " + ", ".join(missing)
+            )
+        fetched_at = utc_from_ms(self.clock.timestamp_ms())
+        if fetched_at is None:
+            raise BinanceTestnetError("startup account fetch time could not be represented.")
+        return VenueAccountSnapshot(
+            venue_account_id=str(uid),
+            venue_update_time_ms=update_time,
+            fetched_at=fetched_at,
+            balances=tuple(parsed[asset] for asset in requested),
         )
 
     def verify_environment(self, *, symbol: str | None = None) -> TestnetEnvironment:

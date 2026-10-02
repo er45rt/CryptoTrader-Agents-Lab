@@ -23,6 +23,7 @@ __all__ = [
     "FIXTURE_ORDER_SUBMISSION_ATTEMPTED",
     "FIXTURE_PARTIAL_FILL",
     "FIXTURE_VENUE_TRADE_RECORDED",
+    "FIXTURE_ACCOUNT_EQUITY_RECORDED",
     "FIXTURE_RECOVERY_STATE_CHANGED",
     "FIXTURE_RISK_DECISION",
     "FIXTURE_ROOT_STRATEGY_DECISION",
@@ -171,6 +172,39 @@ FIXTURE_VENUE_TRADE_RECORDED: dict[str, Any] = {
     },
 }
 
+# 5c. Durable production account-equity baseline root.
+FIXTURE_ACCOUNT_EQUITY_RECORDED: dict[str, Any] = {
+    "event_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "event_type": "account.equity.recorded",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:02Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": None,
+    "producer": "application.production.equity",
+    "strategy_id": None,
+    "order_id": None,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "kind": "baseline",
+        "environment": "binance-spot-testnet",
+        "venue_account_id": "123456789",
+        "base_asset": "SYNTH",
+        "quote_asset": "USDT",
+        "base_balance": "10.00000000",
+        "quote_balance": "1000.00000000",
+        "mark_price": "100.25000000",
+        "mark_reference": "market:SYNTHUSDT:fixture",
+        "mark_event_ts": "2026-01-01T12:00:02Z",
+        "equity_quote": "2002.50000000",
+        "peak_equity_quote": "2002.50000000",
+        "baseline_event_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "previous_event_id": None,
+        "fence_term": 1,
+        "reason": "Synthetic production equity baseline fixture.",
+    },
+}
+
 # 6. Recovery/reconciliation state change.
 FIXTURE_RECOVERY_STATE_CHANGED: dict[str, Any] = {
     "event_id": "88888888-8888-4888-8888-888888888888",
@@ -224,6 +258,7 @@ FIXTURES: dict[str, dict[str, Any]] = {
     "order_state_changed": FIXTURE_ORDER_STATE_CHANGED,
     "partial_fill": FIXTURE_PARTIAL_FILL,
     "venue_trade_recorded": FIXTURE_VENUE_TRADE_RECORDED,
+    "account_equity_recorded": FIXTURE_ACCOUNT_EQUITY_RECORDED,
     "recovery_state_changed": FIXTURE_RECOVERY_STATE_CHANGED,
 }
 

@@ -147,6 +147,7 @@ def test_phase3_contracts_are_unchanged_by_phase4():
         "order.state.changed",
         "execution.fill.recorded",
         "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
     }
     event_types = set(re.findall(r'= "([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"', contracts))

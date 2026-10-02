@@ -181,6 +181,8 @@ def account_response(
             "permissions": list(permissions),
             "makerCommission": 10,
             "takerCommission": 10,
+            "updateTime": SERVER_TIME_MS,
+            "uid": 123456789,
             "balances": [
                 {"asset": asset, "free": free, "locked": "0"},
                 {"asset": "BTC", "free": "1.0", "locked": "0"},

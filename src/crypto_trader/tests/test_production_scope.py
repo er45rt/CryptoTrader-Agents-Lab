@@ -297,6 +297,7 @@ def test_phase14_adds_no_event_contract():
         "order.submission.attempted",
         "execution.fill.recorded",
         "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

@@ -800,3 +800,162 @@ def test_startup_my_trades_rejects_binary_float_economics():
     client.clock.synchronize(fx.SERVER_TIME_MS)
     with pytest.raises(BinanceTestnetError):
         client.startup_my_trades(fx.SYMBOL, "42")
+
+
+def test_startup_account_snapshot_requires_explicit_base_and_quote_evidence():
+    transport = ScriptedTransport([fx.account_response()])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    snapshot = client.startup_account_snapshot("BTC", "USDT")
+
+    assert snapshot.venue_account_id == "123456789"
+    assert snapshot.venue_update_time_ms == fx.SERVER_TIME_MS
+    assert [item.asset for item in snapshot.balances] == ["BTC", "USDT"]
+    assert snapshot.balance("BTC").total == Decimal("1.0")
+    assert snapshot.balance("USDT").total == Decimal("100000")
+    request = transport.requests[0]
+    assert request.method == "GET" and "/api/v3/account" in request.url
+    assert "signature=" in request.query
+
+
+def test_startup_account_snapshot_accepts_explicit_zero_balance():
+    response = fx.account_response(free="0")
+    response.body["balances"][0]["locked"] = "0"
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    snapshot = client.startup_account_snapshot("USDT")
+    assert snapshot.balance("USDT").total == Decimal("0")
+
+
+def test_startup_account_snapshot_rejects_missing_required_asset():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"] = [response.body["balances"][0]]
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError, match="missing required asset"):
+        client.startup_account_snapshot("BTC", "USDT")
+
+
+@pytest.mark.parametrize("field,value", [("uid", None), ("uid", 0), ("uid", True), ("updateTime", None), ("updateTime", 0), ("updateTime", True)])
+def test_startup_account_snapshot_rejects_missing_or_malformed_identity(field, value):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body[field] = value
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot("BTC", "USDT")
+
+
+@pytest.mark.parametrize("field,value", [("free", "abc"), ("free", "NaN"), ("free", "-1"), ("locked", "Infinity"), ("locked", -1)])
+def test_startup_account_snapshot_rejects_malformed_balances(field, value):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"][0][field] = value
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot("USDT")
+
+
+def test_startup_account_snapshot_rejects_duplicate_required_asset_entries():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"].append(dict(response.body["balances"][0]))
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError, match="duplicate"):
+        client.startup_account_snapshot("USDT")
+
+
+@pytest.mark.parametrize("assets", [(), ("btc",), (" BTC",), ("BTC", "BTC")])
+def test_startup_account_snapshot_rejects_noncanonical_asset_requests(assets):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot(*assets)
+
+
+def test_startup_account_snapshot_pins_zero_balance_semantics_and_weight():
+    transport = ScriptedTransport([fx.account_response()])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    client.startup_account_snapshot("BTC", "USDT")
+    request = transport.requests[0]
+    assert request.weight == 20
+    assert "omitZeroBalances=false" in request.query
+
+
+@pytest.mark.parametrize("body", [None, {"uid": 1, "updateTime": 1, "balances": {}}, {"uid": 1, "updateTime": 1, "balances": ["bad"]}])
+def test_startup_account_snapshot_rejects_malformed_containers(body):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([fx.response(200, body)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot("USDT")
+
+
+@pytest.mark.parametrize("missing", ["free", "locked"])
+def test_startup_account_snapshot_rejects_missing_balance_fields(missing):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response()
+    response.body["balances"][0].pop(missing)
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot("USDT")
+
+
+@pytest.mark.parametrize("raw", [" 1 ", "1_000", "1e5", "-0", "+1", "١"])
+def test_startup_account_snapshot_rejects_noncanonical_decimal_strings(raw):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    response = fx.account_response(free=raw)
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot("USDT")
+
+
+@pytest.mark.parametrize("asset", ["BTC/", "BT C", "BTC-USD", "BṪC"])
+def test_startup_account_snapshot_rejects_non_alphanumeric_asset_codes(asset):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_account_snapshot(asset)
+
+
+def test_legacy_account_snapshot_does_not_require_new_account_identity_fields():
+    response = fx.account_response()
+    response.body.pop("uid")
+    response.body.pop("updateTime")
+    client = fx.client(ScriptedTransport([response]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    legacy = client.account_snapshot(asset="USDT")
+    assert legacy.free_balance == Decimal("100000")
+
+
+def test_strict_account_models_reject_invalid_direct_construction():
+    from datetime import datetime, timezone
+    from crypto_trader.execution.binance_testnet import VenueAccountSnapshot, VenueAssetBalance
+    with pytest.raises(ValueError):
+        VenueAssetBalance(asset="BTC", free=Decimal("-1"), locked=Decimal("0"))
+    good = VenueAssetBalance(asset="BTC", free=Decimal("1"), locked=Decimal("0"))
+    with pytest.raises(ValueError):
+        VenueAccountSnapshot(
+            venue_account_id="123", venue_update_time_ms=1,
+            fetched_at=datetime(2026, 1, 1), balances=(good,)
+        )
+    with pytest.raises(ValueError):
+        VenueAccountSnapshot(
+            venue_account_id="123", venue_update_time_ms=1,
+            fetched_at=datetime(2026, 1, 1, tzinfo=timezone.utc), balances=(good, good)
+        )
+    with pytest.raises(ValueError):
+        VenueAccountSnapshot(
+            venue_account_id="123", venue_update_time_ms=1,
+            fetched_at=datetime(2026, 1, 1, tzinfo=timezone.utc), balances=[good]
+        )
