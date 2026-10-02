@@ -699,3 +699,57 @@ def test_startup_valid_reads_are_signed_and_leave_client_cache_untouched():
     assert client.startup_order_status(fx.SYMBOL, "another").status == "FILLED"
     assert client._orders == {}
     assert all(r.method == "GET" and "signature=" in r.query for r in transport.requests)
+
+
+def test_startup_my_trades_is_signed_strict_and_cache_free():
+    transport = ScriptedTransport([fx.my_trades_response(
+        fx.trade(trade_id=7), fx.trade(trade_id=8, qty="0.00025000", quote_qty="6.75000000"),
+    )])
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    trades = client.startup_my_trades(fx.SYMBOL, "42")
+
+    assert [trade.trade_id for trade in trades] == ["7", "8"]
+    assert trades[0].price == Decimal("27000.00")
+    assert trades[0].commission_asset == "BTC"
+    assert trades[0].is_buyer is True and trades[0].is_maker is False
+    assert client._orders == {}
+    request = transport.requests[0]
+    assert request.method == "GET" and "/api/v3/myTrades" in request.url
+    assert "orderId=42" in request.query and "limit=1000" in request.query
+    assert "signature=" in request.query
+
+
+@pytest.mark.parametrize("field,value", [
+    ("symbol", "ETHUSDT"), ("orderId", 99), ("id", True), ("id", -1),
+    ("price", "0"), ("qty", "0"), ("quoteQty", "NaN"), ("commission", "-1"),
+    ("commissionAsset", ""), ("time", 0), ("isBuyer", 1), ("isMaker", "false"),
+])
+def test_startup_my_trades_rejects_malformed_trade_fields(field, value):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    item = fx.trade()
+    item[field] = value
+    client = fx.client(ScriptedTransport([fx.my_trades_response(item)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_my_trades(fx.SYMBOL, "42")
+
+
+@pytest.mark.parametrize("ids", [(8, 7), (7, 7)])
+def test_startup_my_trades_rejects_non_monotonic_or_duplicate_trade_ids(ids):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    body = fx.my_trades_response(*(fx.trade(trade_id=value) for value in ids))
+    client = fx.client(ScriptedTransport([body]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_my_trades(fx.SYMBOL, "42")
+
+
+def test_startup_my_trades_refuses_a_potentially_truncated_max_page():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    page = [fx.trade(trade_id=index) for index in range(1000)]
+    client = fx.client(ScriptedTransport([fx.response(200, page)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError, match="completeness is not provable"):
+        client.startup_my_trades(fx.SYMBOL, "42")

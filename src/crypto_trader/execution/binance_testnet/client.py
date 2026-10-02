@@ -54,6 +54,7 @@ from .models import (
     TestnetAccountState,
     TestnetEnvironment,
     TestnetFill,
+    VenueTrade,
     TestnetOrder,
     TestnetOrderRequest,
     TestnetSymbolRules,
@@ -146,10 +147,12 @@ PATH_EXCHANGE_INFO = "/api/v3/exchangeInfo"
 PATH_ACCOUNT = "/api/v3/account"
 PATH_ORDER = "/api/v3/order"
 PATH_OPEN_ORDERS = "/api/v3/openOrders"
+PATH_MY_TRADES = "/api/v3/myTrades"
 PATH_PRICE = "/api/v3/ticker/price"
 
 _WEIGHT_READ_ORDER = 2
 _WEIGHT_READ_OPEN_ORDERS = 3
+_WEIGHT_READ_MY_TRADES_WITH_ORDER = 5
 _WEIGHT_EXCHANGE_INFO = 20
 _WEIGHT_WRITE = 1
 
@@ -770,6 +773,87 @@ class BinanceSpotTestnetClient:
             classify_order_absence=True,
         )
         return self._parse_startup_order(body, symbol, reference)
+
+    def startup_my_trades(self, symbol: str, venue_order_id: str) -> tuple[VenueTrade, ...]:
+        """Strict signed trade-history evidence for one exact venue order."""
+        try:
+            requested_order_id = int(venue_order_id)
+        except (TypeError, ValueError) as exc:
+            raise BinanceTestnetError("startup trade history requires a numeric venue order id.") from exc
+        if requested_order_id <= 0:
+            raise BinanceTestnetError("startup trade history requires a positive venue order id.")
+        body = self._request(
+            PATH_MY_TRADES,
+            {"symbol": symbol, "orderId": requested_order_id, "limit": 1000},
+            weight=_WEIGHT_READ_MY_TRADES_WITH_ORDER,
+            is_write=False,
+            signed=True,
+        )
+        if not isinstance(body, list):
+            raise BinanceTestnetError("startup myTrades must return a list.")
+        if len(body) >= 1000:
+            raise BinanceTestnetError(
+                "startup myTrades returned the maximum page size; completeness is not provable."
+            )
+        trades = tuple(
+            self._parse_startup_trade(item, symbol=symbol, order_id=requested_order_id)
+            for item in body
+        )
+        ids = [int(trade.trade_id) for trade in trades]
+        if ids != sorted(ids) or len(ids) != len(set(ids)):
+            raise BinanceTestnetError(
+                "startup myTrades trade ids must be strictly ordered and unique."
+            )
+        return trades
+
+    def _parse_startup_trade(
+        self, body: Any, *, symbol: str, order_id: int
+    ) -> VenueTrade:
+        if not isinstance(body, Mapping):
+            raise BinanceTestnetError("startup trade evidence must be an object.")
+        if body.get("symbol") != symbol or type(body.get("orderId")) is not int:
+            raise BinanceTestnetError("startup trade symbol or order identity is invalid.")
+        if body["orderId"] != order_id or type(body.get("id")) is not int or body["id"] < 0:
+            raise BinanceTestnetError("startup trade order/trade identity is invalid.")
+        values: dict[str, Decimal] = {}
+        for name, positive in (
+            ("price", True), ("qty", True), ("quoteQty", True), ("commission", False)
+        ):
+            raw = body.get(name)
+            if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+                raise BinanceTestnetError(f"startup trade {name} is missing or malformed.")
+            try:
+                value = Decimal(str(raw))
+            except InvalidOperation as exc:
+                raise BinanceTestnetError(f"startup trade {name} is malformed.") from exc
+            if not value.is_finite() or value < 0 or (positive and value <= 0):
+                raise BinanceTestnetError(f"startup trade {name} is not a valid finite amount.")
+            values[name] = value
+        commission_asset = body.get("commissionAsset")
+        timestamp = body.get("time")
+        is_buyer = body.get("isBuyer")
+        is_maker = body.get("isMaker")
+        if not isinstance(commission_asset, str) or not commission_asset.strip():
+            raise BinanceTestnetError("startup trade commissionAsset is missing or malformed.")
+        if type(timestamp) is not int or timestamp <= 0:
+            raise BinanceTestnetError("startup trade time is missing or malformed.")
+        if type(is_buyer) is not bool or type(is_maker) is not bool:
+            raise BinanceTestnetError("startup trade buyer/maker flags are missing or malformed.")
+        trade_time = utc_from_ms(timestamp)
+        assert trade_time is not None
+        return VenueTrade(
+            symbol=symbol,
+            venue_order_id=str(order_id),
+            trade_id=str(body["id"]),
+            price=values["price"],
+            quantity=values["qty"],
+            quote_quantity=values["quoteQty"],
+            commission=values["commission"],
+            commission_asset=commission_asset,
+            trade_time=trade_time,
+            is_buyer=is_buyer,
+            is_maker=is_maker,
+        )
 
     def _parse_startup_order(
         self, body: Any, symbol: str, reference: str | None = None,

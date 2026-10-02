@@ -99,6 +99,7 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
         "order.state.changed",
         "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

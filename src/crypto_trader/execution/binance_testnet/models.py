@@ -18,6 +18,7 @@ __all__ = [
     "TestnetAccountState",
     "TestnetEnvironment",
     "TestnetFill",
+    "VenueTrade",
     "TestnetOrder",
     "TestnetOrderRequest",
     "TestnetSymbolRules",
@@ -79,6 +80,23 @@ class TestnetFill:
     commission: Decimal = ZERO
     commission_asset: str | None = None
     trade_id: str | None = None
+
+
+@dataclass(frozen=True)
+class VenueTrade:
+    """One strict account trade read from Binance trade history."""
+
+    symbol: str
+    venue_order_id: str
+    trade_id: str
+    price: Decimal
+    quantity: Decimal
+    quote_quantity: Decimal
+    commission: Decimal
+    commission_asset: str
+    trade_time: datetime
+    is_buyer: bool
+    is_maker: bool
 
 
 @dataclass(frozen=True)

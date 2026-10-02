@@ -31,6 +31,8 @@ Additive contracts added by later phases (existing schemas unchanged):
 12. ``order.submission.attempted``     (Phase 15 durable ambiguity) - one durable fact that a
     venue submission was attempted, recorded BEFORE the external transport call, carrying the
     stable venue-facing client order identity and the immutable economic anchors
+13. ``venue.trade.recorded``           (G4 production-ledger reader compatibility) - immutable
+    venue trade metadata linked to one existing execution.fill.recorded event
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ __all__ = [
     "ORDER_STATE_EVENT_TYPE",
     "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
+    "VENUE_TRADE_EVENT_TYPE",
     "VALIDITY_EVENT_TYPE",
     "StrategyDecisionPayload",
     "TradeIntentPayload",
@@ -70,6 +73,8 @@ __all__ = [
     "OrderSubmissionAttemptPayload",
     "OrderSubmissionAttempted",
     "ExecutionFillRecorded",
+    "VenueTradeRecordPayload",
+    "VenueTradeRecorded",
     "RecoveryStateChanged",
     "V1_CONTRACTS",
     "ValidityDisposition",
@@ -103,6 +108,8 @@ ORDER_STATE_EVENT_TYPE = "order.state.changed"
 #: Phase 15 durability additive contract: the durable pre-send submission attempt fact.
 ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE = "order.submission.attempted"
 EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
+#: G4 additive contract: immutable venue trade metadata linked to one fill event.
+VENUE_TRADE_EVENT_TYPE = "venue.trade.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
 #: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
 VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
@@ -371,6 +378,39 @@ class ExecutionFillRecorded(DomainEvent):
     event_type: Literal["execution.fill.recorded"] = EXECUTION_FILL_EVENT_TYPE
     schema_version: Literal[1] = 1
     payload: FillRecordPayload
+
+
+# --- 5b. Venue trade metadata (G4 production-ledger compatibility) -------
+
+class VenueTradeRecordPayload(EventPayload):
+    """Immutable venue trade metadata linked to one execution fill event."""
+
+    venue_reference: str = Field(min_length=1, max_length=128)
+    venue_order_id: str = Field(min_length=1, max_length=128)
+    venue_trade_id: str = Field(min_length=1, max_length=128)
+    fill_event_id: UUID
+    price: Decimal = Field(gt=0)
+    quantity: Decimal = Field(gt=0)
+    quote_quantity: Decimal = Field(gt=0)
+    commission: Decimal = Field(ge=0)
+    commission_asset: str = Field(min_length=1, max_length=64)
+    is_buyer: bool
+    is_maker: bool
+
+    @field_validator("venue_reference", "venue_order_id", "venue_trade_id", "commission_asset")
+    @classmethod
+    def _trade_identity_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("venue trade identity fields must not be blank.")
+        return value
+
+
+class VenueTradeRecorded(DomainEvent):
+    """One immutable venue trade linked to its execution.fill.recorded event."""
+
+    event_type: Literal["venue.trade.recorded"] = VENUE_TRADE_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: VenueTradeRecordPayload
 
 
 # --- 6. Recovery / reconciliation -----------------------------------------
@@ -717,6 +757,7 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     OrderStateChanged,
     OrderSubmissionAttempted,
     ExecutionFillRecorded,
+    VenueTradeRecorded,
     RecoveryStateChanged,
     ValidityDispositionRecorded,
     RiskEvaluationRecorded,

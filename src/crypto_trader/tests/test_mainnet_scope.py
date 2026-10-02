@@ -222,6 +222,7 @@ def test_phase15_adds_exactly_one_additive_stream_lifecycle_contract():
         # Phase 15 durability additive contract (existing schemas unchanged).
         "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

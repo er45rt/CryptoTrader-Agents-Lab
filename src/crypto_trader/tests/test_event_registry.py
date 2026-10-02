@@ -19,6 +19,7 @@ from crypto_trader.events import (
     RiskDecisionRecorded,
     StrategyDecisionRecorded,
     TradeIntentCreated,
+    VenueTradeRecorded,
     UnknownEventTypeError,
     UnsupportedSchemaVersionError,
     V1_CONTRACTS,
@@ -51,6 +52,7 @@ def test_default_registry_registers_every_v1_contract():
         "risk.decision.recorded",
         "order.state.changed",
         "execution.fill.recorded",
+        "venue.trade.recorded",
         "recovery.state.changed",
         # Phase 6 additive contract (existing schemas unchanged).
         "validity.disposition.recorded",
@@ -127,6 +129,7 @@ def test_register_model_requires_declared_defaults():
         ("risk_decision", RiskDecisionRecorded),
         ("order_state_changed", OrderStateChanged),
         ("partial_fill", ExecutionFillRecorded),
+        ("venue_trade_recorded", VenueTradeRecorded),
         ("recovery_state_changed", RecoveryStateChanged),
     ],
 )

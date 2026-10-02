@@ -20,6 +20,7 @@ from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
     ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     STREAM_LIFECYCLE_EVENT_TYPE,
+    VENUE_TRADE_EVENT_TYPE,
     OperatorCommandRecordPayload,
     V1_CONTRACTS,
 )
@@ -415,6 +416,7 @@ def _contract_checks() -> list[BreakGlassItem]:
             (OPERATOR_COMMAND_EVENT_TYPE, 1),
             (STREAM_LIFECYCLE_EVENT_TYPE, 1),
             (ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE, 1),
+            (VENUE_TRADE_EVENT_TYPE, 1),
         ]
     )
     items.append(
@@ -425,7 +427,7 @@ def _contract_checks() -> list[BreakGlassItem]:
             "pass" if not unchanged and new_contracts == expected_additive else "fail",
             "every Phase 1-12 tagged contract keeps its exact payload fields and version; later "
             "phases add only the reviewed additive v1 contracts (Phase 13 operator command, "
-            "Phase 15 stream lifecycle, Phase 15 durable submission attempt)",
+            "Phase 15 stream lifecycle, Phase 15 durable submission attempt, G4 venue trade metadata)",
             {
                 "modified": unchanged,
                 "additive": [f"{name} v{version}" for name, version in new_contracts],

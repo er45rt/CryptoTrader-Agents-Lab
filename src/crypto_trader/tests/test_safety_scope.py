@@ -109,6 +109,7 @@ def test_safety_reuses_the_phase3_state_and_only_adds_one_contract():
         # Phase 15 durable ambiguity additive contract (existing schemas unchanged).
         "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

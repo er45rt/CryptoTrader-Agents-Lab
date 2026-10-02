@@ -22,6 +22,7 @@ __all__ = [
     "FIXTURE_ORDER_STATE_CHANGED",
     "FIXTURE_ORDER_SUBMISSION_ATTEMPTED",
     "FIXTURE_PARTIAL_FILL",
+    "FIXTURE_VENUE_TRADE_RECORDED",
     "FIXTURE_RECOVERY_STATE_CHANGED",
     "FIXTURE_RISK_DECISION",
     "FIXTURE_ROOT_STRATEGY_DECISION",
@@ -141,6 +142,34 @@ FIXTURE_PARTIAL_FILL: dict[str, Any] = {
     },
 }
 
+# 5b. Venue trade metadata linked to the existing partial fill.
+FIXTURE_VENUE_TRADE_RECORDED: dict[str, Any] = {
+    "event_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "event_type": "venue.trade.recorded",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:15Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": "77777777-7777-4777-8777-777777777777",
+    "producer": "infrastructure.synthetic_venue",
+    "strategy_id": "strat-synthetic-1",
+    "order_id": ORDER_ID,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "venue_reference": "ct-44444444444444444444",
+        "venue_order_id": "42",
+        "venue_trade_id": "7001",
+        "fill_event_id": "77777777-7777-4777-8777-777777777777",
+        "price": "100.25000000",
+        "quantity": "0.40000000",
+        "quote_quantity": "40.10000000",
+        "commission": "0.00400000",
+        "commission_asset": "SYNTH",
+        "is_buyer": True,
+        "is_maker": False,
+    },
+}
+
 # 6. Recovery/reconciliation state change.
 FIXTURE_RECOVERY_STATE_CHANGED: dict[str, Any] = {
     "event_id": "88888888-8888-4888-8888-888888888888",
@@ -193,6 +222,7 @@ FIXTURES: dict[str, dict[str, Any]] = {
     "order_submission_attempted": FIXTURE_ORDER_SUBMISSION_ATTEMPTED,
     "order_state_changed": FIXTURE_ORDER_STATE_CHANGED,
     "partial_fill": FIXTURE_PARTIAL_FILL,
+    "venue_trade_recorded": FIXTURE_VENUE_TRADE_RECORDED,
     "recovery_state_changed": FIXTURE_RECOVERY_STATE_CHANGED,
 }
 

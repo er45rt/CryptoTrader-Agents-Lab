@@ -173,6 +173,7 @@ def test_phase13_adds_exactly_one_additive_event_contract():
         # Phase 15 durable ambiguity additive contract (existing schemas unchanged).
         "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",

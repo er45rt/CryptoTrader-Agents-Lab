@@ -247,6 +247,40 @@ def fill(
     }
 
 
+def trade(
+    *,
+    trade_id: int = 7,
+    order_id: int = 42,
+    symbol: str = SYMBOL,
+    price: str = "27000.00",
+    qty: str = "0.00050000",
+    quote_qty: str = "13.50000000",
+    commission: str = "0.00000050",
+    commission_asset: str = "BTC",
+    time_ms: int = SERVER_TIME_MS,
+    is_buyer: bool = True,
+    is_maker: bool = False,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "id": trade_id,
+        "orderId": order_id,
+        "price": price,
+        "qty": qty,
+        "quoteQty": quote_qty,
+        "commission": commission,
+        "commissionAsset": commission_asset,
+        "time": time_ms,
+        "isBuyer": is_buyer,
+        "isMaker": is_maker,
+        "isBestMatch": True,
+    }
+
+
+def my_trades_response(*items: dict[str, object]) -> HttpResponse:
+    return response(200, list(items))
+
+
 def rejected(code: int = -2010, msg: str = "Account has insufficient balance") -> HttpResponse:
     return response(400, {"code": code, "msg": msg})
 
