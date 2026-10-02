@@ -64,6 +64,7 @@ def attempt_event(
     limit_price: str | None = "100.00000000",
     venue_producer: str = VENUE_PRODUCER,
     producer: str = LOCAL_PRODUCER,
+    strategy_id: str | None = "strategy.stage1",
     sequence_number: int | None = None,
 ) -> OrderSubmissionAttempted:
     return OrderSubmissionAttempted(
@@ -71,7 +72,7 @@ def attempt_event(
         occurred_at=BASE + timedelta(seconds=index),
         correlation_id=CORRELATION,
         producer=producer,
-        strategy_id="strategy.stage1",
+        strategy_id=strategy_id,
         order_id=order_id,
         symbol=SYMBOL,
         sequence_number=sequence_number,
@@ -384,6 +385,24 @@ def test_m_immutable_economic_identity_mismatch_is_a_conflict(journal):
     )
 
 
+def test_m_strategy_attribution_is_part_of_the_immutable_attempt_identity(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0, strategy_id="strategy.stage1"),
+            attempt_event(index=1, strategy_id="strategy.other"),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    anchors = reconstructor.attempt_anchors(CLIENT_ORDER_ID)
+
+    assert anchors is not None
+    assert anchors.strategy_id == "strategy.stage1"
+    assert reconstructor.conflicts()[CLIENT_ORDER_ID] == (
+        "immutable_economic_identity_mismatch",
+    )
+
+
 # --- N / O: legacy fallback and determinism ---------------------------------------
 
 def test_n_legacy_journals_without_the_attempt_contract_still_reconstruct(journal):
@@ -670,6 +689,7 @@ def test_snapshot_restore_preserves_attempt_anchors_and_bookkeeping(tmp_path):
     assert anchors.order_reference == CLIENT_ORDER_ID
     assert anchors.order_id == ORDER_ID
     assert anchors.intent_id == INTENT_ID
+    assert anchors.strategy_id == "strategy.stage1"
     assert anchors.side == "buy"
     assert anchors.order_type == "limit"
     assert anchors.quantity == ORIGINAL

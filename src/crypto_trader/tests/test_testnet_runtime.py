@@ -325,7 +325,12 @@ def test_submitting_twice_with_the_same_intent_never_creates_two_orders(journal)
 
 def test_reconnect_after_an_outage_reverifies_the_environment():
     transport = ScriptedTransport(
-        responses=[*fx.environment_responses(), fx.time_response(), fx.account_response()]
+        responses=[
+            *fx.environment_responses(),
+            fx.time_response(),
+            fx.exchange_info_response(),
+            fx.account_response(),
+        ]
     )
     instance = started_runtime(transport)
 

@@ -137,6 +137,7 @@ class AttemptAnchors:
     intent_id: UUID
     correlation_id: UUID | None
     symbol: str
+    strategy_id: str | None
     side: str
     order_type: str
     quantity: Decimal
@@ -151,6 +152,7 @@ class AttemptAnchors:
             str(self.order_id),
             str(self.intent_id),
             self.symbol,
+            self.strategy_id,
             self.side,
             self.order_type,
             str(self.quantity),
@@ -207,6 +209,7 @@ class OrderStateReconstructor(IdempotentConsumer):
             intent_id=payload.intent_id,
             correlation_id=event.correlation_id,
             symbol=event.symbol,
+            strategy_id=event.strategy_id,
             side=payload.side,
             order_type=payload.order_type,
             quantity=payload.quantity,
@@ -662,6 +665,7 @@ def _attempt_to_dict(anchors: AttemptAnchors) -> dict[str, Any]:
         "intent_id": str(anchors.intent_id),
         "correlation_id": None if anchors.correlation_id is None else str(anchors.correlation_id),
         "symbol": anchors.symbol,
+        "strategy_id": anchors.strategy_id,
         "side": anchors.side,
         "order_type": anchors.order_type,
         "quantity": str(anchors.quantity),
@@ -681,6 +685,7 @@ def _attempt_from_dict(entry: dict[str, Any]) -> AttemptAnchors:
             None if entry.get("correlation_id") is None else UUID(entry["correlation_id"])
         ),
         symbol=str(entry["symbol"]),
+        strategy_id=None if entry.get("strategy_id") is None else str(entry["strategy_id"]),
         side=str(entry["side"]),
         order_type=str(entry["order_type"]),
         quantity=Decimal(str(entry["quantity"])),

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from crypto_trader.events import ORDER_STATE_EVENT_TYPE
+from crypto_trader.events import ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
 from crypto_trader.breakglass import BinanceSpotTestnetEmergencyControl
 from crypto_trader.execution.binance_testnet import (
     SPOT_TESTNET_REST_BASE,
@@ -23,6 +23,7 @@ from crypto_trader.execution.binance_testnet import (
 )
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.production import ProductionStateError
 from crypto_trader.recovery import reconstruct_order_states
 from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.test_production_live_testnet import _require_reconciliation_closure
@@ -67,6 +68,20 @@ def _wired(journal, state_dir, transport, *, control=None):
 
 # --- 12: testnet execution still works through the production runtime -------------
 
+def test_invalid_strategy_id_is_rejected_before_any_attempt_or_post(journal, state_dir):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, _client = _wired(journal, state_dir, transport)
+    runtime.start()
+
+    with pytest.raises(ProductionStateError):
+        intent("invalid-strategy", strategy_id="my strategy")
+
+    assert not any(
+        event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE for event in journal.replay()
+    )
+    assert [request for request in transport.requests if request.is_write] == []
+
+
 def test_testnet_execution_flows_through_the_production_runtime(journal, state_dir):
     intent_obj = intent("testnet-flow-1")
     transport = fx.ScriptedTransport(
@@ -88,7 +103,11 @@ def test_testnet_execution_flows_through_the_production_runtime(journal, state_d
     assert outcome.submission.safety_mode == "normal"
     assert outcome.submission.environment == "testnet"
     assert port.observations()
-    assert ORDER_STATE_EVENT_TYPE in [event.event_type for event in journal.replay()]
+    events = list(journal.replay())
+    assert ORDER_STATE_EVENT_TYPE in [event.event_type for event in events]
+    attempts = [event for event in events if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE]
+    assert len(attempts) == 1
+    assert attempts[0].strategy_id == intent_obj.strategy_id
     writes = [request for request in transport.requests if request.is_write]
     assert len(writes) == 1
 
@@ -223,6 +242,7 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
             *startup_responses(),
             fx.order_response(reference, status="NEW"),
             fx.time_response(),
+            fx.exchange_info_response(),
             fx.account_response(),
             fx.response(200, [fx.order_response(reference, status="NEW").body]),
             fx.cancel_response(reference),

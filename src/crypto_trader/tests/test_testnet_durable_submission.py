@@ -105,8 +105,24 @@ def attempt_events(journal) -> list:
 class _FailingJournal:
     """A journal whose durable append fails (marker commit unavailable)."""
 
+    def read_range(self, **_kwargs):
+        return []
+
+    def read_by_id(self, _event_id):
+        return None
+
     def append(self, event):  # noqa: ANN001 - test double
         raise RuntimeError("durable journal unavailable")
+
+
+class _UnreadableAttemptJournal:
+    """Structural durable journal whose attempt history cannot be queried."""
+
+    def append(self, _event):
+        return True
+
+    def read_by_id(self, _event_id):
+        return None
 
 
 class _MarkerVisibilityTransport:
@@ -186,7 +202,20 @@ def test_c_a_marker_commit_failure_prevents_any_post():
     )
     instance.start()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="durable journal unavailable"):
+        instance.submit(execution_request())
+
+    assert posts(transport) == []
+
+
+def test_unreadable_attempt_history_fails_closed_before_any_post():
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    instance = OrderRuntime(
+        client=client_for(transport), instrument=INSTRUMENT, journal=_UnreadableAttemptJournal()
+    )
+    instance.start()
+
+    with pytest.raises(AttemptJournalRequiredError, match="cannot prove prior submission attempts"):
         instance.submit(execution_request())
 
     assert posts(transport) == []
@@ -437,6 +466,419 @@ def test_duplicate_client_order_id_is_reconciled_by_identity_not_terminalised(tm
             if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "rejected"
         ]
         assert rejected == []
+
+
+@pytest.mark.parametrize(
+    "read_failures",
+    [
+        pytest.param(
+            [fx.rejected(code=-2013, msg="Order does not exist.")],
+            id="not_found",
+        ),
+        pytest.param(
+            [PreSendTransportError("identity read never connected")] * 3,
+            id="pre_send_read_failure",
+        ),
+        pytest.param(
+            [TransportTimeout("identity read timed out")] * 3,
+            id="read_timeout",
+        ),
+    ],
+)
+def test_duplicate_identity_failed_reread_stays_ambiguous_and_pending(tmp_path, read_failures):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            *read_failures,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+        states = instance.local_states()
+        assert len(states) == 1
+        assert states[0].order_reference == CLIENT_ORDER_ID
+        assert states[0].state.value == "submitted"
+        assert states[0].submission_attempted is True
+
+
+@pytest.mark.parametrize(
+    "mutate_body",
+    [
+        pytest.param(
+            lambda body: {**body, "clientOrderId": "ct-different-identity"},
+            id="different_client_id",
+        ),
+        pytest.param(
+            lambda body: {**body, "symbol": "ETHUSDT"},
+            id="different_symbol",
+        ),
+        pytest.param(
+            lambda body: {key: value for key, value in body.items() if key != "orderId"},
+            id="missing_order_id",
+        ),
+    ],
+)
+def test_duplicate_identity_mismatched_reread_stays_ambiguous_and_pending(
+    tmp_path, mutate_body
+):
+    reread = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=99)
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, mutate_body(dict(reread.body))),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+        assert instance.client.known_orders() == ()
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+@pytest.mark.parametrize("reread_exists", [True, False], ids=["adopt", "not_found"])
+def test_ambiguous_submit_explicit_resubmit_never_posts_twice(tmp_path, reread_exists):
+    reread = (
+        fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=777)
+        if reread_exists
+        else fx.rejected(code=-2013, msg="Order does not exist.")
+    )
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            reread,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        if reread_exists:
+            assert instance.submit(execution_request()) == CLIENT_ORDER_ID
+            states = instance.local_states()
+            assert len(states) == 1
+            assert states[0].order_reference == CLIENT_ORDER_ID
+            assert states[0].state.value == "accepted"
+            accepted = [
+                event
+                for event in journal.read_range()
+                if event.event_type == ORDER_STATE_EVENT_TYPE
+                and event.payload.state == "accepted"
+            ]
+            assert len(accepted) == 1
+        else:
+            with pytest.raises(AmbiguousOrderError):
+                instance.submit(execution_request())
+            assert instance.local_states()[0].state.value == "submitted"
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+
+@pytest.mark.parametrize("reread_exists", [True, False], ids=["adopt", "not_found"])
+def test_restart_durable_attempt_never_posts_same_identity_again(tmp_path, reread_exists):
+    journal_path = tmp_path / "journal.db"
+    first_transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), TransportTimeout("post-send ambiguity")]
+    )
+    with SQLiteEventJournal(journal_path) as journal:
+        first = started(first_transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            first.submit(execution_request())
+        assert len(posts(first_transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+    reread = (
+        fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=778)
+        if reread_exists
+        else fx.rejected(code=-2013, msg="Order does not exist.")
+    )
+    second_transport = ScriptedTransport(responses=[*fx.environment_responses(), reread])
+    with SQLiteEventJournal(journal_path) as journal:
+        restarted = started(second_transport, journal)
+
+        if reread_exists:
+            assert restarted.submit(execution_request()) == CLIENT_ORDER_ID
+            states = restarted.local_states()
+            assert len(states) == 1
+            assert states[0].order_reference == CLIENT_ORDER_ID
+            assert states[0].state.value == "accepted"
+        else:
+            with pytest.raises(AmbiguousOrderError):
+                restarted.submit(execution_request())
+
+        assert posts(second_transport) == []
+        assert len(attempt_events(journal)) == 1
+
+
+def test_recovered_pending_identity_without_marker_is_never_posted(tmp_path):
+    """recover_order() leaves the identity pending: a later submit must fail closed, zero POSTs."""
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2013, msg="Order does not exist."),  # the recovery lookup
+            fx.rejected(code=-2013, msg="Order does not exist."),  # the identity re-read
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        assert instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID) is None
+        assert attempt_events(journal) == []
+
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            instance.submit(execution_request())
+
+        assert posts(transport) == []
+        assert attempt_events(journal) == []
+        states = instance.local_states()
+        assert len(states) == 1
+        assert states[0].order_reference == CLIENT_ORDER_ID
+        assert states[0].state.value == "submitted"
+
+
+def test_duplicate_failed_reread_then_resubmit_still_never_posts_again(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+
+
+
+@pytest.mark.parametrize(
+    "guard_read_failures",
+    [
+        pytest.param(
+            [PreSendTransportError("guard read never connected")] * 3,
+            id="pre_send_read_failure",
+        ),
+        pytest.param(
+            [TransportTimeout("guard read timed out")] * 3,
+            id="read_timeout",
+        ),
+    ],
+)
+def test_existing_durable_attempt_guard_read_failure_never_reposts(tmp_path, guard_read_failures):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            *guard_read_failures,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+
+
+def test_existing_durable_attempt_guard_rejects_mismatched_identity_without_caching(tmp_path):
+    reread = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad_body = {**dict(reread.body), "clientOrderId": "ct-foreign-identity"}
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad_body),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.client.known_orders() == ()
+        assert "ct-foreign-identity" not in instance.client._orders
+
+
+def test_durable_attempt_for_one_identity_does_not_block_a_different_identity(tmp_path):
+    second_intent = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    second_correlation = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    second_reference = f"ct-{second_intent.hex[:20]}"
+    second_request = ExecutionRequest.create(
+        correlation_id=second_correlation,
+        symbol="BTCUSDT",
+        side=ExecutionSide.BUY,
+        order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal("0.00100000"),
+        limit_price=Decimal("27000.00"),
+        intent_id=second_intent,
+    )
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("first identity is ambiguous"),
+            fx.order_response(second_reference, status="NEW", order_id=780),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert instance.submit(second_request) == second_reference
+
+        assert len(posts(transport)) == 2
+        attempts = attempt_events(journal)
+        assert [event.payload.venue_reference for event in attempts] == [
+            CLIENT_ORDER_ID,
+            second_reference,
+        ]
+
+
+@pytest.mark.parametrize(
+    "first_outcome,first_error",
+    [
+        pytest.param(
+            PreSendTransportError("write never connected"),
+            PreSendTransportError,
+            id="pre_send_canceled",
+        ),
+        pytest.param(
+            fx.rejected(
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow",
+            ),
+            VenueProtocolRejectionError,
+            id="timestamp_rejected",
+        ),
+        pytest.param(
+            fx.rejected(code=-2019, msg="Margin is insufficient"),
+            RejectedError,
+            id="ordinary_rejected",
+        ),
+    ],
+)
+def test_terminal_durable_attempt_identity_is_never_reposted_in_process(
+    tmp_path, first_outcome, first_error
+):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            first_outcome,
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(first_error):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+
+@pytest.mark.parametrize(
+    "first_outcome,first_error",
+    [
+        pytest.param(
+            PreSendTransportError("write never connected"),
+            PreSendTransportError,
+            id="pre_send_canceled",
+        ),
+        pytest.param(
+            fx.rejected(
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow",
+            ),
+            VenueProtocolRejectionError,
+            id="timestamp_rejected",
+        ),
+        pytest.param(
+            fx.rejected(code=-2019, msg="Margin is insufficient"),
+            RejectedError,
+            id="ordinary_rejected",
+        ),
+    ],
+)
+def test_terminal_durable_attempt_identity_is_never_reposted_after_restart(
+    tmp_path, first_outcome, first_error
+):
+    journal_path = tmp_path / "terminal-identity.db"
+    first_transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), first_outcome]
+    )
+    with SQLiteEventJournal(journal_path) as journal:
+        first = started(first_transport, journal)
+        with pytest.raises(first_error):
+            first.submit(execution_request())
+        assert len(posts(first_transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+    second_transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(journal_path) as journal:
+        restarted = started(second_transport, journal)
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            restarted.submit(execution_request())
+
+        assert posts(second_transport) == []
+        assert len(attempt_events(journal)) == 1
 
 
 def test_ordinary_deterministic_rejection_still_terminalises(tmp_path):

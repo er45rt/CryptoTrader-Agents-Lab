@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -93,6 +94,8 @@ from .errors import (
     ProductionStateError,
 )
 from .fence import FenceCheck, ProductionFence
+
+_STRATEGY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 
 __all__ = [
     "PRODUCTION_PRODUCER",
@@ -246,6 +249,12 @@ class ProductionIntent:
                 raise ProductionStateError(f"{name} must be timezone-aware.")
         if not self.symbol or not self.strategy_id or not self.market_reference:
             raise ProductionStateError("symbol, strategy_id and market_reference are required.")
+        if not isinstance(self.strategy_id, str) or not _STRATEGY_ID_PATTERN.fullmatch(
+            self.strategy_id
+        ):
+            raise ProductionStateError(
+                "strategy_id must be 1-128 characters of letters, digits, '_', '-' or '.'."
+            )
 
     @property
     def risk_price(self) -> Decimal:
@@ -265,6 +274,7 @@ class IntentPreparation:
     quantity: Decimal
     limit_price: Decimal | None
     time_in_force: ExecutionTimeInForce
+    strategy_id: str
     approved: bool
     stages: tuple[str, ...]
     blocked_reason_code: str | None
@@ -281,6 +291,7 @@ class IntentPreparation:
             "order_type": self.order_type.value,
             "quantity": str(self.quantity),
             "limit_price": None if self.limit_price is None else str(self.limit_price),
+            "strategy_id": self.strategy_id,
             "approved": self.approved,
             "stages": list(self.stages),
             "blocked_reason_code": self.blocked_reason_code,
@@ -748,6 +759,7 @@ class ProductionRuntime:
             quantity=intent.quantity,
             limit_price=intent.limit_price,
             time_in_force=intent.time_in_force,
+            strategy_id=intent.strategy_id,
             approved=True,
             stages=tuple(stages),
             blocked_reason_code=None,
@@ -797,6 +809,7 @@ class ProductionRuntime:
             quantity=preparation.quantity,
             limit_price=preparation.limit_price,
             time_in_force=preparation.time_in_force,
+            strategy_id=preparation.strategy_id,
         )
         try:
             # Venue-writing execution goes through the approved durable submission sequence
@@ -906,6 +919,7 @@ class ProductionRuntime:
             quantity=intent.quantity,
             limit_price=intent.limit_price,
             time_in_force=intent.time_in_force,
+            strategy_id=intent.strategy_id,
             approved=False,
             stages=tuple(stages),
             blocked_reason_code=reason_code,

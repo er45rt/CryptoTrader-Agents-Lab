@@ -267,6 +267,7 @@ class ExecutionRequest:
     quantity: Decimal
     limit_price: Decimal | None = None
     time_in_force: ExecutionTimeInForce = ExecutionTimeInForce.GTC
+    strategy_id: str | None = None
 
     @classmethod
     def create(
@@ -280,6 +281,7 @@ class ExecutionRequest:
         limit_price: Decimal | None = None,
         time_in_force: ExecutionTimeInForce = ExecutionTimeInForce.GTC,
         intent_id: UUID | None = None,
+        strategy_id: str | None = None,
     ) -> "ExecutionRequest":
         return cls(
             intent_id=intent_id or uuid4(),
@@ -290,6 +292,7 @@ class ExecutionRequest:
             quantity=quantity,
             limit_price=limit_price,
             time_in_force=time_in_force,
+            strategy_id=strategy_id,
         )
 
     def validate_for(self, instrument: InstrumentSpec) -> None:

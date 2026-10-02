@@ -61,6 +61,8 @@ def client(
     clock_instance: SpotClock | None = None,
     retries: int = 3,
     withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.REQUIRE_DISABLED,
+    rules_ttl_seconds: float = 60.0,
+    rules_monotonic=None,
 ) -> SpotClient:
     return SpotClient(
         credentials=credentials(),
@@ -70,6 +72,8 @@ def client(
         retry=RetryPolicy(max_attempts=retries, base_delay_seconds=0.001, max_delay_seconds=0.01),
         withdrawal_policy=withdrawal_policy,
         budget=budget(),
+        rules_ttl_seconds=rules_ttl_seconds,
+        **({} if rules_monotonic is None else {"rules_monotonic": rules_monotonic}),
     )
 
 

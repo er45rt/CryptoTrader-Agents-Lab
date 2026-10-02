@@ -526,10 +526,14 @@ def test_recv_window_is_clamped_to_the_documented_maximum():
 
 # --- reconnect -------------------------------------------------------------
 
-def test_reconnect_reverifies_endpoint_clock_and_permissions():
-    # Instrument rules are cached, so a re-verification refreshes the clock and the account only.
+def test_reconnect_reverifies_endpoint_clock_permissions_and_symbol_rules():
     transport = ScriptedTransport(
-        responses=[*fx.environment_responses(), fx.time_response(), fx.account_response()]
+        responses=[
+            *fx.environment_responses(),
+            fx.time_response(),
+            fx.exchange_info_response(),
+            fx.account_response(),
+        ]
     )
     client = fx.client(transport)
     client.verify_environment()
@@ -539,7 +543,90 @@ def test_reconnect_reverifies_endpoint_clock_and_permissions():
     assert environment.venue_label == "binance-spot-testnet"
     assert fx.request_paths(transport).count("/api/v3/time") == 2
     assert fx.request_paths(transport).count("/api/v3/account") == 2
+    assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 2
+
+
+def test_prepare_order_reuses_fresh_symbol_rules_without_an_extra_read():
+    now = [0.0]
+    transport = ScriptedTransport(responses=[fx.exchange_info_response()])
+    client = fx.client(transport, rules_monotonic=lambda: now[0])
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    client.symbol_rules()
+    client.prepare_order(fx.limit_order_request(CLIENT_ORDER_ID))
+
     assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+
+def test_prepare_order_refreshes_expired_symbol_rules_before_any_write():
+    now = [0.0]
+    transport = ScriptedTransport(
+        responses=[
+            fx.exchange_info_response(min_notional="5"),
+            fx.exchange_info_response(min_notional="999999"),
+        ]
+    )
+    client = fx.client(transport, rules_ttl_seconds=60.0, rules_monotonic=lambda: now[0])
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    assert client.symbol_rules().min_notional == Decimal("5")
+    now[0] = 60.0
+    with pytest.raises(SymbolError):
+        client.prepare_order(fx.limit_order_request(CLIENT_ORDER_ID))
+
+    assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 2
+    assert [item for item in transport.requests if item.method == "POST"] == []
+
+
+def test_symbol_rule_cache_ttl_boundary_and_backwards_clock_both_refresh():
+    now = [10.0]
+    transport = ScriptedTransport(
+        responses=[
+            fx.exchange_info_response(min_notional="5"),
+            fx.exchange_info_response(min_notional="6"),
+            fx.exchange_info_response(min_notional="7"),
+        ]
+    )
+    client = fx.client(transport, rules_ttl_seconds=60.0, rules_monotonic=lambda: now[0])
+
+    assert client.symbol_rules().min_notional == Decimal("5")
+    now[0] = 69.999
+    assert client.symbol_rules().min_notional == Decimal("5")
+    now[0] = 70.0
+    assert client.symbol_rules().min_notional == Decimal("6")
+    now[0] = 69.0
+    assert client.symbol_rules().min_notional == Decimal("7")
+    assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 3
+
+
+def test_failed_forced_refresh_invalidates_previous_symbol_rule_cache():
+    now = [0.0]
+    bad_one = fx.exchange_info_response()
+    bad_one.body["symbols"][0]["status"] = "BREAK"
+    bad_two = fx.exchange_info_response()
+    bad_two.body["symbols"][0]["status"] = "BREAK"
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.time_response(), bad_one, bad_two]
+    )
+    client = fx.client(transport, rules_monotonic=lambda: now[0])
+
+    client.verify_environment()
+    with pytest.raises(SymbolError):
+        client.reconnect()
+    with pytest.raises(SymbolError):
+        client.prepare_order(fx.limit_order_request(CLIENT_ORDER_ID))
+
+    assert fx.request_paths(transport).count("/api/v3/exchangeInfo") == 3
+    assert [item for item in transport.requests if item.method == "POST"] == []
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_symbol_rule_ttl_is_rejected(bad):
+    from crypto_trader.execution.binance_testnet.errors import TestnetEndpointError
+
+    with pytest.raises(TestnetEndpointError):
+        fx.client(ScriptedTransport([]), rules_ttl_seconds=bad)
+
 
 # G6: strict startup reads preserve the raw evidence boundary and never adopt a cache.
 @pytest.mark.parametrize("body", [None, {}, "", "[]", 0, False, {"orders": []}])

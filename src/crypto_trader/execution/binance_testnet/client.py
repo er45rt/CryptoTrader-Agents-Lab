@@ -17,8 +17,10 @@ Guarantees:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+import math
+import time
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
@@ -41,6 +43,7 @@ from .errors import (
     RateLimitError,
     OrderNotFoundError,
     TestnetRejectedError,
+    TestnetEndpointError,
     TestnetSymbolError,
     UnsafeTestnetAccountError,
     UnsupportedOrderTypeError,
@@ -166,12 +169,17 @@ class BinanceSpotTestnetClient:
     symbol: str = "BTCUSDT"
     withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.REQUIRE_DISABLED
     budget: RateLimitBudget | None = None
+    rules_ttl_seconds: float = 60.0
+    rules_monotonic: Callable[[], float] = time.monotonic
     _orders: dict[str, TestnetOrder] = field(default_factory=dict, init=False)
     _request_log: list[str] = field(default_factory=list, init=False)
     _rules: TestnetSymbolRules | None = field(default=None, init=False)
+    _rules_fetched_at: float | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.base_url = require_testnet_base_url(self.base_url)
+        if not math.isfinite(self.rules_ttl_seconds) or self.rules_ttl_seconds <= 0:
+            raise TestnetEndpointError("rules_ttl_seconds must be a finite positive number.")
         if self.budget is None:
             self.budget = RateLimitBudget(bucket=TokenBucket(capacity=1200, refill_per_second=20.0))
 
@@ -242,7 +250,7 @@ class BinanceSpotTestnetClient:
         """
         target = symbol or self.symbol
         offset = self.synchronize_clock()
-        rules = self.symbol_rules(target)
+        rules = self.symbol_rules(target, refresh=True)
         account = self.account_snapshot(asset=rules.quote_asset)
         if account.withdrawals_available and self.withdrawal_policy is WithdrawalPolicy.REQUIRE_DISABLED:
             raise UnsafeTestnetAccountError(
@@ -279,11 +287,28 @@ class BinanceSpotTestnetClient:
             notes=notes,
         )
 
-    def symbol_rules(self, symbol: str | None = None) -> TestnetSymbolRules:
-        """Fetch (and cache) the trading rules for one symbol."""
+    def symbol_rules(
+        self, symbol: str | None = None, *, refresh: bool = False
+    ) -> TestnetSymbolRules:
+        """Fetch trading rules, reusing the local cache only while it is provably fresh."""
         target = symbol or self.symbol
-        if self._rules is not None and self._rules.symbol == target:
+        now = float(self.rules_monotonic())
+        if not math.isfinite(now):
+            raise TestnetEndpointError("rules_monotonic returned a non-finite value.")
+        fetched_at = self._rules_fetched_at
+        age = None if fetched_at is None else now - fetched_at
+        if (
+            not refresh
+            and self._rules is not None
+            and self._rules.symbol == target
+            and age is not None
+            and 0 <= age < self.rules_ttl_seconds
+        ):
             return self._rules
+
+        # A failed refresh must never leave a previously cached rule set eligible for reuse.
+        self._rules = None
+        self._rules_fetched_at = None
         body = self._request(
             PATH_EXCHANGE_INFO, {"symbol": target}, weight=_WEIGHT_EXCHANGE_INFO, is_write=False
         )
@@ -302,6 +327,7 @@ class BinanceSpotTestnetClient:
             max_quantity=parsed.max_quantity,
             min_notional=parsed.min_notional,
         )
+        self._rules_fetched_at = now
         return self._rules
 
     # --- orders -------------------------------------------------------------
@@ -579,7 +605,20 @@ class BinanceSpotTestnetClient:
             # treatment is reconciliation by the SAME identity: re-read the order and adopt the
             # venue view. The write is never retried (this POST count stays at one) and the durable
             # attempt marker stays in place for reconciliation.
-            order = self.order_status(prepared.symbol, prepared.client_order_id)
+            try:
+                order = self.order_status(
+                    prepared.symbol,
+                    prepared.client_order_id,
+                    require_exact_identity=True,
+                )
+            except BinanceTestnetError as exc:
+                raise AmbiguousOrderError(
+                    "the venue reported a duplicate client order identity, but the required "
+                    "identity re-read failed; the original write outcome remains unknown and "
+                    "the order must stay pending reconciliation."
+                ) from exc
+            # Exact identity was proved by the strict read before the response could enter
+            # the in-memory order cache.
             self._orders[order.client_order_id] = order
             return replace(order, deduplicated=True)
         if code == CODE_TIMESTAMP_OUTSIDE_RECV_WINDOW:
@@ -671,7 +710,13 @@ class BinanceSpotTestnetClient:
         self._orders[client_order_id] = order
         return order
 
-    def order_status(self, symbol: str, client_order_id: str) -> TestnetOrder:
+    def order_status(
+        self,
+        symbol: str,
+        client_order_id: str,
+        *,
+        require_exact_identity: bool = False,
+    ) -> TestnetOrder:
         body = self._request(
             PATH_ORDER,
             {"symbol": symbol, "origClientOrderId": client_order_id},
@@ -679,6 +724,17 @@ class BinanceSpotTestnetClient:
             is_write=False,
             signed=True,
         )
+        if require_exact_identity:
+            if (
+                not isinstance(body, Mapping)
+                or body.get("clientOrderId") != client_order_id
+                or body.get("symbol") != symbol
+                or type(body.get("orderId")) is not int
+                or body.get("orderId") <= 0
+            ):
+                raise BinanceTestnetError(
+                    "order status response did not prove the exact requested client order identity."
+                )
         order = self._parse_order(body)
         self._orders[order.client_order_id] = order
         return order

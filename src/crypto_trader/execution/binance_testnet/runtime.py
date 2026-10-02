@@ -176,10 +176,30 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             ),
         )
 
-        prepared = self.client.prepare_order(order_request)
-
         self._intents[client_order_id] = request.intent_id
         self._correlations[client_order_id] = request.correlation_id
+
+        if (
+            client_order_id in self._pending_submissions
+            or self._has_durable_attempt(client_order_id)
+        ):
+            try:
+                order = self.client.order_status(
+                    request.symbol,
+                    client_order_id,
+                    require_exact_identity=True,
+                )
+            except BinanceTestnetError as exc:
+                raise AmbiguousOrderError(
+                    "a durable submission attempt already reserves this client order identity; "
+                    "the venue identity could not be established, so the identity remains "
+                    "permanently ineligible for another venue write."
+                ) from exc
+            self._record(order, correlation_id=request.correlation_id)
+            self._pending_submissions.pop(client_order_id, None)
+            return PreparedVenueWrite(handle=order, adopted_reference=client_order_id)
+
+        prepared = self.client.prepare_order(order_request)
 
         if not prepared.requires_write:
             # The venue already knows this order: adopt it without a marker and without a POST.
@@ -199,6 +219,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             occurred_at=self._now(),
             correlation_id=request.correlation_id,
             producer=self.producer,
+            strategy_id=request.strategy_id,
             order_id=deterministic_order_uuid(client_prepared.client_order_id),
             symbol=client_prepared.symbol,
             payload=OrderSubmissionAttemptPayload(
@@ -304,6 +325,20 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             order, correlation_id=request.correlation_id, occurred_at=self._now(), reason=reason
         ):
             self.journal.append(event)
+
+    def _has_durable_attempt(self, client_order_id: str) -> bool:
+        """True when this deterministic venue identity has ever crossed the durable send boundary."""
+        assert self.journal is not None
+        read_range = getattr(self.journal, "read_range", None)
+        if not callable(read_range):
+            raise AttemptJournalRequiredError(
+                "the durable journal cannot prove prior submission attempts; refusing a venue write."
+            )
+        return any(
+            isinstance(event, OrderSubmissionAttempted)
+            and event.payload.venue_reference == client_order_id
+            for event in read_range()
+        )
 
     def _now(self) -> datetime:
         stamp = self.clock() if self.clock is not None else datetime.now(timezone.utc)
