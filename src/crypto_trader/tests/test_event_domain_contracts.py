@@ -239,6 +239,7 @@ def test_venue_trade_contract_links_strict_trade_metadata_to_a_fill():
     event = VenueTradeRecorded(
         **base_fields(
             order_id=ORDER_ID,
+            causation_id=fill_id,
             producer="infrastructure.synthetic_venue",
             payload=VenueTradeRecordPayload(
                 venue_reference="ct-synthetic",
@@ -250,6 +251,7 @@ def test_venue_trade_contract_links_strict_trade_metadata_to_a_fill():
                 quote_quantity=Decimal("40.1"),
                 commission=Decimal("0.004"),
                 commission_asset="SYNTH",
+                trade_time=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
                 is_buyer=True,
                 is_maker=False,
             ),
@@ -265,14 +267,16 @@ def test_venue_trade_contract_rejects_blank_identity_and_invalid_economics():
             venue_reference=" ", venue_order_id="42", venue_trade_id="7",
             fill_event_id=uuid.uuid4(), price=Decimal("1"), quantity=Decimal("1"),
             quote_quantity=Decimal("1"), commission=Decimal("0"),
-            commission_asset="SYNTH", is_buyer=True, is_maker=False,
+            commission_asset="SYNTH", trade_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+            is_buyer=True, is_maker=False,
         )
     with pytest.raises(ValidationError):
         VenueTradeRecordPayload(
             venue_reference="ct-x", venue_order_id="42", venue_trade_id="7",
             fill_event_id=uuid.uuid4(), price=Decimal("0"), quantity=Decimal("1"),
             quote_quantity=Decimal("1"), commission=Decimal("0"),
-            commission_asset="SYNTH", is_buyer=True, is_maker=False,
+            commission_asset="SYNTH", trade_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+            is_buyer=True, is_maker=False,
         )
 
 

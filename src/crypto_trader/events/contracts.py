@@ -394,6 +394,7 @@ class VenueTradeRecordPayload(EventPayload):
     quote_quantity: Decimal = Field(gt=0)
     commission: Decimal = Field(ge=0)
     commission_asset: str = Field(min_length=1, max_length=64)
+    trade_time: datetime
     is_buyer: bool
     is_maker: bool
 
@@ -404,6 +405,24 @@ class VenueTradeRecordPayload(EventPayload):
             raise ValueError("venue trade identity fields must not be blank.")
         return value
 
+    @field_validator("venue_order_id", "venue_trade_id")
+    @classmethod
+    def _canonical_positive_numeric_id(cls, value: str) -> str:
+        if (
+            not value.isascii()
+            or not value.isdigit()
+            or value.startswith("0")
+        ):
+            raise ValueError("venue order/trade ids must be canonical positive ASCII integers.")
+        return value
+
+    @field_validator("trade_time")
+    @classmethod
+    def _trade_time_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("venue trade time must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
 
 class VenueTradeRecorded(DomainEvent):
     """One immutable venue trade linked to its execution.fill.recorded event."""
@@ -411,6 +430,16 @@ class VenueTradeRecorded(DomainEvent):
     event_type: Literal["venue.trade.recorded"] = VENUE_TRADE_EVENT_TYPE
     schema_version: Literal[1] = 1
     payload: VenueTradeRecordPayload
+
+    @model_validator(mode="after")
+    def _require_fill_linkage(self) -> "VenueTradeRecorded":
+        if self.order_id is None:
+            raise ValueError("venue trade records require an order_id.")
+        if self.causation_id != self.payload.fill_event_id:
+            raise ValueError("venue trade causation_id must equal fill_event_id.")
+        if self.occurred_at != self.payload.trade_time:
+            raise ValueError("venue trade occurred_at must equal the venue trade time.")
+        return self
 
 
 # --- 6. Recovery / reconciliation -----------------------------------------

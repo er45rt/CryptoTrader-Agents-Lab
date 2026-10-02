@@ -722,7 +722,7 @@ def test_startup_my_trades_is_signed_strict_and_cache_free():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("symbol", "ETHUSDT"), ("orderId", 99), ("id", True), ("id", -1),
+    ("symbol", "ETHUSDT"), ("orderId", 99), ("id", True), ("id", 0), ("id", -1),
     ("price", "0"), ("qty", "0"), ("quoteQty", "NaN"), ("commission", "-1"),
     ("commissionAsset", ""), ("time", 0), ("isBuyer", 1), ("isMaker", "false"),
 ])
@@ -752,4 +752,51 @@ def test_startup_my_trades_refuses_a_potentially_truncated_max_page():
     client = fx.client(ScriptedTransport([fx.response(200, page)]))
     client.clock.synchronize(fx.SERVER_TIME_MS)
     with pytest.raises(BinanceTestnetError, match="completeness is not provable"):
+        client.startup_my_trades(fx.SYMBOL, "42")
+
+
+@pytest.mark.parametrize("venue_order_id", ["0", "abc", " 42", "+42", "042", True, 42])
+def test_startup_my_trades_rejects_noncanonical_requested_order_id(venue_order_id):
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    client = fx.client(ScriptedTransport([]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        client.startup_my_trades(fx.SYMBOL, venue_order_id)
+
+
+def test_startup_my_trades_rejects_non_list_body_and_accepts_empty_list():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    bad = fx.client(ScriptedTransport([fx.response(200, {})]))
+    bad.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
+        bad.startup_my_trades(fx.SYMBOL, "42")
+    empty = fx.client(ScriptedTransport([fx.my_trades_response()]))
+    empty.clock.synchronize(fx.SERVER_TIME_MS)
+    assert empty.startup_my_trades(fx.SYMBOL, "42") == ()
+
+
+def test_startup_my_trades_accepts_999_row_complete_page():
+    page = [fx.trade(trade_id=index) for index in range(1, 1000)]
+    client = fx.client(ScriptedTransport([fx.response(200, page)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    trades = client.startup_my_trades(fx.SYMBOL, "42")
+    assert len(trades) == 999 and trades[-1].trade_id == "999"
+
+
+def test_startup_my_trades_wraps_timestamp_overflow_as_typed_error():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    item = fx.trade(time_ms=10**30)
+    client = fx.client(ScriptedTransport([fx.my_trades_response(item)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError, match="outside the supported range"):
+        client.startup_my_trades(fx.SYMBOL, "42")
+
+
+def test_startup_my_trades_rejects_binary_float_economics():
+    from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
+    item = fx.trade()
+    item["price"] = 27000.0
+    client = fx.client(ScriptedTransport([fx.my_trades_response(item)]))
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with pytest.raises(BinanceTestnetError):
         client.startup_my_trades(fx.SYMBOL, "42")

@@ -165,6 +165,7 @@ FIXTURE_VENUE_TRADE_RECORDED: dict[str, Any] = {
         "quote_quantity": "40.10000000",
         "commission": "0.00400000",
         "commission_asset": "SYNTH",
+        "trade_time": "2026-01-01T12:00:15Z",
         "is_buyer": True,
         "is_maker": False,
     },

@@ -1,5 +1,6 @@
 """G6 authoritative startup guard: all requests use offline scripted transports."""
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from threading import Event, Thread
 from uuid import uuid4
@@ -13,6 +14,7 @@ from crypto_trader.execution.binance_testnet.errors import BinanceTestnetError
 from crypto_trader.execution.binance_testnet.startup import (
     BinanceStartupCollector, StartupEvidenceError,
 )
+from crypto_trader.events import VenueTradeRecorded, VenueTradeRecordPayload
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import ProductionRecoveryRequiredError
 from crypto_trader.recovery import StaticVenueStateSource
@@ -208,6 +210,38 @@ def test_writing_journal_scope_refuses_missing_or_other_symbol(journal, tmp_path
     seed(journal, symbol=symbol)
     runtime, _, _, transport = wired(journal, tmp_path)
     with pytest.raises(StartupEvidenceError): runtime.start()
+    assert transport.requests == []
+    assert_stopped(runtime, transport)
+
+
+def test_writing_journal_scope_refuses_foreign_symbol_venue_trade(journal, tmp_path):
+    fill_event_id = uuid4()
+    trade_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    journal.append(VenueTradeRecorded(
+        occurred_at=trade_time,
+        correlation_id=uuid4(),
+        causation_id=fill_event_id,
+        producer="infrastructure.binance_testnet",
+        order_id=uuid4(),
+        symbol="ETHUSDT",
+        payload=VenueTradeRecordPayload(
+            venue_reference="ct-foreign",
+            venue_order_id="42",
+            venue_trade_id="7",
+            fill_event_id=fill_event_id,
+            price=Decimal("27000"),
+            quantity=Decimal("0.001"),
+            quote_quantity=Decimal("27"),
+            commission=Decimal("0"),
+            commission_asset="USDT",
+            trade_time=trade_time,
+            is_buyer=True,
+            is_maker=False,
+        ),
+    ))
+    runtime, _, _, transport = wired(journal, tmp_path)
+    with pytest.raises(StartupEvidenceError):
+        runtime.start()
     assert transport.requests == []
     assert_stopped(runtime, transport)
 

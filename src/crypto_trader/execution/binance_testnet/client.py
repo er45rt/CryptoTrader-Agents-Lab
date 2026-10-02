@@ -776,12 +776,16 @@ class BinanceSpotTestnetClient:
 
     def startup_my_trades(self, symbol: str, venue_order_id: str) -> tuple[VenueTrade, ...]:
         """Strict signed trade-history evidence for one exact venue order."""
-        try:
-            requested_order_id = int(venue_order_id)
-        except (TypeError, ValueError) as exc:
-            raise BinanceTestnetError("startup trade history requires a numeric venue order id.") from exc
-        if requested_order_id <= 0:
-            raise BinanceTestnetError("startup trade history requires a positive venue order id.")
+        if (
+            not isinstance(venue_order_id, str)
+            or not venue_order_id.isascii()
+            or not venue_order_id.isdigit()
+            or venue_order_id.startswith("0")
+        ):
+            raise BinanceTestnetError(
+                "startup trade history requires a canonical positive ASCII venue order id."
+            )
+        requested_order_id = int(venue_order_id)
         body = self._request(
             PATH_MY_TRADES,
             {"symbol": symbol, "orderId": requested_order_id, "limit": 1000},
@@ -813,14 +817,14 @@ class BinanceSpotTestnetClient:
             raise BinanceTestnetError("startup trade evidence must be an object.")
         if body.get("symbol") != symbol or type(body.get("orderId")) is not int:
             raise BinanceTestnetError("startup trade symbol or order identity is invalid.")
-        if body["orderId"] != order_id or type(body.get("id")) is not int or body["id"] < 0:
+        if body["orderId"] != order_id or type(body.get("id")) is not int or body["id"] <= 0:
             raise BinanceTestnetError("startup trade order/trade identity is invalid.")
         values: dict[str, Decimal] = {}
         for name, positive in (
             ("price", True), ("qty", True), ("quoteQty", True), ("commission", False)
         ):
             raw = body.get(name)
-            if not isinstance(raw, (str, int, float)) or isinstance(raw, bool):
+            if not isinstance(raw, str):
                 raise BinanceTestnetError(f"startup trade {name} is missing or malformed.")
             try:
                 value = Decimal(str(raw))
@@ -839,7 +843,10 @@ class BinanceSpotTestnetClient:
             raise BinanceTestnetError("startup trade time is missing or malformed.")
         if type(is_buyer) is not bool or type(is_maker) is not bool:
             raise BinanceTestnetError("startup trade buyer/maker flags are missing or malformed.")
-        trade_time = utc_from_ms(timestamp)
+        try:
+            trade_time = utc_from_ms(timestamp)
+        except (OSError, OverflowError, ValueError) as exc:
+            raise BinanceTestnetError("startup trade time is outside the supported range.") from exc
         assert trade_time is not None
         return VenueTrade(
             symbol=symbol,
