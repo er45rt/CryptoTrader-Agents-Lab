@@ -105,7 +105,11 @@ def test_durable_runtime_prepares_with_canonical_identity_before_hard_risk(tmp_p
         )
         runtime.start()
 
-        preparation = admitted_prepare(runtime, target)
+        preparation = admitted_prepare(
+            runtime,
+            target,
+            latest_scope_intent_id=target.intent_id,
+        )
 
         assert preparation.approved is True
         assert preparation.intent_id == canonical_id
