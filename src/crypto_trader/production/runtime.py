@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ from crypto_trader.validity import (
     DecisionValidityGate,
     Disposition,
     MarketStateProvider,
+    ValidityPolicy,
     ValidityRequest,
 )
 
@@ -106,7 +108,9 @@ __all__ = [
     "ProductionRuntime",
     "ProductionStartupReport",
     "ProductionSubmitResult",
+    "intent_deadline",
     "production_control",
+    "validity_request_for",
 ]
 
 PRODUCTION_PRODUCER = "application.production"
@@ -261,6 +265,44 @@ class ProductionIntent:
     def risk_price(self) -> Decimal:
         """The deterministic price Hard Risk evaluates against (never a guessed market price)."""
         return self.limit_price if self.limit_price is not None else self.reference_price
+
+
+def validity_request_for(intent: ProductionIntent) -> ValidityRequest:
+    """Build the one canonical validity request for a production intent."""
+    if not isinstance(intent, ProductionIntent):
+        raise ProductionStateError("validity_request_for expects a ProductionIntent.")
+    return ValidityRequest(
+        correlation_id=intent.correlation_id,
+        symbol=intent.symbol,
+        decision_started_at=intent.decision_started_at,
+        decision_completed_at=intent.decision_completed_at,
+        market_event_ts=intent.market_event_ts,
+        reference_price=intent.reference_price,
+        market_reference=intent.market_reference,
+        intent_id=intent.intent_id,
+        decision_scope=intent.decision_scope,
+        valid_until=intent.valid_until,
+    )
+
+
+def intent_deadline(intent: ProductionIntent, policy: ValidityPolicy) -> datetime:
+    """Return the earliest deterministic deadline after which an intent is invalid."""
+    if not isinstance(intent, ProductionIntent):
+        raise ProductionStateError("intent_deadline expects a ProductionIntent.")
+    if not isinstance(policy, ValidityPolicy):
+        raise ProductionStateError("intent_deadline requires a resolved ValidityPolicy.")
+    deadlines = [
+        intent.market_event_ts.astimezone(timezone.utc)
+        + timedelta(seconds=policy.max_age_seconds)
+    ]
+    if intent.valid_until is not None:
+        deadlines.append(intent.valid_until.astimezone(timezone.utc))
+    if policy.valid_until_seconds is not None:
+        deadlines.append(
+            intent.decision_completed_at.astimezone(timezone.utc)
+            + timedelta(seconds=policy.valid_until_seconds)
+        )
+    return min(deadlines)
 
 
 @dataclass(frozen=True)
@@ -440,6 +482,9 @@ class ProductionRuntime:
         if not isinstance(owner_id, str) or not owner_id.strip():
             raise ProductionStateError("the production runtime requires a non-empty owner id.")
 
+        # SQLiteEventJournal is thread-affine. The production runtime must be constructed
+        # and subsequently used on that same owner thread; producer threads use admission only.
+        self._owner_thread_id = threading.get_ident()
         self._journal = journal
         self._state_dir = Path(state_dir)
         self._instrument = instrument
@@ -476,6 +521,7 @@ class ProductionRuntime:
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._issued_preparations: dict[UUID, tuple[IntentPreparation, datetime]] = {}
+        self._admission_token: object | None = None
         self._producer = producer
         self._control = (
             control
@@ -523,8 +569,14 @@ class ProductionRuntime:
     def startup_report(self) -> ProductionStartupReport | None:
         return self._startup
 
+    @property
+    def validity_policy(self) -> ValidityPolicy:
+        """The immutable validity policy shared with production admission."""
+        return self._validity_gate.policy
+
     def status(self) -> dict[str, object]:
         """Read-only runtime posture (never writes, never repairs, never caches an approval)."""
+        self._require_owner_thread()
         posture = self._control.status()
         return {
             "runtime_state": self._state.value,
@@ -546,6 +598,7 @@ class ProductionRuntime:
 
     def start(self, *, correlation_id: UUID | None = None) -> ProductionStartupReport:
         """Writing startup claims first, then proves current signed venue/recovery evidence."""
+        self._require_owner_thread()
         if self._state is ExecutionRuntimeState.RUNNING:
             raise ProductionStateError("the production runtime is already running.")
         self._startup = None
@@ -691,6 +744,7 @@ class ProductionRuntime:
 
     def stop(self) -> None:
         """Stop serving. The held lease record stays on disk; a restart takes a fresh term."""
+        self._require_owner_thread()
         self._execution.stop()
         self._state = ExecutionRuntimeState.STOPPED
 
@@ -702,8 +756,11 @@ class ProductionRuntime:
         *,
         capacity_available: bool = True,
         latest_scope_intent_id: UUID | None = None,
+        _admission_token: object | None = None,
     ) -> IntentPreparation:
         """Run validity then canonical Hard Risk; writing mode refreshes read-only venue evidence."""
+        self._require_owner_thread()
+        self._require_admission_token(_admission_token)
         self._require_running()
         if not isinstance(intent, ProductionIntent):
             raise ProductionStateError("prepare_intent expects a ProductionIntent.")
@@ -723,18 +780,7 @@ class ProductionRuntime:
 
         # Stage 1: deterministic decision validity / staleness.
         validity = self._validity_gate.evaluate(
-            ValidityRequest(
-                correlation_id=intent.correlation_id,
-                symbol=intent.symbol,
-                decision_started_at=intent.decision_started_at,
-                decision_completed_at=intent.decision_completed_at,
-                market_event_ts=intent.market_event_ts,
-                reference_price=intent.reference_price,
-                market_reference=intent.market_reference,
-                intent_id=intent.intent_id,
-                decision_scope=intent.decision_scope,
-                valid_until=intent.valid_until,
-            ),
+            validity_request_for(intent),
             market_state=self._market_state,
             now=now,
             latest_scope_intent_id=latest_scope_intent_id,
@@ -802,12 +848,19 @@ class ProductionRuntime:
         )
         self._issued_preparations[intent.intent_id] = (
             preparation,
-            self._preparation_expiry(intent),
+            intent_deadline(intent, self._validity_gate.policy),
         )
         return preparation
 
-    def submit_prepared(self, preparation: IntentPreparation) -> ProductionSubmitResult:
+    def submit_prepared(
+        self,
+        preparation: IntentPreparation,
+        *,
+        _admission_token: object | None = None,
+    ) -> ProductionSubmitResult:
         """Wait on venue admission outside the lock, then atomically authorize and submit."""
+        self._require_owner_thread()
+        self._require_admission_token(_admission_token)
         if self._durable_venue_writes:
             try:
                 self._validate_submission_preparation(preparation, release_on_failure=False)
@@ -943,12 +996,19 @@ class ProductionRuntime:
         *,
         capacity_available: bool = True,
         latest_scope_intent_id: UUID | None = None,
+        _admission_token: object | None = None,
     ) -> ProductionExecutionOutcome:
-        """Convenience path: prepare then submit. A blocked decision never reaches the venue."""
+        """Prepare then submit; an admission-bound runtime requires its controller capability.
+
+        Durable venue-writing paths deduplicate an exact intent_id across restart via the
+        deterministic client order id and journal. A new intent_id for the same decision is not
+        equivalent durable identity and must be handled before Mainnet promotion.
+        """
         preparation = self.prepare_intent(
             intent,
             capacity_available=capacity_available,
             latest_scope_intent_id=latest_scope_intent_id,
+            _admission_token=_admission_token,
         )
         if not preparation.approved:
             return ProductionExecutionOutcome(
@@ -957,7 +1017,10 @@ class ProductionRuntime:
                 submission=None,
                 blocked_reason_code=preparation.blocked_reason_code,
             )
-        submission = self.submit_prepared(preparation)
+        submission = self.submit_prepared(
+            preparation,
+            _admission_token=_admission_token,
+        )
         return ProductionExecutionOutcome(
             submitted=True,
             preparation=preparation,
@@ -967,20 +1030,34 @@ class ProductionRuntime:
 
     # --- internals -----------------------------------------------------------
 
-    def _preparation_expiry(self, intent: ProductionIntent) -> datetime:
-        policy = self._validity_gate.policy
-        deadlines = [
-            intent.market_event_ts.astimezone(timezone.utc)
-            + timedelta(seconds=policy.max_age_seconds)
-        ]
-        if intent.valid_until is not None:
-            deadlines.append(intent.valid_until.astimezone(timezone.utc))
-        if policy.valid_until_seconds is not None:
-            deadlines.append(
-                intent.decision_completed_at.astimezone(timezone.utc)
-                + timedelta(seconds=policy.valid_until_seconds)
+    def _bind_admission(self) -> object:
+        """Bind exactly one serialized admission controller to this runtime."""
+        self._require_owner_thread()
+        if self._admission_token is not None:
+            raise ProductionStateError(
+                "production runtime already has an admission controller bound."
             )
-        return min(deadlines)
+        if self._issued_preparations or len(self._pending) != 0:
+            raise ProductionStateError(
+                "production runtime cannot bind admission with outstanding preparations "
+                "or pending economic reservations."
+            )
+        token = object()
+        self._admission_token = token
+        return token
+
+    def _require_admission_token(self, token: object | None) -> None:
+        if self._admission_token is not None and token is not self._admission_token:
+            raise ProductionStateError(
+                "production runtime is admission-bound; direct decision-path calls are refused."
+            )
+
+    def _require_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise ProductionStateError(
+                "production runtime is thread-affine: construct and use it on the journal owner "
+                "thread; producer threads must use the admission controller."
+            )
 
     def _release_preparation(self, intent_id: UUID) -> None:
         self._issued_preparations.pop(intent_id, None)

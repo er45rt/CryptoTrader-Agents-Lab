@@ -19,7 +19,7 @@ import pytest
 
 from crypto_trader.events import ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
 from crypto_trader.breakglass import BinanceSpotTestnetEmergencyControl
-from crypto_trader.breakglass.ownership import OwnerKind
+from crypto_trader.breakglass.ownership import OwnerKind, OwnershipStore
 from crypto_trader.breakglass.errors import StaleWriterFenceError
 from crypto_trader.execution import ExecutionSide
 from crypto_trader.execution.binance_testnet import (
@@ -365,24 +365,22 @@ def test_expired_prelock_validation_preserves_reservation_until_locked_cleanup(
     assert runtime._issued_preparations.get(preparation.intent_id, (None,))[0] is preparation
 
 
-def test_concurrent_prelock_cleanup_cannot_release_retired_ambiguity_reservation(
+def test_foreign_submit_is_refused_before_admission_or_reservation_cleanup(
     journal, state_dir
 ):
     transport = fx.ScriptedTransport(startup_responses())
     runtime, port, _client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent("ambiguous-concurrent-cleanup"))
+    preparation = runtime.prepare_intent(intent("foreign-submit-refused"))
 
-    admission_failed = threading.Event()
+    admission_called = threading.Event()
     failures: list[BaseException] = []
 
-    def fail_admission() -> None:
-        admission_failed.set()
-        raise RateLimitAdmissionDeferredError(
-            "synthetic pre-lock deferral", retry_after_seconds=1.0
-        )
+    def fail_if_called() -> None:
+        admission_called.set()
+        raise AssertionError("foreign thread reached venue admission")
 
-    port.await_write_admission = fail_admission  # type: ignore[method-assign]
+    port.await_write_admission = fail_if_called  # type: ignore[method-assign]
 
     def submit() -> None:
         try:
@@ -390,23 +388,17 @@ def test_concurrent_prelock_cleanup_cannot_release_retired_ambiguity_reservation
         except BaseException as exc:
             failures.append(exc)
 
-    # The cleanup path must serialize with the authoritative submission section. While it waits,
-    # model the exact ambiguity transition: retire the one-shot issued object but keep its
-    # economic reservation. Cleanup must then observe the retired identity and leave it alone.
-    with runtime.control.ownership_store.exclusive(purpose="submission"):
-        failer = threading.Thread(target=submit, name="admission-failer", daemon=True)
-        failer.start()
-        assert admission_failed.wait(timeout=5.0)
+    worker = threading.Thread(target=submit, name="foreign-submit", daemon=True)
+    worker.start()
+    worker.join(timeout=5.0)
 
-        runtime._issued_preparations.pop(preparation.intent_id, None)
-        assert len(runtime._pending) == 1
-
-    failer.join(timeout=5.0)
-    assert not failer.is_alive()
+    assert not worker.is_alive()
     assert len(failures) == 1
-    assert isinstance(failures[0], RateLimitAdmissionDeferredError)
+    assert isinstance(failures[0], ProductionStateError)
+    assert "thread-affine" in str(failures[0])
+    assert admission_called.is_set() is False
     assert len(runtime._pending) == 1
-    assert runtime._issued_preparations == {}
+    assert runtime._issued_preparations[preparation.intent_id][0] is preparation
     assert not [request for request in transport.requests if request.method == "POST"]
     assert not [
         event for event in journal.replay()
@@ -468,37 +460,45 @@ def test_rate_limit_race_after_preflight_fails_fast_inside_lock(
     assert runtime._issued_preparations == {}
 
 
-def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(
-    journal, state_dir
-):
+def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    journal_path = tmp_path / "journal.db"
     transport = fx.ScriptedTransport(startup_responses())
-    runtime, _port, client = _wired(journal, state_dir, transport)
-    runtime.start()
-    preparation = runtime.prepare_intent(intent("pre-lock-wait-takeover"))
-    assert client.budget is not None
 
+    ready = threading.Event()
     entered = threading.Event()
     release = threading.Event()
     failures: list[BaseException] = []
+    final_state: dict[str, object] = {}
 
-    def blocking_sleep(_seconds: float) -> None:
-        entered.set()
-        assert release.wait(timeout=2.0)
+    def owner_thread() -> None:
+        with SQLiteEventJournal(journal_path) as thread_journal:
+            runtime, _port, client = _wired(thread_journal, state_dir, transport)
+            runtime.start()
+            preparation = runtime.prepare_intent(intent("pre-lock-wait-takeover"))
+            assert client.budget is not None
 
-    client.budget.backoff_until = client.budget.monotonic() + 60.0
-    client.budget.sleep = blocking_sleep
+            def blocking_sleep(_seconds: float) -> None:
+                entered.set()
+                assert release.wait(timeout=5.0)
 
-    def submit() -> None:
-        try:
-            runtime.submit_prepared(preparation)
-        except BaseException as exc:  # capture the expected stale-writer refusal
-            failures.append(exc)
+            client.budget.backoff_until = client.budget.monotonic() + 60.0
+            client.budget.sleep = blocking_sleep
+            ready.set()
+            try:
+                runtime.submit_prepared(preparation)
+            except BaseException as exc:
+                failures.append(exc)
+            final_state["pending"] = len(runtime._pending)
+            final_state["issued"] = dict(runtime._issued_preparations)
 
-    worker = threading.Thread(target=submit, daemon=True)
+    worker = threading.Thread(target=owner_thread, name="runtime-owner", daemon=True)
     worker.start()
-    assert entered.wait(timeout=2.0), "submission never reached the pre-lock admission wait"
+    assert ready.wait(timeout=5.0)
+    assert entered.wait(timeout=5.0), "submission never reached the pre-lock admission wait"
 
-    takeover = runtime.control.ownership_store.takeover(
+    takeover = OwnershipStore(state_dir / "ownership.json").takeover(
         owner_id="emergency:test",
         owner_kind=OwnerKind.EMERGENCY,
         acquired_at=BASE,
@@ -507,12 +507,11 @@ def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(
     assert takeover.owner_kind is OwnerKind.EMERGENCY
 
     release.set()
-    worker.join(timeout=2.0)
+    worker.join(timeout=5.0)
     assert not worker.is_alive()
     assert any(isinstance(exc, StaleWriterFenceError) for exc in failures)
     assert not [request for request in transport.requests if request.method == "POST"]
-    assert len(runtime._pending) == 0
-    assert runtime._issued_preparations == {}
+    assert final_state == {"pending": 0, "issued": {}}
 
 
 # --- 16: the withdrawal-disabled invariant still fails closed ----------------------

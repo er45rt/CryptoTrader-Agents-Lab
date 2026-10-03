@@ -42,6 +42,7 @@ from .errors import (
 from .fence import FenceCheck, ProductionFence
 from .equity import EquityChainState, load_equity_chain
 from .risk_state import ProductionRiskStateSource, derive_risk_state
+from .admission import ProductionAdmissionController
 from .backfill import TradeBackfillMaintenanceWriter, TradeBackfillWriteReport
 from .runtime import (
     PRODUCTION_PRODUCER,
@@ -65,6 +66,7 @@ __all__ = [
     "FenceCheck",
     "IntentPreparation",
     "MainnetDisabledError",
+    "ProductionAdmissionController",
     "ProductionConfigError",
     "ProductionExecutionOutcome",
     "ProductionFence",
