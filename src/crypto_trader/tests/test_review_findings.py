@@ -208,9 +208,9 @@ def test_durable_boundary_rejects_changed_wiring_or_marker(tmp_path,monkeypatch,
     from crypto_trader.execution import NonDurableExecutionError,ExecutionCapability
     from crypto_trader.tests import testnet_fixtures as tfx
     from crypto_trader.tests.production_fixtures import (
-        INSTRUMENT, build_runtime, canonical_risk_refresh_responses,
-        canonical_test_risk_source, control_for, intent, seed_canonical_equity_root,
-        startup_responses,
+        INSTRUMENT, admitted_prepare, admitted_submit, build_runtime,
+        canonical_risk_refresh_responses, canonical_test_risk_source, control_for,
+        intent, seed_canonical_equity_root, startup_responses,
     )
     target=intent('review-wiring')
     reference=f'ct-{target.intent_id.hex[:20]}'
@@ -227,9 +227,10 @@ def test_durable_boundary_rejects_changed_wiring_or_marker(tmp_path,monkeypatch,
         production=build_runtime(
             journal=journal,state_dir=tmp_path/'state',execution=port,
             control=control,risk_state_source=risk_source,
+            bind_admission=True,
         )
         production.start()
-        preparation=production.prepare_intent(target)
+        preparation=admitted_prepare(production, target)
         assert preparation.approved
         if mutation=='journal':port.journal=other
         elif mutation=='capability':port.capability=ExecutionCapability.NON_WRITING
@@ -241,7 +242,7 @@ def test_durable_boundary_rejects_changed_wiring_or_marker(tmp_path,monkeypatch,
                     return item.model_copy(update={'correlation_id':uuid4()})
                 return item
             monkeypatch.setattr(journal,'read_by_id',corrupt)
-        with pytest.raises(NonDurableExecutionError):production.submit_prepared(preparation)
+        with pytest.raises(NonDurableExecutionError):admitted_submit(production, preparation)
         assert not [r for r in transport.requests if r.method=='POST']
 
 

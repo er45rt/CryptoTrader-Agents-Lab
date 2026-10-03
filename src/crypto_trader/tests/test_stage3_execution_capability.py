@@ -35,6 +35,9 @@ from crypto_trader.tests import testnet_fixtures as fx
 from crypto_trader.tests.production_fixtures import INSTRUMENT as PRODUCTION_INSTRUMENT, startup_responses
 from crypto_trader.tests.production_fixtures import (
     RecordingExecutionPort,
+    admitted_execute,
+    admitted_prepare,
+    admitted_submit,
     build_runtime,
     canonical_risk_refresh_responses,
     canonical_test_risk_source,
@@ -342,6 +345,7 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
             execution=port,
             control=control,
             risk_state_source=risk_source,
+            bind_admission=True,
         )
 
         assert port.capability is ExecutionCapability.DURABLE_VENUE_WRITING
@@ -349,7 +353,7 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
         assert runtime is not None
 
         runtime.start()
-        outcome = runtime.execute_intent(intent_obj)
+        outcome = admitted_execute(runtime, intent_obj)
 
         assert outcome.submitted is True
         posts = [item for item in transport.requests if item.method == "POST"]
@@ -389,15 +393,16 @@ def test_submit_rechecks_canonical_risk_client_binding(tmp_path):
             execution=port,
             control=control,
             risk_state_source=risk_source,
+            bind_admission=True,
         )
         runtime.start()
-        preparation = runtime.prepare_intent(target)
+        preparation = admitted_prepare(runtime, target)
         assert preparation.approved
 
         risk_source._client = fx.client(ScriptedTransport([]))
 
         with pytest.raises(ProductionStateError, match="not bound"):
-            runtime.submit_prepared(preparation)
+            admitted_submit(runtime, preparation)
 
         assert not [request for request in transport.requests if request.method == "POST"]
 

@@ -30,7 +30,13 @@ from crypto_trader.execution import (
 from crypto_trader.execution.binance_testnet import BinanceSpotTestnetClient, TestnetOrderRuntime
 from crypto_trader.events import AccountEquityRecorded, AccountEquityRecordPayload
 from crypto_trader.persistence import EventJournal
-from crypto_trader.production import ProductionIntent, ProductionRiskStateSource, ProductionRuntime
+from crypto_trader.production import (
+    ProductionAdmissionController,
+    ProductionIntent,
+    ProductionRiskStateSource,
+    ProductionRuntime,
+    ProductionStateError,
+)
 from crypto_trader.recovery import ReconciliationPolicy, load_policy as load_recovery_policy
 from crypto_trader.risk import (
     PendingIntentRegistry,
@@ -272,8 +278,9 @@ def build_runtime(
     venue_sources=(),
     pending: PendingIntentRegistry | None = None,
     when: datetime = BASE,
+    bind_admission: bool = False,
 ) -> ProductionRuntime:
-    return ProductionRuntime(
+    runtime = ProductionRuntime(
         journal=journal,
         state_dir=state_dir,
         instrument=INSTRUMENT,
@@ -291,6 +298,56 @@ def build_runtime(
         control=control,
         clock=clock(when),
         pending=pending,
+    )
+    if bind_admission:
+        bind_test_admission(runtime, when=when)
+    return runtime
+
+
+def bind_test_admission(
+    runtime: ProductionRuntime,
+    *,
+    when: datetime = BASE,
+) -> ProductionAdmissionController:
+    """Bind the real admission capability for tests that exercise venue-writing internals."""
+    return ProductionAdmissionController(
+        runtime=runtime,
+        max_size=8,
+        max_per_strategy_queued=2,
+        max_retired=32,
+        max_per_strategy_retired=8,
+        max_rejection_strategies=8,
+        clock=clock(when),
+    )
+
+
+def _bound_admission_token(runtime: ProductionRuntime) -> object:
+    token = runtime._admission_token
+    if token is None:
+        raise ProductionStateError("test runtime has no bound production admission controller.")
+    return token
+
+
+def admitted_prepare(runtime: ProductionRuntime, intent_obj: ProductionIntent, **kwargs):
+    return runtime.prepare_intent(
+        intent_obj,
+        _admission_token=_bound_admission_token(runtime),
+        **kwargs,
+    )
+
+
+def admitted_submit(runtime: ProductionRuntime, preparation):
+    return runtime.submit_prepared(
+        preparation,
+        _admission_token=_bound_admission_token(runtime),
+    )
+
+
+def admitted_execute(runtime: ProductionRuntime, intent_obj: ProductionIntent, **kwargs):
+    return runtime.execute_intent(
+        intent_obj,
+        _admission_token=_bound_admission_token(runtime),
+        **kwargs,
     )
 
 
@@ -314,6 +371,7 @@ def testnet_runtime(
         execution=port,
         control=active_control,
         risk_state_source=risk_source,
+        bind_admission=True,
     )
     return runtime, port
 

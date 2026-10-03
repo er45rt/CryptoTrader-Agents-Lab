@@ -41,9 +41,15 @@ def wired(journal, tmp_path, responses=(), **kwargs):
     state_dir = tmp_path / "state"
     control = control_for(journal, state_dir)
     risk_source = canonical_test_risk_source(journal=journal, control=control, client=client)
+    bind_admission = kwargs.pop("bind_admission", True)
     production = build_runtime(
-        journal=journal, state_dir=state_dir, execution=port, control=control,
-        risk_state_source=risk_source, **kwargs,
+        journal=journal,
+        state_dir=state_dir,
+        execution=port,
+        control=control,
+        risk_state_source=risk_source,
+        bind_admission=bind_admission,
+        **kwargs,
     )
     return production, port, client, transport
 

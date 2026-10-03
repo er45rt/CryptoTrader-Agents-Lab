@@ -43,6 +43,10 @@ from crypto_trader.tests.production_fixtures import (
     BASE,
     INSTRUMENT,
     startup_responses,
+    admitted_execute,
+    admitted_prepare,
+    admitted_submit,
+    bind_test_admission,
     build_runtime,
     clock,
     control_for,
@@ -92,7 +96,15 @@ def _risk_refresh_responses():
 
 
 def _wired(
-    journal, state_dir, transport, *, control=None, port=None, client=None, limits_value=None
+    journal,
+    state_dir,
+    transport,
+    *,
+    control=None,
+    port=None,
+    client=None,
+    limits_value=None,
+    bind_admission=True,
 ):
     client = client or fx.client(transport)
     port = port or OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
@@ -140,13 +152,87 @@ def _wired(
         max_mark_age_seconds=13 * 60 * 60,
     )
     runtime = build_runtime(
-        journal=journal, state_dir=state_dir, execution=port, control=active_control,
-        risk_state_source=risk_source, limits_value=limits_value,
+        journal=journal,
+        state_dir=state_dir,
+        execution=port,
+        control=active_control,
+        risk_state_source=risk_source,
+        limits_value=limits_value,
+        bind_admission=bind_admission,
     )
     return runtime, port, client
 
 
 # --- 12: testnet execution still works through the production runtime -------------
+
+def test_venue_writing_runtime_refuses_start_without_admission_binding(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, port, _client = _wired(
+        journal,
+        state_dir,
+        transport,
+        bind_admission=False,
+    )
+
+    with pytest.raises(ProductionStateError, match="requires a bound"):
+        runtime.start()
+
+    status = runtime.status()
+    assert status["runtime_state"] == "stopped"
+    assert status["last_refusal"] == "admission_unbound"
+    assert port.state().value == "stopped"
+    assert transport.requests == []
+
+
+def test_unbound_writing_runtime_refuses_direct_decision_paths_before_io(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, _client = _wired(
+        journal,
+        state_dir,
+        transport,
+        bind_admission=False,
+    )
+    candidate = intent("unbound-direct-path")
+
+    with pytest.raises(ProductionStateError, match="requires a bound"):
+        runtime.execute_intent(candidate)
+    with pytest.raises(ProductionStateError, match="requires a bound"):
+        runtime.prepare_intent(candidate)
+    with pytest.raises(ProductionStateError, match="requires a bound"):
+        runtime.submit_prepared(object())  # token gate must win before payload validation
+
+    assert transport.requests == []
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
+
+
+def test_bound_admission_is_the_only_writing_decision_ingress(journal, state_dir):
+    intent_obj = intent("bound-admission-ingress")
+    transport = fx.ScriptedTransport(
+        [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
+    )
+    runtime, _port, _client = _wired(
+        journal,
+        state_dir,
+        transport,
+        bind_admission=False,
+    )
+    admission = bind_test_admission(runtime)
+    runtime.start()
+
+    assert admission.offer(intent_obj) == (True, "accepted")
+    outcome = admission.run_once()
+    assert outcome is not None and outcome.submitted is True
+    assert len([request for request in transport.requests if request.method == "POST"]) == 1
+
+    with pytest.raises(ProductionStateError, match="admission-bound"):
+        runtime.execute_intent(intent("bound-direct-bypass"))
+    assert len([request for request in transport.requests if request.method == "POST"]) == 1
+
 
 def test_invalid_strategy_id_is_rejected_before_any_attempt_or_post(journal, state_dir):
     transport = fx.ScriptedTransport(startup_responses())
@@ -167,12 +253,13 @@ def test_unattributed_sell_is_blocked_before_any_venue_write(journal, state_dir)
     runtime, _port, _client = _wired(journal, state_dir, transport)
     runtime.start()
 
-    outcome = runtime.execute_intent(
+    outcome = admitted_execute(
+        runtime,
         intent(
             "unattributed-sell",
             side=ExecutionSide.SELL,
             quantity=Decimal("0.001"),
-        )
+        ),
     )
 
     assert outcome.submitted is False
@@ -206,11 +293,11 @@ def test_second_prepare_accounts_for_first_pending_reservation(
     )
     runtime.start()
 
-    first = runtime.prepare_intent(
-        intent("reservation-first", quantity=Decimal("0.01"))
+    first = admitted_prepare(
+        runtime, intent("reservation-first", quantity=Decimal("0.01"))
     )
-    second = runtime.prepare_intent(
-        intent("reservation-second", quantity=Decimal("0.01"))
+    second = admitted_prepare(
+        runtime, intent("reservation-second", quantity=Decimal("0.01"))
     )
 
     assert first.approved is True
@@ -232,7 +319,7 @@ def test_testnet_execution_flows_through_the_production_runtime(journal, state_d
     assert report.base_url == SPOT_TESTNET_REST_BASE
     assert report.safety_mode == "normal"
 
-    outcome = runtime.execute_intent(intent_obj)
+    outcome = admitted_execute(runtime, intent_obj)
 
     assert outcome.submitted is True
     assert outcome.submission is not None
@@ -262,7 +349,7 @@ def test_an_ambiguous_submit_stays_unknown_pending_reconciliation(journal, state
     runtime.start()
 
     with pytest.raises(AmbiguousOrderError):
-        runtime.execute_intent(intent("ambiguous-1"))
+        admitted_execute(runtime, intent("ambiguous-1"))
 
     assert runtime.status()["last_outcome"] == "unknown_pending_reconciliation"
     writes = [request for request in transport.requests if request.is_write]
@@ -301,7 +388,7 @@ def test_post_send_rate_limit_keeps_production_reservation_unknown(
     runtime.start()
 
     with pytest.raises(expected) as caught:
-        runtime.execute_intent(intent(seed))
+        admitted_execute(runtime, intent(seed))
 
     assert isinstance(caught.value, AmbiguousOrderError)
     assert runtime.status()["last_outcome"] == f"unknown_pending_reconciliation:{reason_code}"
@@ -329,10 +416,10 @@ def test_ambiguous_preparation_is_one_shot_and_cannot_drop_its_reservation(
     )
     runtime, _port, _client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent_obj)
+    preparation = admitted_prepare(runtime, intent_obj)
 
     with pytest.raises(WriteRateLimitedOutcomeUnknownError):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
 
     posts_before = len([request for request in transport.requests if request.method == "POST"])
     assert posts_before == 1
@@ -340,7 +427,7 @@ def test_ambiguous_preparation_is_one_shot_and_cannot_drop_its_reservation(
     assert runtime._issued_preparations == {}
 
     with pytest.raises(ProductionStateError, match="exact unused preparation"):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
 
     assert len([request for request in transport.requests if request.method == "POST"]) == posts_before
     assert len(runtime._pending) == 1
@@ -353,7 +440,7 @@ def test_expired_prelock_validation_preserves_reservation_until_locked_cleanup(
     transport = fx.ScriptedTransport(startup_responses())
     runtime, _port, _client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent("expired-prelock-preserve"))
+    preparation = admitted_prepare(runtime, intent("expired-prelock-preserve"))
 
     runtime._clock = clock(BASE + timedelta(hours=1))
     with pytest.raises(ProductionStateError, match="expired before submission"):
@@ -371,7 +458,7 @@ def test_foreign_submit_is_refused_before_admission_or_reservation_cleanup(
     transport = fx.ScriptedTransport(startup_responses())
     runtime, port, _client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent("foreign-submit-refused"))
+    preparation = admitted_prepare(runtime, intent("foreign-submit-refused"))
 
     admission_called = threading.Event()
     failures: list[BaseException] = []
@@ -384,7 +471,7 @@ def test_foreign_submit_is_refused_before_admission_or_reservation_cleanup(
 
     def submit() -> None:
         try:
-            runtime.submit_prepared(preparation)
+            admitted_submit(runtime, preparation)
         except BaseException as exc:
             failures.append(exc)
 
@@ -412,13 +499,13 @@ def test_pre_send_deferred_admission_releases_reservation_without_marker_or_post
     transport = fx.ScriptedTransport(startup_responses())
     runtime, _port, client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent("pre-send-deferred"))
+    preparation = admitted_prepare(runtime, intent("pre-send-deferred"))
     assert preparation.approved is True
     assert client.budget is not None
     client.budget.backoff_until = client.budget.monotonic() + 5.0
 
     with pytest.raises(RateLimitAdmissionDeferredError):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
 
     assert not [request for request in transport.requests if request.method == "POST"]
     assert not [
@@ -435,7 +522,7 @@ def test_rate_limit_race_after_preflight_fails_fast_inside_lock(
     transport = fx.ScriptedTransport(startup_responses())
     runtime, port, client = _wired(journal, state_dir, transport)
     runtime.start()
-    preparation = runtime.prepare_intent(intent("preflight-race"))
+    preparation = admitted_prepare(runtime, intent("preflight-race"))
     assert client.budget is not None
 
     def race_after_preflight() -> None:
@@ -449,7 +536,7 @@ def test_rate_limit_race_after_preflight_fails_fast_inside_lock(
     client.budget.bucket.sleep = forbidden_sleep
 
     with pytest.raises(RateLimitAdmissionDeferredError):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
 
     assert not [request for request in transport.requests if request.method == "POST"]
     assert not [
@@ -476,7 +563,7 @@ def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(tmp_path
         with SQLiteEventJournal(journal_path) as thread_journal:
             runtime, _port, client = _wired(thread_journal, state_dir, transport)
             runtime.start()
-            preparation = runtime.prepare_intent(intent("pre-lock-wait-takeover"))
+            preparation = admitted_prepare(runtime, intent("pre-lock-wait-takeover"))
             assert client.budget is not None
 
             def blocking_sleep(_seconds: float) -> None:
@@ -487,7 +574,7 @@ def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(tmp_path
             client.budget.sleep = blocking_sleep
             ready.set()
             try:
-                runtime.submit_prepared(preparation)
+                admitted_submit(runtime, preparation)
             except BaseException as exc:
                 failures.append(exc)
             final_state["pending"] = len(runtime._pending)
@@ -537,7 +624,7 @@ def test_no_credential_value_leaks_into_records_or_the_journal(journal, state_di
     )
     runtime, port, client = _wired(journal, state_dir, transport)
     runtime.start()
-    outcome = runtime.execute_intent(intent_obj)
+    outcome = admitted_execute(runtime, intent_obj)
 
     observable = json.dumps(
         {
@@ -577,7 +664,7 @@ def _deterministic_run(root: Path):
         )
         runtime, port, client = _wired(journal, state_dir, transport)
         runtime.start(correlation_id=START_CORRELATION_ID)
-        runtime.execute_intent(intent_obj)
+        admitted_execute(runtime, intent_obj)
 
         def states():
             reconstructed, _ = reconstruct_order_states(journal)
@@ -634,7 +721,7 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
         journal, state_dir, transport, control=control, port=port, client=client
     )
     runtime.start()
-    submitted = runtime.execute_intent(intent_obj)
+    submitted = admitted_execute(runtime, intent_obj)
     assert submitted.submitted is True
 
     outcome = control.handle(operator_command("cancel_open", seed="cancel-open-emergency"))
@@ -662,7 +749,7 @@ def test_cancel_open_emergency_behavior_remains_available(journal, state_dir):
     # A fresh halt preserves the existing refusal check below, without a new order.
     control.handle(operator_command("halt_new_risk", seed="closure-rehalt"))
 
-    blocked = runtime.execute_intent(intent("cancel-open-2"))
+    blocked = admitted_execute(runtime, intent("cancel-open-2"))
     assert blocked.submitted is False
     assert "trading_halted" in (blocked.blocked_reason_code or "")
 

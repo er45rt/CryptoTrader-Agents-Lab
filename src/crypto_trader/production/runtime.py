@@ -605,8 +605,15 @@ class ProductionRuntime:
         self._environment = self._guard = self._fence = self._last_fence = None
         self._last_outcome = self._last_refusal = None
         execution_started = False
-        phase = "environment"
+        phase = "admission_binding"
         try:
+            if self._durable_venue_writes and self._admission_token is None:
+                self._last_refusal = "admission_unbound"
+                raise ProductionStateError(
+                    "venue-writing production runtime requires a bound "
+                    "ProductionAdmissionController before startup."
+                )
+            phase = "environment"
             now = self._now()
             run_id = correlation_id or uuid4()
             nonce = uuid4()  # Caller correlation identity never supplies freshness.
@@ -1047,6 +1054,11 @@ class ProductionRuntime:
         return token
 
     def _require_admission_token(self, token: object | None) -> None:
+        if self._durable_venue_writes and self._admission_token is None:
+            raise ProductionStateError(
+                "venue-writing production runtime requires a bound "
+                "ProductionAdmissionController; direct decision-path calls are refused."
+            )
         if self._admission_token is not None and token is not self._admission_token:
             raise ProductionStateError(
                 "production runtime is admission-bound; direct decision-path calls are refused."

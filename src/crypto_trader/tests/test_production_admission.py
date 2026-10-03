@@ -92,6 +92,14 @@ def _intent_at(seed: str, stamp: datetime, **overrides):
     return intent(seed, **values)
 
 
+def test_non_writing_runtime_starts_without_admission_binding(journal, state_dir):
+    port, runtime = _started(journal, state_dir)
+
+    assert runtime._admission_token is None
+    assert runtime.status()["runtime_state"] == "running"
+    assert port.state().value == "running"
+
+
 def test_runtime_refuses_non_owner_thread_before_any_state_change(journal, state_dir):
     port, runtime = _started(journal, state_dir)
     before_pending = runtime._pending.items()
@@ -1159,6 +1167,93 @@ def test_global_rejection_floor_blocks_older_unrecorded_strategy_but_allows_newe
         decision_scope="new-c",
     )
     assert admission.offer(newer) == (True, "accepted")
+
+
+def test_global_floor_still_blocks_strategy_after_floor_slot_frees(journal, state_dir):
+    clock = MutableClock(BASE)
+    _port, runtime = _started(journal, state_dir)
+    admission = _admission(
+        runtime,
+        clock,
+        max_size=2,
+        max_per_strategy_queued=1,
+        max_retired=3,
+        max_per_strategy_retired=2,
+        max_rejection_strategies=1,
+    )
+    old_retired = _intent_at(
+        "global-dominance-old",
+        BASE - timedelta(seconds=30),
+        strategy_id="strategy.old",
+        decision_scope="old",
+    )
+    q1 = _intent_at(
+        "global-dominance-q1",
+        BASE,
+        strategy_id="strategy.q1",
+        decision_scope="q1",
+    )
+    q2 = _intent_at(
+        "global-dominance-q2",
+        BASE,
+        strategy_id="strategy.q2",
+        decision_scope="q2",
+    )
+    occupying_floor = _intent_at(
+        "global-dominance-occupying-floor",
+        BASE - timedelta(seconds=30),
+        strategy_id="strategy.x",
+        decision_scope="x",
+    )
+    c1 = _intent_at(
+        "global-dominance-c1",
+        BASE,
+        strategy_id="strategy.a",
+        decision_scope="c1",
+    )
+
+    assert admission.offer(old_retired) == (True, "accepted")
+    assert admission.run_once().submitted is True
+    assert admission.offer(q1) == (True, "accepted")
+    assert admission.offer(q2) == (True, "accepted")
+    assert admission.offer(occupying_floor) == (False, "replay_capacity_exhausted")
+    assert admission.offer(c1) == (False, "replay_capacity_exhausted")
+    assert "strategy.a" not in admission._strategy_rejection_floor
+    assert admission._global_rejection_floor is not None
+    assert admission._global_rejection_floor.order_key == admission._decision_order_key(c1)
+
+    clock.value = BASE + timedelta(seconds=31)
+    c0 = _intent_at(
+        "global-dominance-c0",
+        BASE - timedelta(seconds=5),
+        strategy_id="strategy.a",
+        decision_scope="c0",
+    )
+    between = _intent_at(
+        "global-dominance-between",
+        BASE - timedelta(seconds=2),
+        strategy_id="strategy.a",
+        decision_scope="between",
+    )
+    assert admission.offer(c0) == (
+        False,
+        "superseded_by_global_capacity_rejection_floor",
+    )
+    assert "strategy.a" not in admission._strategy_rejection_floor
+    assert admission.offer(between) == (
+        False,
+        "superseded_by_global_capacity_rejection_floor",
+    )
+    assert "strategy.a" not in admission._strategy_rejection_floor
+
+    assert admission.run_once().submitted is True
+    fresh = _intent_at(
+        "global-dominance-fresh",
+        clock.value,
+        strategy_id="strategy.a",
+        decision_scope="fresh",
+    )
+    assert admission.offer(fresh) == (True, "accepted")
 
 
 def test_rejection_floors_expire_and_remain_hard_bounded(journal, state_dir):

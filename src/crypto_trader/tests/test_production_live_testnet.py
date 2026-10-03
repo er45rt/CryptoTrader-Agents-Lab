@@ -46,6 +46,7 @@ from crypto_trader.execution.binance_testnet import (
 from crypto_trader.execution.binance_testnet import TestnetClock as SpotClock
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import (
+    ProductionAdmissionController,
     ProductionIntent,
     ProductionRiskStateSource,
     ProductionRuntime,
@@ -60,6 +61,7 @@ from crypto_trader.validity import (
     MarketObservation,
 )
 from crypto_trader.validity import load_policy as load_validity_policy
+from crypto_trader.tests.production_fixtures import admitted_prepare, admitted_submit
 
 RUN_FLAG = "CRYPTO_TRADER_RUN_TESTNET"
 SYMBOL = "BTCUSDT"
@@ -240,7 +242,16 @@ def live_context(tmp_path: Path):
         clock=_now,
         owner_id="normal:production-live-test",
     )
-    yield runtime, control, client, journal
+    admission = ProductionAdmissionController(
+        runtime=runtime,
+        max_size=8,
+        max_per_strategy_queued=2,
+        max_retired=32,
+        max_per_strategy_retired=8,
+        max_rejection_strategies=8,
+        clock=_now,
+    )
+    yield runtime, admission, control, client, journal
     try:
         client.cancel_all_open_orders(SYMBOL)
     except Exception:  # pragma: no cover - best-effort cleanup of a testnet-only order
@@ -252,7 +263,7 @@ def live_context(tmp_path: Path):
 
 
 def test_live_runtime_claims_the_normal_lease_and_verifies_the_testnet_venue(live_context):
-    runtime, control, _client, _journal = live_context
+    runtime, _admission, control, _client, _journal = live_context
 
     report = runtime.start()
 
@@ -267,14 +278,17 @@ def test_live_runtime_claims_the_normal_lease_and_verifies_the_testnet_venue(liv
 
 
 def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_order(live_context):
-    runtime, control, client, journal = live_context
+    runtime, admission, control, client, journal = live_context
     runtime.start()
 
     market, limit_price, quantity = _resting_limit_terms(client)
     first = _intent(market=market, limit_price=limit_price, quantity=quantity)
-    outcome = runtime.execute_intent(first)
+    assert admission.offer(first) == (True, "accepted")
+    outcome = admission.run_once()
 
-    assert outcome.submitted is True, "the production runtime did not submit the testnet order"
+    assert outcome is not None and outcome.submitted is True, (
+        "the production admission path did not submit the testnet order"
+    )
     reference = outcome.submission.order_reference
     resting_orders = client.open_orders(SYMBOL)
     resting = {order.client_order_id for order in resting_orders}
@@ -286,12 +300,12 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
     # A second intent is approved by validity + Hard Risk, then the operator takes over.
     market, limit_price, quantity = _resting_limit_terms(client)
     second = _intent(market=market, limit_price=limit_price, quantity=quantity)
-    preparation = runtime.prepare_intent(second)
+    preparation = admitted_prepare(runtime, second)
     assert preparation.approved is True
     control.handle(_command("halt_new_risk", seed="live-halt", reason="live fencing validation"))
 
     with pytest.raises(StaleWriterFenceError):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
     second_reference = f"ct-{second.intent_id.hex[:20]}"
     assert second_reference not in {order.client_order_id for order in client.open_orders(SYMBOL)}
 
@@ -350,16 +364,20 @@ def _require_reconciliation_closure(control):
 
 def test_live_new_risk_after_takeover_is_refused_by_the_runtime(live_context):
     """A halted posture must refuse new risk through the production runtime, not just the control."""
-    runtime, control, client, _journal = live_context
+    runtime, admission, control, client, _journal = live_context
     runtime.start()
     control.handle(_command("halt_new_risk", seed="live-halt-2", reason="halt before new risk"))
 
     market, limit_price, quantity = _resting_limit_terms(client)
-    blocked = runtime.execute_intent(
-        _intent(market=market, limit_price=limit_price, quantity=quantity)
+    blocked_intent = _intent(
+        market=market,
+        limit_price=limit_price,
+        quantity=quantity,
     )
+    assert admission.offer(blocked_intent) == (True, "accepted")
+    blocked = admission.run_once()
 
-    assert blocked.submitted is False
+    assert blocked is not None and blocked.submitted is False
     assert blocked.blocked_reason_code
     assert control.status().new_risk_permitted is False
 
