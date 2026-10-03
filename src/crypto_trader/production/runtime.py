@@ -807,11 +807,35 @@ class ProductionRuntime:
         return preparation
 
     def submit_prepared(self, preparation: IntentPreparation) -> ProductionSubmitResult:
-        """Atomically authorize and submit relative to operator takeover."""
+        """Wait on venue admission outside the lock, then atomically authorize and submit."""
+        if self._durable_venue_writes:
+            try:
+                self._validate_submission_preparation(preparation, release_on_failure=False)
+                self._execution.await_write_admission()
+            except Exception as admission_exc:
+                # Admission failed before this call can create a marker or POST. Cleanup must
+                # serialize with a concurrent submit of the SAME preparation: if another thread
+                # crossed the durable boundary while we waited, its ambiguity reservation wins.
+                try:
+                    with self._control.ownership_store.exclusive(purpose="submission"):
+                        issued = self._issued_preparations.get(preparation.intent_id)
+                        if issued is not None and issued[0] is preparation:
+                            self._release_preparation(preparation.intent_id)
+                except Exception as cleanup_exc:
+                    # Failure to prove safe cleanup is fail-closed: keep the reservation and
+                    # preserve the original admission failure as the public cause.
+                    raise admission_exc from cleanup_exc
+                raise
         with self._control.ownership_store.exclusive(purpose="submission"):
             return self._submit_prepared_locked(preparation)
 
-    def _submit_prepared_locked(self, preparation: IntentPreparation) -> ProductionSubmitResult:
+    def _validate_submission_preparation(
+        self,
+        preparation: IntentPreparation,
+        *,
+        release_on_failure: bool = True,
+    ) -> datetime:
+        """Validate local submission prerequisites; callers re-run this after taking the lock."""
         self._require_running()
         if not isinstance(preparation, IntentPreparation):
             raise ProductionStateError("submit_prepared expects an IntentPreparation.")
@@ -827,10 +851,12 @@ class ProductionRuntime:
             )
         now = self._now()
         if now > issued[1]:
-            self._release_preparation(preparation.intent_id)
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
             raise ProductionStateError("the issued preparation expired before submission.")
         if self._fence is None:
-            self._release_preparation(preparation.intent_id)
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
         try:
@@ -845,8 +871,13 @@ class ProductionRuntime:
             if self._durable_venue_writes:
                 self._require_canonical_risk_binding()
         except Exception:
-            self._release_preparation(preparation.intent_id)
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
             raise
+        return now
+
+    def _submit_prepared_locked(self, preparation: IntentPreparation) -> ProductionSubmitResult:
+        now = self._validate_submission_preparation(preparation)
         try:
             # The last thing that happens before the venue call. Never cached, never skipped.
             check = self._fence.authorize_new_risk(
@@ -877,10 +908,17 @@ class ProductionRuntime:
                 reference = DurableVenueWritePort.submit_durably(self._execution, request)
             else:
                 reference = self._execution.submit(request)
-        except AmbiguousOrderError:
-            # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
-            # Keep the reservation until a resolved recovery/startup supersedes the unknown state.
-            self._last_outcome = "unknown_pending_reconciliation"
+        except AmbiguousOrderError as exc:
+            # UNKNOWN_PENDING_RECONCILIATION: never retry this preparation. Retire the one-shot
+            # issued object but KEEP its economic pending reservation until recovery/startup
+            # establishes authoritative outcome.
+            self._issued_preparations.pop(preparation.intent_id, None)
+            reason_code = getattr(exc, "reason_code", None)
+            self._last_outcome = (
+                "unknown_pending_reconciliation"
+                if not reason_code
+                else f"unknown_pending_reconciliation:{reason_code}"
+            )
             raise
         except Exception:
             self._release_preparation(preparation.intent_id)

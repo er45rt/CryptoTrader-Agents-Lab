@@ -140,6 +140,14 @@ class DurableVenueWritePort(ABC):
 
     # --- adapter hooks -------------------------------------------------------
 
+    def await_write_admission(self) -> None:
+        """Optionally wait for pre-send venue admission outside a writer critical section.
+
+        Correctness must never depend on this hint: the durable prepare step must re-check
+        admission without sleeping before it commits the attempt marker.
+        """
+        return None
+
     @abstractmethod
     def durable_attempt_journal(self) -> DurableAttemptJournal | None:
         """The durable journal this port commits its submission-attempt marker into."""
@@ -163,6 +171,7 @@ class DurableVenueWritePort(ABC):
     @abstractmethod
     def _send_authorized_write(self, prepared: PreparedVenueWrite, request: ExecutionRequest) -> str:
         """Send the already-authorized write exactly once and classify the outcome."""
+
 
     # --- the runtime-owned approved sequence ---------------------------------
 

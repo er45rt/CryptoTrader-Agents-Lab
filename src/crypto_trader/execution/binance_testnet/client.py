@@ -41,7 +41,10 @@ from .errors import (
     AttemptJournalRequiredError,
     BinanceTestnetError,
     ClockDriftError,
+    RateLimitBanError,
     RateLimitError,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
     OrderNotFoundError,
     TestnetRejectedError,
     TestnetEndpointError,
@@ -430,7 +433,7 @@ class BinanceSpotTestnetClient:
         )
 
     def symbol_rules(
-        self, symbol: str | None = None, *, refresh: bool = False
+        self, symbol: str | None = None, *, refresh: bool = False, wait: bool = True
     ) -> TestnetSymbolRules:
         """Fetch trading rules, reusing the local cache only while it is provably fresh."""
         target = symbol or self.symbol
@@ -452,7 +455,11 @@ class BinanceSpotTestnetClient:
         self._rules = None
         self._rules_fetched_at = None
         body = self._request(
-            PATH_EXCHANGE_INFO, {"symbol": target}, weight=_WEIGHT_EXCHANGE_INFO, is_write=False
+            PATH_EXCHANGE_INFO,
+            {"symbol": target},
+            weight=_WEIGHT_EXCHANGE_INFO,
+            is_write=False,
+            wait=wait,
         )
         try:
             parsed = parse_exchange_filters(body, target)
@@ -474,7 +481,15 @@ class BinanceSpotTestnetClient:
 
     # --- orders -------------------------------------------------------------
 
-    def prepare_order(self, request: TestnetOrderRequest) -> PreparedTestnetOrder:
+    def await_order_write_admission(self, symbol: str) -> None:
+        """Wait outside the submission lock until order preparation should be non-blocking."""
+        self.symbol_rules(symbol)
+        assert self.budget is not None
+        self.budget.wait_for_admission(_WEIGHT_WRITE)
+
+    def prepare_order(
+        self, request: TestnetOrderRequest, *, wait: bool = True
+    ) -> PreparedTestnetOrder:
         """Do every locally rejectable step for a write, without performing the write.
 
         Read-only venue calls (an idempotency status lookup and symbol-rule retrieval) are allowed
@@ -488,7 +503,9 @@ class BinanceSpotTestnetClient:
         """
         existing = self._orders.get(request.client_order_id)
         if existing is not None:
-            current = self.order_status(request.symbol, request.client_order_id)
+            current = self.order_status(
+                request.symbol, request.client_order_id, wait=wait
+            )
             self._orders[current.client_order_id] = current
             return PreparedTestnetOrder(
                 client_order_id=request.client_order_id,
@@ -508,7 +525,7 @@ class BinanceSpotTestnetClient:
                 "validation contract is implemented."
             )
 
-        rules = self.symbol_rules(request.symbol)
+        rules = self.symbol_rules(request.symbol, wait=wait)
         assert request.price is not None
         try:
             validate_limit_order(rules, price=request.price, quantity=request.quantity)
@@ -530,8 +547,11 @@ class BinanceSpotTestnetClient:
         # Rate/backoff admission and the clock/signing preconditions are the last local steps that
         # can reject the write, so they must complete before the caller commits the attempt marker.
         assert self.budget is not None
-        self.budget.enforce_backoff()
-        self.budget.bucket.acquire(_WEIGHT_WRITE)
+        if wait:
+            self.budget.enforce_backoff()
+            self.budget.bucket.acquire(_WEIGHT_WRITE)
+        else:
+            self.budget.admit_now(_WEIGHT_WRITE)
         signed_payload = self.clock.signed_timestamp_params(params)
         query = signed_query_string(signed_payload, self.credentials.with_secret())
         http_request = HttpRequest(
@@ -726,12 +746,22 @@ class BinanceSpotTestnetClient:
             return self._parse_write_success(response.body, prepared)
         if status_code == 418:
             assert self.budget is not None
-            self.budget.record_418(response.retry_after_seconds)
+            retry_after = response.retry_after_seconds
+            try:
+                self.budget.record_418(retry_after)
+            except RateLimitBanError as exc:
+                raise WriteIpBannedOutcomeUnknownError(
+                    "the venue signalled an IP ban after the order POST; the final order outcome "
+                    "is unknown and must be reconciled.",
+                    retry_after_seconds=retry_after,
+                ) from exc
         if status_code == 429:
             assert self.budget is not None
             delay = self.budget.record_429(response.retry_after_seconds)
-            raise RateLimitError(
-                f"rate limited on a write (429); backing off {delay}s without retrying."
+            raise WriteRateLimitedOutcomeUnknownError(
+                f"the venue rate-limited the order POST (429); final order outcome is unknown; "
+                f"backoff {delay}s and reconcile without retrying.",
+                retry_after_seconds=response.retry_after_seconds,
             )
         if 500 <= status_code < 600:
             raise AmbiguousOrderError(
@@ -752,6 +782,7 @@ class BinanceSpotTestnetClient:
                     prepared.symbol,
                     prepared.client_order_id,
                     require_exact_identity=True,
+                    wait=False,
                 )
             except BinanceTestnetError as exc:
                 raise AmbiguousOrderError(
@@ -769,11 +800,9 @@ class BinanceSpotTestnetClient:
                 "order was created. The write is NOT retried; the durable attempt remains and must "
                 "be reconciled."
             )
-        # HTTP 429/418 (and the generic deterministic-rejection branch below) mean the venue
-        # responded, but 429/418 alone do NOT prove the final order-processing outcome, so they are
-        # neither PRE_SEND nor a terminal REJECTED: the RateLimitError/RateLimitBanError raised
-        # here leaves the durable attempt marker in place, keeps the order fenced pending
-        # reconciliation, and never triggers an automatic POST retry.
+        # HTTP 429/418 were classified above as typed ambiguous rate-limit outcomes: the venue
+        # responded, but neither status proves the final order-processing outcome. The generic
+        # deterministic-rejection branch below is only for responses whose order outcome is known.
         raise TestnetRejectedError(
             f"the testnet venue rejected the request (HTTP {status_code}, code "
             f"{code}): {self._safe_message(message)}"
@@ -858,6 +887,7 @@ class BinanceSpotTestnetClient:
         client_order_id: str,
         *,
         require_exact_identity: bool = False,
+        wait: bool = True,
     ) -> TestnetOrder:
         body = self._request(
             PATH_ORDER,
@@ -865,6 +895,7 @@ class BinanceSpotTestnetClient:
             weight=_WEIGHT_READ_ORDER,
             is_write=False,
             signed=True,
+            wait=wait,
         )
         if require_exact_identity:
             if (
@@ -1112,14 +1143,18 @@ class BinanceSpotTestnetClient:
         signed: bool = False,
         method: str | None = None,
         classify_order_absence: bool = False,
+        wait: bool = True,
     ) -> Any:
         assert self.budget is not None
         attempt = 0
         resync_used = False
         while True:
             attempt += 1
-            self.budget.enforce_backoff()
-            self.budget.bucket.acquire(weight)
+            if wait:
+                self.budget.enforce_backoff()
+                self.budget.bucket.acquire(weight)
+            else:
+                self.budget.admit_now(weight)
 
             payload = dict(params)
             if signed:
@@ -1149,7 +1184,7 @@ class BinanceSpotTestnetClient:
                         "the write outcome is unknown (transport failure before a response); the "
                         "order is NOT retried and must go through reconciliation."
                     ) from exc
-                if attempt >= self.retry.max_attempts:
+                if not wait or attempt >= self.retry.max_attempts:
                     raise
                 self._sleep(self.retry.delay_for_attempt(attempt))
                 continue
@@ -1166,7 +1201,7 @@ class BinanceSpotTestnetClient:
                     raise RateLimitError(
                         f"rate limited on a write (429); backing off {delay}s without retrying."
                     )
-                if attempt >= self.retry.max_attempts:
+                if not wait or attempt >= self.retry.max_attempts:
                     raise RateLimitError("rate limited (429) and retries are exhausted.")
                 continue
 
@@ -1176,7 +1211,7 @@ class BinanceSpotTestnetClient:
                         f"the venue returned {response.status_code} for a write; the outcome is "
                         "unknown and the order is not retried."
                     )
-                if attempt >= self.retry.max_attempts:
+                if not wait or attempt >= self.retry.max_attempts:
                     raise TransportError(f"the venue returned {response.status_code}.")
                 self._sleep(self.retry.delay_for_attempt(attempt))
                 continue
@@ -1195,6 +1230,11 @@ class BinanceSpotTestnetClient:
                     raise ClockDriftError(
                         "the venue rejected the timestamp (-1021) on a write; re-synchronize the "
                         "clock and reconcile before sending anything else."
+                    )
+                if not wait:
+                    raise ClockDriftError(
+                        "the venue rejected the timestamp (-1021); no-wait reads never resync "
+                        "inside the submission lock."
                     )
                 if resync_used:
                     raise ClockDriftError(

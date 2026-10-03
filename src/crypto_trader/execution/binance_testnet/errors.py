@@ -12,8 +12,11 @@ __all__ = [
     "BinanceTestnetError",
     "ClockDriftError",
     "MainnetForbiddenError",
+    "RateLimitAdmissionDeferredError",
     "RateLimitBanError",
     "RateLimitError",
+    "WriteIpBannedOutcomeUnknownError",
+    "WriteRateLimitedOutcomeUnknownError",
     "TestnetCredentialsRequiredError",
     "TestnetEndpointError",
     "TestnetSymbolError",
@@ -57,6 +60,36 @@ class RateLimitError(BinanceTestnetError):
 
 class RateLimitBanError(RateLimitError):
     """An IP ban was signalled; no further request may be attempted in this run."""
+
+
+class RateLimitAdmissionDeferredError(RateLimitError):
+    """A pre-send request cannot be admitted immediately without waiting."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class WriteRateLimitedOutcomeUnknownError(AmbiguousOrderError):
+    """A write received HTTP 429 after send, so it must be reconciled and never retried."""
+
+    reason_code = "venue_rate_limited_after_send"
+    http_status = 429
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class WriteIpBannedOutcomeUnknownError(WriteRateLimitedOutcomeUnknownError):
+    """A write received HTTP 418 after send, so it must be reconciled and never retried."""
+
+    reason_code = "venue_ip_banned_after_send"
+    http_status = 418
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ClockDriftError(BinanceTestnetError):

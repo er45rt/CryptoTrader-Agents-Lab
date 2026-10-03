@@ -32,7 +32,8 @@ from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient,
     PreSendTransportError,
     RateLimitBanError,
-    RateLimitError as RateLimited,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
     RequestsTransport,
     ScriptedTransport,
     TransportError,
@@ -233,8 +234,8 @@ def test_d_marker_is_durably_committed_before_the_exact_prepared_post(tmp_path):
         captured: dict = {}
         original_prepare = client.prepare_order
 
-        def spy_prepare(request):  # noqa: ANN001 - test spy
-            prepared = original_prepare(request)
+        def spy_prepare(request, *, wait=True):  # noqa: ANN001 - test spy
+            prepared = original_prepare(request, wait=wait)
             captured["prepared"] = prepared
             captured["prepare_calls"] = captured.get("prepare_calls", 0) + 1
             return prepared
@@ -906,8 +907,8 @@ def test_ordinary_deterministic_rejection_still_terminalises(tmp_path):
 @pytest.mark.parametrize(
     "response,expected",
     [
-        (fx.rate_limited("1"), RateLimited),
-        (fx.banned("120"), RateLimitBanError),
+        (fx.rate_limited("1"), WriteRateLimitedOutcomeUnknownError),
+        (fx.banned("120"), WriteIpBannedOutcomeUnknownError),
     ],
     ids=["429", "418"],
 )
@@ -916,11 +917,14 @@ def test_rate_limit_responses_keep_the_marker_and_never_terminalise(tmp_path, re
     with SQLiteEventJournal(tmp_path / "journal.db") as journal:
         instance = started(transport, journal)
 
-        with pytest.raises(expected):
+        with pytest.raises(expected) as caught:
             instance.submit(execution_request())
 
+        assert isinstance(caught.value, AmbiguousOrderError)
         assert len(posts(transport)) == 1, "no automatic POST retry"
         assert len(attempt_events(journal)) == 1, "the durable attempt stays for reconciliation"
+        assert CLIENT_ORDER_ID in instance._pending_submissions
+        assert instance.local_states()[0].submission_attempted is True
         assert [
             event
             for event in journal.read_range()

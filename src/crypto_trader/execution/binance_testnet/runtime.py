@@ -136,8 +136,15 @@ class TestnetOrderRuntime(DurableVenueWritePort):
         return f"ct-{intent_id.hex[:20]}"
 
     def submit(self, request: ExecutionRequest) -> str:
-        """Delegate to the approved durable submission sequence (Stage 2 behaviour unchanged)."""
+        """Wait outside any ownership lock, then run the approved durable submission sequence."""
+        self.await_write_admission()
         return self.submit_durably(request)
+
+    def await_write_admission(self) -> None:
+        """Wait on venue read/rate prerequisites outside the ownership submission lock."""
+        if self._state is not ExecutionRuntimeState.RUNNING:
+            raise RuntimeStateError("the testnet runtime must be started before submitting.")
+        self.client.await_order_write_admission(self.instrument.symbol)
 
     # --- the approved durable boundary hooks ---------------------------------
 
@@ -188,6 +195,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
                     request.symbol,
                     client_order_id,
                     require_exact_identity=True,
+                    wait=False,
                 )
             except BinanceTestnetError as exc:
                 raise AmbiguousOrderError(
@@ -199,7 +207,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             self._pending_submissions.pop(client_order_id, None)
             return PreparedVenueWrite(handle=order, adopted_reference=client_order_id)
 
-        prepared = self.client.prepare_order(order_request)
+        prepared = self.client.prepare_order(order_request, wait=False)
 
         if not prepared.requires_write:
             # The venue already knows this order: adopt it without a marker and without a POST.

@@ -20,16 +20,16 @@ from crypto_trader.execution import (
 )
 from crypto_trader.execution.binance_testnet import (
     AmbiguousOrderError,
-    RateLimitBanError,
     ScriptedTransport,
     TransportTimeout,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
 )
 from crypto_trader.execution.binance_testnet import (
     TestnetOrderRuntime as OrderRuntime,
 )
 from crypto_trader.execution.binance_testnet import BinanceTestnetError as AdapterError
 from crypto_trader.execution.binance_testnet import (
-    RateLimitError as RateLimited,
     TestnetRejectedError as RejectedError,
 )
 from crypto_trader.persistence import SQLiteEventJournal
@@ -346,7 +346,7 @@ def test_ip_ban_during_a_submit_surfaces_and_does_not_retry(journal):
     )
     instance = started_runtime(transport, journal=journal)
 
-    with pytest.raises(RateLimitBanError):
+    with pytest.raises(WriteIpBannedOutcomeUnknownError):
         instance.submit(execution_request())
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
@@ -358,7 +358,7 @@ def test_rate_limited_write_is_reported_without_retry(journal):
     )
     instance = started_runtime(transport, journal=journal)
 
-    with pytest.raises(RateLimited):
+    with pytest.raises(WriteRateLimitedOutcomeUnknownError):
         instance.submit(execution_request())
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1

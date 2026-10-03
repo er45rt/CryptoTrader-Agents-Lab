@@ -7,8 +7,9 @@ double, so no credential value is used and no network request is made.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -18,10 +19,15 @@ import pytest
 
 from crypto_trader.events import ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
 from crypto_trader.breakglass import BinanceSpotTestnetEmergencyControl
+from crypto_trader.breakglass.ownership import OwnerKind
+from crypto_trader.breakglass.errors import StaleWriterFenceError
 from crypto_trader.execution import ExecutionSide
 from crypto_trader.execution.binance_testnet import (
     SPOT_TESTNET_REST_BASE,
     AmbiguousOrderError,
+    RateLimitAdmissionDeferredError,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
     TransportTimeout,
     UnsafeTestnetAccountError,
 )
@@ -266,7 +272,247 @@ def test_an_ambiguous_submit_stays_unknown_pending_reconciliation(journal, state
     ]
     assert pending, "the ambiguous submission must stay pending for reconciliation"
     assert len(runtime._pending) == 1
-    assert len(runtime._issued_preparations) == 1
+    assert runtime._issued_preparations == {}
+
+
+@pytest.mark.parametrize(
+    "response,expected,reason_code,seed",
+    [
+        (
+            fx.rate_limited("1"),
+            WriteRateLimitedOutcomeUnknownError,
+            "venue_rate_limited_after_send",
+            "rate-ambiguous-429",
+        ),
+        (
+            fx.banned("120"),
+            WriteIpBannedOutcomeUnknownError,
+            "venue_ip_banned_after_send",
+            "rate-ambiguous-418",
+        ),
+    ],
+    ids=["429", "418"],
+)
+def test_post_send_rate_limit_keeps_production_reservation_unknown(
+    journal, state_dir, response, expected, reason_code, seed
+):
+    transport = fx.ScriptedTransport([*startup_responses(), response])
+    runtime, port, client = _wired(journal, state_dir, transport)
+    runtime.start()
+
+    with pytest.raises(expected) as caught:
+        runtime.execute_intent(intent(seed))
+
+    assert isinstance(caught.value, AmbiguousOrderError)
+    assert runtime.status()["last_outcome"] == f"unknown_pending_reconciliation:{reason_code}"
+    assert len([request for request in transport.requests if request.method == "POST"]) == 1
+    assert len(runtime._pending) == 1
+    assert runtime._issued_preparations == {}
+    assert any(state.submission_attempted and state.is_open for state in port.local_states())
+    attempts = [
+        event for event in journal.replay()
+        if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+    terminals = [event for event in journal.replay() if event.event_type == ORDER_STATE_EVENT_TYPE]
+    assert len(attempts) == 1
+    assert terminals == []
+    if expected is WriteIpBannedOutcomeUnknownError:
+        assert client.budget is not None and client.budget.banned is True
+
+
+def test_ambiguous_preparation_is_one_shot_and_cannot_drop_its_reservation(
+    journal, state_dir
+):
+    intent_obj = intent("ambiguous-one-shot")
+    transport = fx.ScriptedTransport(
+        [*startup_responses(), fx.rate_limited("1")]
+    )
+    runtime, _port, _client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent_obj)
+
+    with pytest.raises(WriteRateLimitedOutcomeUnknownError):
+        runtime.submit_prepared(preparation)
+
+    posts_before = len([request for request in transport.requests if request.method == "POST"])
+    assert posts_before == 1
+    assert len(runtime._pending) == 1
+    assert runtime._issued_preparations == {}
+
+    with pytest.raises(ProductionStateError, match="exact unused preparation"):
+        runtime.submit_prepared(preparation)
+
+    assert len([request for request in transport.requests if request.method == "POST"]) == posts_before
+    assert len(runtime._pending) == 1
+    assert runtime._issued_preparations == {}
+
+
+def test_expired_prelock_validation_preserves_reservation_until_locked_cleanup(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, _client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("expired-prelock-preserve"))
+
+    runtime._clock = clock(BASE + timedelta(hours=1))
+    with pytest.raises(ProductionStateError, match="expired before submission"):
+        runtime._validate_submission_preparation(
+            preparation, release_on_failure=False
+        )
+
+    assert len(runtime._pending) == 1
+    assert runtime._issued_preparations.get(preparation.intent_id, (None,))[0] is preparation
+
+
+def test_concurrent_prelock_cleanup_cannot_release_retired_ambiguity_reservation(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, port, _client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("ambiguous-concurrent-cleanup"))
+
+    admission_failed = threading.Event()
+    failures: list[BaseException] = []
+
+    def fail_admission() -> None:
+        admission_failed.set()
+        raise RateLimitAdmissionDeferredError(
+            "synthetic pre-lock deferral", retry_after_seconds=1.0
+        )
+
+    port.await_write_admission = fail_admission  # type: ignore[method-assign]
+
+    def submit() -> None:
+        try:
+            runtime.submit_prepared(preparation)
+        except BaseException as exc:
+            failures.append(exc)
+
+    # The cleanup path must serialize with the authoritative submission section. While it waits,
+    # model the exact ambiguity transition: retire the one-shot issued object but keep its
+    # economic reservation. Cleanup must then observe the retired identity and leave it alone.
+    with runtime.control.ownership_store.exclusive(purpose="submission"):
+        failer = threading.Thread(target=submit, name="admission-failer", daemon=True)
+        failer.start()
+        assert admission_failed.wait(timeout=5.0)
+
+        runtime._issued_preparations.pop(preparation.intent_id, None)
+        assert len(runtime._pending) == 1
+
+    failer.join(timeout=5.0)
+    assert not failer.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], RateLimitAdmissionDeferredError)
+    assert len(runtime._pending) == 1
+    assert runtime._issued_preparations == {}
+    assert not [request for request in transport.requests if request.method == "POST"]
+    assert not [
+        event for event in journal.replay()
+        if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+
+
+def test_pre_send_deferred_admission_releases_reservation_without_marker_or_post(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("pre-send-deferred"))
+    assert preparation.approved is True
+    assert client.budget is not None
+    client.budget.backoff_until = client.budget.monotonic() + 5.0
+
+    with pytest.raises(RateLimitAdmissionDeferredError):
+        runtime.submit_prepared(preparation)
+
+    assert not [request for request in transport.requests if request.method == "POST"]
+    assert not [
+        event for event in journal.replay()
+        if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
+
+
+def test_rate_limit_race_after_preflight_fails_fast_inside_lock(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, port, client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("preflight-race"))
+    assert client.budget is not None
+
+    def race_after_preflight() -> None:
+        client.budget.backoff_until = client.budget.monotonic() + 5.0
+
+    def forbidden_sleep(_seconds: float) -> None:
+        pytest.fail("submission lock path attempted to sleep")
+
+    port.await_write_admission = race_after_preflight
+    client.budget.sleep = forbidden_sleep
+    client.budget.bucket.sleep = forbidden_sleep
+
+    with pytest.raises(RateLimitAdmissionDeferredError):
+        runtime.submit_prepared(preparation)
+
+    assert not [request for request in transport.requests if request.method == "POST"]
+    assert not [
+        event for event in journal.replay()
+        if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
+
+
+def test_rate_limit_wait_happens_before_lock_so_emergency_takeover_wins(
+    journal, state_dir
+):
+    transport = fx.ScriptedTransport(startup_responses())
+    runtime, _port, client = _wired(journal, state_dir, transport)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("pre-lock-wait-takeover"))
+    assert client.budget is not None
+
+    entered = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+
+    def blocking_sleep(_seconds: float) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0)
+
+    client.budget.backoff_until = client.budget.monotonic() + 60.0
+    client.budget.sleep = blocking_sleep
+
+    def submit() -> None:
+        try:
+            runtime.submit_prepared(preparation)
+        except BaseException as exc:  # capture the expected stale-writer refusal
+            failures.append(exc)
+
+    worker = threading.Thread(target=submit, daemon=True)
+    worker.start()
+    assert entered.wait(timeout=2.0), "submission never reached the pre-lock admission wait"
+
+    takeover = runtime.control.ownership_store.takeover(
+        owner_id="emergency:test",
+        owner_kind=OwnerKind.EMERGENCY,
+        acquired_at=BASE,
+        reason_code="test_rate_limit_prelock_takeover",
+    )
+    assert takeover.owner_kind is OwnerKind.EMERGENCY
+
+    release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert any(isinstance(exc, StaleWriterFenceError) for exc in failures)
+    assert not [request for request in transport.requests if request.method == "POST"]
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
 
 
 # --- 16: the withdrawal-disabled invariant still fails closed ----------------------

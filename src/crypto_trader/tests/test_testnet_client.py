@@ -8,8 +8,13 @@ import pytest
 from crypto_trader.execution.binance_testnet import (
     AmbiguousOrderError,
     ClockDriftError,
+    RateLimitAdmissionDeferredError,
     RateLimitBanError,
+    RateLimitBudget,
     RateLimitError,
+    TokenBucket,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
     ScriptedTransport,
     UnsupportedOrderTypeError,
     WithdrawalPolicy,
@@ -392,6 +397,29 @@ def test_reads_retry_with_backoff_on_server_errors():
     assert len(transport.requests) == 3
 
 
+def test_admit_now_on_exhausted_bucket_never_calls_sleep():
+    bucket_sleeps: list[float] = []
+    budget_sleeps: list[float] = []
+    bucket = TokenBucket(
+        capacity=1,
+        refill_per_second=1.0,
+        monotonic=lambda: 0.0,
+        sleep=bucket_sleeps.append,
+    )
+    budget = RateLimitBudget(
+        bucket=bucket,
+        sleep=budget_sleeps.append,
+        monotonic=lambda: 0.0,
+    )
+
+    budget.admit_now(1)
+    with pytest.raises(RateLimitAdmissionDeferredError):
+        budget.admit_now(1)
+
+    assert bucket_sleeps == []
+    assert budget_sleeps == []
+
+
 def test_reads_retry_after_rate_limiting_and_honour_retry_after():
     slept: list[float] = []
     transport = ScriptedTransport(responses=[fx.rate_limited("2"), fx.price_response()])
@@ -406,17 +434,43 @@ def test_reads_retry_after_rate_limiting_and_honour_retry_after():
     assert client.budget.violations == 1
 
 
-def test_writes_are_not_retried_after_rate_limiting():
+def test_post_send_429_is_ambiguous_never_retryable_and_never_retried():
     transport = ScriptedTransport(
         responses=[fx.exchange_info_response(), fx.rate_limited("1")]
     )
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
-    with pytest.raises(RateLimitError):
+    with pytest.raises(WriteRateLimitedOutcomeUnknownError) as caught:
         fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
 
+    assert isinstance(caught.value, AmbiguousOrderError)
+    assert not isinstance(caught.value, RateLimitError)
+    assert caught.value.reason_code == "venue_rate_limited_after_send"
+    assert caught.value.http_status == 429
+    assert caught.value.retry_after_seconds == 1.0
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
+
+
+def test_post_send_418_is_ambiguous_but_leaves_the_budget_banned():
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), fx.banned("120")]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with pytest.raises(WriteIpBannedOutcomeUnknownError) as caught:
+        fx.place_order(client, fx.limit_order_request(CLIENT_ORDER_ID))
+
+    assert isinstance(caught.value, AmbiguousOrderError)
+    assert not isinstance(caught.value, RateLimitBanError)
+    assert caught.value.reason_code == "venue_ip_banned_after_send"
+    assert caught.value.http_status == 418
+    assert client.budget is not None and client.budget.banned is True
+    request_count = len(transport.requests)
+    with pytest.raises(RateLimitBanError):
+        client.price()
+    assert len(transport.requests) == request_count
 
 
 def test_ip_ban_stops_the_run_immediately():
