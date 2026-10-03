@@ -6,12 +6,25 @@ from decimal import Decimal
 
 import pytest
 
+from crypto_trader.execution.binance_testnet import ScriptedTransport
+from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import EventIdConflictError, SQLiteEventJournal
 from crypto_trader.production.runtime import (
     _durable_decision_identity,
     _durable_intent_anchor,
 )
-from crypto_trader.tests.production_fixtures import intent
+from crypto_trader.tests import testnet_fixtures as fx
+from crypto_trader.tests.production_fixtures import (
+    INSTRUMENT,
+    admitted_prepare,
+    build_runtime,
+    canonical_risk_refresh_responses,
+    canonical_test_risk_source,
+    control_for,
+    intent,
+    seed_canonical_equity_root,
+    startup_responses,
+)
 
 
 def test_same_decision_different_caller_ids_share_one_durable_identity():
@@ -64,3 +77,41 @@ def test_new_decision_evidence_gets_a_new_durable_identity():
     other_scope = intent("durable-new-scope", decision_scope="exit")
 
     assert _durable_decision_identity(first) != _durable_decision_identity(other_scope)
+
+
+def test_durable_runtime_prepares_with_canonical_identity_before_hard_risk(tmp_path):
+    target = intent("durable-runtime-canonical")
+    canonical_id = _durable_decision_identity(target)
+    transport = ScriptedTransport(
+        responses=[*startup_responses(), *canonical_risk_refresh_responses()]
+    )
+    client = fx.client(transport)
+
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        state_dir = tmp_path / "state"
+        seed_canonical_equity_root(journal)
+        control = control_for(journal, state_dir)
+        port = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+        risk_source = canonical_test_risk_source(
+            journal=journal, control=control, client=client
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+            bind_admission=True,
+        )
+        runtime.start()
+
+        preparation = admitted_prepare(runtime, target)
+
+        assert preparation.approved is True
+        assert preparation.intent_id == canonical_id
+        assert preparation.intent_id != target.intent_id
+        assert preparation.stages[0] == "identity:durable"
+        anchor = journal.read_by_id(canonical_id)
+        assert anchor is not None
+        assert anchor.event_type == "trade.intent.created"
+        assert not [request for request in transport.requests if request.method == "POST"]
