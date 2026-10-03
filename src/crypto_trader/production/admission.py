@@ -4,10 +4,10 @@ Producer threads may enqueue only. Exactly one owner thread -- the thread that c
 ProductionRuntime and its SQLite journal -- drains the queue with run_once(). Queued intents are
 not economic reservations; Hard Risk creates those only after an intent leaves this queue.
 
-The replay/high-water ledger here is process-local. For durable venue-writing runtimes, an exact
-intent_id is also protected across restart by the deterministic client_order_id and durable
-submission journal. Re-emitting the same decision under a new intent_id needs durable decision
-identity before Mainnet promotion; this controller does not pretend otherwise.
+The replay/high-water ledger here is process-local. Durable venue-writing runtimes add a stable
+decision identity at the owner-thread runtime boundary before Hard Risk, so a producer-generated
+UUID cannot create a second venue identity for the same logical decision after restart. Exact
+economic drift for that same decision conflicts in the durable journal and fails closed.
 
 Capacity-rejected brand-new scopes are guarded by bounded strategy/global rejection floors. That
 is deliberately conservative: a global overflow floor may temporarily block unrelated new scopes,
