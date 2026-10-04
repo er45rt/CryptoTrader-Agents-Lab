@@ -15,9 +15,20 @@ from crypto_trader.recovery import (
     ReconciliationOutcome,
     ReconciliationPolicy,
     RecoveryConfigError,
+    RestartRecovery,
+    StaticVenueStateSource,
     VenueOrderReport,
     load_policy,
 )
+from crypto_trader.events import (
+    OrderStateChanged,
+    OrderStateChangePayload,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
+)
+from crypto_trader.execution.binance_testnet import PRODUCER as VENUE_PRODUCER
+from crypto_trader.execution.binance_testnet import deterministic_order_uuid
+from crypto_trader.persistence import SQLiteEventJournal
 
 BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -321,3 +332,171 @@ def test_affected_order_ids_are_the_known_phase3_identities():
     report = engine().reconcile([_local(order_id=order_id)], [_venue()])
 
     assert report.affected_order_ids() == [order_id]
+
+
+# --- the ONLY terminal -> FILLED release path: current venue evidence -------------
+
+@pytest.mark.parametrize(
+    "terminal", [OrderStateName.CANCELED, OrderStateName.EXPIRED, OrderStateName.REJECTED]
+)
+def test_current_venue_evidence_releases_a_terminal_order_to_filled(terminal):
+    """Reconciliation, not historical reconstruction, is the terminal -> FILLED authority."""
+    local = _local("O-1", state=terminal, filled="0", remaining="1.00000000", attempted=True)
+    report = engine().reconcile(
+        [local],
+        [_venue("O-1", state=OrderStateName.FILLED, filled="1.00000000", remaining="0")],
+    )
+
+    assert report.outcome_for("O-1") is ReconciliationOutcome.RESOLVED_FROM_VENUE
+    assert report.is_fully_resolved is True
+    assert report.requires_halt_new_risk is False
+    adjustment = report.adjustments[0]
+    assert adjustment.source is AdjustmentSource.VENUE_REPORT
+    assert adjustment.before.state is terminal
+    assert adjustment.after.state is OrderStateName.FILLED
+    assert adjustment.after.filled_quantity == Decimal("1.00000000")
+    assert adjustment.after.remaining_quantity == 0
+
+
+@pytest.mark.parametrize(
+    "filled,remaining",
+    [
+        ("0.50000000", "0.50000000"),  # executedQty != Q (origQty == Q)
+        ("0.60000000", "0.60000000"),  # implied origQty != Q
+        ("1.00000000", "0.50000000"),  # inconsistent remaining for a FILLED report
+    ],
+)
+def test_a_contradictory_filled_report_does_not_release_a_terminal_order(tmp_path, filled, remaining):
+    """Guard: a FILLED report must prove executedQty == Q and origQty == Q against the anchors."""
+    reference = "ct-44444444444444444444"
+    order_id = deterministic_order_uuid(reference)
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        journal.append_batch(
+            [
+                OrderSubmissionAttempted(
+                    event_id=uuid4(),
+                    occurred_at=BASE,
+                    correlation_id=uuid4(),
+                    producer="application.production",
+                    order_id=order_id,
+                    symbol="ETHUSDT",
+                    payload=OrderSubmissionAttemptPayload(
+                        venue_reference=reference,
+                        intent_id=uuid4(),
+                        side="buy",
+                        order_type="limit",
+                        quantity=Decimal("1.00000000"),
+                        limit_price=Decimal("100.00000000"),
+                        time_in_force="gtc",
+                        venue_producer=VENUE_PRODUCER,
+                    ),
+                ),
+                OrderStateChanged(
+                    event_id=uuid4(),
+                    occurred_at=BASE,
+                    correlation_id=uuid4(),
+                    producer=VENUE_PRODUCER,
+                    order_id=order_id,
+                    symbol="ETHUSDT",
+                    payload=OrderStateChangePayload(
+                        state="canceled", reason="venue_status_canceled"
+                    ),
+                ),
+            ]
+        )
+        run = RestartRecovery(
+            engine=engine(),
+            journal=journal,
+            venue_sources=[
+                StaticVenueStateSource(
+                    entries=(
+                        VenueOrderReport(
+                            order_reference=reference,
+                            venue_order_id="V-1",
+                            state=OrderStateName.FILLED,
+                            filled_quantity=Decimal(filled),
+                            remaining_quantity=Decimal(remaining),
+                        ),
+                    ),
+                    name="test.current_venue_evidence",
+                )
+            ],
+        ).run(now=BASE)
+
+    report = run.report
+    # The refused report never reached the engine: the order did NOT resolve as FILLED, and the
+    # contradiction keeps it unresolved/fenced instead.
+    assert report.outcome_for(reference) is not ReconciliationOutcome.RESOLVED_FROM_VENUE
+    assert report.is_fully_resolved is False
+    assert report.requires_halt_new_risk is True
+    assert report.reason_codes[reference].startswith("venue_filled_report")
+    assert reference in report.unresolved_orders
+    assert run.rebuilt_states[0].state is OrderStateName.CANCELED
+
+
+def test_current_venue_evidence_releases_a_terminal_order_end_to_end(tmp_path):
+    """The positive counterpart, through the real journal + reconciliation entry point."""
+    reference = "ct-44444444444444444444"
+    order_id = deterministic_order_uuid(reference)
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        journal.append_batch(
+            [
+                OrderSubmissionAttempted(
+                    event_id=uuid4(),
+                    occurred_at=BASE,
+                    correlation_id=uuid4(),
+                    producer="application.production",
+                    order_id=order_id,
+                    symbol="ETHUSDT",
+                    payload=OrderSubmissionAttemptPayload(
+                        venue_reference=reference,
+                        intent_id=uuid4(),
+                        side="buy",
+                        order_type="limit",
+                        quantity=Decimal("1.00000000"),
+                        limit_price=Decimal("100.00000000"),
+                        time_in_force="gtc",
+                        venue_producer=VENUE_PRODUCER,
+                    ),
+                ),
+                OrderStateChanged(
+                    event_id=uuid4(),
+                    occurred_at=BASE,
+                    correlation_id=uuid4(),
+                    producer=VENUE_PRODUCER,
+                    order_id=order_id,
+                    symbol="ETHUSDT",
+                    payload=OrderStateChangePayload(
+                        state="canceled", reason="venue_status_canceled"
+                    ),
+                ),
+            ]
+        )
+        run = RestartRecovery(
+            engine=engine(),
+            journal=journal,
+            venue_sources=[
+                StaticVenueStateSource(
+                    entries=(
+                        VenueOrderReport(
+                            order_reference=reference,
+                            venue_order_id="V-1",
+                            state=OrderStateName.FILLED,
+                            filled_quantity=Decimal("1.00000000"),
+                            remaining_quantity=Decimal("0"),
+                        ),
+                    ),
+                    name="test.current_venue_evidence",
+                )
+            ],
+        ).run(now=BASE)
+
+    report = run.report
+    assert report.outcome_for(reference) is ReconciliationOutcome.RESOLVED_FROM_VENUE
+    assert report.is_fully_resolved is True
+    assert report.requires_halt_new_risk is False
+    adjustment = report.adjustments[0]
+    assert adjustment.before.state is OrderStateName.CANCELED
+    assert adjustment.after.state is OrderStateName.FILLED
+    assert adjustment.after.filled_quantity == Decimal("1.00000000")
+    assert adjustment.after.remaining_quantity == 0

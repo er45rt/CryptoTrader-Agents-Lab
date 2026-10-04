@@ -207,11 +207,302 @@ def test_reduce_only_mode_blocks_exposure_increasing_orders():
     long_state = state(position_quantity={"ETHUSDT": Decimal("1")})
 
     increasing = engine.evaluate(request(side=Side.BUY), long_state)
-    reducing = engine.evaluate(request(side=Side.SELL, strategy="s2"), long_state)
+    reducing = engine.evaluate(request(side=Side.SELL, quantity="1", strategy="s2"), long_state)
 
     assert increasing.allowed is False
     assert "reduce_only_violation" in increasing.reason_codes
     assert reducing.allowed is True
+
+
+def test_reduce_only_rejects_quantity_that_would_cross_through_zero():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    long_state = state(position_quantity={"ETHUSDT": Decimal("1")})
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="1.00000001", price="1000", strategy="s2"),
+        long_state,
+    )
+
+    assert decision.allowed is False
+    assert "reduce_only_quantity_exceeded" in decision.reason_codes
+
+
+def test_reduce_only_requires_clear_open_orders_and_pending_intents():
+    open_order_engine = HardRiskEngine(limits(reduce_only_mode=True))
+    long_with_open_order = state(
+        position_quantity={"ETHUSDT": Decimal("1")},
+        open_orders=1,
+    )
+    open_order_decision = open_order_engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        long_with_open_order,
+    )
+
+    pending = PendingIntentRegistry()
+    pending.register(
+        PendingIntent(
+            intent_id=uuid4(),
+            symbol="BTCUSDT",
+            strategy_id="other-strategy",
+            side=Side.SELL,
+            quantity=Decimal("0.1"),
+            notional=Decimal("100"),
+        )
+    )
+    pending_engine = HardRiskEngine(
+        limits(reduce_only_mode=True),
+        pending=pending,
+        include_pending_reservations=False,
+    )
+    pending_decision = pending_engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        state(position_quantity={"ETHUSDT": Decimal("1")}),
+    )
+
+    assert open_order_decision.allowed is False
+    assert "reduce_only_open_orders_present" in open_order_decision.reason_codes
+    assert pending_decision.allowed is False
+    assert "reduce_only_pending_intents_present" in pending_decision.reason_codes
+
+
+def test_reduce_only_keeps_strategy_attribution_fail_closed():
+    engine = HardRiskEngine(
+        limits(reduce_only_mode=True),
+        include_pending_reservations=True,
+        enforce_attributed_inventory=True,
+    )
+    attributed_elsewhere = state(
+        position_quantity={"ETHUSDT": Decimal("1")},
+        strategy_position_quantity={"s1": Decimal("1"), "s2": Decimal("0")},
+        strategy_open_sell_quantity={"s1": Decimal("0"), "s2": Decimal("0")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        attributed_elsewhere,
+    )
+
+    assert decision.allowed is False
+    assert "insufficient_attributed_inventory" in decision.reason_codes
+
+
+def test_reduce_only_reduction_is_not_blocked_by_limits_for_new_exposure():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    breached = state(
+        equity_quote=Decimal("8000"),
+        peak_equity_quote=Decimal("10000"),
+        realized_pnl_quote=Decimal("-1000"),
+        gross_exposure_quote=Decimal("49000"),
+        net_exposure_quote=Decimal("40000"),
+        open_positions=3,
+        symbol_exposure_quote={"ETHUSDT": Decimal("25000")},
+        strategy_exposure_quote={"s2": Decimal("45000")},
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        breached,
+    )
+
+    assert decision.allowed is True
+    assert "halt_new_risk" in decision.risk_actions
+    for rule_id in (
+        "max_open_positions",
+        "max_symbol_exposure",
+        "max_strategy_exposure",
+        "max_net_exposure",
+        "loss_limit",
+        "max_drawdown",
+        "concentration",
+    ):
+        rule = next(item for item in decision.rule_results if item.rule_id == rule_id)
+        assert rule.allowed is True
+        assert rule.reason_code == "reduce_only_non_expanding"
+
+    gross_rule = next(item for item in decision.rule_results if item.rule_id == "max_gross_exposure")
+    assert gross_rule.allowed is True
+    assert gross_rule.reason_code == "gross_exposure_ok"
+
+
+def test_reduce_only_sequential_approval_blocks_second_when_pending_exists():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    long_state = state(position_quantity={"ETHUSDT": Decimal("1")})
+
+    first = engine.evaluate(
+        request(side=Side.SELL, quantity="0.6", price="1000", strategy="s2"),
+        long_state,
+    )
+    second = engine.evaluate(
+        request(side=Side.SELL, quantity="0.6", price="1000", strategy="s2"),
+        long_state,
+    )
+
+    assert first.allowed is True
+    assert second.allowed is False
+    assert "reduce_only_pending_intents_present" in second.reason_codes
+
+
+def test_reduce_only_short_side_boundaries_are_symmetric():
+    short_state = state(position_quantity={"ETHUSDT": Decimal("-1")})
+
+    exact = HardRiskEngine(limits(reduce_only_mode=True)).evaluate(
+        request(side=Side.BUY, quantity="1", price="1000", strategy="s2"),
+        short_state,
+    )
+    over = HardRiskEngine(limits(reduce_only_mode=True)).evaluate(
+        request(side=Side.BUY, quantity="1.00000001", price="1000", strategy="s2"),
+        short_state,
+    )
+    same_side = HardRiskEngine(limits(reduce_only_mode=True)).evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        short_state,
+    )
+
+    assert exact.allowed is True
+    assert over.allowed is False
+    assert "reduce_only_quantity_exceeded" in over.reason_codes
+    assert same_side.allowed is False
+    assert "reduce_only_violation" in same_side.reason_codes
+
+
+def test_reduce_only_rejects_zero_or_missing_position():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+
+    buy = engine.evaluate(
+        request(side=Side.BUY, quantity="0.25", price="1000", strategy="s2"),
+        state(position_quantity={"ETHUSDT": Decimal("0")}),
+    )
+    sell = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s3"),
+        state(),
+    )
+
+    assert buy.allowed is False
+    assert "reduce_only_violation" in buy.reason_codes
+    assert sell.allowed is False
+    assert "reduce_only_violation" in sell.reason_codes
+
+
+def test_reduce_only_attributed_buy_cannot_cover_another_strategys_short():
+    engine = HardRiskEngine(
+        limits(reduce_only_mode=True),
+        enforce_attributed_inventory=True,
+    )
+    attributed_elsewhere = state(
+        position_quantity={"ETHUSDT": Decimal("-1")},
+        strategy_position_quantity={"s1": Decimal("-1"), "s2": Decimal("0")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.BUY, quantity="0.25", price="1000", strategy="s2"),
+        attributed_elsewhere,
+    )
+
+    assert decision.allowed is False
+    assert "insufficient_attributed_inventory" in decision.reason_codes
+
+
+def test_reduce_only_does_not_exempt_expanding_net_exposure():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    exposed = state(
+        gross_exposure_quote=Decimal("1000"),
+        net_exposure_quote=Decimal("-29900"),
+        symbol_exposure_quote={"ETHUSDT": Decimal("1000")},
+        strategy_exposure_quote={"s2": Decimal("1000")},
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        exposed,
+    )
+
+    assert decision.allowed is False
+    assert "max_net_exposure_exceeded" in decision.reason_codes
+    net_rule = next(item for item in decision.rule_results if item.rule_id == "max_net_exposure")
+    assert net_rule.reason_code == "max_net_exposure_exceeded"
+
+
+def test_reduce_only_does_not_exempt_expanding_strategy_exposure():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    exposed = state(
+        gross_exposure_quote=Decimal("1000"),
+        net_exposure_quote=Decimal("1000"),
+        symbol_exposure_quote={"ETHUSDT": Decimal("1000")},
+        strategy_exposure_quote={"s2": Decimal("-39900")},
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        exposed,
+    )
+
+    assert decision.allowed is False
+    assert "max_strategy_exposure_exceeded" in decision.reason_codes
+    strategy_rule = next(item for item in decision.rule_results if item.rule_id == "max_strategy_exposure")
+    assert strategy_rule.reason_code == "max_strategy_exposure_exceeded"
+
+
+def test_reduce_only_does_not_exempt_gross_exposure():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    exposed = state(
+        gross_exposure_quote=Decimal("50000"),
+        net_exposure_quote=Decimal("1000"),
+        symbol_exposure_quote={"ETHUSDT": Decimal("1000")},
+        strategy_exposure_quote={"s2": Decimal("1000")},
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        exposed,
+    )
+
+    assert decision.allowed is False
+    assert "max_gross_exposure_exceeded" in decision.reason_codes
+    gross_rule = next(item for item in decision.rule_results if item.rule_id == "max_gross_exposure")
+    assert gross_rule.reason_code == "max_gross_exposure_exceeded"
+
+
+def test_reduce_only_symbol_exemption_requires_consistent_signed_exposure():
+    engine = HardRiskEngine(limits(reduce_only_mode=True))
+    inconsistent = state(
+        symbol_exposure_quote={"ETHUSDT": Decimal("-25000")},
+        position_quantity={"ETHUSDT": Decimal("1")},
+    )
+
+    decision = engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        inconsistent,
+    )
+
+    assert decision.allowed is False
+    assert "max_symbol_exposure_exceeded" in decision.reason_codes
+    symbol_rule = next(item for item in decision.rule_results if item.rule_id == "max_symbol_exposure")
+    assert symbol_rule.reason_code == "max_symbol_exposure_exceeded"
+
+
+def test_reduce_only_does_not_bypass_trading_halt_or_stale_state():
+    halted = HardRiskEngine(limits(reduce_only_mode=True, trading_halted=True)).evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        state(position_quantity={"ETHUSDT": Decimal("1")}),
+    )
+    stale_engine = HardRiskEngine(
+        limits(reduce_only_mode=True),
+        max_state_age_seconds=1.0,
+    )
+    stale = stale_engine.evaluate(
+        request(side=Side.SELL, quantity="0.25", price="1000", strategy="s2"),
+        state(position_quantity={"ETHUSDT": Decimal("1")}),
+        now=BASE + timedelta(seconds=2),
+    )
+
+    assert halted.allowed is False
+    assert "trading_halted" in halted.reason_codes
+    assert stale.allowed is False
+    assert "stale_risk_state" in stale.reason_codes
 
 
 def test_duplicate_and_conflicting_intents_are_rejected():
@@ -312,3 +603,13 @@ def test_risk_layer_has_no_llm_or_network_dependency():
 
     for token in ("crewai", "deepseek", "openai", "requests", "http", "socket"):
         assert token not in source, f"risk engine must not reference {token}"
+
+def test_future_risk_state_timestamp_is_rejected_when_freshness_is_configured():
+    engine = HardRiskEngine(limits(), max_state_age_seconds=5.0)
+    future_state = state(snapshot_ts=BASE + timedelta(seconds=10))
+
+    decision = engine.evaluate(request(), future_state, now=BASE)
+
+    assert decision.allowed is False
+    assert "risk_state_timestamp_in_future" in decision.reason_codes
+

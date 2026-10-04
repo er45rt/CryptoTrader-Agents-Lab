@@ -6,6 +6,7 @@ guards prove the addition stays narrow and does not weaken any Phase 1-13 invari
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -15,9 +16,13 @@ PRODUCTION_DIR = PACKAGE_DIR / "production"
 
 _AUTHORIZED_MODULES = {
     "__init__.py",
+    "admission.py",
+    "backfill.py",
     "environment.py",
     "errors.py",
+    "equity.py",
     "fence.py",
+    "risk_state.py",
     "runtime.py",
 }
 
@@ -63,6 +68,91 @@ _FORBIDDEN_IMPORTS = re.compile(
 
 def _files() -> list[Path]:
     return [file for file in PRODUCTION_DIR.rglob("*.py") if "__pycache__" not in file.parts]
+
+
+def _repository_mutation_violations(file: Path) -> list[str]:
+    """Reject obvious repository/process mutation capabilities; obfuscated dynamic imports are out of scope."""
+    tree = ast.parse(file.read_text(encoding="utf-8"))
+    violations: list[str] = []
+    blocked_modules = {"subprocess", "git", "pygit2", "dulwich", "pty"}
+    importlib_module_names = {"importlib"}
+    import_module_names: set[str] = set()
+
+    def dangerous_os_name(name: str) -> bool:
+        return name in {"system", "popen"} or name.startswith(("exec", "spawn", "fork"))
+
+    def blocked_module_name(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        return any(value == module or value.startswith(module + ".") for module in blocked_modules)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".", 1)[0]
+                if top in blocked_modules:
+                    violations.append(f"import {alias.name}")
+                if alias.name == "importlib":
+                    importlib_module_names.add(alias.asname or "importlib")
+        elif isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".", 1)[0]
+            if module in blocked_modules:
+                violations.append(f"from {node.module} import ...")
+            if node.module == "os":
+                for alias in node.names:
+                    if dangerous_os_name(alias.name):
+                        violations.append(f"from os import {alias.name}")
+            if node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        import_module_names.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "os"
+                and dangerous_os_name(node.attr)
+            ):
+                violations.append(f"os.{node.attr}")
+        elif isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "os"
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and dangerous_os_name(node.args[1].value)
+            ):
+                violations.append(f"getattr(os, {node.args[1].value!r})")
+
+            first_arg = (
+                node.args[0].value
+                if node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                else None
+            )
+            if blocked_module_name(first_arg):
+                if isinstance(node.func, ast.Name) and (
+                    node.func.id == "__import__" or node.func.id in import_module_names
+                ):
+                    violations.append(f"dynamic import {first_arg}")
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in importlib_module_names
+                ):
+                    violations.append(f"dynamic import {first_arg}")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            normalized = node.value.replace("\\", "/").lower()
+            if ".git" in [part for part in normalized.split("/") if part]:
+                violations.append(f".git path literal on line {node.lineno}")
+
+    return violations
 
 
 def test_the_production_package_contains_only_authorized_components():
@@ -118,16 +208,84 @@ def test_the_production_environment_defaults_to_testnet_and_production_is_disabl
     assert "owner authorization gate" in source
 
 
-def test_the_final_fence_is_revalidated_immediately_before_the_venue_call():
-    """Structural proof that a submission cannot skip the final safety/fence check."""
+def test_the_final_fence_is_revalidated_inside_the_exclusive_submission_path():
+    """Structural complement to the behavioral fencing/concurrency regression tests."""
     source = (PRODUCTION_DIR / "runtime.py").read_text(encoding="utf-8")
-    submit_body = source.split("def submit_prepared", 1)[1].split("\n    def ", 1)[0]
-    fence_index = submit_body.index("authorize_new_risk")
-    venue_index = submit_body.index("_execution.submit(")
+    tree = ast.parse(source)
+    runtime = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ProductionRuntime"
+    )
+    methods = {
+        node.name: node
+        for node in runtime.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    wrapper = methods["submit_prepared"]
+    locked = methods["_submit_prepared_locked"]
 
-    assert fence_index < venue_index
-    assert submit_body.count("_execution.submit(") == 1
-    assert source.count("_execution.submit(") == 1, "the venue call must exist only in the fenced path"
+    helper_calls = [
+        node for node in ast.walk(runtime)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_submit_prepared_locked"
+    ]
+    assert len(helper_calls) == 1
+    assert helper_calls[0].lineno >= wrapper.lineno
+    assert helper_calls[0].end_lineno <= wrapper.end_lineno
+
+    exclusive_blocks = [
+        node for node in wrapper.body
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and item.context_expr.func.attr == "exclusive"
+            and any(
+                keyword.arg == "purpose"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "submission"
+                for keyword in item.context_expr.keywords
+            )
+            for item in node.items
+        )
+    ]
+    assert len(exclusive_blocks) == 1
+    block = exclusive_blocks[0]
+    assert block.lineno <= helper_calls[0].lineno <= block.end_lineno
+
+    authorize_calls = [
+        node for node in ast.walk(locked)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "authorize_new_risk"
+    ]
+    assert len(authorize_calls) == 1
+
+    durable_calls = [
+        node for node in ast.walk(runtime)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "DurableVenueWritePort"
+        and node.func.attr == "submit_durably"
+    ]
+    plain_calls = [
+        node for node in ast.walk(runtime)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "submit"
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+        and node.func.value.attr == "_execution"
+    ]
+    assert len(durable_calls) == 1
+    assert len(plain_calls) == 1
+    venue_calls = durable_calls + plain_calls
+    assert all(locked.lineno <= call.lineno <= locked.end_lineno for call in venue_calls)
+    assert authorize_calls[0].lineno < min(call.lineno for call in venue_calls)
+    assert not any(isinstance(node, ast.Await) for node in ast.walk(locked))
 
 
 def test_phase14_adds_no_event_contract():
@@ -139,7 +297,11 @@ def test_phase14_adds_no_event_contract():
         "trade.intent.created",
         "risk.decision.recorded",
         "order.state.changed",
+        # Phase 15 durable ambiguity additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",
@@ -161,14 +323,9 @@ def test_domain_packages_do_not_depend_on_the_production_runtime():
             )
 
 
-def test_no_push_was_performed_by_this_phase():
-    git_dir = PROJECT_ROOT / ".git"
-    config = (git_dir / "config").read_text(encoding="utf-8")
-
-    for name, body in re.findall(
-        r'\[branch "([^"]+)"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
-    ):
-        if name.startswith("phase-14"):
-            assert "remote =" not in body, f"the {name} branch has a push upstream"
-    remote_refs = list((git_dir / "refs" / "remotes").rglob("*"))
-    assert not any("phase-14" in ref.name for ref in remote_refs if ref.is_file())
+def test_the_production_package_has_no_repository_mutation_capability():
+    files = _files()
+    assert files, "production capability scan must inspect at least one source file"
+    for file in files:
+        violations = _repository_mutation_violations(file)
+        assert not violations, f"{file.name} can mutate repository/process state: {violations}"

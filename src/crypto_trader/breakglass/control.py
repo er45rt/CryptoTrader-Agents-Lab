@@ -14,10 +14,12 @@ Guarantees:
 * fail-closed: a refused command changes nothing, an unconfirmed venue-side control escalates
   through ``degraded`` into ``recovery_required`` with ``UNKNOWN_PENDING_RECONCILIATION``, and a
   corrupt persisted state fails closed into ``recovery_required``;
-* single-writer: every accepted break-glass action takes the writer lease as the emergency owner
-  and mints a new fencing term, so the normal writer cannot keep trading concurrently;
-* no automatic return to ``normal``: restore requires a resolved reconciliation AND an explicit
-  operator acknowledgement, and is the only path that releases the kill switch.
+* single-writer: emergency break-glass actions take the writer lease as the emergency owner
+  and mint a new fencing term; ``reduce_only`` is an audited policy restriction that preserves
+  the current normal lease while Hard Risk proves each reduction;
+* no automatic return to ``normal``: emergency epochs require resolved reconciliation plus
+  operator acknowledgement; a policy-only ``reduce_only`` posture still requires an explicit
+  audited operator restore.
 """
 
 from __future__ import annotations
@@ -331,19 +333,20 @@ class BreakGlassControl:
         Refused while a break-glass epoch is open: after an emergency takeover the normal runtime may
         not simply help itself to the lease again.
         """
-        epoch = self.load_epoch()
-        if epoch is not None and epoch.is_open:
-            raise BreakGlassActiveError(
-                f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
-                "the trading-state lease until an operator restore completes."
+        with self._ownership_store.exclusive():
+            epoch = self.load_epoch()
+            if epoch is not None and epoch.is_open:
+                raise BreakGlassActiveError(
+                    f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
+                    "the trading-state lease until an operator restore completes."
+                )
+            record = self._ownership_store.takeover(
+                owner_id=owner_id,
+                owner_kind=OwnerKind.NORMAL,
+                acquired_at=self._now(),
+                reason_code=reason_code,
             )
-        record = self._ownership_store.takeover(
-            owner_id=owner_id,
-            owner_kind=OwnerKind.NORMAL,
-            acquired_at=self._now(),
-            reason_code=reason_code,
-        )
-        return WriterGuard(self._ownership_store, record.fence)
+            return WriterGuard(self._ownership_store, record.fence)
 
     def status(self) -> BreakGlassStatus:
         """Read-only posture. Never writes, never mutates, never silently repairs anything."""
@@ -371,7 +374,7 @@ class BreakGlassControl:
             epoch_actions=() if epoch is None else epoch.actions,
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             reconciliation_reason_code=None if epoch is None else epoch.reconciliation_reason_code,
-            operator_acknowledgement_pending=acknowledgement is None,
+            operator_acknowledgement_pending=bool(epoch is not None and acknowledgement is None),
             operator_acknowledged_by=(
                 None if acknowledgement is None else acknowledgement.operator_label
             ),
@@ -414,7 +417,11 @@ class BreakGlassControl:
     # --- the single ingress ---------------------------------------------------
 
     def handle(self, command: OperatorCommand) -> OperatorCommandOutcome:
-        """Apply one validated operator command deterministically (or refuse it, fail-closed)."""
+        """Serialize the complete operator transaction against normal submission."""
+        with self._ownership_store.exclusive():
+            return self._handle_locked(command)
+
+    def _handle_locked(self, command: OperatorCommand) -> OperatorCommandOutcome:
         if not isinstance(command, OperatorCommand):
             raise BreakGlassConfigError("handle() expects a validated OperatorCommand.")
         delivered_at = self._now()
@@ -465,6 +472,85 @@ class BreakGlassControl:
                     f"{previous_mode.value} to {target.value}, which is less restrictive; the "
                     "break-glass path never downgrades safety."
                 ),
+            )
+
+        if command.command_type is OperatorCommandType.REDUCE_ONLY:
+            if open_epoch is not None:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="reduce_only_refused_break_glass_epoch_open",
+                    note=(
+                        "reduce-only cannot replace or weaken an active emergency epoch; "
+                        "reconciliation, acknowledgement and explicit restore remain mandatory."
+                    ),
+                )
+            ownership = self._read_ownership()
+            if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="reduce_only_refused_emergency_owner",
+                    note=(
+                        "reduce-only cannot restore trading authority while the emergency owner "
+                        "holds the writer lease."
+                    ),
+                )
+            correlation_id = command.correlation_id or command.command_id
+            transitions = self._apply_posture(
+                controller,
+                target,
+                command=command,
+                engage_kill_switch=False,
+            )
+            fence_term = self._current_term()
+            recorded = self._append_records(
+                command,
+                controller,
+                previous_mode=previous_mode,
+                resulting_mode=controller.mode,
+                disposition="accepted",
+                reason_code=self._action_reason_code(command, controller, None),
+                correlation_id=correlation_id,
+                venue_control="not_requested",
+                reconciliation_status="not_required",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=fence_term,
+                occurred_at=delivered_at,
+                transitions=transitions,
+            )
+            self._persist_state_cache(controller)
+            return OperatorCommandOutcome(
+                command_id=command.command_id,
+                command_type=command.command_type.value,
+                disposition="accepted",
+                reason_code=self._action_reason_code(command, controller, None),
+                previous_safety_state=previous_mode.value,
+                resulting_safety_state=controller.mode.value,
+                correlation_id=correlation_id,
+                causation_id=command.causation_id,
+                delivered_at=delivered_at,
+                reconciliation_required=False,
+                reconciliation_status="not_required",
+                operator_acknowledgement_pending=False,
+                new_risk_permitted=False,
+                venue_control="not_requested",
+                fence_term=fence_term,
+                safety_transitions=tuple(
+                    f"{item.previous_mode.value}->{item.mode.value}" for item in transitions
+                ),
+                journaled_event_ids=tuple(recorded),
+                notes=(
+                    "reduce-only is an operator-audited policy restriction; it preserves the "
+                    "current normal writer lease and delegates reduction proof to Hard Risk.",
+                    load.detail,
+                ),
+                safety_state_source=load.source,
             )
 
         reanchor = open_epoch is None or open_epoch.provenance == "provenance_missing"
@@ -723,6 +809,97 @@ class BreakGlassControl:
         load: SafetyStateLoad,
         delivered_at: datetime,
     ) -> OperatorCommandOutcome:
+        if (
+            (epoch is None or not epoch.is_open)
+            and controller.mode is SafetyMode.REDUCE_ONLY
+            and not controller.kill_switch_engaged
+        ):
+            try:
+                ownership = self._ownership_store.read()
+            except OwnershipStateError:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="restore_denied_ownership_unreadable",
+                    note=(
+                        "normal cannot be restored from reduce-only while writer ownership "
+                        "cannot be read authoritatively."
+                    ),
+                )
+            if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="restore_denied_emergency_owner",
+                    note=(
+                        "normal cannot be restored from reduce-only while the emergency owner "
+                        "holds the writer lease."
+                    ),
+                )
+            correlation_id = command.correlation_id or command.command_id
+            transitions = [
+                controller.set_mode(
+                    SafetyMode.NORMAL,
+                    reason_code="operator_restore_normal",
+                    reason=(
+                        f"operator {command.operator_label} restored normal from the "
+                        "reduce-only policy posture"
+                    ),
+                    trigger="operator",
+                )
+            ]
+            fence_term = self._current_term()
+            event_ids = self._append_records(
+                command,
+                controller,
+                previous_mode=SafetyMode.REDUCE_ONLY,
+                resulting_mode=controller.mode,
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                correlation_id=correlation_id,
+                venue_control="not_requested",
+                reconciliation_status="not_required",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=fence_term,
+                occurred_at=delivered_at,
+                transitions=tuple(transitions),
+            )
+            self._persist_state_cache(controller)
+            return OperatorCommandOutcome(
+                command_id=command.command_id,
+                command_type=command.command_type.value,
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                previous_safety_state=SafetyMode.REDUCE_ONLY.value,
+                resulting_safety_state=controller.mode.value,
+                correlation_id=correlation_id,
+                causation_id=command.causation_id,
+                delivered_at=delivered_at,
+                reconciliation_required=False,
+                reconciliation_status="not_required",
+                operator_acknowledgement_pending=False,
+                new_risk_permitted=self._new_risk_permitted(
+                    controller, None, ownership
+                ),
+                fence_term=fence_term,
+                safety_transitions=tuple(
+                    f"{item.previous_mode.value}->{item.mode.value}"
+                    for item in transitions
+                ),
+                journaled_event_ids=tuple(event_ids),
+                notes=(
+                    "normal was restored by an explicit operator command from reduce-only; "
+                    "no emergency epoch or ownership takeover was involved.",
+                    load.detail,
+                ),
+                safety_state_source=load.source,
+            )
+
         if epoch is None or not epoch.is_open:
             return self._reject(
                 command,
@@ -1139,7 +1316,7 @@ class BreakGlassControl:
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             reconciliation_result=None if epoch is None else epoch.reconciliation_reason_code,
             operator_acknowledgement_pending=bool(
-                epoch is None or not epoch.acknowledgement_satisfied
+                epoch is not None and not epoch.acknowledgement_satisfied
             ),
             new_risk_permitted=self._new_risk_permitted(controller, epoch, self._read_ownership()),
             fence_term=self._current_term(),
@@ -1197,8 +1374,8 @@ class BreakGlassControl:
             reconciliation_required=bool(epoch is not None and epoch.is_open),
             reconciliation_status=prior.reconciliation_status,
             reconciliation_result=None if epoch is None else epoch.reconciliation_reason_code,
-            operator_acknowledgement_pending=(
-                epoch is None or not epoch.acknowledgement_satisfied
+            operator_acknowledgement_pending=bool(
+                epoch is not None and not epoch.acknowledgement_satisfied
             ),
             new_risk_permitted=self._new_risk_permitted(controller, epoch, self._read_ownership()),
             venue_control=prior.venue_control,

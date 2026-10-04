@@ -19,6 +19,8 @@ from crypto_trader.events import (
     RiskDecisionRecorded,
     StrategyDecisionRecorded,
     TradeIntentCreated,
+    VenueTradeRecorded,
+    AccountEquityRecorded,
     UnknownEventTypeError,
     UnsupportedSchemaVersionError,
     V1_CONTRACTS,
@@ -51,6 +53,8 @@ def test_default_registry_registers_every_v1_contract():
         "risk.decision.recorded",
         "order.state.changed",
         "execution.fill.recorded",
+        "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         # Phase 6 additive contract (existing schemas unchanged).
         "validity.disposition.recorded",
@@ -61,6 +65,7 @@ def test_default_registry_registers_every_v1_contract():
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
         # Phase 15 additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "stream.lifecycle.recorded",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
@@ -126,6 +131,8 @@ def test_register_model_requires_declared_defaults():
         ("risk_decision", RiskDecisionRecorded),
         ("order_state_changed", OrderStateChanged),
         ("partial_fill", ExecutionFillRecorded),
+        ("venue_trade_recorded", VenueTradeRecorded),
+        ("account_equity_recorded", AccountEquityRecorded),
         ("recovery_state_changed", RecoveryStateChanged),
     ],
 )

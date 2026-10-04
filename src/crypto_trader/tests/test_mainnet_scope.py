@@ -8,6 +8,7 @@ to downgrade the dry-run into live trading.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -48,6 +49,91 @@ _AUTHORIZED_MODULES = {
 
 def _files() -> list[Path]:
     return [file for file in MAINNET_DIR.rglob("*.py") if "__pycache__" not in file.parts]
+
+
+def _repository_mutation_violations(file: Path) -> list[str]:
+    """Reject obvious repository/process mutation capabilities; obfuscated dynamic imports are out of scope."""
+    tree = ast.parse(file.read_text(encoding="utf-8"))
+    violations: list[str] = []
+    blocked_modules = {"subprocess", "git", "pygit2", "dulwich", "pty"}
+    importlib_module_names = {"importlib"}
+    import_module_names: set[str] = set()
+
+    def dangerous_os_name(name: str) -> bool:
+        return name in {"system", "popen"} or name.startswith(("exec", "spawn", "fork"))
+
+    def blocked_module_name(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        return any(value == module or value.startswith(module + ".") for module in blocked_modules)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".", 1)[0]
+                if top in blocked_modules:
+                    violations.append(f"import {alias.name}")
+                if alias.name == "importlib":
+                    importlib_module_names.add(alias.asname or "importlib")
+        elif isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".", 1)[0]
+            if module in blocked_modules:
+                violations.append(f"from {node.module} import ...")
+            if node.module == "os":
+                for alias in node.names:
+                    if dangerous_os_name(alias.name):
+                        violations.append(f"from os import {alias.name}")
+            if node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        import_module_names.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "os"
+                and dangerous_os_name(node.attr)
+            ):
+                violations.append(f"os.{node.attr}")
+        elif isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "os"
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+                and dangerous_os_name(node.args[1].value)
+            ):
+                violations.append(f"getattr(os, {node.args[1].value!r})")
+
+            first_arg = (
+                node.args[0].value
+                if node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                else None
+            )
+            if blocked_module_name(first_arg):
+                if isinstance(node.func, ast.Name) and (
+                    node.func.id == "__import__" or node.func.id in import_module_names
+                ):
+                    violations.append(f"dynamic import {first_arg}")
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in importlib_module_names
+                ):
+                    violations.append(f"dynamic import {first_arg}")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            normalized = node.value.replace("\\", "/").lower()
+            if ".git" in [part for part in normalized.split("/") if part]:
+                violations.append(f".git path literal on line {node.lineno}")
+
+    return violations
 
 
 def test_the_mainnet_package_contains_only_authorized_components():
@@ -133,7 +219,11 @@ def test_phase15_adds_exactly_one_additive_stream_lifecycle_contract():
         "trade.intent.created",
         "risk.decision.recorded",
         "order.state.changed",
+        # Phase 15 durability additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "execution.fill.recorded",
+        "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         "validity.disposition.recorded",
         "risk.evaluation.recorded",
@@ -173,14 +263,9 @@ def test_the_phase12_mainnet_guard_narrowing_is_explicit_and_reviewable():
     assert mainnet_package.__name__ == "crypto_trader.mainnet"
 
 
-def test_no_push_was_performed_by_this_phase():
-    git_dir = PROJECT_ROOT / ".git"
-    config = (git_dir / "config").read_text(encoding="utf-8")
-
-    for name, body in re.findall(
-        r'\[branch "([^"]+)"\]\s*(.*?)(?=\n\[|\Z)', config, re.DOTALL
-    ):
-        if name.startswith("phase-15"):
-            assert "remote =" not in body, f"the {name} branch has a push upstream"
-    remote_refs = list((git_dir / "refs" / "remotes").rglob("*"))
-    assert not any("phase-15" in ref.name for ref in remote_refs if ref.is_file())
+def test_the_mainnet_package_has_no_repository_mutation_capability():
+    files = _files()
+    assert files, "mainnet capability scan must inspect at least one source file"
+    for file in files:
+        violations = _repository_mutation_violations(file)
+        assert not violations, f"{file.name} can mutate repository/process state: {violations}"

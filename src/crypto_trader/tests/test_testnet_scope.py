@@ -20,6 +20,7 @@ AUTHORISED_TESTNET_DIRECTORY = TESTNET_DIR
 
 _AUTHORIZED_MODULES = {
     "__init__.py",
+    "backfill.py",
     "client.py",
     "clock.py",
     "credentials.py",
@@ -29,6 +30,7 @@ _AUTHORIZED_MODULES = {
     "rate_limit.py",
     "runtime.py",
     "signing.py",
+    "startup.py",
     "transport.py",
     "translate.py",
 }

@@ -8,16 +8,23 @@ from __future__ import annotations
 
 __all__ = [
     "AmbiguousOrderError",
+    "AttemptJournalRequiredError",
     "BinanceTestnetError",
     "ClockDriftError",
     "MainnetForbiddenError",
+    "RateLimitAdmissionDeferredError",
     "RateLimitBanError",
     "RateLimitError",
+    "WriteIpBannedOutcomeUnknownError",
+    "WriteRateLimitedOutcomeUnknownError",
     "TestnetCredentialsRequiredError",
     "TestnetEndpointError",
     "TestnetSymbolError",
+    "TradeBackfillError",
     "TestnetRejectedError",
     "UnsafeTestnetAccountError",
+    "UnsupportedOrderTypeError",
+    "VenueProtocolRejectionError",
 ]
 
 
@@ -55,17 +62,81 @@ class RateLimitBanError(RateLimitError):
     """An IP ban was signalled; no further request may be attempted in this run."""
 
 
+class RateLimitAdmissionDeferredError(RateLimitError):
+    """A pre-send request cannot be admitted immediately without waiting."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class WriteRateLimitedOutcomeUnknownError(AmbiguousOrderError):
+    """A write received HTTP 429 after send, so it must be reconciled and never retried."""
+
+    reason_code = "venue_rate_limited_after_send"
+    http_status = 429
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class WriteIpBannedOutcomeUnknownError(WriteRateLimitedOutcomeUnknownError):
+    """A write received HTTP 418 after send, so it must be reconciled and never retried."""
+
+    reason_code = "venue_ip_banned_after_send"
+    http_status = 418
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class ClockDriftError(BinanceTestnetError):
     """The local clock drifted beyond the configured tolerance; refuse to sign requests."""
+
+
+class VenueProtocolRejectionError(ClockDriftError):
+    """The venue mechanically rejected the request before any order could be created.
+
+    This is a transport/venue fact (``VENUE_RESPONDED``), not a local rejection and not an ordinary
+    venue order rejection: Binance ``-1021`` means the signed timestamp was outside ``recvWindow``,
+    so the order was never processed. The write is never retried; the durable submission attempt
+    stays as historical proof that a submission was attempted.
+    """
+
+    reason_code = "venue_protocol_rejection_before_order_creation"
+    evidence_code = "venue_timestamp_outside_recv_window"
 
 
 class TestnetRejectedError(BinanceTestnetError):
     """The venue rejected the request deterministically (a real, non-ambiguous outcome)."""
 
 
+class OrderNotFoundError(TestnetRejectedError):
+    """A signed order read returned HTTP 400 with integer Binance code -2013."""
+
+
 class UnsafeTestnetAccountError(BinanceTestnetError):
     """The testnet account has unsafe permissions (for example withdrawals are enabled)."""
 
 
+class UnsupportedOrderTypeError(BinanceTestnetError):
+    """A venue-writing order type has no approved fail-closed validation contract."""
+
+
+class AttemptJournalRequiredError(BinanceTestnetError):
+    """A venue write was refused because no durable attempt journal is available.
+
+    Stage 2 invariant: a new venue-writing path must fail closed *before* any POST unless it can
+    commit the durable ``order.submission.attempted`` marker first. This error is never raised for
+    a successful write, and it never follows a POST.
+    """
+
+
 class TestnetSymbolError(BinanceTestnetError):
     """The instrument is missing or its trading rules cannot be satisfied without rounding."""
+
+
+class TradeBackfillError(BinanceTestnetError):
+    """Authoritative venue trade evidence cannot be reconciled with durable fill history."""

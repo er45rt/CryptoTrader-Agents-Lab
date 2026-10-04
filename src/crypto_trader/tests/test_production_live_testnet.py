@@ -46,10 +46,13 @@ from crypto_trader.execution.binance_testnet import (
 from crypto_trader.execution.binance_testnet import TestnetClock as SpotClock
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.production import (
+    ProductionAdmissionController,
     ProductionIntent,
+    ProductionRiskStateSource,
     ProductionRuntime,
     resolve_environment,
 )
+from crypto_trader.production.equity import AccountEquityBaselineWriter
 from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.risk import load_limits
 from crypto_trader.validity import (
@@ -58,6 +61,7 @@ from crypto_trader.validity import (
     MarketObservation,
 )
 from crypto_trader.validity import load_policy as load_validity_policy
+from crypto_trader.tests.production_fixtures import admitted_prepare, admitted_submit
 
 RUN_FLAG = "CRYPTO_TRADER_RUN_TESTNET"
 SYMBOL = "BTCUSDT"
@@ -188,6 +192,34 @@ def live_context(tmp_path: Path):
         reconciliation_policy=load_recovery_policy({"policy_id": LIVE_POLICY_ID}),
         clock=_now,
     )
+    market_state = _live_market_state(client)
+    client.synchronize_clock()
+    venue_account_id = client.startup_account_snapshot(
+        INSTRUMENT.base_currency, INSTRUMENT.quote_currency
+    ).venue_account_id
+    AccountEquityBaselineWriter(
+        journal=journal,
+        control=control,
+        client=client,
+        market_state=market_state,
+        instrument=INSTRUMENT,
+        environment=client.venue_label,
+        venue_account_id=venue_account_id,
+        max_account_age_seconds=30,
+        max_mark_age_seconds=30,
+        clock=_now,
+        owner_id="normal:production-live-baseline",
+    ).create()
+    risk_source = ProductionRiskStateSource(
+        journal=journal,
+        control=control,
+        client=client,
+        instrument=INSTRUMENT,
+        environment=client.venue_label,
+        venue_account_id=venue_account_id,
+        max_account_age_seconds=30,
+        max_mark_age_seconds=30,
+    )
     runtime = ProductionRuntime(
         journal=journal,
         state_dir=state_dir,
@@ -202,15 +234,24 @@ def live_context(tmp_path: Path):
                 }
             )
         ),
-        market_state=_live_market_state(client),
+        market_state=market_state,
         limits=load_limits(LIVE_LIMITS),
-        risk_state_provider=lambda now: _flat_risk_state(now),
+        risk_state_provider=risk_source,
         reconciliation_policy=load_recovery_policy({"policy_id": LIVE_POLICY_ID}),
         control=control,
         clock=_now,
         owner_id="normal:production-live-test",
     )
-    yield runtime, control, client, journal
+    admission = ProductionAdmissionController(
+        runtime=runtime,
+        max_size=8,
+        max_per_strategy_queued=2,
+        max_retired=32,
+        max_per_strategy_retired=8,
+        max_rejection_strategies=8,
+        clock=_now,
+    )
+    yield runtime, admission, control, client, journal
     try:
         client.cancel_all_open_orders(SYMBOL)
     except Exception:  # pragma: no cover - best-effort cleanup of a testnet-only order
@@ -221,23 +262,8 @@ def live_context(tmp_path: Path):
         journal.close()
 
 
-def _flat_risk_state(now: datetime):
-    from crypto_trader.risk import RiskStateSnapshot
-
-    return RiskStateSnapshot(
-        equity_quote=Decimal("100000"),
-        peak_equity_quote=Decimal("100000"),
-        realized_pnl_quote=Decimal("0"),
-        gross_exposure_quote=Decimal("0"),
-        net_exposure_quote=Decimal("0"),
-        open_orders=0,
-        open_positions=0,
-        snapshot_ts=now,
-    )
-
-
 def test_live_runtime_claims_the_normal_lease_and_verifies_the_testnet_venue(live_context):
-    runtime, control, _client, _journal = live_context
+    runtime, _admission, control, _client, _journal = live_context
 
     report = runtime.start()
 
@@ -252,27 +278,34 @@ def test_live_runtime_claims_the_normal_lease_and_verifies_the_testnet_venue(liv
 
 
 def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_order(live_context):
-    runtime, control, client, journal = live_context
+    runtime, admission, control, client, journal = live_context
     runtime.start()
 
     market, limit_price, quantity = _resting_limit_terms(client)
     first = _intent(market=market, limit_price=limit_price, quantity=quantity)
-    outcome = runtime.execute_intent(first)
+    assert admission.offer(first) == (True, "accepted")
+    outcome = admission.run_once()
 
-    assert outcome.submitted is True, "the production runtime did not submit the testnet order"
+    assert outcome is not None and outcome.submitted is True, (
+        "the production admission path did not submit the testnet order"
+    )
     reference = outcome.submission.order_reference
-    resting = {order.client_order_id for order in client.open_orders(SYMBOL)}
+    resting_orders = client.open_orders(SYMBOL)
+    resting = {order.client_order_id for order in resting_orders}
     assert reference in resting, "the submitted testnet order is not resting at the venue"
+    original_venue_id = next(
+        order.venue_order_id for order in resting_orders if order.client_order_id == reference
+    )
 
     # A second intent is approved by validity + Hard Risk, then the operator takes over.
     market, limit_price, quantity = _resting_limit_terms(client)
     second = _intent(market=market, limit_price=limit_price, quantity=quantity)
-    preparation = runtime.prepare_intent(second)
+    preparation = admitted_prepare(runtime, second)
     assert preparation.approved is True
     control.handle(_command("halt_new_risk", seed="live-halt", reason="live fencing validation"))
 
     with pytest.raises(StaleWriterFenceError):
-        runtime.submit_prepared(preparation)
+        admitted_submit(runtime, preparation)
     second_reference = f"ct-{second.intent_id.hex[:20]}"
     assert second_reference not in {order.client_order_id for order in client.open_orders(SYMBOL)}
 
@@ -284,13 +317,11 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
     assert runtime.status()["new_risk_permitted"] is False
 
     # Reconciliation + acknowledgement are mandatory before normal can be restored.
-    control.handle(_command("reconcile", seed="live-reconcile", reason="reconcile after emergency"))
-    if control.status().reconciliation_status == "resolved":
-        control.handle(_command("acknowledge", seed="live-ack", reason="operator acknowledgement"))
-        restored = control.handle(
-            _command("restore_normal", seed="live-restore", reason="restore normal")
-        )
-        assert restored.accepted
+    terminal = client.order_status(SYMBOL, reference)
+    assert terminal.client_order_id == reference
+    assert terminal.status == "CANCELED"
+    assert terminal.venue_order_id == original_venue_id
+    _require_reconciliation_closure(control)
 
     rendered = json.dumps(
         {
@@ -308,18 +339,45 @@ def test_live_new_risk_is_fenced_and_the_break_glass_path_removes_the_resting_or
             assert secret not in rendered, "a credential value reached an observable surface"
 
 
+def _require_reconciliation_closure(control):
+    """A live gate cannot pass by skipping unresolved reconciliation and recovery."""
+    reconciled = control.handle(
+        _command("reconcile", seed="live-reconcile", reason="reconcile after emergency")
+    )
+    assert reconciled.accepted
+    assert reconciled.reconciliation_status == "resolved"
+    assert reconciled.reason_code == "reconciliation_resolved"
+    assert control.status().reconciliation_status == "resolved"
+    assert control.status().reconciliation_reason_code == "reconciliation_resolved"
+    acknowledged = control.handle(
+        _command("acknowledge", seed="live-ack", reason="operator acknowledgement")
+    )
+    assert acknowledged.accepted
+    assert control.status().operator_acknowledgement_pending is False
+    restored = control.handle(
+        _command("restore_normal", seed="live-restore", reason="restore normal")
+    )
+    assert restored.accepted
+    assert control.status().safety_mode == "normal"
+    assert control.status().new_risk_permitted is True
+
+
 def test_live_new_risk_after_takeover_is_refused_by_the_runtime(live_context):
     """A halted posture must refuse new risk through the production runtime, not just the control."""
-    runtime, control, client, _journal = live_context
+    runtime, admission, control, client, _journal = live_context
     runtime.start()
     control.handle(_command("halt_new_risk", seed="live-halt-2", reason="halt before new risk"))
 
     market, limit_price, quantity = _resting_limit_terms(client)
-    blocked = runtime.execute_intent(
-        _intent(market=market, limit_price=limit_price, quantity=quantity)
+    blocked_intent = _intent(
+        market=market,
+        limit_price=limit_price,
+        quantity=quantity,
     )
+    assert admission.offer(blocked_intent) == (True, "accepted")
+    blocked = admission.run_once()
 
-    assert blocked.submitted is False
+    assert blocked is not None and blocked.submitted is False
     assert blocked.blocked_reason_code
     assert control.status().new_risk_permitted is False
 

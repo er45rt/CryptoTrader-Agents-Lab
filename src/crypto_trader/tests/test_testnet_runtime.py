@@ -6,7 +6,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from crypto_trader.events import EXECUTION_FILL_EVENT_TYPE, ORDER_STATE_EVENT_TYPE
+from crypto_trader.events import (
+    EXECUTION_FILL_EVENT_TYPE,
+    ORDER_STATE_EVENT_TYPE,
+    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+)
 from crypto_trader.execution import (
     ExecutionOrderType,
     ExecutionRequest,
@@ -16,16 +20,16 @@ from crypto_trader.execution import (
 )
 from crypto_trader.execution.binance_testnet import (
     AmbiguousOrderError,
-    RateLimitBanError,
     ScriptedTransport,
     TransportTimeout,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
 )
 from crypto_trader.execution.binance_testnet import (
     TestnetOrderRuntime as OrderRuntime,
 )
 from crypto_trader.execution.binance_testnet import BinanceTestnetError as AdapterError
 from crypto_trader.execution.binance_testnet import (
-    RateLimitError as RateLimited,
     TestnetRejectedError as RejectedError,
 )
 from crypto_trader.persistence import SQLiteEventJournal
@@ -166,8 +170,8 @@ def test_cancel_all_is_the_safety_lane_action(journal):
         responses=[
             *fx.environment_responses(),
             fx.open_orders_response("ct-a", "ct-b"),
-            fx.order_response("ct-a", status="CANCELED"),
-            fx.order_response("ct-b", status="CANCELED"),
+            fx.cancel_response("ct-a", order_id=100),
+            fx.cancel_response("ct-b", order_id=101),
         ]
     )
     instance = started_runtime(transport, journal=journal)
@@ -185,11 +189,11 @@ def test_cancel_all_is_the_safety_lane_action(journal):
 
 # --- ambiguity ------------------------------------------------------------
 
-def test_ambiguous_submission_is_marked_pending_and_not_marked_failed():
+def test_ambiguous_submission_is_marked_pending_and_not_marked_failed(journal):
     transport = ScriptedTransport(
         responses=[*fx.environment_responses(), TransportTimeout("no response")]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
 
     with pytest.raises(AmbiguousOrderError):
         instance.submit(execution_request())
@@ -200,9 +204,17 @@ def test_ambiguous_submission_is_marked_pending_and_not_marked_failed():
     assert states[0].submission_attempted is True
     assert states[0].state.value == "submitted"
     assert instance.observations() == ()
+    # The durable attempt marker is committed before the write, not merely held in memory.
+    attempts = [
+        event
+        for event in journal.read_range()
+        if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+    assert len(attempts) == 1
+    assert attempts[0].payload.venue_reference == CLIENT_ORDER_ID
 
 
-def test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence():
+def test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence(journal):
     transport = ScriptedTransport(
         responses=[
             *fx.environment_responses(),
@@ -210,7 +222,7 @@ def test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence():
             fx.order_response(CLIENT_ORDER_ID, status="NEW"),  # the venue told us the truth
         ]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
     with pytest.raises(AmbiguousOrderError):
         instance.submit(execution_request())
 
@@ -225,7 +237,7 @@ def test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence():
     assert report.adjustments[0].after.state.value == "accepted"
 
 
-def test_ambiguous_submission_stays_pending_when_the_venue_has_no_record():
+def test_ambiguous_submission_stays_pending_when_the_venue_has_no_record(journal):
     transport = ScriptedTransport(
         responses=[
             *fx.environment_responses(),
@@ -233,7 +245,7 @@ def test_ambiguous_submission_stays_pending_when_the_venue_has_no_record():
             fx.rejected(code=-2013, msg="Order does not exist."),  # the venue view: nothing there
         ]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
     with pytest.raises(AmbiguousOrderError):
         instance.submit(execution_request())
 
@@ -291,7 +303,7 @@ def test_restart_leaves_a_truly_ambiguous_order_pending():
     assert restarted.venue_state_source().reports() == ()
 
 
-def test_submitting_twice_with_the_same_intent_never_creates_two_orders():
+def test_submitting_twice_with_the_same_intent_never_creates_two_orders(journal):
     transport = ScriptedTransport(
         responses=[
             *fx.environment_responses(),
@@ -299,7 +311,7 @@ def test_submitting_twice_with_the_same_intent_never_creates_two_orders():
             fx.order_response(CLIENT_ORDER_ID, status="NEW"),  # the idempotent re-read
         ]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
 
     first = instance.submit(execution_request())
     second = instance.submit(execution_request())
@@ -313,7 +325,12 @@ def test_submitting_twice_with_the_same_intent_never_creates_two_orders():
 
 def test_reconnect_after_an_outage_reverifies_the_environment():
     transport = ScriptedTransport(
-        responses=[*fx.environment_responses(), fx.time_response(), fx.account_response()]
+        responses=[
+            *fx.environment_responses(),
+            fx.time_response(),
+            fx.exchange_info_response(),
+            fx.account_response(),
+        ]
     )
     instance = started_runtime(transport)
 
@@ -323,37 +340,44 @@ def test_reconnect_after_an_outage_reverifies_the_environment():
     assert fx.request_paths(transport).count("/api/v3/time") == 2
 
 
-def test_ip_ban_during_a_submit_surfaces_and_does_not_retry():
+def test_ip_ban_during_a_submit_surfaces_and_does_not_retry(journal):
     transport = ScriptedTransport(
         responses=[*fx.environment_responses(), fx.banned("120")]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
 
-    with pytest.raises(RateLimitBanError):
+    with pytest.raises(WriteIpBannedOutcomeUnknownError):
         instance.submit(execution_request())
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
 
 
-def test_rate_limited_write_is_reported_without_retry():
+def test_rate_limited_write_is_reported_without_retry(journal):
     transport = ScriptedTransport(
         responses=[*fx.environment_responses(), fx.rate_limited("1")]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
 
-    with pytest.raises(RateLimited):
+    with pytest.raises(WriteRateLimitedOutcomeUnknownError):
         instance.submit(execution_request())
 
     assert len([item for item in transport.requests if item.method == "POST"]) == 1
 
 
-def test_rejected_order_is_not_recorded_as_pending():
+def test_rejected_order_is_not_recorded_as_pending(journal):
     transport = ScriptedTransport(
         responses=[*fx.environment_responses(), fx.rejected(code=-2010, msg="insufficient balance")]
     )
-    instance = started_runtime(transport)
+    instance = started_runtime(transport, journal=journal)
 
     with pytest.raises(RejectedError):
         instance.submit(execution_request())
 
     assert instance.local_states() == ()
+    # A deterministic venue rejection is recorded as a terminal resolution for the durable attempt.
+    rejected = [
+        event
+        for event in journal.read_range()
+        if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "rejected"
+    ]
+    assert len(rejected) == 1

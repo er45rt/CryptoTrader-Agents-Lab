@@ -11,12 +11,17 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
+from ..exchange_filters import ExchangeSymbolFilters
 from ..ports import ExecutionObservation, OrderLifecycleState
 
 __all__ = [
     "TestnetAccountState",
     "TestnetEnvironment",
     "TestnetFill",
+    "VenueTrade",
+    "VenueAssetBalance",
+    "VenueAccountSnapshot",
+    "MarkEvidence",
     "TestnetOrder",
     "TestnetOrderRequest",
     "TestnetSymbolRules",
@@ -81,6 +86,129 @@ class TestnetFill:
 
 
 @dataclass(frozen=True)
+class VenueTrade:
+    """One strict account trade read from Binance trade history."""
+
+    symbol: str
+    venue_order_id: str
+    trade_id: str
+    price: Decimal
+    quantity: Decimal
+    quote_quantity: Decimal
+    commission: Decimal
+    commission_asset: str
+    trade_time: datetime
+    is_buyer: bool
+    is_maker: bool
+
+
+@dataclass(frozen=True)
+class VenueAssetBalance:
+    """One strictly parsed account balance used for production accounting evidence."""
+
+    asset: str
+    free: Decimal
+    locked: Decimal
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.asset, str)
+            or not self.asset.isascii()
+            or self.asset != self.asset.upper()
+            or not self.asset.isalnum()
+        ):
+            raise ValueError("venue asset must be an uppercase ASCII alphanumeric code.")
+        for value in (self.free, self.locked):
+            if not isinstance(value, Decimal) or not value.is_finite() or value < ZERO:
+                raise ValueError("venue balances must be finite nonnegative Decimal values.")
+
+    @property
+    def total(self) -> Decimal:
+        return self.free + self.locked
+
+
+@dataclass(frozen=True)
+class VenueAccountSnapshot:
+    """A strict non-secret account snapshot for canonical production risk state."""
+
+    venue_account_id: str
+    venue_update_time_ms: int
+    fetched_at: datetime
+    balances: tuple[VenueAssetBalance, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.venue_account_id, str)
+            or not self.venue_account_id.isascii()
+            or not self.venue_account_id.isdigit()
+            or self.venue_account_id.startswith("0")
+        ):
+            raise ValueError("venue_account_id must be a canonical positive ASCII integer.")
+        if type(self.venue_update_time_ms) is not int or self.venue_update_time_ms <= 0:
+            raise ValueError("venue_update_time_ms must be a positive integer.")
+        if not isinstance(self.fetched_at, datetime):
+            raise ValueError("fetched_at must be a datetime.")
+        if (
+            self.fetched_at.tzinfo is None
+            or self.fetched_at.utcoffset() is None
+            or self.fetched_at.utcoffset().total_seconds() != 0
+        ):
+            raise ValueError("fetched_at must be timezone-aware UTC.")
+        try:
+            venue_updated_at = datetime.fromtimestamp(
+                self.venue_update_time_ms / 1000, tz=timezone.utc
+            )
+        except (OSError, OverflowError, ValueError) as exc:
+            raise ValueError("venue_update_time_ms cannot be represented as UTC time.") from exc
+        if venue_updated_at > self.fetched_at:
+            raise ValueError("venue account updateTime cannot be later than fetched_at.")
+        if not isinstance(self.balances, tuple):
+            raise ValueError("balances must be an immutable tuple.")
+        if not self.balances or any(not isinstance(item, VenueAssetBalance) for item in self.balances):
+            raise ValueError("balances must contain at least one VenueAssetBalance.")
+        assets = tuple(item.asset for item in self.balances)
+        if len(set(assets)) != len(assets):
+            raise ValueError("venue account balances must contain unique assets.")
+
+    def balance(self, asset: str) -> VenueAssetBalance:
+        matches = tuple(item for item in self.balances if item.asset == asset)
+        if len(matches) != 1:
+            raise KeyError(asset)
+        return matches[0]
+
+
+@dataclass(frozen=True)
+class MarkEvidence:
+    """Strict timestamped market mark for production risk/equity evidence."""
+
+    symbol: str
+    price: Decimal
+    observed_at: datetime
+    reference: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.symbol, str)
+            or not self.symbol.isascii()
+            or self.symbol != self.symbol.upper()
+            or not self.symbol.isalnum()
+        ):
+            raise ValueError("mark symbol must be an uppercase ASCII alphanumeric code.")
+        if not isinstance(self.price, Decimal) or not self.price.is_finite() or self.price <= ZERO:
+            raise ValueError("mark price must be a positive finite Decimal.")
+        if not isinstance(self.observed_at, datetime):
+            raise ValueError("mark observed_at must be a datetime.")
+        if (
+            self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() is None
+            or self.observed_at.utcoffset().total_seconds() != 0
+        ):
+            raise ValueError("mark observed_at must be timezone-aware UTC.")
+        if not isinstance(self.reference, str) or not self.reference.strip():
+            raise ValueError("mark evidence requires a non-empty reference.")
+
+
+@dataclass(frozen=True)
 class TestnetOrder:
     """The venue's view of one order, in our vocabulary."""
 
@@ -89,6 +217,7 @@ class TestnetOrder:
     venue_order_id: str | None
     state: OrderLifecycleState
     status: str
+    side: str | None = None
     original_quantity: Decimal = ZERO
     executed_quantity: Decimal = ZERO
     cummulative_quote_quantity: Decimal = ZERO
@@ -193,33 +322,16 @@ def format_decimal(value: Decimal) -> str:
 
 
 @dataclass(frozen=True)
-class TestnetSymbolRules:
-    """Trading rules for one symbol, as reported by ``exchangeInfo``."""
+class TestnetSymbolRules(ExchangeSymbolFilters):
+    """Compatibility view over the shared fail-closed exchange filter contract."""
 
-    symbol: str
-    base_asset: str
-    quote_asset: str
-    price_tick: Decimal
-    quantity_step: Decimal
-    min_quantity: Decimal = ZERO
-    min_notional: Decimal = ZERO
-    status: str = "TRADING"
+    @property
+    def price_tick(self) -> Decimal:
+        return self.tick_size
 
-    def quantity_is_valid(self, quantity: Decimal) -> bool:
-        """True when the quantity satisfies step size and minimum (no rounding performed)."""
-        if quantity < self.min_quantity:
-            return False
-        if self.quantity_step > 0 and quantity % self.quantity_step != 0:
-            return False
-        return True
-
-    def price_is_valid(self, price: Decimal) -> bool:
-        if self.price_tick > 0 and price % self.price_tick != 0:
-            return False
-        return price > 0
-
-    def notional_is_valid(self, quantity: Decimal, price: Decimal) -> bool:
-        return quantity * price >= self.min_notional
+    @property
+    def quantity_step(self) -> Decimal:
+        return self.step_size
 
 
 def utc_from_ms(value: int | None) -> datetime | None:

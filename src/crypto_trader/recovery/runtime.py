@@ -21,7 +21,7 @@ until external evidence appears.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -31,7 +31,12 @@ from crypto_trader.persistence import EventJournal, RebuildSummary, SnapshotReco
 from .engine import ReconciliationEngine
 from .journaling import record_reconciliation
 from .models import LocalOrderState, ReconciliationReport, VenueOrderReport
-from .reconstruction import OrderStateReconstructor, reconstruct_order_states
+from .reconstruction import (
+    AttemptAnchors,
+    OrderStateReconstructor,
+    reconstruct_order_states,
+    validate_venue_evidence,
+)
 
 __all__ = [
     "RecoveryRun",
@@ -82,6 +87,12 @@ class RecoveryRun:
     rebuild: RebuildSummary | None = None
     journaled_event_ids: list[UUID] = field(default_factory=list)
     recovery_state: Literal["resolved", "failed"] = "resolved"
+    #: References whose reconstructed lifecycle carried an authoritative contradiction. They stay
+    #: unresolved (new risk fenced) until external evidence resolves them; the reason codes live in
+    #: ``report.reason_codes``.
+    conflicted_orders: tuple[str, ...] = ()
+    #: Terminal orders whose executed quantity advanced from a late authoritative fill.
+    late_fill_refinements: int = 0
 
     @property
     def blocked_orders(self) -> list[str]:
@@ -142,13 +153,48 @@ class RestartRecovery:
         """Restore, rebuild, reconcile and journal one restart recovery pass."""
         rebuild: RebuildSummary | None = None
         states: tuple[LocalOrderState, ...]
+        conflicts: dict[str, list[str]] = {}
+        late_fill_refinements = 0
+        anchors: dict[str, AttemptAnchors] = {}
         if local_states is None:
             reconstructor, rebuild = reconstruct_order_states(self._journal, snapshot=snapshot)
             states = reconstructor.states()
+            conflicts = {
+                reference: list(reasons) for reference, reasons in reconstructor.conflicts().items()
+            }
+            late_fill_refinements = reconstructor.late_fill_refinements
+            anchors = reconstructor.attempt_anchor_map()
         else:
             states = tuple(local_states)
 
-        report = self._engine.reconcile(states, self._collect_venue_reports())
+        # Current venue evidence is validated against the durable attempt anchors before it can
+        # reach the engine: a FILLED report must prove executedQty == Q and origQty == Q, otherwise
+        # it is refused and the order stays unresolved (fenced).
+        accepted_reports: list[VenueOrderReport] = []
+        for venue_report in self._collect_venue_reports():
+            reason = validate_venue_evidence(
+                anchors.get(venue_report.order_reference), venue_report
+            )
+            if reason is None:
+                accepted_reports.append(venue_report)
+                continue
+            existing = conflicts.setdefault(venue_report.order_reference, [])
+            if reason not in existing:
+                existing.append(reason)
+
+        report = self._engine.reconcile(states, tuple(accepted_reports))
+        if conflicts:
+            # A lifecycle contradiction is never dropped and never auto-resolved: it keeps the
+            # order unresolved so the fence stays engaged until authoritative evidence exists.
+            report = replace(
+                report,
+                ambiguous_orders=sorted({*report.ambiguous_orders, *conflicts}),
+                reason_codes={
+                    **report.reason_codes,
+                    **{reference: ",".join(reasons) for reference, reasons in conflicts.items()},
+                },
+                requires_halt_new_risk=True,
+            )
         journaled = record_reconciliation(
             self._journal,
             report,
@@ -163,6 +209,8 @@ class RestartRecovery:
             rebuild=rebuild,
             journaled_event_ids=journaled,
             recovery_state="resolved" if report.is_fully_resolved else "failed",
+            conflicted_orders=tuple(sorted(conflicts)),
+            late_fill_refinements=late_fill_refinements,
         )
 
     def _collect_venue_reports(self) -> tuple[VenueOrderReport, ...]:

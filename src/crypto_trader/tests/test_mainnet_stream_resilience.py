@@ -262,6 +262,7 @@ def test_C_pre_disconnect_decision_can_never_become_executable(tmp_path):
             tmp_path=tmp_path,
             market=provider,
             decision_source=decision_source,
+            runtime_clock=clock,
         )
         pipeline.start()
 

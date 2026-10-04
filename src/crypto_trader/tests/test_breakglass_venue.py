@@ -103,7 +103,7 @@ def test_cancel_open_cancels_through_the_adapter_and_confirms_once(journal):
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-1"),
-            txf.order_response("ct-1", status="CANCELED"),
+            txf.cancel_response("ct-1", order_id=100),
         ],
     )
 
@@ -154,7 +154,7 @@ def test_the_request_log_never_exposes_the_api_key_or_signature(journal):
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-3"),
-            txf.order_response("ct-3", status="CANCELED"),
+            txf.cancel_response("ct-3", order_id=100),
         ],
     )
     control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
@@ -200,7 +200,7 @@ def test_break_glass_cancel_records_lifecycle_events_for_the_journal(journal, tm
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-4"),
-            txf.order_response("ct-4", status="CANCELED"),
+            txf.cancel_response("ct-4", order_id=100),
         ],
     )
     breakglass = BreakGlassControl(

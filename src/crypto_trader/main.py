@@ -1,4 +1,5 @@
 # src/crypto_trader/main.py
+import sys
 import os
 import logging
 import argparse
@@ -218,11 +219,11 @@ def run():
     
     # Setup environment
     if not setup_environment():
-        return
+        sys.exit(1)
     
     # Validate inputs
     if not validate_inputs(config):
-        return
+        sys.exit(1)
     
     # Prepare output directory
     output_dir = prepare_output_directory(config)
@@ -234,11 +235,12 @@ def run():
     result = run_crew(inputs, output_dir)
     
     # Display summary of results
-    if result:
-        logger.info("Trading plan generation completed successfully.")
-        # Optional: Add a summary of the trading plan here if needed
-    else:
+    if result is None:
         logger.error("Failed to generate trading plan.")
+        sys.exit(1)
+
+    logger.info("Trading plan generation completed successfully.")
+    # Optional: Add a summary of the trading plan here if needed
 
 if __name__ == "__main__":
     run()

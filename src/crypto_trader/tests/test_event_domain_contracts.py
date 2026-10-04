@@ -9,15 +9,22 @@ from pydantic import ValidationError
 
 from crypto_trader.events import (
     EXECUTION_FILL_EVENT_TYPE,
+    VENUE_TRADE_EVENT_TYPE,
+    ACCOUNT_EQUITY_EVENT_TYPE,
     ORDER_STATE_EVENT_TYPE,
     RECOVERY_EVENT_TYPE,
     RISK_DECISION_EVENT_TYPE,
     STRATEGY_DECISION_EVENT_TYPE,
     TRADE_INTENT_EVENT_TYPE,
     ExecutionFillRecorded,
+    VenueTradeRecordPayload,
+    VenueTradeRecorded,
+    AccountEquityRecordPayload,
+    AccountEquityRecorded,
     FillRecordPayload,
     OrderStateChanged,
     OrderStateChangePayload,
+    OrderSubmissionAttempted,
     RecoveryStateChanged,
     RecoveryStateChangePayload,
     RiskDecisionPayload,
@@ -230,6 +237,180 @@ def test_fill_contract_defaults_fee_to_zero_and_allows_full_fill():
     assert payload.remaining_quantity == Decimal("0")  # fully filled
 
 
+def test_venue_trade_contract_links_strict_trade_metadata_to_a_fill():
+    fill_id = uuid.UUID("77777777-7777-4777-8777-777777777777")
+    event = VenueTradeRecorded(
+        **base_fields(
+            order_id=ORDER_ID,
+            causation_id=fill_id,
+            producer="infrastructure.synthetic_venue",
+            payload=VenueTradeRecordPayload(
+                venue_reference="ct-synthetic",
+                venue_order_id="42",
+                venue_trade_id="7001",
+                fill_event_id=fill_id,
+                price=Decimal("100.25"),
+                quantity=Decimal("0.4"),
+                quote_quantity=Decimal("40.1"),
+                commission=Decimal("0.004"),
+                commission_asset="SYNTH",
+                trade_time=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+                is_buyer=True,
+                is_maker=False,
+            ),
+        )
+    )
+    assert event.event_type == VENUE_TRADE_EVENT_TYPE
+    assert event.payload.fill_event_id == fill_id
+
+
+def test_venue_trade_contract_rejects_blank_identity_and_invalid_economics():
+    with pytest.raises(ValidationError):
+        VenueTradeRecordPayload(
+            venue_reference=" ", venue_order_id="42", venue_trade_id="7",
+            fill_event_id=uuid.uuid4(), price=Decimal("1"), quantity=Decimal("1"),
+            quote_quantity=Decimal("1"), commission=Decimal("0"),
+            commission_asset="SYNTH", trade_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+            is_buyer=True, is_maker=False,
+        )
+    with pytest.raises(ValidationError):
+        VenueTradeRecordPayload(
+            venue_reference="ct-x", venue_order_id="42", venue_trade_id="7",
+            fill_event_id=uuid.uuid4(), price=Decimal("0"), quantity=Decimal("1"),
+            quote_quantity=Decimal("1"), commission=Decimal("0"),
+            commission_asset="SYNTH", trade_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+            is_buyer=True, is_maker=False,
+        )
+
+
+def _equity_payload(**overrides):
+    values = {
+        "kind": "baseline",
+        "environment": "binance-spot-testnet",
+        "venue_account_id": "123456789",
+        "base_asset": "SYNTH",
+        "quote_asset": "USDT",
+        "base_balance": Decimal("10"),
+        "quote_balance": Decimal("1000"),
+        "mark_price": Decimal("100.25"),
+        "mark_reference": "market:SYNTHUSDT:test",
+        "mark_event_ts": datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        "equity_quote": Decimal("2002.5"),
+        "peak_equity_quote": Decimal("2002.5"),
+        "baseline_event_id": uuid.uuid4(),
+        "previous_event_id": None,
+        "fence_term": 1,
+        "reason": "synthetic baseline",
+    }
+    values.update(overrides)
+    return AccountEquityRecordPayload(**values)
+
+
+def test_account_equity_baseline_contract_forms_a_chain_root():
+    baseline_id = uuid.uuid4()
+    event = AccountEquityRecorded(
+        **base_fields(
+            event_id=baseline_id,
+            producer="application.production.equity",
+            payload=_equity_payload(baseline_event_id=baseline_id),
+        )
+    )
+    assert event.event_type == ACCOUNT_EQUITY_EVENT_TYPE
+    assert event.kind_is_root is True
+    assert event.payload.peak_equity_quote == event.payload.equity_quote
+
+
+def test_account_equity_peak_requires_previous_and_preserves_baseline_identity():
+    baseline_id = uuid.uuid4()
+    peak_id = uuid.uuid4()
+    event = AccountEquityRecorded(
+        **base_fields(
+            event_id=peak_id,
+            producer="application.production.equity",
+            payload=_equity_payload(
+                kind="peak",
+                baseline_event_id=baseline_id,
+                previous_event_id=baseline_id,
+                quote_balance=Decimal("1097.5"),
+                equity_quote=Decimal("2100"),
+                peak_equity_quote=Decimal("2100"),
+            ),
+        )
+    )
+    assert event.kind_is_root is False
+    assert event.payload.baseline_event_id == baseline_id
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"equity_quote": Decimal("999999"), "peak_equity_quote": Decimal("999999")},
+        {"peak_equity_quote": Decimal("2100")},
+        {"base_asset": "USDT", "quote_asset": "USDT"},
+        {"venue_account_id": "001"},
+        {"base_asset": "synth"},
+        {"kind": "peak", "previous_event_id": None},
+        {"kind": "baseline", "previous_event_id": uuid.uuid4()},
+    ],
+)
+def test_account_equity_payload_rejects_invalid_chain_or_scope(overrides):
+    with pytest.raises(ValidationError):
+        _equity_payload(**overrides)
+
+
+def test_account_equity_root_requires_baseline_event_id_to_equal_event_id():
+    with pytest.raises(ValidationError):
+        AccountEquityRecorded(
+            **base_fields(
+                event_id=uuid.uuid4(),
+                producer="application.production.equity",
+                payload=_equity_payload(),
+            )
+        )
+
+
+def test_account_equity_envelope_symbol_must_match_asset_pair():
+    baseline_id = uuid.uuid4()
+    with pytest.raises(ValidationError, match="symbol must match"):
+        AccountEquityRecorded(
+            **base_fields(
+                event_id=baseline_id,
+                symbol="ETHUSDT",
+                producer="application.production.equity",
+                payload=_equity_payload(baseline_event_id=baseline_id),
+            )
+        )
+
+
+def test_account_equity_chain_rejects_self_link_and_future_mark():
+    event_id = uuid.uuid4()
+    baseline_id = uuid.uuid4()
+    with pytest.raises(ValidationError, match="self-link"):
+        AccountEquityRecorded(
+            **base_fields(
+                event_id=event_id,
+                producer="application.production.equity",
+                payload=_equity_payload(
+                    kind="peak",
+                    baseline_event_id=baseline_id,
+                    previous_event_id=event_id,
+                ),
+            )
+        )
+    root_id = uuid.uuid4()
+    with pytest.raises(ValidationError, match="mark_event_ts"):
+        AccountEquityRecorded(
+            **base_fields(
+                event_id=root_id,
+                producer="application.production.equity",
+                payload=_equity_payload(
+                    baseline_event_id=root_id,
+                    mark_event_ts=datetime(2026, 1, 1, 12, 0, 1, tzinfo=UTC),
+                ),
+            )
+        )
+
+
 # --- 6. Recovery / reconciliation -----------------------------------------
 
 def test_recovery_state_contract_validates():
@@ -268,7 +449,10 @@ def test_recovery_state_contract_defaults_to_no_affected_orders():
         ("causal_trade_intent", TradeIntentCreated),
         ("risk_decision", RiskDecisionRecorded),
         ("order_state_changed", OrderStateChanged),
+        ("order_submission_attempted", OrderSubmissionAttempted),
         ("partial_fill", ExecutionFillRecorded),
+        ("venue_trade_recorded", VenueTradeRecorded),
+        ("account_equity_recorded", AccountEquityRecorded),
         ("recovery_state_changed", RecoveryStateChanged),
     ],
 )
@@ -328,6 +512,8 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         "risk.decision.recorded",
         "order.state.changed",
         "execution.fill.recorded",
+        "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         # Phase 6 additive contract (existing schemas unchanged).
         "validity.disposition.recorded",
@@ -338,6 +524,7 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
         # Phase 15 additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "stream.lifecycle.recorded",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)

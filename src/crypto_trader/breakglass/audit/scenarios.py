@@ -380,7 +380,7 @@ def scenario_cancel_open_through_safety_path(workspace: Path) -> BreakGlassScena
                 txf.exchange_info_response(),
                 txf.account_response(),
                 txf.open_orders_response("ct-open-1"),
-                txf.order_response("ct-open-1", status="CANCELED"),
+                txf.cancel_response("ct-open-1", order_id=100),
             ],
         )
         control = _open_control(root, journal=journal, venue=venue.control)
@@ -1125,7 +1125,7 @@ def scenario_primary_runtime_unavailable(workspace: Path) -> BreakGlassScenarioR
                 txf.exchange_info_response(),
                 txf.account_response(),
                 txf.open_orders_response("ct-dead-runtime"),
-                txf.order_response("ct-dead-runtime", status="CANCELED"),
+                txf.cancel_response("ct-dead-runtime", order_id=100),
             ],
         )
         control = _open_control(root, journal=journal, venue=venue.control)
@@ -1497,7 +1497,7 @@ def scenario_secret_leak_scan(workspace: Path) -> BreakGlassScenarioResult:
                 txf.exchange_info_response(),
                 txf.account_response(),
                 txf.open_orders_response("ct-secret"),
-                txf.order_response("ct-secret", status="CANCELED"),
+                txf.cancel_response("ct-secret", order_id=100),
             ],
         )
         control = _open_control(root, journal=journal, venue=venue.control)
@@ -1612,7 +1612,7 @@ def scenario_withdrawal_recorded_but_unusable(workspace: Path) -> BreakGlassScen
                 txf.exchange_info_response(),
                 txf.account_response(can_withdraw=True),
                 txf.open_orders_response("ct-flag"),
-                txf.order_response("ct-flag", status="CANCELED"),
+                txf.cancel_response("ct-flag", order_id=100),
             ],
             withdrawal_policy=WithdrawalPolicy.RECORD_ONLY,
         )

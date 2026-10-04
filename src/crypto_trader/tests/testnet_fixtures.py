@@ -16,7 +16,10 @@ from crypto_trader.execution.binance_testnet import (
     ScriptedTransport,
     TokenBucket,
     WithdrawalPolicy,
+    deterministic_order_uuid,
 )
+from crypto_trader.execution.binance_testnet import TestnetOrderRequest
+from uuid import uuid4
 # Aliased so pytest never mistakes these classes for test classes in any collecting context.
 from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient as SpotClient,
@@ -58,6 +61,8 @@ def client(
     clock_instance: SpotClock | None = None,
     retries: int = 3,
     withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.REQUIRE_DISABLED,
+    rules_ttl_seconds: float = 60.0,
+    rules_monotonic=None,
 ) -> SpotClient:
     return SpotClient(
         credentials=credentials(),
@@ -67,7 +72,48 @@ def client(
         retry=RetryPolicy(max_attempts=retries, base_delay_seconds=0.001, max_delay_seconds=0.01),
         withdrawal_policy=withdrawal_policy,
         budget=budget(),
+        rules_ttl_seconds=rules_ttl_seconds,
+        **({} if rules_monotonic is None else {"rules_monotonic": rules_monotonic}),
     )
+
+
+def place_order(
+    spot_client: SpotClient,
+    request: TestnetOrderRequest,
+    *,
+    marker_event_id=None,
+    intent_id=None,
+    correlation_id=None,
+):
+    """TEST-ONLY helper: drive a fresh client write below the runtime boundary.
+
+    * ``marker_event_id`` / ``intent_id`` / ``correlation_id`` are generated synthetically here and
+      are only used to satisfy the client's authorization *shape* check.
+    * These synthetic ids do NOT prove durable journal authorization. In production the
+      authorization is created only by ``TestnetOrderRuntime`` after a REAL committed
+      ``order.submission.attempted`` marker has been appended to the durable journal.
+    * This helper exists solely so client-level tests can exercise behaviour below the runtime
+      boundary; no production code may use it.
+    * Already-known orders take the read-only dedup path and need no authorization.
+    """
+    prepared = spot_client.prepare_order(request)
+    if not prepared.requires_write:
+        return spot_client.submit_prepared(prepared)
+    prepared = spot_client._authorize_attempt(
+        prepared,
+        marker_event_id=marker_event_id or uuid4(),
+        venue_reference=prepared.client_order_id,
+        order_id=deterministic_order_uuid(prepared.client_order_id),
+        intent_id=intent_id or uuid4(),
+        correlation_id=correlation_id or uuid4(),
+        symbol=prepared.symbol,
+        side=prepared.side,
+        order_type=prepared.order_type,
+        quantity=prepared.quantity,
+        limit_price=prepared.limit_price,
+        time_in_force=prepared.time_in_force,
+    )
+    return spot_client.submit_prepared(prepared)
 
 
 # --- responses -------------------------------------------------------------
@@ -90,6 +136,7 @@ def exchange_info_response(
     tick: str = "0.01",
     step: str = "0.00001",
     min_qty: str = "0.00001",
+    max_qty: str = "9000.00000000",
     min_notional: str = "5",
 ) -> HttpResponse:
     return response(
@@ -103,7 +150,12 @@ def exchange_info_response(
                     "quoteAsset": "USDT",
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": tick},
-                        {"filterType": "LOT_SIZE", "stepSize": step, "minQty": min_qty},
+                        {
+                            "filterType": "LOT_SIZE",
+                            "stepSize": step,
+                            "minQty": min_qty,
+                            "maxQty": max_qty,
+                        },
                         {"filterType": "NOTIONAL", "minNotional": min_notional},
                     ],
                 }
@@ -129,6 +181,8 @@ def account_response(
             "permissions": list(permissions),
             "makerCommission": 10,
             "takerCommission": 10,
+            "updateTime": SERVER_TIME_MS,
+            "uid": 123456789,
             "balances": [
                 {"asset": asset, "free": free, "locked": "0"},
                 {"asset": "BTC", "free": "1.0", "locked": "0"},
@@ -145,10 +199,15 @@ def order_response(
     orig_qty: str = "0.00100000",
     executed_qty: str = "0",
     price: str = "27000.00",
-    cummulative_quote: str = "0",
+    cummulative_quote: str | None = None,
     fills: tuple[dict[str, str], ...] = (),
     transact_time: int = SERVER_TIME_MS,
 ) -> HttpResponse:
+    cumulative = (
+        cummulative_quote
+        if cummulative_quote is not None
+        else str(Decimal(price) * Decimal(executed_qty))
+    )
     return response(
         200,
         {
@@ -159,7 +218,7 @@ def order_response(
             "price": price,
             "origQty": orig_qty,
             "executedQty": executed_qty,
-            "cummulativeQuoteQty": cummulative_quote,
+            "cummulativeQuoteQty": cumulative,
             "status": status,
             "timeInForce": "GTC",
             "type": "LIMIT",
@@ -167,6 +226,16 @@ def order_response(
             "fills": list(fills),
         },
     )
+
+
+def cancel_response(
+    original_id: str, *, cancel_client_id: str = "venue-generated-cancel-id",
+    order_id: int = 42,
+) -> HttpResponse:
+    """DELETE carries the original identity separately from the cancellation identity."""
+    body = dict(order_response(cancel_client_id, status="CANCELED", order_id=order_id).body)
+    body["origClientOrderId"] = original_id
+    return response(200, body)
 
 
 def fill(
@@ -183,6 +252,40 @@ def fill(
         "commissionAsset": asset,
         "tradeId": str(trade_id),
     }
+
+
+def trade(
+    *,
+    trade_id: int = 7,
+    order_id: int = 42,
+    symbol: str = SYMBOL,
+    price: str = "27000.00",
+    qty: str = "0.00050000",
+    quote_qty: str = "13.50000000",
+    commission: str = "0.00000050",
+    commission_asset: str = "BTC",
+    time_ms: int = SERVER_TIME_MS,
+    is_buyer: bool = True,
+    is_maker: bool = False,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "id": trade_id,
+        "orderId": order_id,
+        "price": price,
+        "qty": qty,
+        "quoteQty": quote_qty,
+        "commission": commission,
+        "commissionAsset": commission_asset,
+        "time": time_ms,
+        "isBuyer": is_buyer,
+        "isMaker": is_maker,
+        "isBestMatch": True,
+    }
+
+
+def my_trades_response(*items: dict[str, object]) -> HttpResponse:
+    return response(200, list(items))
 
 
 def rejected(code: int = -2010, msg: str = "Account has insufficient balance") -> HttpResponse:
@@ -214,7 +317,7 @@ def open_orders_response(
                 "price": "27000.00",
                 "origQty": "0.00100000",
                 "executedQty": executed_qty,
-                "cummulativeQuoteQty": "0",
+                "cummulativeQuoteQty": str(Decimal("27000.00") * Decimal(executed_qty)),
                 "status": status,
                 "timeInForce": "GTC",
                 "type": "LIMIT",

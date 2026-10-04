@@ -28,6 +28,13 @@ Additive contracts added by later phases (existing schemas unchanged):
     break-glass command and its deterministic disposition
 11. ``stream.lifecycle.recorded``      (Phase 15) - one deterministic market-data stream
     lifecycle transition (disconnect/reconnect/resubscribe/resync), secret-free
+12. ``order.submission.attempted``     (Phase 15 durable ambiguity) - one durable fact that a
+    venue submission was attempted, recorded BEFORE the external transport call, carrying the
+    stable venue-facing client order identity and the immutable economic anchors
+13. ``venue.trade.recorded``           (G4 production-ledger reader compatibility) - immutable
+    venue trade metadata linked to one existing execution.fill.recorded event
+14. ``account.equity.recorded``        (G5b canonical risk-state prerequisite) - durable account
+    equity baseline/rebaseline roots and observed high-water-mark updates
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ from pydantic import Field, field_validator, model_validator
 from .base import DomainEvent, EventPayload
 
 __all__ = [
+    "AttemptTimeInForce",
     "FillRecordPayload",
     "OrderStateChangePayload",
     "RECOVERY_EVENT_TYPE",
@@ -54,7 +62,10 @@ __all__ = [
     "STRATEGY_DECISION_EVENT_TYPE",
     "TRADE_INTENT_EVENT_TYPE",
     "ORDER_STATE_EVENT_TYPE",
+    "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
+    "VENUE_TRADE_EVENT_TYPE",
+    "ACCOUNT_EQUITY_EVENT_TYPE",
     "VALIDITY_EVENT_TYPE",
     "StrategyDecisionPayload",
     "TradeIntentPayload",
@@ -62,7 +73,13 @@ __all__ = [
     "TradeIntentCreated",
     "RiskDecisionRecorded",
     "OrderStateChanged",
+    "OrderSubmissionAttemptPayload",
+    "OrderSubmissionAttempted",
     "ExecutionFillRecorded",
+    "VenueTradeRecordPayload",
+    "VenueTradeRecorded",
+    "AccountEquityRecordPayload",
+    "AccountEquityRecorded",
     "RecoveryStateChanged",
     "V1_CONTRACTS",
     "ValidityDisposition",
@@ -93,7 +110,13 @@ STRATEGY_DECISION_EVENT_TYPE = "strategy.decision.recorded"
 TRADE_INTENT_EVENT_TYPE = "trade.intent.created"
 RISK_DECISION_EVENT_TYPE = "risk.decision.recorded"
 ORDER_STATE_EVENT_TYPE = "order.state.changed"
+#: Phase 15 durability additive contract: the durable pre-send submission attempt fact.
+ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE = "order.submission.attempted"
 EXECUTION_FILL_EVENT_TYPE = "execution.fill.recorded"
+#: G4 additive contract: immutable venue trade metadata linked to one fill event.
+VENUE_TRADE_EVENT_TYPE = "venue.trade.recorded"
+#: G5b additive contract: durable account-equity baseline / peak chain.
+ACCOUNT_EQUITY_EVENT_TYPE = "account.equity.recorded"
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
 #: Phase 6 additive contract: the deterministic validity/staleness disposition of an intent.
 VALIDITY_EVENT_TYPE = "validity.disposition.recorded"
@@ -260,6 +283,83 @@ class OrderStateChanged(DomainEvent):
     payload: OrderStateChangePayload
 
 
+# --- 4b. Durable submission attempt (Phase 15 durability, additive) --------
+
+#: Time-in-force vocabulary of the durable attempt record. Lowercase, engine-independent; the
+#: venue adapters translate it to the venue's own uppercase form at the transport boundary.
+AttemptTimeInForce = Literal["gtc", "ioc", "fok"]
+
+
+class OrderSubmissionAttemptPayload(EventPayload):
+    """The durable, pre-send submission attempt fact for one order.
+
+    This record is written BEFORE the external transport call. It carries exactly the facts a
+    restart needs to correlate an unresolved attempt with the venue and to validate that whatever
+    the venue reports later is the same economic order:
+
+    * ``venue_reference`` - the stable client order identity sent to the venue (the idempotency
+      key and the key an authoritative per-order lookup uses after a restart);
+    * ``intent_id`` - the originating intent identity, which is NOT recoverable from the client
+      order identity alone;
+    * the immutable economic anchors ``side`` / ``order_type`` / ``quantity`` / ``limit_price`` /
+      ``time_in_force``;
+    * ``venue_producer`` - an explicit provenance anchor naming the producer whose lifecycle and
+      fill records for this order are authoritative venue evidence. Authority is read from this
+      durable fact, never inferred from timestamps or from a producer-string convention.
+
+    The event envelope carries ``order_id`` (the deterministic system order identity), ``symbol``,
+    ``correlation_id`` and ``occurred_at``. ``sequence_number`` is deliberately left unset: no
+    recovery decision may depend on it.
+    """
+
+    venue_reference: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Stable client order identity sent to the venue (idempotency key).",
+    )
+    intent_id: UUID = Field(description="Originating intent identity (not derivable from the key).")
+    side: Literal["buy", "sell"] = Field(description="Direction of the attempted order.")
+    order_type: Literal["market", "limit"] = Field(description="Attempted order type.")
+    quantity: Decimal = Field(
+        gt=0, description="Immutable original quantity (the Q anchor for quantity invariants)."
+    )
+    limit_price: Decimal | None = Field(
+        default=None, gt=0, description="Immutable limit price; required for limit attempts only."
+    )
+    time_in_force: AttemptTimeInForce = Field(description="Time in force of the attempted order.")
+    venue_producer: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "Producer identifier whose lifecycle/fill records for this order are authoritative "
+            "venue evidence (explicit provenance; never inferred from time)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_order_type_fields(self) -> "OrderSubmissionAttemptPayload":
+        if self.order_type == "limit" and self.limit_price is None:
+            raise ValueError("limit_price is required when order_type is 'limit'.")
+        if self.order_type == "market" and self.limit_price is not None:
+            raise ValueError("limit_price must be omitted when order_type is 'market'.")
+        return self
+
+    @field_validator("venue_reference", "venue_producer")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("durable attempt identity fields must not be blank.")
+        return value
+
+
+class OrderSubmissionAttempted(DomainEvent):
+    """A submission attempt was durably recorded before the external transport call."""
+
+    event_type: Literal["order.submission.attempted"] = ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: OrderSubmissionAttemptPayload
+
+
 # --- 5. Execution / fill ---------------------------------------------------
 
 class FillRecordPayload(EventPayload):
@@ -285,6 +385,162 @@ class ExecutionFillRecorded(DomainEvent):
     event_type: Literal["execution.fill.recorded"] = EXECUTION_FILL_EVENT_TYPE
     schema_version: Literal[1] = 1
     payload: FillRecordPayload
+
+
+# --- 5b. Venue trade metadata (G4 production-ledger compatibility) -------
+
+class VenueTradeRecordPayload(EventPayload):
+    """Immutable venue trade metadata linked to one execution fill event."""
+
+    venue_reference: str = Field(min_length=1, max_length=128)
+    venue_order_id: str = Field(min_length=1, max_length=128)
+    venue_trade_id: str = Field(min_length=1, max_length=128)
+    fill_event_id: UUID
+    price: Decimal = Field(gt=0)
+    quantity: Decimal = Field(gt=0)
+    quote_quantity: Decimal = Field(gt=0)
+    commission: Decimal = Field(ge=0)
+    commission_asset: str = Field(min_length=1, max_length=64)
+    trade_time: datetime
+    is_buyer: bool
+    is_maker: bool
+
+    @field_validator("venue_reference", "venue_order_id", "venue_trade_id", "commission_asset")
+    @classmethod
+    def _trade_identity_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("venue trade identity fields must not be blank.")
+        return value
+
+    @field_validator("venue_order_id", "venue_trade_id")
+    @classmethod
+    def _canonical_positive_numeric_id(cls, value: str) -> str:
+        if (
+            not value.isascii()
+            or not value.isdigit()
+            or value.startswith("0")
+        ):
+            raise ValueError("venue order/trade ids must be canonical positive ASCII integers.")
+        return value
+
+    @field_validator("trade_time")
+    @classmethod
+    def _trade_time_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("venue trade time must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+
+class VenueTradeRecorded(DomainEvent):
+    """One immutable venue trade linked to its execution.fill.recorded event."""
+
+    event_type: Literal["venue.trade.recorded"] = VENUE_TRADE_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: VenueTradeRecordPayload
+
+    @model_validator(mode="after")
+    def _require_fill_linkage(self) -> "VenueTradeRecorded":
+        if self.order_id is None:
+            raise ValueError("venue trade records require an order_id.")
+        if self.causation_id != self.payload.fill_event_id:
+            raise ValueError("venue trade causation_id must equal fill_event_id.")
+        if self.occurred_at != self.payload.trade_time:
+            raise ValueError("venue trade occurred_at must equal the venue trade time.")
+        return self
+
+
+# --- 5c. Account equity baseline / peak chain (G5b) ----------------------
+
+class AccountEquityRecordPayload(EventPayload):
+    """Durable account-equity chain root or high-water-mark update."""
+
+    kind: Literal["baseline", "peak", "rebaseline"]
+    environment: str = Field(min_length=1, max_length=128)
+    venue_account_id: str = Field(min_length=1, max_length=128)
+    base_asset: str = Field(min_length=1, max_length=32)
+    quote_asset: str = Field(min_length=1, max_length=32)
+    base_balance: Decimal = Field(ge=0)
+    quote_balance: Decimal = Field(ge=0)
+    mark_price: Decimal = Field(gt=0)
+    mark_reference: str = Field(min_length=1, max_length=256)
+    mark_event_ts: datetime
+    equity_quote: Decimal = Field(gt=0)
+    peak_equity_quote: Decimal = Field(gt=0)
+    baseline_event_id: UUID
+    previous_event_id: UUID | None = None
+    fence_term: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("environment", "mark_reference", "reason")
+    @classmethod
+    def _equity_text_non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("account equity text fields must not be blank.")
+        return value
+
+    @field_validator("venue_account_id")
+    @classmethod
+    def _canonical_account_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isdigit() or value.startswith("0"):
+            raise ValueError("venue_account_id must be a canonical positive ASCII integer.")
+        return value
+
+    @field_validator("base_asset", "quote_asset")
+    @classmethod
+    def _canonical_asset(cls, value: str) -> str:
+        if not value.isascii() or value != value.upper() or not value.isalnum():
+            raise ValueError("account equity assets must be uppercase ASCII alphanumeric codes.")
+        return value
+
+    @field_validator("mark_event_ts")
+    @classmethod
+    def _mark_time_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("mark_event_ts must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def _equity_invariants(self) -> "AccountEquityRecordPayload":
+        if self.base_asset == self.quote_asset:
+            raise ValueError("base_asset and quote_asset must differ.")
+        expected_equity = self.base_balance * self.mark_price + self.quote_balance
+        if self.equity_quote != expected_equity:
+            raise ValueError("equity_quote must equal base_balance * mark_price + quote_balance.")
+        if self.peak_equity_quote != self.equity_quote:
+            raise ValueError("each equity-chain observation must record peak equal to observed equity.")
+        if self.kind == "baseline" and self.previous_event_id is not None:
+            raise ValueError("baseline cannot have a previous_event_id.")
+        if self.kind in {"peak", "rebaseline"} and self.previous_event_id is None:
+            raise ValueError("peak and rebaseline require previous_event_id.")
+        return self
+
+
+class AccountEquityRecorded(DomainEvent):
+    """One durable account-equity baseline, rebaseline or peak observation."""
+
+    event_type: Literal["account.equity.recorded"] = ACCOUNT_EQUITY_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: AccountEquityRecordPayload
+
+    @model_validator(mode="after")
+    def _require_equity_chain_identity(self) -> "AccountEquityRecorded":
+        if self.symbol is None:
+            raise ValueError("account equity records require symbol on the envelope.")
+        if self.symbol != f"{self.payload.base_asset}{self.payload.quote_asset}":
+            raise ValueError("account equity envelope symbol must match base_asset + quote_asset.")
+        if self.payload.previous_event_id == self.event_id:
+            raise ValueError("account equity previous_event_id cannot self-link to event_id.")
+        if self.payload.mark_event_ts > self.occurred_at:
+            raise ValueError("account equity mark_event_ts cannot be later than occurred_at.")
+        if self.kind_is_root and self.payload.baseline_event_id != self.event_id:
+            raise ValueError("baseline_event_id must equal event_id for a chain root.")
+        if not self.kind_is_root and self.payload.baseline_event_id == self.event_id:
+            raise ValueError("peak events cannot identify themselves as the baseline.")
+        return self
+
+    @property
+    def kind_is_root(self) -> bool:
+        return self.payload.kind in {"baseline", "rebaseline"}
 
 
 # --- 6. Recovery / reconciliation -----------------------------------------
@@ -629,7 +885,10 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     TradeIntentCreated,
     RiskDecisionRecorded,
     OrderStateChanged,
+    OrderSubmissionAttempted,
     ExecutionFillRecorded,
+    VenueTradeRecorded,
+    AccountEquityRecorded,
     RecoveryStateChanged,
     ValidityDispositionRecorded,
     RiskEvaluationRecorded,
