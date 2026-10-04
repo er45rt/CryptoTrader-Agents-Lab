@@ -33,16 +33,17 @@ import re
 import threading
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
 from crypto_trader.events import (
     ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
+    TradeIntentCreated, TradeIntentPayload,
 )
 from crypto_trader.execution import (
     DurableVenueWritePort,
@@ -116,6 +117,11 @@ __all__ = [
 PRODUCTION_PRODUCER = "application.production"
 
 _DEFAULT_OWNER_ID = "normal:production-runtime"
+
+# Frozen namespace for durable production decision identity. Changing this value would change
+# venue-facing client_order_id values for the same logical decision and is therefore a persisted
+# compatibility break.
+_PRODUCTION_DECISION_NAMESPACE = UUID("6f2b67bf-2b0e-4ab2-9c8e-6fbe8262e4e1")
 
 _SIDE_TO_RISK = {
     ExecutionSide.BUY: RiskSide.BUY,
@@ -265,6 +271,70 @@ class ProductionIntent:
     def risk_price(self) -> Decimal:
         """The deterministic price Hard Risk evaluates against (never a guessed market price)."""
         return self.limit_price if self.limit_price is not None else self.reference_price
+
+
+def _utc_text(value: datetime | None) -> str | None:
+    return None if value is None else value.astimezone(timezone.utc).isoformat()
+
+
+def _durable_decision_identity(intent: ProductionIntent) -> UUID:
+    """Return one stable id for the strategy+scope decision, independent of caller UUIDs.
+
+    The key mirrors admission's same-decision evidence: strategy/scope plus the completed-decision
+    and original market-event timestamps. Symbol is included because durable production journals
+    are symbol scoped. Economic fields are deliberately excluded from the key; if the same logical
+    decision is replayed with changed economics, the immutable journal anchor must conflict and
+    fail closed instead of creating a second venue identity.
+    """
+    material = json.dumps(
+        {
+            "version": 1,
+            "strategy_id": intent.strategy_id,
+            "decision_scope": intent.decision_scope,
+            "symbol": intent.symbol,
+            "decision_completed_at": _utc_text(intent.decision_completed_at),
+            "market_event_ts": _utc_text(intent.market_event_ts),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(_PRODUCTION_DECISION_NAMESPACE, material)
+
+
+def _durable_intent_anchor(intent: ProductionIntent, canonical_id: UUID) -> TradeIntentCreated:
+    """Bind the stable decision id to the exact immutable production intent economics."""
+    evidence = json.dumps(
+        {
+            "identity_version": 1,
+            "decision_scope": intent.decision_scope,
+            "decision_started_at": _utc_text(intent.decision_started_at),
+            "decision_completed_at": _utc_text(intent.decision_completed_at),
+            "market_event_ts": _utc_text(intent.market_event_ts),
+            "market_reference": intent.market_reference,
+            "reference_price": str(intent.reference_price),
+            "time_in_force": intent.time_in_force.value,
+            "valid_until": _utc_text(intent.valid_until),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return TradeIntentCreated(
+        event_id=canonical_id,
+        occurred_at=intent.decision_completed_at,
+        # This production-boundary identity fact must replay byte-identically even if an upstream
+        # retry creates a new workflow correlation id after restart.
+        correlation_id=canonical_id,
+        producer="application.production.identity",
+        strategy_id=intent.strategy_id,
+        symbol=intent.symbol,
+        payload=TradeIntentPayload(
+            side=intent.side.value,
+            quantity=intent.quantity,
+            order_type=intent.order_type.value,
+            limit_price=intent.limit_price,
+            rationale=evidence,
+        ),
+    )
 
 
 def validity_request_for(intent: ProductionIntent) -> ValidityRequest:
@@ -805,6 +875,18 @@ class ProductionRuntime:
                 now,
             )
 
+        # Durable venue-writing decisions receive a stable identity before validity, Hard Risk or
+        # any possible venue submission. An exact replay appends the same event as an idempotent
+        # no-op; changed economics for the same logical decision raise EventIdConflictError.
+        if self._durable_venue_writes:
+            caller_intent_id = intent.intent_id
+            canonical_id = _durable_decision_identity(intent)
+            self._journal.append(_durable_intent_anchor(intent, canonical_id))
+            intent = replace(intent, intent_id=canonical_id)
+            if latest_scope_intent_id == caller_intent_id:
+                latest_scope_intent_id = canonical_id
+            stages.append("identity:durable")
+
         # Stage 1: deterministic decision validity / staleness.
         validity = self._validity_gate.evaluate(
             validity_request_for(intent),
@@ -1029,9 +1111,9 @@ class ProductionRuntime:
     ) -> ProductionExecutionOutcome:
         """Prepare then submit; an admission-bound runtime requires its controller capability.
 
-        Durable venue-writing paths deduplicate an exact intent_id across restart via the
-        deterministic client order id and journal. A new intent_id for the same decision is not
-        equivalent durable identity and must be handled before Mainnet promotion.
+        Durable venue-writing paths canonicalize the logical decision into a stable intent_id and
+        persist the exact economics before Hard Risk. The venue client_order_id therefore survives
+        process restart even when an upstream producer generated a fresh UUID for the same decision.
         """
         preparation = self.prepare_intent(
             intent,
