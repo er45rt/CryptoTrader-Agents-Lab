@@ -613,6 +613,8 @@ class ProductionRuntime:
                     "venue-writing production runtime requires a bound "
                     "ProductionAdmissionController before startup."
                 )
+            phase = "startup_safety_anchor"
+            startup_safety_anchor = self._safety_transition_anchor()
             phase = "environment"
             now = self._now()
             run_id = correlation_id or uuid4()
@@ -624,6 +626,8 @@ class ProductionRuntime:
             phase = "startup_posture"
             load = self._control.load_safety_state()
             self._require_startup_posture(load.controller)
+            self._require_startup_safety_anchor(startup_safety_anchor)
+            startup_safety_mode = load.controller.mode.value
             phase = "execution_context"
             capability = self._resolve_execution_capability(self._execution)
             if capability is not self._capability:
@@ -650,6 +654,19 @@ class ProductionRuntime:
                     raise ProductionStateError("startup refused: normal writer lease unavailable.") from exc
 
             guard = fence = view = batch = None
+
+            def authorize_startup_fence_locked(active_fence: ProductionFence) -> FenceCheck:
+                self._require_startup_safety_anchor(startup_safety_anchor)
+                return active_fence.authorize_new_risk(
+                    now=self._now(),
+                    correlation_id=run_id,
+                    prepared_safety_mode=startup_safety_mode,
+                )
+
+            def authorize_startup_fence(active_fence: ProductionFence) -> FenceCheck:
+                with self._control.ownership_store.exclusive(purpose="startup_fence"):
+                    return authorize_startup_fence_locked(active_fence)
+
             if writing:
                 phase = "writer_claim"
                 guard = claim()
@@ -657,14 +674,14 @@ class ProductionRuntime:
                     control=self._control, guard=guard, owner_id=self._owner_id,
                     environment=decision.environment,
                 )
-                fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                authorize_startup_fence(fence)
                 phase = "venue_evidence"
                 view = JournalView.capture(self._journal, self._instrument.symbol)
                 batch = collector.collect(
                     nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
                 )
                 # The ownership lock is deliberately not held during network I/O.
-                fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                authorize_startup_fence(fence)
                 source = collector.validate(batch, nonce=nonce, fence_term=fence.fence_term, view=view)
                 view.require_stable(self._journal, symbol=self._instrument.symbol)
                 sources = [source]
@@ -710,7 +727,7 @@ class ProductionRuntime:
 
             phase = "post_recovery_evidence"
             verify_evidence()
-            check = fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+            check = authorize_startup_fence(fence)
             phase = "execution_boundary_start_failed"
             execution_started = True
             self._execution.start()
@@ -718,7 +735,7 @@ class ProductionRuntime:
             # Serialize final publication with takeover, without locking the venue reads.
             with self._control.ownership_store.exclusive(purpose="submission"):
                 verify_evidence()
-                check = fence.authorize_new_risk(now=self._now(), correlation_id=run_id)
+                check = authorize_startup_fence_locked(fence)
                 if self._execution.state() is not ExecutionRuntimeState.RUNNING:
                     raise ProductionStartupError("execution boundary did not become running.")
                 self._environment, self._guard, self._fence = decision, guard, fence
@@ -775,7 +792,10 @@ class ProductionRuntime:
         self._expire_preparations(now)
         controller = self._control.load_safety_state().controller
         stages: list[str] = []
-        if not controller.allow_new_risk():
+        if (
+            controller.kill_switch_engaged
+            or controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}
+        ):
             stages.append("safety:blocked")
             return self._blocked(
                 intent,
@@ -941,7 +961,9 @@ class ProductionRuntime:
         try:
             # The last thing that happens before the venue call. Never cached, never skipped.
             check = self._fence.authorize_new_risk(
-                now=now, correlation_id=preparation.correlation_id
+                now=now,
+                correlation_id=preparation.correlation_id,
+                prepared_safety_mode=preparation.safety_mode,
             )
         except Exception as exc:
             if isinstance(exc, ProductionSafetyBlockedError):
@@ -1174,19 +1196,39 @@ class ProductionRuntime:
             raise ProductionStartupError(
                 "startup refused: the persisted safety state has the kill switch engaged."
             )
-        if controller.mode is not SafetyMode.NORMAL:
+        if controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}:
             self._last_refusal = f"safety_mode_{controller.mode.value}"
             raise ProductionStartupError(
                 "startup refused: the persisted safety posture is "
-                f"{controller.mode.value!r}, which does not permit a normal trading writer. "
-                "Reconcile, acknowledge and restore normal through the operator break-glass channel "
-                "first."
+                f"{controller.mode.value!r}, which does not permit the production writer. "
+                "Reconcile, acknowledge and restore an allowed posture through the operator "
+                "break-glass channel first."
             )
         epoch = self._control.load_epoch()
         if epoch is not None and epoch.is_open:
             self._last_refusal = "break_glass_epoch_open"
             raise ProductionStartupError(
                 f"startup refused: break-glass epoch {epoch.session_id} is open."
+            )
+
+    def _safety_transition_anchor(self) -> tuple[int, UUID | None]:
+        """Return the append-only identity of accepted operator safety transitions."""
+        transitions = tuple(
+            record
+            for record in self._control.load_ledger().records
+            if record.accepted
+            and record.previous_safety_state != record.resulting_safety_state
+        )
+        return (
+            len(transitions),
+            None if not transitions else transitions[-1].event_id,
+        )
+
+    def _require_startup_safety_anchor(self, expected: tuple[int, UUID | None]) -> None:
+        if self._safety_transition_anchor() != expected:
+            self._last_refusal = "safety_state_changed_during_startup"
+            raise ProductionStartupError(
+                "startup refused: the safety state changed during startup."
             )
 
     def _require_running(self) -> None:

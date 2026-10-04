@@ -8,12 +8,19 @@ marker -> authorization -> one send, wired to the runtime's own durable journal)
 from __future__ import annotations
 
 import ast
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
+from crypto_trader.events import (
+    ExecutionFillRecorded,
+    FillRecordPayload,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
+)
 from crypto_trader.execution import (
     DurableVenueWritePort,
     ExecutionCapability,
@@ -30,9 +37,16 @@ from crypto_trader.execution import (
 from crypto_trader.execution.binance_testnet import ScriptedTransport
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.persistence import SQLiteEventJournal
-from crypto_trader.production import ProductionStateError
+from crypto_trader.production import ProductionStartupError, ProductionStateError
+from crypto_trader.production.runtime import JournalView
 from crypto_trader.tests import testnet_fixtures as fx
-from crypto_trader.tests.production_fixtures import INSTRUMENT as PRODUCTION_INSTRUMENT, startup_responses
+from crypto_trader.tests.production_fixtures import (
+    BASE,
+    NAMESPACE,
+    PRICE,
+    INSTRUMENT as PRODUCTION_INSTRUMENT,
+    startup_responses,
+)
 from crypto_trader.tests.production_fixtures import (
     RecordingExecutionPort,
     admitted_execute,
@@ -43,6 +57,7 @@ from crypto_trader.tests.production_fixtures import (
     canonical_test_risk_source,
     control_for,
     intent as production_intent,
+    operator_command,
     seed_canonical_equity_root,
 )
 
@@ -62,6 +77,83 @@ def _request() -> ExecutionRequest:
         time_in_force=ExecutionTimeInForce.GTC,
         intent_id=INTENT_ID,
     )
+
+
+def _seed_owned_long_position(journal: SQLiteEventJournal) -> None:
+    seed_canonical_equity_root(
+        journal,
+        occurred_at=BASE - timedelta(minutes=1),
+        base_balance=Decimal("0"),
+        quote_balance=Decimal("100000"),
+        mark_price=PRICE,
+    )
+    order_id = uuid5(NAMESPACE, "reduce-only-owned-long-order")
+    intent_id = uuid5(NAMESPACE, "reduce-only-owned-long-intent")
+    correlation_id = uuid5(NAMESPACE, "reduce-only-owned-long-correlation")
+    journal.append(
+        OrderSubmissionAttempted(
+            event_id=uuid5(NAMESPACE, "reduce-only-owned-long-attempt"),
+            occurred_at=BASE - timedelta(seconds=2),
+            correlation_id=correlation_id,
+            producer="application.production",
+            strategy_id="strategy.production-test",
+            order_id=order_id,
+            symbol=PRODUCTION_INSTRUMENT.symbol,
+            payload=OrderSubmissionAttemptPayload(
+                venue_reference=f"ct-{order_id.hex[:20]}",
+                intent_id=intent_id,
+                side="buy",
+                order_type="limit",
+                quantity=Decimal("1"),
+                limit_price=PRICE,
+                time_in_force="gtc",
+                venue_producer="infrastructure.binance_testnet",
+            ),
+        )
+    )
+    journal.append(
+        ExecutionFillRecorded(
+            event_id=uuid5(NAMESPACE, "reduce-only-owned-long-fill"),
+            occurred_at=BASE - timedelta(seconds=1),
+            correlation_id=correlation_id,
+            producer="infrastructure.binance_testnet",
+            strategy_id="strategy.production-test",
+            order_id=order_id,
+            symbol=PRODUCTION_INSTRUMENT.symbol,
+            sequence_number=1,
+            payload=FillRecordPayload(
+                quantity=Decimal("1"),
+                price=PRICE,
+                fee=Decimal("0"),
+                fee_asset=None,
+                remaining_quantity=Decimal("0"),
+                liquidity="taker",
+            ),
+        )
+    )
+
+
+def _reduce_only_risk_refresh_responses():
+    account = fx.account_response(free="73000")
+    return [
+        fx.time_response(fx.SERVER_TIME_MS + 1),
+        fx.open_orders_response(),
+        account,
+        fx.price_response(str(PRICE)),
+        fx.open_orders_response(),
+    ]
+
+
+def _sell_order_response(client_order_id: str):
+    response = fx.order_response(
+        client_order_id,
+        status="NEW",
+        orig_qty="0.10000",
+        executed_qty="0",
+        price=str(PRICE),
+    )
+    response.body["side"] = "SELL"
+    return response
 
 
 class _ShapeOnlyPort:
@@ -319,6 +411,50 @@ def test_venue_writing_runtime_refuses_mismatched_canonical_risk_binding(tmp_pat
 
 # --- 10/11: the approved durable path is accepted and behaves durably --------------
 
+def test_writing_startup_refuses_safety_round_trip_before_journal_baseline(
+    tmp_path, monkeypatch
+):
+    transport = ScriptedTransport(responses=startup_responses())
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
+        state_dir = tmp_path / "state"
+        seed_canonical_equity_root(journal)
+        control = control_for(journal, state_dir)
+        risk_source = canonical_test_risk_source(
+            journal=journal, control=control, client=client
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+            bind_admission=True,
+        )
+        original_capture = JournalView.capture
+
+        def capture_after_round_trip(active_journal, symbol):
+            assert control.handle(
+                operator_command("reduce_only", seed="startup-roundtrip-reduce")
+            ).accepted
+            assert control.handle(
+                operator_command("restore_normal", seed="startup-roundtrip-restore")
+            ).accepted
+            return original_capture(active_journal, symbol)
+
+        monkeypatch.setattr(JournalView, "capture", capture_after_round_trip)
+
+        with pytest.raises(
+            ProductionStartupError, match="safety state changed during startup"
+        ):
+            runtime.start()
+
+        assert control.load_safety_state().controller.mode.value == "normal"
+        assert not [request for request in transport.requests if request.method == "POST"]
+
+
 def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(tmp_path):
     intent_obj = production_intent("stage3-durable")
     reference = f"ct-{intent_obj.intent_id.hex[:20]}"
@@ -366,6 +502,198 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
         assert len(markers) == 1
         assert markers[0].payload.venue_reference == reference
 
+
+
+def test_durable_runtime_restarts_in_reduce_only_without_restoring_normal(tmp_path):
+    first_transport = ScriptedTransport(responses=startup_responses())
+    first_client = fx.client(first_transport)
+    first_client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        state_dir = tmp_path / "state"
+        control = control_for(journal, state_dir)
+        first_port = OrderRuntime(
+            client=first_client,
+            instrument=PRODUCTION_INSTRUMENT,
+            journal=journal,
+        )
+        first_source = canonical_test_risk_source(
+            journal=journal,
+            control=control,
+            client=first_client,
+        )
+        first_runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=first_port,
+            control=control,
+            risk_state_source=first_source,
+            bind_admission=True,
+        )
+
+        first_report = first_runtime.start()
+        reduced = control.handle(
+            operator_command("reduce_only", seed="stage3-restart-reduce-only")
+        )
+        first_runtime.stop()
+
+        second_transport = ScriptedTransport(responses=startup_responses())
+        second_client = fx.client(second_transport)
+        second_client.clock.synchronize(fx.SERVER_TIME_MS)
+        second_port = OrderRuntime(
+            client=second_client,
+            instrument=PRODUCTION_INSTRUMENT,
+            journal=journal,
+        )
+        second_source = canonical_test_risk_source(
+            journal=journal,
+            control=control,
+            client=second_client,
+        )
+        second_runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=second_port,
+            control=control,
+            risk_state_source=second_source,
+            bind_admission=True,
+        )
+
+        second_report = second_runtime.start()
+
+        assert reduced.accepted
+        assert second_report.safety_mode == "reduce_only"
+        assert second_report.fence_term == first_report.fence_term + 1
+        assert control.status().safety_mode == "reduce_only"
+        assert control.status().new_risk_permitted is False
+        assert not [request for request in first_transport.requests if request.is_write]
+        assert not [request for request in second_transport.requests if request.is_write]
+
+
+def test_durable_reduce_only_reduction_keeps_marker_then_single_send(tmp_path):
+    target = production_intent(
+        "stage3-reduce-only-sell",
+        side=ExecutionSide.SELL,
+        quantity=Decimal("0.10000"),
+    )
+    reference = f"ct-{target.intent_id.hex[:20]}"
+    transport = ScriptedTransport(
+        responses=[
+            *startup_responses(),
+            *_reduce_only_risk_refresh_responses(),
+            _sell_order_response(reference),
+        ]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        state_dir = tmp_path / "state"
+        _seed_owned_long_position(journal)
+        control = control_for(journal, state_dir)
+        port = OrderRuntime(
+            client=client,
+            instrument=PRODUCTION_INSTRUMENT,
+            journal=journal,
+        )
+        risk_source = canonical_test_risk_source(
+            journal=journal,
+            control=control,
+            client=client,
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+            bind_admission=True,
+        )
+
+        report = runtime.start()
+        reduced = control.handle(
+            operator_command("reduce_only", seed="stage3-durable-reduce-only")
+        )
+        outcome = admitted_execute(runtime, target)
+
+        assert reduced.accepted
+        assert reduced.reconciliation_required is False
+        assert control.ownership_store.require_fence().term == report.fence_term
+        assert outcome.submitted is True
+        assert outcome.preparation.safety_mode == "reduce_only"
+        assert outcome.submission is not None
+        assert outcome.submission.fence.safety_mode == "reduce_only"
+
+        posts = [item for item in transport.requests if item.method == "POST"]
+        assert len(posts) == 1
+        markers = [
+            event
+            for event in journal.read_range()
+            if event.event_type == "order.submission.attempted"
+        ]
+        assert len(markers) == 2
+        assert markers[-1].payload.venue_reference == reference
+
+
+@pytest.mark.parametrize(
+    ("side", "quantity", "reason_fragment"),
+    [
+        (ExecutionSide.BUY, "0.10000", "reduce_only_violation"),
+        (ExecutionSide.SELL, "1.10000", "reduce_only_quantity_exceeded"),
+    ],
+)
+def test_durable_reduce_only_blocks_increase_and_overclose_before_post(
+    tmp_path, side, quantity, reason_fragment
+):
+    target = production_intent(
+        f"stage3-reduce-only-reject-{side.value}-{quantity}",
+        side=side,
+        quantity=Decimal(quantity),
+    )
+    transport = ScriptedTransport(
+        responses=[
+            *startup_responses(),
+            *_reduce_only_risk_refresh_responses(),
+        ]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        state_dir = tmp_path / "state"
+        _seed_owned_long_position(journal)
+        control = control_for(journal, state_dir)
+        port = OrderRuntime(
+            client=client,
+            instrument=PRODUCTION_INSTRUMENT,
+            journal=journal,
+        )
+        risk_source = canonical_test_risk_source(
+            journal=journal,
+            control=control,
+            client=client,
+        )
+        runtime = build_runtime(
+            journal=journal,
+            state_dir=state_dir,
+            execution=port,
+            control=control,
+            risk_state_source=risk_source,
+            bind_admission=True,
+        )
+
+        runtime.start()
+        control.handle(
+            operator_command(
+                "reduce_only",
+                seed=f"stage3-reduce-only-reject-mode-{side.value}-{quantity}",
+            )
+        )
+        outcome = admitted_execute(runtime, target)
+
+        assert outcome.submitted is False
+        assert reason_fragment in (outcome.blocked_reason_code or "")
+        assert not [item for item in transport.requests if item.method == "POST"]
 
 
 def test_submit_rechecks_canonical_risk_client_binding(tmp_path):

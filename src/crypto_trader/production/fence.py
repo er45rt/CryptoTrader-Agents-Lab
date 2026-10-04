@@ -10,11 +10,12 @@ Order of the checks (fail closed at the first failure):
 1. the HELD writer token must still be current - an emergency takeover or a competing normal
    writer mints a higher fencing term and raises ``StaleWriterFenceError``;
 2. no break-glass epoch may be open;
-3. the persisted safety state must be ``normal`` with the kill switch released;
-4. the authoritative lease must still be held by this runtime's normal owner.
+3. the persisted safety state must match the safety mode recorded on the issued preparation;
+4. only ``normal`` or ``reduce_only`` may submit, with the kill switch released;
+5. the authoritative lease must still be held by this runtime's normal owner.
 
-The gate never submits anything and never mutates state: it only answers "may this writer create
-new risk right now?".
+The gate never submits anything and never mutates state: it only answers whether this exact
+one-shot preparation may cross the durable venue-write boundary now.
 """
 
 from __future__ import annotations
@@ -92,11 +93,24 @@ class ProductionFence:
     def fence_term(self) -> int:
         return self._guard.fence.term
 
-    def authorize_new_risk(self, *, now: datetime, correlation_id=None) -> FenceCheck:
-        """Authorize one new-risk submission, or raise (never returns a cached approval)."""
+    def authorize_new_risk(
+        self,
+        *,
+        now: datetime,
+        correlation_id=None,
+        prepared_safety_mode: str = SafetyMode.NORMAL.value,
+    ) -> FenceCheck:
+        """Authorize one production submission, or raise (never returns a cached approval)."""
         del correlation_id  # identity travels on the intent/execution request, not the fence.
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
             raise ProductionFenceError("the fence requires an aware ``now`` timestamp.")
+        try:
+            prepared_mode = SafetyMode(prepared_safety_mode)
+        except (TypeError, ValueError) as exc:
+            raise ProductionSafetyBlockedError(
+                "invalid_prepared_safety_mode: the issued preparation carries an unknown "
+                "safety posture."
+            ) from exc
 
         # 1. The held token must still be the authoritative lease.
         record = self._guard.require_current()
@@ -114,15 +128,27 @@ class ProductionFence:
                 "impossible until reconciliation, acknowledgement and an operator restore."
             )
 
-        # 4. The persisted posture must permit new risk, exactly and freshly.
+        # 4. The persisted posture must match the posture under which Hard Risk
+        # approved this exact one-shot preparation. NORMAL and REDUCE_ONLY are the only
+        # production postures that can reach this fence.
         if controller.kill_switch_engaged:
             raise ProductionSafetyBlockedError(
                 "kill_switch_engaged: the persisted safety state has the kill switch engaged."
             )
-        if not controller.allow_new_risk() or controller.mode is not SafetyMode.NORMAL:
+        if controller.mode is not prepared_mode:
             raise ProductionSafetyBlockedError(
-                f"safety_mode_{controller.mode.value}: new risk is not permitted by the persisted "
-                "safety state."
+                "safety_mode_changed_since_prepare: the persisted safety posture changed from "
+                f"{prepared_mode.value!r} to {controller.mode.value!r}; the preparation is stale."
+            )
+        if controller.mode is SafetyMode.NORMAL:
+            if not controller.allow_new_risk():
+                raise ProductionSafetyBlockedError(
+                    "safety_mode_normal: the persisted normal posture does not permit new risk."
+                )
+        elif controller.mode is not SafetyMode.REDUCE_ONLY:
+            raise ProductionSafetyBlockedError(
+                f"safety_mode_{controller.mode.value}: production submission is not permitted by "
+                "the persisted safety state."
             )
 
         # 5. The authoritative lease must still be this runtime's normal lease.
