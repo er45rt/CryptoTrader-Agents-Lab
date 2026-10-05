@@ -1,0 +1,16 @@
+{
+  "code_commit": "083294bd84b901f4f3ced219937c00a4fa61a6d4",
+  "code_commit_date_utc": "2025-09-16T02:36:13Z",
+  "code_repository": "https://github.com/shiyu-coder/Kronos.git",
+  "max_context": 512,
+  "minimum_sample_count": 20,
+  "model_id": "NeoQuasar/Kronos-small",
+  "model_revision": "901c26c1332695a2a8f243eb2f37243a37bea320",
+  "model_revision_date_utc": "2025-09-09T14:10:26Z",
+  "model_safetensors_sha256": "b082dfcbd8e8c142a725c8bbb99781802f38fec81210e13479effb32b3c3e020",
+  "model_version": "kronos-small@901c26c13326+tokenizer-base@0e0117387f39+code@083294bd84b9",
+  "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-base",
+  "tokenizer_revision": "0e0117387f39004a9016484a186a908917e22426",
+  "tokenizer_revision_date_utc": "2025-09-09T14:10:02Z",
+  "tokenizer_safetensors_sha256": "59d85f6af76a2c3b8240ea06cb21db4213b4eeca053f246b23e29cf832fc6bee"
+}

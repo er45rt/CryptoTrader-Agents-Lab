@@ -1,0 +1,8 @@
+{
+  "load_plus_inference_seconds": 13.428462399999262,
+  "steady_state_inference_seconds": 3.914688999997452,
+  "direction": "long",
+  "expected_return": 2.2786855697631837e-05,
+  "confidence": 0.21169657735567352,
+  "error": null
+}
