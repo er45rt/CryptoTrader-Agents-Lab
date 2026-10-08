@@ -6,7 +6,9 @@ Checks either PASS with evidence, or FAIL with the offending detail.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +46,32 @@ TESTNET_DIR = PACKAGE_DIR / "execution" / "binance_testnet"
 MAINNET_READONLY_DIR = PACKAGE_DIR / "mainnet"
 
 NAUTILUS_ADAPTER_DIR = PACKAGE_DIR / "execution" / "nautilus"
+FUTURES_PUBLIC_ADAPTER = PACKAGE_DIR / "tools" / "binance_futures_public_tool.py"
+# Amendment 14 preserves the existing Phase 11 adapter authority for this
+# unchanged denylist only. Any byte change requires a separate review.
+LEGACY_TESTNET_ENDPOINT_POLICY_SHA256 = "10ee32d2bf4d378c19ad84cbc9140779b93a0c443a6d3623dd03d800e1065458"
+
+
+def _exact_regular_path(file: Path, target: Path) -> bool:
+    """Only the exact regular file, below non-reparse package components, inherits an exception."""
+    if file != target:
+        return False
+    try:
+        file.relative_to(PACKAGE_DIR)
+        file_stat = file.lstat()
+        if not stat.S_ISREG(file_stat.st_mode):
+            return False
+        component = file
+        while True:
+            attributes = getattr(component.lstat(), "st_file_attributes", 0)
+            if (attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                    or component.is_symlink() or getattr(component, "is_junction", lambda: False)()):
+                return False
+            if component == PACKAGE_DIR:
+                return True
+            component = component.parent
+    except (OSError, ValueError):
+        return False
 
 REQUIRED_ENGINE_VERSION = "1.231.0"
 REQUIRED_PYTHON = ">=3.12,<3.13"
@@ -81,12 +109,41 @@ def _docs_text() -> str:
     return re.sub(r"\s+", " ", raw)
 
 
+def _package_relative_parts(file: Path) -> tuple[str, ...]:
+    try:
+        return file.relative_to(PACKAGE_DIR).parts
+    except ValueError:
+        return ()
+
+
 def _production_files() -> list[Path]:
-    return [
-        file
-        for file in PACKAGE_DIR.rglob("*.py")
-        if "__pycache__" not in file.parts and "tests" not in file.parts
-    ]
+    files: list[Path] = []
+    for file in PACKAGE_DIR.rglob("*.py"):
+        parts = _package_relative_parts(file)
+        if not parts or parts[0] == "tests" or "__pycache__" in parts:
+            continue
+        files.append(file)
+    return files
+
+
+def _inventory_errors(files: list[Path]) -> list[str]:
+    """Fail closed when the production scan is empty or misses structural anchors."""
+    errors: list[str] = []
+    if not files:
+        errors.append("inventory:empty")
+    present = set(files)
+    anchors = (
+        PACKAGE_DIR / "audit" / "checks.py",
+        TESTNET_DIR / "endpoints.py",
+        PACKAGE_DIR / "tools" / "binance_public_tool.py",
+        FUTURES_PUBLIC_ADAPTER,
+        PACKAGE_DIR / "tools" / "derivatives_schema.py",
+    )
+    for anchor in anchors:
+        relative = anchor.relative_to(PACKAGE_DIR).as_posix()
+        if anchor not in present or not _exact_regular_path(anchor, anchor):
+            errors.append(f"inventory:missing_or_nonregular:{relative}")
+    return errors
 
 
 def _relative(path: Path) -> str:
@@ -153,6 +210,8 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
     """Run every static/dynamic readiness check and return the matrix rows."""
     items: list[ReadinessItem] = []
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    production_files = _production_files()
+    inventory_errors = _inventory_errors(production_files)
 
     pinned = re.search(r'"nautilus_trader==([0-9.]+)"', pyproject)
     python_pin = re.search(r'requires-python = "([^"]+)"', pyproject)
@@ -200,8 +259,8 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
     engine_import = re.compile(
         r"^\s*(?:import|from)\s+(nautilus_trader|nautilus)\b", re.MULTILINE
     )
-    engine_offenders: list[str] = []
-    for file in _production_files():
+    engine_offenders: list[str] = list(inventory_errors)
+    for file in production_files:
         if file.is_relative_to(NAUTILUS_ADAPTER_DIR) or file.is_relative_to(PACKAGE_DIR / "audit"):
             continue
         if engine_import.search(file.read_text(encoding="utf-8")):
@@ -228,8 +287,8 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
         r"^\s*(?:import|from)\s+(crewai|crypto_trader\.llm)\b", re.MULTILINE
     )
     domain_packages = ("events", "validity", "risk", "recovery", "safety", "paper")
-    llm_offenders: list[str] = []
-    for file in _production_files():
+    llm_offenders: list[str] = list(inventory_errors)
+    for file in production_files:
         if not any(file.is_relative_to(PACKAGE_DIR / package) for package in domain_packages):
             continue
         if llm_import.search(file.read_text(encoding="utf-8")):
@@ -245,29 +304,101 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
         )
     )
 
-    mainnet_offenders: list[str] = []
-    for file in _production_files():
-        if (
+    mainnet_offenders: list[str] = list(inventory_errors)
+    legacy_fapi_policy_path = TESTNET_DIR / "endpoints.py"
+    audit_self_path = PACKAGE_DIR / "audit" / "checks.py"
+    legacy_tokens = ("api/v3/order", "api/v3/account", "x-mbx-apikey", "/sapi/")
+    public_futures_routes = {
+        "/fapi/v1/fundingrate",
+        "/fapi/v1/premiumindex",
+        "/fapi/v1/fundinginfo",
+        "/fapi/v1/openinterest",
+    }
+    futures_route_pattern = re.compile(
+        r"(?<![a-z0-9_])/?(?:fapi|dapi|papi)/v[0-9]+/[a-z0-9_./-]+"
+    )
+    futures_sensitive_tokens = (
+        "fapi.",
+        "fapi/v1/order", "fapi/v1/batchorders", "fapi/v1/allopenorders",
+        "fapi/v1/account", "fapi/v2/account", "fapi/v3/account",
+        "fapi/v1/leverage", "fapi/v1/margintype", "fapi/v1/positionmargin",
+        "fapi/v1/positionside/dual", "fapi/v2/positionrisk", "fapi/v3/positionrisk",
+        "fapi/v1/listenkey", "fapi/v1/income", "fapi/v1/usertrades", "fapi/v1/forceorders",
+        "dapi.binance.com", "dapi/v1/order", "dapi/v1/batchorders", "dapi/v1/allopenorders",
+        "dapi/v1/account", "dapi/v1/leverage", "dapi/v1/margintype", "dapi/v1/positionmargin",
+        "dapi/v1/positionside/dual", "dapi/v1/positionrisk", "dapi/v1/listenkey",
+        "papi.binance.com", "papi/v1/um/order", "papi/v1/cm/order",
+        "binancefuture.com",
+    )
+    for file in production_files:
+        legacy_exempt = (
             file.is_relative_to(TESTNET_DIR)
             or file.is_relative_to(MAINNET_READONLY_DIR)
             or file.is_relative_to(PACKAGE_DIR / "audit")
-            or file.name == "binance_public_tool.py"
-        ):
+            or file == PACKAGE_DIR / "tools" / "binance_public_tool.py"
+        )
+        try:
+            raw = file.read_bytes()
+        except OSError:
+            mainnet_offenders.append(f"{_relative(file)}:unreadable_source")
             continue
-        text = file.read_text(encoding="utf-8").lower()
-        for token in ("api/v3/order", "api/v3/account", "x-mbx-apikey", "/sapi/", "fapi."):
+        try:
+            text = raw.decode("utf-8").lower()
+        except UnicodeDecodeError:
+            mainnet_offenders.append(f"{_relative(file)}:undecodable_source")
+            continue
+        public_adapter = _exact_regular_path(file, FUTURES_PUBLIC_ADAPTER)
+        legacy_fapi_policy = (
+            _exact_regular_path(file, legacy_fapi_policy_path)
+            and hashlib.sha256(raw).hexdigest() == LEGACY_TESTNET_ENDPOINT_POLICY_SHA256
+        )
+        derivatives_schema = _exact_regular_path(file, PACKAGE_DIR / "tools" / "derivatives_schema.py")
+        audit_self = _exact_regular_path(file, audit_self_path)
+
+        for token in legacy_tokens:
+            if legacy_exempt:
+                continue
             if token in text:
                 mainnet_offenders.append(f"{_relative(file)}:{token}")
+
+        for token in futures_sensitive_tokens:
+            if token == "fapi." and public_adapter:
+                continue
+            if token in ("fapi.", "dapi.binance.com") and legacy_fapi_policy:
+                continue
+            if audit_self:
+                continue
+            if token in text:
+                mainnet_offenders.append(f"{_relative(file)}:{token}")
+
+        # Endpoint families evolve faster than a hand-maintained token list. Any literal
+        # fapi/dapi/papi versioned route is therefore sensitive by default. The one
+        # exact public adapter may name only its four allowlisted public fapi routes.
+        for match in futures_route_pattern.finditer(text):
+            route = "/" + match.group(0).lstrip("/")
+            if audit_self:
+                continue
+            if public_adapter and route in public_futures_routes:
+                continue
+            marker = f"{_relative(file)}:{route}"
+            if marker not in mainnet_offenders:
+                mainnet_offenders.append(marker)
+
+        if public_adapter or derivatives_schema:
+            for token in ("listenkey", "signature"):
+                if token in text:
+                    mainnet_offenders.append(f"{_relative(file)}:{token}")
     items.append(
         ReadinessItem(
             "no_mainnet_capability",
             "Mainnet safety",
             True,
             "pass" if not mainnet_offenders else "fail",
-            "no authenticated mainnet MUTATION/futures capability exists outside the two "
+            "no authenticated mainnet MUTATION capability exists outside the two "
             "authorised adapters: the Spot Testnet adapter and the Phase 15 mainnet READ-ONLY "
             "dry-run adapter (whose hard no-submit gate is proven by test_mainnet_scope.py and "
-            "test_mainnet_nosubmit.py)",
+            "test_mainnet_nosubmit.py); the exact public Futures adapter may use its "
+            "public host but remains checked for authenticated/mutation tokens",
             {
                 "offenders": mainnet_offenders,
                 "exempt": [
@@ -276,14 +407,19 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
                     + " (Phase 15 mainnet READ-ONLY dry-run: allowlisted GET paths only, an "
                     "internal hard no-submit gate and a strict read-only permission contract)",
                     "tools/binance_public_tool.py (public read-only)",
+                    "tools/binance_futures_public_tool.py (exact path; public host token only)",
+                    _relative(legacy_fapi_policy_path) + " (fapi./dapi host markers only; SHA256="
+                    + LEGACY_TESTNET_ENDPOINT_POLICY_SHA256
+                    + "; immutable mainnet/Futures host denylist under existing Phase 11 Spot Testnet authority; "
+                    "any byte change fails closed and requires separate review)",
                     _relative(PACKAGE_DIR / "audit") + " (the auditor names the tokens it forbids)",
                 ],
             },
         )
     )
 
-    withdrawal_offenders: list[str] = []
-    for file in _production_files():
+    withdrawal_offenders: list[str] = list(inventory_errors)
+    for file in production_files:
         if file.is_relative_to(PACKAGE_DIR / "audit"):
             continue
         text = file.read_text(encoding="utf-8").lower()
@@ -312,7 +448,8 @@ def run_static_checks() -> tuple[ReadinessItem, ...]:
     audit_url = re.compile(r"https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
     auditor_network: list[str] = []
     for file in (PACKAGE_DIR / "audit").rglob("*.py"):
-        if "__pycache__" in file.parts:
+        relative_parts = _package_relative_parts(file)
+        if not relative_parts or "__pycache__" in relative_parts:
             continue
         text = file.read_text(encoding="utf-8")
         if audit_network_import.search(text):

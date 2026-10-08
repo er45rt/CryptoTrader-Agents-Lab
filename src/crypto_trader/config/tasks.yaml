@@ -87,6 +87,34 @@ research_news_and_sentiment_task:
     - Overall research confidence score based on source diversity and quality
     Format as organized markdown with clear source attributions.
 
+fetch_derivatives_snapshot_task:
+  agent: binance_data_analyst
+  description: >
+    Call Binance Futures Public Advisory Data with action 'snapshot' and symbol
+    '{target_symbol}'. Preserve every metric's status, quality_reason, event_time,
+    fetched_at, available_at, availability_provenance and replay_eligible.
+    Keep current_funding_context (lastFundingRate, nextFundingTime, markPrice,
+    indexPrice and source time) separate from settled_funding_history.
+    Include the resolved per-symbol funding interval and interval_source.
+    Unavailable metrics have no usable value: reduce confidence explicitly, never
+    invent a value or build a primary trade thesis on an unavailable metric.
+    Suspect permits limited advisory evidence only with explicit confidence reduction.
+    Derivatives remain advisory only and never authorize risk, sizing or execution.
+    Historical API rows are exploratory_only, cannot enter strict no-lookahead
+    replay or A/B feature-adoption evidence. Missing derivatives must not prevent
+    reporting the other market evidence with reduced confidence.
+    Report Strict A/B adoption gate: NOT YET ELIGIBLE. replay_eligible: true concerns
+    causal replay admissibility only and is not A/B adoption evidence. Use historical
+    rows only for exploratory research, distributions, anomalies and hypotheses.
+    Meaningful evaluation needs provable live/archive availability over several weeks
+    minimum, preferably longer across multiple market regimes; no numeric duration
+    cutoff is defined here. Never claim improved returns, drawdown or promotion
+    based on retrospective historical data.
+  expected_output: >
+    The structured derivatives snapshot for {target_symbol}, including all metric
+    statuses and provenance, with an explicit confidence reduction for suspect or
+    unavailable data. No inferred missing values or feature-performance claims.
+
 analyze_crypto_data_task:
   agent: crypto_analyst
   description: >
@@ -114,10 +142,21 @@ analyze_crypto_data_task:
        - Assign confidence levels (High/Medium/Low) to each major conclusion
        - Base confidence on data quality, sample size, and consistency across sources
        - Highlight areas where more data would improve analysis reliability
+       - Derivatives are advisory only; unavailable means reduce confidence and
+         never invent values or build a primary trade thesis on that metric.
+         Suspect permits limited advisory evidence with explicit confidence reduction.
+         Historical API rows remain exploratory_only and never qualify strict A/B adoption.
+       - Report Strict A/B adoption gate: NOT YET ELIGIBLE. replay_eligible: true
+         concerns causal replay admissibility only and is not A/B adoption evidence.
+         Historical research, distributions, anomalies and hypotheses do not prove
+         improved returns, drawdown or promotion. Meaningful evaluation requires
+         provable live/archive availability over several weeks minimum, preferably
+         longer across multiple market regimes; no numeric duration cutoff is defined.
   context:
     - fetch_binance_klines_task
     - fetch_binance_price_ticker_task  
     - fetch_binance_24hr_stats_task
+    - fetch_derivatives_snapshot_task
     - research_news_and_sentiment_task
   expected_output: >
     A comprehensive analysis report in Markdown format for {target_symbol} as of {current_datetime}, structured as:
