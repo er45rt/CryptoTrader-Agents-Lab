@@ -1532,3 +1532,156 @@ def test_migrated_audit_scenarios_use_the_runtime_path():
     assert network.status == "pass", network.detail
     assert network.evidence["write_posts"] == 1
     assert network.evidence["attempt_marker"] is True
+
+
+def test_durable_resubmit_refuses_economic_mismatch_without_another_post(tmp_path):
+    reread = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    reread["side"] = "SELL"
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, reread),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.client.known_orders() == ()
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+def test_durable_resubmit_refuses_changed_known_venue_order_id(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=780),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        reports = instance.venue_state_source().reports()
+        assert reports[0].venue_order_id == "779"
+        assert instance.client.known_orders()[0].venue_order_id == "779"
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert instance.client.known_orders()[0].venue_order_id == "779"
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+def test_durable_resubmit_malformed_adoption_is_typed_ambiguous_and_pending(tmp_path):
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    bad["side"] = []
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+def test_duplicate_post_malformed_adoption_is_typed_ambiguous_and_pending(tmp_path):
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    bad["side"] = []
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+_MALFORMED_ADOPTION_MUTATORS = [
+    pytest.param(lambda body: {**body, "side": []}, id="side_list"),
+    pytest.param(lambda body: {**body, "side": {}}, id="side_mapping"),
+    pytest.param(lambda body: {**body, "fills": [1]}, id="fills_scalar"),
+    pytest.param(lambda body: {**body, "transactTime": 10**30}, id="timestamp_overflow"),
+    pytest.param(
+        lambda body: {**body, "updateTime": -(10**18), "transactTime": None},
+        id="timestamp_oserror",
+    ),
+]
+
+
+@pytest.mark.parametrize("mutate", _MALFORMED_ADOPTION_MUTATORS)
+def test_durable_resubmit_malformed_payloads_remain_ambiguous_and_pending(tmp_path, mutate):
+    good = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad = mutate(dict(good.body))
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+@pytest.mark.parametrize("mutate", _MALFORMED_ADOPTION_MUTATORS)
+def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path, mutate):
+    good = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad = mutate(dict(good.body))
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()

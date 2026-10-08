@@ -72,7 +72,10 @@ __all__ = [
 ]
 
 #: Schema version for the reconstructor's serialized snapshot state.
-RECONSTRUCTION_SNAPSHOT_SCHEMA = 1
+RECONSTRUCTION_SNAPSHOT_SCHEMA = 2
+
+#: Durable venue identities allowed to confer authoritative replay provenance.
+_RECOGNIZED_VENUE_PRODUCERS = frozenset({"infrastructure.binance_testnet"})
 
 #: The lifecycle rank at/after which a submission attempt must have been recorded.
 _SUBMISSION_ATTEMPT_RANK = STATE_RANK["submitted"]
@@ -161,6 +164,16 @@ class AttemptAnchors:
         )
 
 
+@dataclass(frozen=True)
+class _CompletionFact:
+    """Source evidence for a FILLED fact that arrived before its durable attempt anchor."""
+
+    producer: str
+    kind: str
+    filled_quantity: Decimal | None = None
+    remaining_quantity: Decimal | None = None
+
+
 def _to_ns(value: Any) -> int:
     return int(value.timestamp() * 1_000_000_000)
 
@@ -173,6 +186,7 @@ class OrderStateReconstructor(IdempotentConsumer):
         self._states: dict[str, LocalOrderState] = {}
         self._attempts: dict[str, AttemptAnchors] = {}
         self._reference_by_order_id: dict[UUID, str] = {}
+        self._completion_facts: dict[str, _CompletionFact] = {}
         self._last_applied_ns: dict[str, int] = {}
         self._conflicts: dict[str, list[str]] = {}
         self._out_of_order_events_skipped = 0
@@ -230,10 +244,12 @@ class OrderStateReconstructor(IdempotentConsumer):
             self._attempts[reference] = anchors
             self._reference_by_order_id[event.order_id] = reference
             self._submission_attempts_merged += 1
+            recorded = anchors
+        if anchors.venue_producer not in _RECOGNIZED_VENUE_PRODUCERS:
+            self._record_conflict(reference, "unrecognized_venue_producer")
 
         state = self._states.get(reference)
         if state is None:
-            # A resolution may already have been rebuilt under the legacy reference.
             legacy_key = str(event.order_id)
             candidate = self._states.pop(legacy_key, None)
             if candidate is not None and candidate.order_id != event.order_id:
@@ -241,6 +257,11 @@ class OrderStateReconstructor(IdempotentConsumer):
                 self._record_conflict(reference, "attempt_reference_does_not_match_the_order")
                 return
             state = candidate
+            completion = self._completion_facts.pop(legacy_key, None)
+            if completion is not None:
+                self._completion_facts[reference] = completion
+            if legacy_key in self._last_applied_ns:
+                self._last_applied_ns[reference] = self._last_applied_ns.pop(legacy_key)
 
         if state is None:
             self._states[reference] = LocalOrderState(
@@ -258,7 +279,6 @@ class OrderStateReconstructor(IdempotentConsumer):
             self._last_applied_ns[reference] = anchors.occurred_at_ns
             return
 
-        # FACT MERGE ONLY: state and resolved quantities are preserved exactly.
         self._states[reference] = replace(
             state,
             order_reference=reference,
@@ -267,6 +287,29 @@ class OrderStateReconstructor(IdempotentConsumer):
             symbol=state.symbol or event.symbol,
             submission_attempted=True,
         )
+        completion = self._completion_facts.get(reference)
+        if state.state is _FILLED and completion is not None:
+            self._validate_completion_fact(reference, completion, recorded)
+
+    def _validate_completion_fact(
+        self, reference: str, completion: _CompletionFact, anchors: AttemptAnchors
+    ) -> None:
+        if (
+            anchors.venue_producer not in _RECOGNIZED_VENUE_PRODUCERS
+            or completion.producer != anchors.venue_producer
+        ):
+            self._record_conflict(
+                reference, "filled_completion_requires_authoritative_venue_evidence"
+            )
+            return
+        if (
+            completion.kind == "fill"
+            and completion.filled_quantity is not None
+            and completion.filled_quantity != anchors.quantity
+        ):
+            self._record_conflict(
+                reference, "filled_completion_quantity_contradicts_original_quantity"
+            )
 
     def _apply_state_change(self, event: EventEnvelope) -> None:
         reference = self._reference_for(event, "order.state.changed")
@@ -289,11 +332,26 @@ class OrderStateReconstructor(IdempotentConsumer):
                 admitted_locally=True,
                 submission_attempted=incoming.rank >= _SUBMISSION_ATTEMPT_RANK,
             )
+            if incoming is _FILLED and anchors is None:
+                self._completion_facts[reference] = _CompletionFact(
+                    producer=event.producer, kind="lifecycle"
+                )
             self._last_applied_ns[reference] = occurred_at_ns
             return
 
         if anchors is not None and event.symbol and anchors.symbol != event.symbol:
             self._record_conflict(reference, "immutable_economic_identity_mismatch")
+            return
+
+        if (
+            incoming is _FILLED
+            and current.state not in _TERMINAL_STATES
+            and anchors is not None
+            and provenance is not Provenance.AUTHORITATIVE_VENUE_LIFECYCLE
+        ):
+            self._record_conflict(
+                reference, "filled_completion_requires_authoritative_venue_evidence"
+            )
             return
 
         decision = self._decide_state_transition(
@@ -313,9 +371,6 @@ class OrderStateReconstructor(IdempotentConsumer):
         if decision is _Decision.IDEMPOTENT_NO_OP:
             return
 
-        # A lifecycle transition never mutates quantities: a historical ``order.state.changed``
-        # fact carries no executedQty/origQty, so it cannot prove a quantity, and a terminal
-        # refinement to FILLED is never granted here (see ``_decide_state_transition``).
         self._states[reference] = replace(
             current,
             state=incoming,
@@ -325,6 +380,10 @@ class OrderStateReconstructor(IdempotentConsumer):
                 current.submission_attempted or incoming.rank >= _SUBMISSION_ATTEMPT_RANK
             ),
         )
+        if incoming is _FILLED and anchors is None:
+            self._completion_facts[reference] = _CompletionFact(
+                producer=event.producer, kind="lifecycle"
+            )
         self._last_applied_ns[reference] = max(
             self._last_applied_ns.get(reference, 0), occurred_at_ns
         )
@@ -350,12 +409,10 @@ class OrderStateReconstructor(IdempotentConsumer):
             and current.remaining_quantity > 0
             and payload.remaining_quantity > current.remaining_quantity
         ):
-            # More remaining than before means the executed quantity moved backwards. A remaining
-            # quantity of exactly zero without a durable attempt anchor is "not measured yet"
-            # (the legacy rebuild default), not evidence of a decrease.
             self._record_conflict(reference, "executed_quantity_decreased")
             return
         remaining = payload.remaining_quantity
+        explicit_remaining = remaining is not None
         if remaining is None:
             remaining = max(_ZERO, current.remaining_quantity - payload.quantity)
 
@@ -374,15 +431,36 @@ class OrderStateReconstructor(IdempotentConsumer):
 
         state = current.state
         if remaining == 0:
-            state = _FILLED
+            if anchors is None:
+                if explicit_remaining:
+                    state = _FILLED
+                elif state.rank < STATE_RANK["partially_filled"]:
+                    state = _PARTIALLY_FILLED
+            elif (
+                explicit_remaining
+                and provenance is Provenance.AUTHORITATIVE_VENUE_FILL
+                and original is not None
+                and filled == original
+            ):
+                state = _FILLED
+            elif state.rank < STATE_RANK["partially_filled"]:
+                state = _PARTIALLY_FILLED
         elif state.rank < STATE_RANK["partially_filled"]:
             state = _PARTIALLY_FILLED
+
         self._states[reference] = replace(
             current,
             state=state,
             filled_quantity=filled,
             remaining_quantity=remaining,
         )
+        if state is _FILLED and anchors is None:
+            self._completion_facts[reference] = _CompletionFact(
+                producer=event.producer,
+                kind="fill",
+                filled_quantity=filled,
+                remaining_quantity=remaining,
+            )
         self._last_applied_ns[reference] = max(
             self._last_applied_ns.get(reference, 0), occurred_at_ns
         )
@@ -451,7 +529,10 @@ class OrderStateReconstructor(IdempotentConsumer):
         """Explicit provenance: the durable producer anchor decides, never the timestamp."""
         if anchors is None:
             return Provenance.NO_ATTEMPT_RECORDED
-        if event.producer == anchors.venue_producer:
+        if (
+            anchors.venue_producer in _RECOGNIZED_VENUE_PRODUCERS
+            and event.producer == anchors.venue_producer
+        ):
             if event.event_type == EXECUTION_FILL_EVENT_TYPE:
                 return Provenance.AUTHORITATIVE_VENUE_FILL
             return Provenance.AUTHORITATIVE_VENUE_LIFECYCLE
@@ -549,6 +630,10 @@ class OrderStateReconstructor(IdempotentConsumer):
             entry["order_reference"]: _attempt_from_dict(entry)
             for entry in state.get("attempts", [])
         }
+        self._completion_facts = {
+            entry["order_reference"]: _completion_from_dict(entry)
+            for entry in state.get("completion_facts", [])
+        }
         self._reference_by_order_id = {
             anchors.order_id: reference for reference, anchors in self._attempts.items()
         }
@@ -561,6 +646,12 @@ class OrderStateReconstructor(IdempotentConsumer):
             str(reference): [str(reason) for reason in reasons]
             for reference, reasons in dict(bookkeeping.get("conflicts", {})).items()
         }
+        for reference, anchors in self._attempts.items():
+            if anchors.venue_producer not in _RECOGNIZED_VENUE_PRODUCERS:
+                self._record_conflict(reference, "unrecognized_venue_producer")
+            completion = self._completion_facts.get(reference)
+            if completion is not None:
+                self._validate_completion_fact(reference, completion, anchors)
         self._out_of_order_events_skipped = int(bookkeeping.get("out_of_order_events_skipped", 0))
         self._late_fill_refinements = int(bookkeeping.get("late_fill_refinements", 0))
         self._submission_attempts_merged = int(
@@ -574,6 +665,10 @@ class OrderStateReconstructor(IdempotentConsumer):
             "orders": [_local_state_to_dict(state) for state in self.states()],
             "attempts": [
                 _attempt_to_dict(self._attempts[reference]) for reference in sorted(self._attempts)
+            ],
+            "completion_facts": [
+                _completion_to_dict(reference, self._completion_facts[reference])
+                for reference in sorted(self._completion_facts)
             ],
             "bookkeeping": {
                 "last_applied_ns": {
@@ -599,7 +694,53 @@ def reconstruct_order_states(
 ) -> tuple[OrderStateReconstructor, RebuildSummary]:
     """Restore a snapshot (if any), replay the journal tail, and return the reconstructed state."""
     reconstructor = OrderStateReconstructor()
-    summary = rebuild_state(journal, reconstructor, snapshot=snapshot)
+    effective_snapshot = snapshot
+    legacy_state: dict[str, Any] | None = None
+    if snapshot is not None:
+        raw_schema = snapshot.state.get("reconstruction_schema")
+        if type(raw_schema) is not int or raw_schema not in {1, RECONSTRUCTION_SNAPSHOT_SCHEMA}:
+            raise RecoveryError(
+                f"reconstruction snapshot schema {raw_schema!r} is not supported "
+                f"(expected 1 or {RECONSTRUCTION_SNAPSHOT_SCHEMA})."
+            )
+        has_derived_state = bool(snapshot.state.get("orders") or snapshot.state.get("attempts"))
+        if snapshot.last_event_id is None and has_derived_state:
+            raise RecoveryError(
+                "a reconstruction snapshot with derived order state must carry a journal watermark."
+            )
+        if raw_schema == 1:
+            legacy_state = dict(snapshot.state)
+            effective_snapshot = None
+
+    summary = rebuild_state(journal, reconstructor, snapshot=effective_snapshot)
+
+    if legacy_state is not None:
+        revision_ids = set(journal.revision().event_ids)
+        if snapshot is None or snapshot.last_event_id is None or snapshot.last_event_id not in revision_ids:
+            raise RecoveryError(
+                "schema-1 reconstruction snapshot cannot be migrated because its journal "
+                "watermark is missing from the current journal."
+            )
+        try:
+            snapshot_applied = {
+                UUID(str(event_id)) for event_id in legacy_state.get("applied_event_ids", [])
+            }
+            snapshot_order_ids = {
+                UUID(str(entry["order_id"]))
+                for section in ("orders", "attempts")
+                for entry in legacy_state.get(section, [])
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RecoveryError("schema-1 reconstruction snapshot metadata is malformed.") from exc
+        if not snapshot_applied.issubset(revision_ids):
+            raise RecoveryError(
+                "schema-1 reconstruction snapshot references events absent from the current journal."
+            )
+        rebuilt_order_ids = {state.order_id for state in reconstructor.states()}
+        if not snapshot_order_ids.issubset(rebuilt_order_ids):
+            raise RecoveryError(
+                "schema-1 reconstruction snapshot references orders absent from the rebuilt journal."
+            )
     return reconstructor, summary
 
 
@@ -652,6 +793,38 @@ def _state_conflict_reason(
     if current in _TERMINAL_STATES and incoming in _TERMINAL_STATES:
         return "mutually_exclusive_terminal_states"
     return "lifecycle_state_regressed_without_stale_evidence"
+
+
+def _completion_to_dict(reference: str, completion: _CompletionFact) -> dict[str, Any]:
+    return {
+        "order_reference": reference,
+        "producer": completion.producer,
+        "kind": completion.kind,
+        "filled_quantity": (
+            None if completion.filled_quantity is None else str(completion.filled_quantity)
+        ),
+        "remaining_quantity": (
+            None if completion.remaining_quantity is None else str(completion.remaining_quantity)
+        ),
+    }
+
+
+def _completion_from_dict(entry: dict[str, Any]) -> _CompletionFact:
+    kind = str(entry["kind"])
+    if kind not in {"lifecycle", "fill"}:
+        raise RecoveryError(f"unsupported completion fact kind {kind!r}.")
+    return _CompletionFact(
+        producer=str(entry["producer"]),
+        kind=kind,
+        filled_quantity=(
+            None if entry.get("filled_quantity") is None else Decimal(str(entry["filled_quantity"]))
+        ),
+        remaining_quantity=(
+            None
+            if entry.get("remaining_quantity") is None
+            else Decimal(str(entry["remaining_quantity"]))
+        ),
+    )
 
 
 def _attempt_to_dict(anchors: AttemptAnchors) -> dict[str, Any]:

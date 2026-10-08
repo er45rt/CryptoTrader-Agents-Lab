@@ -877,3 +877,113 @@ def test_filled_late_fill_from_local_producer_stays_fenced(journal):
     assert reconstructor.conflicts()[CLIENT_ORDER_ID] == (
         "non_authoritative_fill_on_terminal_order",
     )
+
+
+def test_unrecognized_venue_producer_never_grants_authority(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0, venue_producer=LOCAL_PRODUCER),
+            state_event("accepted", index=1, producer=LOCAL_PRODUCER),
+            fill_event("1.00000000", index=2, remaining="0", producer=LOCAL_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state is not None
+    assert state.state is not OrderStateName.FILLED
+    assert "unrecognized_venue_producer" in reconstructor.conflicts()[CLIENT_ORDER_ID]
+
+
+def test_local_fill_cannot_complete_an_attempted_order(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("accepted", index=1, producer=VENUE_PRODUCER),
+            fill_event("1.00000000", index=2, remaining="0", producer=LOCAL_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state is not None
+    assert state.state is OrderStateName.PARTIALLY_FILLED
+    assert state.filled_quantity == ORIGINAL
+    assert reconstructor.conflicts() == {}
+
+
+def test_local_lifecycle_cannot_complete_an_attempted_order(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("accepted", index=1, producer=VENUE_PRODUCER),
+            state_event("filled", index=2, producer=LOCAL_PRODUCER),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state is not None
+    assert state.state is OrderStateName.ACCEPTED
+    assert "filled_completion_requires_authoritative_venue_evidence" in (
+        reconstructor.conflicts()[CLIENT_ORDER_ID]
+    )
+
+
+def test_supplied_local_states_preserve_unrecognized_producer_conflict(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0, venue_producer=LOCAL_PRODUCER),
+            state_event("accepted", index=1, producer=LOCAL_PRODUCER),
+        ]
+    )
+    supplied_states = recovered(journal).states()
+    run = RestartRecovery(
+        engine=ReconciliationEngine(load_policy({"policy_id": "recovery-v1"})),
+        journal=journal,
+        venue_sources=[StaticVenueStateSource(entries=())],
+        producer="application.recovery",
+    ).run(now=BASE + timedelta(minutes=1), local_states=supplied_states)
+
+    assert CLIENT_ORDER_ID in run.conflicted_orders
+    assert run.requires_halt_new_risk is True
+    assert "unrecognized_venue_producer" in run.report.reason_codes[CLIENT_ORDER_ID]
+
+
+def test_authoritative_zero_remaining_below_quantity_stays_open_without_conflict(journal):
+    journal.append_batch(
+        [
+            attempt_event(index=0),
+            state_event("accepted", index=1),
+            fill_event("0.10000000", index=2, remaining="0"),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.PARTIALLY_FILLED
+    assert state.filled_quantity == Decimal("0.10000000")
+    assert state.remaining_quantity == Decimal("0")
+    assert reconstructor.conflicts() == {}
+
+
+def test_local_completion_before_attempt_is_fenced_when_attempt_arrives(journal):
+    journal.append_batch(
+        [
+            state_event("submitted", index=0, producer=LOCAL_PRODUCER),
+            fill_event("1.00000000", index=1, remaining="0", producer=LOCAL_PRODUCER),
+            attempt_event(index=2),
+        ]
+    )
+
+    reconstructor = recovered(journal)
+    state = reconstructor.state_for(CLIENT_ORDER_ID)
+
+    assert state.state is OrderStateName.FILLED
+    assert "filled_completion_requires_authoritative_venue_evidence" in (
+        reconstructor.conflicts()[CLIENT_ORDER_ID]
+    )

@@ -487,7 +487,7 @@ class BreakGlassControl:
                         "reconciliation, acknowledgement and explicit restore remain mandatory."
                     ),
                 )
-            ownership = self._read_ownership()
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
             if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
                 return self._reject(
                     command,
@@ -499,6 +499,7 @@ class BreakGlassControl:
                         "reduce-only cannot restore trading authority while the emergency owner "
                         "holds the writer lease."
                     ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
                 )
             correlation_id = command.correlation_id or command.command_id
             transitions = self._apply_posture(
@@ -507,7 +508,6 @@ class BreakGlassControl:
                 command=command,
                 engage_kill_switch=False,
             )
-            fence_term = self._current_term()
             recorded = self._append_records(
                 command,
                 controller,
@@ -549,6 +549,7 @@ class BreakGlassControl:
                     "reduce-only is an operator-audited policy restriction; it preserves the "
                     "current normal writer lease and delegates reduction proof to Hard Risk.",
                     load.detail,
+                    *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
                 ),
                 safety_state_source=load.source,
             )
@@ -569,7 +570,9 @@ class BreakGlassControl:
         notes: list[str] = []
         if command.command_type is OperatorCommandType.CANCEL_OPEN:
             venue_outcome = self._venue.cancel_open_orders(
-                correlation_id=session_id, occurred_at=delivered_at
+                correlation_id=session_id,
+                occurred_at=delivered_at,
+                safety=controller,
             )
             if venue_outcome.disposition == "ambiguous":
                 notes.append(
@@ -683,6 +686,7 @@ class BreakGlassControl:
         reason_code = (
             "reconciliation_resolved" if status == "resolved" else "UNKNOWN_PENDING_RECONCILIATION"
         )
+        ownership, fence_term, ownership_diagnostic = self._ownership_observation()
         event_ids = self._append_records(
             command,
             controller,
@@ -695,7 +699,7 @@ class BreakGlassControl:
             reconciliation_status=status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
@@ -718,11 +722,12 @@ class BreakGlassControl:
                 resulting_epoch is None or not resulting_epoch.acknowledgement_satisfied
             ),
             new_risk_permitted=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
             notes=(
                 f"reconciliation ran through Phase 8 evidence: {reconciliation_note}",
                 "unresolved orders stay UNKNOWN_PENDING_RECONCILIATION and are never retried",
+                *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
             ),
             safety_state_source=load.source,
         )
@@ -761,6 +766,7 @@ class BreakGlassControl:
             if epoch.acknowledgement_satisfied
             else "operator_acknowledgement_recorded"
         )
+        ownership, fence_term, ownership_diagnostic = self._ownership_observation()
         event_ids = self._append_records(
             command,
             controller,
@@ -773,7 +779,7 @@ class BreakGlassControl:
             reconciliation_status=epoch.reconciliation_status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
@@ -793,10 +799,11 @@ class BreakGlassControl:
             reconciliation_result=epoch.reconciliation_reason_code,
             operator_acknowledgement_pending=False,
             new_risk_permitted=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
             notes=(
                 "the acknowledgement is attributed to the operator label in the command record",
+                *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
             ),
             safety_state_source=load.source,
         )
@@ -814,9 +821,8 @@ class BreakGlassControl:
             and controller.mode is SafetyMode.REDUCE_ONLY
             and not controller.kill_switch_engaged
         ):
-            try:
-                ownership = self._ownership_store.read()
-            except OwnershipStateError:
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
+            if ownership_diagnostic == "ownership unreadable":
                 return self._reject(
                     command,
                     controller,
@@ -827,6 +833,7 @@ class BreakGlassControl:
                         "normal cannot be restored from reduce-only while writer ownership "
                         "cannot be read authoritatively."
                     ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
                 )
             if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
                 return self._reject(
@@ -839,6 +846,7 @@ class BreakGlassControl:
                         "normal cannot be restored from reduce-only while the emergency owner "
                         "holds the writer lease."
                     ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
                 )
             correlation_id = command.correlation_id or command.command_id
             transitions = [
@@ -852,7 +860,6 @@ class BreakGlassControl:
                     trigger="operator",
                 )
             ]
-            fence_term = self._current_term()
             event_ids = self._append_records(
                 command,
                 controller,
@@ -896,6 +903,7 @@ class BreakGlassControl:
                     "normal was restored by an explicit operator command from reduce-only; "
                     "no emergency epoch or ownership takeover was involved.",
                     load.detail,
+                    *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
                 ),
                 safety_state_source=load.source,
             )
@@ -1115,17 +1123,21 @@ class BreakGlassControl:
             return "break_glass_engaged_recovery_required"
         return f"break_glass_engaged_{command.command_type.value}"
 
-    def _current_term(self) -> int:
+    def _ownership_observation(self) -> tuple[OwnershipRecord | None, int, str | None]:
+        """Read ownership once and preserve why no usable fence record was available."""
         try:
-            return self._ownership_store.require_fence().term
+            ownership = self._ownership_store.read()
         except OwnershipStateError:
-            return 0
+            return None, 0, "ownership unreadable"
+        if ownership is None:
+            return None, 0, "ownership absent"
+        return ownership, ownership.term, None
+
+    def _current_term(self) -> int:
+        return self._ownership_observation()[1]
 
     def _read_ownership(self) -> OwnershipRecord | None:
-        try:
-            return self._ownership_store.read()
-        except OwnershipStateError:
-            return None
+        return self._ownership_observation()[0]
 
     def _new_risk_permitted(
         self,
@@ -1279,12 +1291,17 @@ class BreakGlassControl:
         *,
         reason_code: str,
         note: str,
+        ownership_observation: tuple[OwnershipRecord | None, int, str | None] | None = None,
     ) -> OperatorCommandOutcome:
         """Record a refused command. A refusal never touches the safety state."""
         epoch = self._effective_epoch(controller, derive_ledger(self._journal))
         correlation_id = command.correlation_id or (
             command.command_id if epoch is None else epoch.session_id
         )
+        if ownership_observation is None:
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
+        else:
+            ownership, fence_term, ownership_diagnostic = ownership_observation
         event_ids = self._append_records(
             command,
             controller,
@@ -1297,10 +1314,14 @@ class BreakGlassControl:
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
+        notes = [note]
+        if ownership_diagnostic is not None:
+            notes.append(ownership_diagnostic)
+        notes.append("a refused command changes no safety state (fail closed)")
         return OperatorCommandOutcome(
             command_id=command.command_id,
             command_type=command.command_type.value,
@@ -1318,10 +1339,10 @@ class BreakGlassControl:
             operator_acknowledgement_pending=bool(
                 epoch is not None and not epoch.acknowledgement_satisfied
             ),
-            new_risk_permitted=self._new_risk_permitted(controller, epoch, self._read_ownership()),
-            fence_term=self._current_term(),
+            new_risk_permitted=self._new_risk_permitted(controller, epoch, ownership),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
-            notes=(note, "a refused command changes no safety state (fail closed)"),
+            notes=tuple(notes),
             safety_state_source=load.source,
         )
 

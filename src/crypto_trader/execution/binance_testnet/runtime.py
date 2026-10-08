@@ -191,12 +191,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             or self._has_durable_attempt(client_order_id)
         ):
             try:
-                order = self.client.order_status(
-                    request.symbol,
-                    client_order_id,
-                    require_exact_identity=True,
-                    wait=False,
-                )
+                order = self.client.adopt_order_status(order_request, wait=False)
             except BinanceTestnetError as exc:
                 raise AmbiguousOrderError(
                     "a durable submission attempt already reserves this client order identity; "

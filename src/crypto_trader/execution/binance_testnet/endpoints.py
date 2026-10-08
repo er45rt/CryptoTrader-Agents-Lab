@@ -74,9 +74,10 @@ def require_testnet_base_url(url: str) -> str:
             "Binance mainnet endpoints are forbidden in Phase 11; refusing to use "
             f"{host!r}. Only the Spot Testnet endpoint is permitted."
         )
-    if not is_testnet_host(url):
+    documented_host = urlparse(SPOT_TESTNET_REST_BASE).hostname
+    if host != documented_host:
         raise TestnetEndpointError(
-            f"{host!r} is not a documented Binance Spot Testnet host; refusing to use it."
+            f"{host!r} is not the documented Binance Spot Testnet host; refusing to use it."
         )
     return url.rstrip("/")
 

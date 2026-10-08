@@ -189,7 +189,7 @@ def test_snapshot_store_carries_the_reconstruction_schema(tmp_path: Path, journa
         )
         record = store.latest("orders")
 
-    assert record.state["reconstruction_schema"] == 1
+    assert record.state["reconstruction_schema"] == 2
     assert record.state["orders"][0]["filled_quantity"] == "0"
 
 
@@ -459,3 +459,85 @@ def test_reconstruct_order_states_rejects_an_unsupported_snapshot_schema(journal
 
     with pytest.raises(RecoveryError):
         reconstructor.restore_state({"reconstruction_schema": 99, "orders": []})
+
+
+def test_schema1_snapshot_is_discarded_and_rebuilt_from_full_journal(journal):
+    order_id = uuid4()
+    journal.append_batch(
+        [
+            state_event(order_id, "submitted", index=0),
+            fill_event(order_id, "0.5", remaining="0.5", index=1),
+        ]
+    )
+    baseline, summary = reconstruct_order_states(journal)
+    stale_state = baseline.snapshot_state()
+    stale_state["reconstruction_schema"] = 1
+    stale_state["orders"][0]["state"] = "filled"
+    stale = SnapshotRecord(
+        name="orders",
+        snapshot_schema=1,
+        state=stale_state,
+        last_event_id=summary.last_event_id,
+        last_occurred_at_ns=summary.last_occurred_at_ns,
+        last_sequence_number=summary.last_sequence_number,
+        created_at_iso=BASE.isoformat(),
+    )
+
+    rebuilt, replay = reconstruct_order_states(journal, snapshot=stale)
+
+    state = rebuilt.state_for(str(order_id))
+    assert state.state is OrderStateName.PARTIALLY_FILLED
+    assert state.filled_quantity == Decimal("0.5")
+    assert replay.events_seen == 2
+
+
+def test_direct_restore_refuses_schema1_under_reconstruction_v2(journal):
+    order_id = uuid4()
+    journal.append(state_event(order_id, "submitted"))
+    reconstructor, _ = reconstruct_order_states(journal)
+    old = reconstructor.snapshot_state()
+    old["reconstruction_schema"] = 1
+
+    with pytest.raises(RecoveryError):
+        OrderStateReconstructor().restore_state(old)
+
+
+def test_schema1_snapshot_with_missing_journal_history_fails_closed(tmp_path):
+    order_id = uuid4()
+    source_event = state_event(order_id, "submitted")
+    with SQLiteEventJournal(tmp_path / "schema1-source.db") as source:
+        source.append(source_event)
+        rebuilt, summary = reconstruct_order_states(source)
+        legacy_state = rebuilt.snapshot_state()
+        legacy_state["reconstruction_schema"] = 1
+        snapshot = SnapshotRecord(
+            name="orders",
+            snapshot_schema=1,
+            state=legacy_state,
+            last_event_id=summary.last_event_id,
+            last_occurred_at_ns=summary.last_occurred_at_ns,
+            last_sequence_number=summary.last_sequence_number,
+            created_at_iso=BASE.isoformat(),
+        )
+
+    with SQLiteEventJournal(tmp_path / "schema1-empty.db") as empty:
+        before = empty.count()
+        with pytest.raises(RecoveryError):
+            recovery(empty).run(now=BASE + timedelta(minutes=1), snapshot=snapshot)
+        assert empty.count() == before
+
+
+@pytest.mark.parametrize("schema", [99, "1", True, "abc"])
+def test_reconstruction_rejects_invalid_inner_snapshot_schema_without_watermark(journal, schema):
+    snapshot = SnapshotRecord(
+        name="orders",
+        snapshot_schema=1,
+        state={"reconstruction_schema": schema},
+        last_event_id=None,
+        last_occurred_at_ns=None,
+        last_sequence_number=None,
+        created_at_iso=BASE.isoformat(),
+    )
+
+    with pytest.raises(RecoveryError):
+        reconstruct_order_states(journal, snapshot=snapshot)

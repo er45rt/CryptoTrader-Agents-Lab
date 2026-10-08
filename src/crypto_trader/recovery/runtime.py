@@ -151,21 +151,13 @@ class RestartRecovery:
         event_ids: tuple[UUID, UUID, UUID] | None = None,
     ) -> RecoveryRun:
         """Restore, rebuild, reconcile and journal one restart recovery pass."""
-        rebuild: RebuildSummary | None = None
-        states: tuple[LocalOrderState, ...]
-        conflicts: dict[str, list[str]] = {}
-        late_fill_refinements = 0
-        anchors: dict[str, AttemptAnchors] = {}
-        if local_states is None:
-            reconstructor, rebuild = reconstruct_order_states(self._journal, snapshot=snapshot)
-            states = reconstructor.states()
-            conflicts = {
-                reference: list(reasons) for reference, reasons in reconstructor.conflicts().items()
-            }
-            late_fill_refinements = reconstructor.late_fill_refinements
-            anchors = reconstructor.attempt_anchor_map()
-        else:
-            states = tuple(local_states)
+        reconstructor, rebuild = reconstruct_order_states(self._journal, snapshot=snapshot)
+        states = reconstructor.states() if local_states is None else tuple(local_states)
+        conflicts: dict[str, list[str]] = {
+            reference: list(reasons) for reference, reasons in reconstructor.conflicts().items()
+        }
+        late_fill_refinements = reconstructor.late_fill_refinements
+        anchors: dict[str, AttemptAnchors] = reconstructor.attempt_anchor_map()
 
         # Current venue evidence is validated against the durable attempt anchors before it can
         # reach the engine: a FILLED report must prove executedQty == Q and origQty == Q, otherwise

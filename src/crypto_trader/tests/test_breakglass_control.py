@@ -521,3 +521,123 @@ def test_status_is_read_only(control, journal):
     control.load_ledger()
     control.load_epoch()
     assert journal.count() == before
+
+
+def test_rejected_command_reports_absent_ownership_diagnostic(control, journal):
+    outcome = control.handle(command("restore_normal", seed="ownership-absent-diagnostic"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+    ][-1]
+
+    assert outcome.disposition == "rejected"
+    assert outcome.fence_term == 0
+    assert recorded.payload.fence_term == 0
+    assert any("ownership absent" in note for note in outcome.notes)
+
+
+def _install_counted_ownership_read(control, monkeypatch, *, fail_after_first=False):
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
+    original = control.ownership_store.read
+    calls = []
+
+    def read():
+        calls.append(len(calls) + 1)
+        if fail_after_first and len(calls) > 1:
+            raise OwnershipStateError("forced second ownership read failure")
+        return original()
+
+    monkeypatch.setattr(control.ownership_store, "read", read)
+    return calls
+
+
+def test_reduce_only_uses_one_ownership_observation(control, monkeypatch):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    calls = _install_counted_ownership_read(control, monkeypatch)
+
+    outcome = control.handle(command("reduce_only", seed="single-read-reduce-only"))
+
+    assert outcome.accepted
+    assert calls == [1]
+
+
+def test_restore_from_reduce_only_uses_one_ownership_observation(control, monkeypatch):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("reduce_only", seed="single-read-restore-setup")).accepted
+    calls = _install_counted_ownership_read(control, monkeypatch)
+
+    outcome = control.handle(command("restore_normal", seed="single-read-restore"))
+
+    assert outcome.accepted
+    assert calls == [1]
+
+
+def test_reconcile_uses_one_ownership_observation_for_journal_and_outcome(
+    control, journal, monkeypatch
+):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("halt_new_risk", seed="single-read-reconcile-setup")).accepted
+    expected = control.ownership_store.read()
+    calls = _install_counted_ownership_read(control, monkeypatch, fail_after_first=True)
+
+    outcome = control.handle(command("reconcile", seed="single-read-reconcile"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+        and event.payload.command_id == outcome.command_id
+    ][-1]
+
+    assert calls == [1]
+    assert outcome.fence_term == expected.term
+    assert recorded.payload.fence_term == expected.term
+
+
+def test_acknowledge_uses_one_ownership_observation_for_journal_and_outcome(
+    control, journal, monkeypatch
+):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("halt_new_risk", seed="single-read-ack-setup")).accepted
+    assert control.handle(command("reconcile", seed="single-read-ack-reconcile")).accepted
+    expected = control.ownership_store.read()
+    calls = _install_counted_ownership_read(control, monkeypatch, fail_after_first=True)
+
+    outcome = control.handle(command("acknowledge", seed="single-read-ack"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+        and event.payload.command_id == outcome.command_id
+    ][-1]
+
+    assert calls == [1]
+    assert outcome.fence_term == expected.term
+    assert recorded.payload.fence_term == expected.term
+
+
+def test_rejected_command_reports_unreadable_ownership_once(control, monkeypatch):
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
+    calls = []
+
+    def unreadable():
+        calls.append(1)
+        raise OwnershipStateError("forced unreadable ownership")
+
+    monkeypatch.setattr(control.ownership_store, "read", unreadable)
+    outcome = control.handle(command("restore_normal", seed="ownership-unreadable-diagnostic"))
+
+    assert calls == [1]
+    assert outcome.fence_term == 0
+    assert any("ownership unreadable" in note for note in outcome.notes)
+
+
+def test_duplicate_preserves_historical_zero_fence_term_after_owner_appears(control):
+    original = command("restore_normal", seed="historical-zero-duplicate")
+    first = control.handle(original)
+    assert first.fence_term == 0
+
+    control.claim_normal_writer(owner_id="normal:runtime")
+    duplicate = control.handle(original)
+
+    assert duplicate.duplicate
+    assert duplicate.fence_term == 0

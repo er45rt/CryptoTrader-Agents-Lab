@@ -107,13 +107,15 @@ def test_cancel_open_cancels_through_the_adapter_and_confirms_once(journal):
         ],
     )
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     deletes = [request for request in transport.requests if request.method == "DELETE"]
 
     assert outcome.confirmed
     assert outcome.cancelled_order_references == ("ct-1",)
     assert len(deletes) == 1
-    assert outcome.to_record()["preflight"] is None
+    assert outcome.to_record()["preflight"] is not None
     assert client.request_log()
 
 
@@ -129,7 +131,9 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
         ],
     )
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     deletes = [request for request in transport.requests if request.method == "DELETE"]
 
     assert outcome.ambiguous
@@ -140,7 +144,9 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
 def test_an_unreachable_venue_is_reported_as_unavailable(journal):
     control, _, _, _ = venue(journal, [TransportError("down")])
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
 
     assert outcome.disposition == "unavailable"
     assert outcome.reason_code == "venue_environment_unverified"
@@ -157,7 +163,9 @@ def test_the_request_log_never_exposes_the_api_key_or_signature(journal):
             txf.cancel_response("ct-3", order_id=100),
         ],
     )
-    control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     log = "\n".join(client.request_log())
 
     assert txf.FAKE_API_KEY not in log
@@ -245,3 +253,102 @@ def test_venue_reports_expose_only_reference_backed_evidence(journal):
     assert reports[0].order_reference == "ct-5"
     assert reports[0].state.value == "canceled"
     assert reports[0].remaining_quantity == Decimal("0.00100000")
+
+
+def test_cancel_preflight_is_current_and_attached_to_outcome(journal):
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-red-1"),
+            txf.cancel_response("ct-red-1", order_id=100),
+        ],
+    )
+    safety = SafetyController(correlation_id=uuid4())
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+
+    assert outcome.confirmed
+    assert outcome.preflight is not None
+    assert outcome.preflight.safety_mode == safety.mode.value
+    assert len([r for r in transport.requests if r.method == "DELETE"]) == 1
+
+
+def test_cancel_preflight_refuses_non_trading_account_before_delete(journal):
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(can_trade=False),
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(),
+        occurred_at=BASE,
+        safety=SafetyController(correlation_id=uuid4()),
+    )
+
+    assert outcome.disposition == "unavailable"
+    assert outcome.reason_code == "venue_environment_unverified"
+    assert [request for request in transport.requests if request.method == "DELETE"] == []
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+
+def test_testnet_acceptance_rejects_undocumented_binance_vision_hosts():
+    for undocumented in (
+        "https://binance.vision",
+        "https://other.binance.vision",
+        "https://child.testnet.binance.vision",
+    ):
+        with pytest.raises(EndpointError):
+            require_testnet_base_url(undocumented)
+
+
+def test_preflight_forces_symbol_rule_refresh_even_when_cache_is_warm(journal):
+    control, client, _, transport = venue(
+        journal,
+        [
+            txf.exchange_info_response(),
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+        ],
+    )
+    client.symbol_rules()
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+    preflight = control.preflight(safety=SafetyController(correlation_id=uuid4()))
+
+    assert preflight.passed
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 2
+
+
+def test_failed_second_cancel_never_reuses_stale_preflight_evidence(journal):
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response(),
+            TransportError("second preflight unavailable"),
+        ],
+    )
+    safety = SafetyController(correlation_id=uuid4())
+
+    first = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+    second = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+
+    assert first.preflight is not None
+    assert second.disposition == "unavailable"
+    assert second.preflight is None

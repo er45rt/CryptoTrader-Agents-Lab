@@ -130,7 +130,7 @@ class EmergencyVenuePort(Protocol):
     """The only venue surface the break-glass control may use."""
 
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome: ...
 
     def venue_reports(self) -> Sequence[VenueOrderReport]: ...
@@ -141,9 +141,9 @@ class PolicyOnlyVenueControl:
     """The default control when no venue is attached: policy-only, deterministic, no I/O."""
 
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
-        del correlation_id, occurred_at
+        del correlation_id, occurred_at, safety
         return VenueControlOutcome(
             disposition="not_requested",
             reason_code="venue_control_not_attached",
@@ -166,7 +166,7 @@ class BinanceSpotTestnetEmergencyControl:
 
     client: BinanceSpotTestnetClient
     runtime: TestnetOrderRuntime
-    withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.REQUIRE_DISABLED
+    withdrawal_policy: WithdrawalPolicy | None = None
     symbol: str | None = None
     _preflight: EmergencyPreflight | None = field(default=None, init=False)
     _order_references: list[str] = field(default_factory=list, init=False)
@@ -174,8 +174,21 @@ class BinanceSpotTestnetEmergencyControl:
     def __post_init__(self) -> None:
         if self.client is None or self.runtime is None:
             raise BreakGlassConfigError("a testnet client and runtime are required.")
+        if self.runtime.client is not self.client:
+            raise BreakGlassConfigError("the emergency runtime and control must share the same client.")
+        runtime_symbol = self.runtime.instrument.symbol
         if self.symbol is None:
-            self.symbol = self.runtime.instrument.symbol
+            self.symbol = runtime_symbol
+        if self.symbol != runtime_symbol or self.client.symbol != runtime_symbol:
+            raise BreakGlassConfigError(
+                "the emergency client, runtime and control must target the same symbol."
+            )
+        if self.withdrawal_policy is None:
+            self.withdrawal_policy = self.client.withdrawal_policy
+        elif self.withdrawal_policy is not self.client.withdrawal_policy:
+            raise BreakGlassConfigError(
+                "the emergency control withdrawal policy must match the client policy."
+            )
 
     # --- pre-flight -------------------------------------------------------
 
@@ -190,38 +203,25 @@ class BinanceSpotTestnetEmergencyControl:
             mainnet_hosts_blocked = True
         except BinanceTestnetError:
             mainnet_hosts_blocked = False
-        self.client.synchronize_clock()
-        offset = self.client.clock.offset_ms
-        clock_synchronized = self.client.clock.is_synchronized
+
+        # Preserve the production environment proof rather than reimplementing a weaker subset:
+        # this forces a fresh symbol-rule read, verifies canTrade, withdrawal policy and clock drift.
+        environment = self.client.verify_environment(symbol=self.symbol)
         self.client.clock.require_acceptable_drift()
-        account = self.client.account_snapshot(asset=self.client.symbol_rules().quote_asset)
+        account = environment.account
         withdrawals_available = account.withdrawals_available
-        policy_ok = not withdrawals_available or self.withdrawal_policy is WithdrawalPolicy.RECORD_ONLY
-        if withdrawals_available and self.withdrawal_policy is WithdrawalPolicy.REQUIRE_DISABLED:
-            raise UnsafeTestnetAccountError(
-                "the account reports withdrawals enabled; the break-glass venue control refuses to "
-                "use a key with withdrawal capability."
-            )
-        notes: list[str] = [
-            "endpoint verified as Binance Spot Testnet",
-            "no mainnet endpoint is reachable from this control",
-            "no withdrawal endpoint exists anywhere in this adapter",
-        ]
-        if withdrawals_available:
-            notes.append(
-                "the venue reports withdrawals enabled on this TESTNET key "
-                f"(policy={self.withdrawal_policy.value}); no withdrawal capability is implemented "
-                "or used, and a future live key MUST be withdrawal-disabled"
-            )
-        else:
-            notes.append("withdrawals unavailable on this key (verified)")
+        policy_ok = (
+            not withdrawals_available
+            or self.withdrawal_policy is WithdrawalPolicy.RECORD_ONLY
+        )
+        notes = list(environment.notes)
         notes.append("cancelling open orders is permitted in every safety mode: it cannot increase risk")
         preflight = EmergencyPreflight(
-            venue_label=self.client.venue_label,
+            venue_label=environment.venue_label,
             endpoint_is_testnet=endpoint_is_testnet,
             mainnet_hosts_blocked=mainnet_hosts_blocked,
-            clock_synchronized=clock_synchronized,
-            clock_offset_ms=offset,
+            clock_synchronized=self.client.clock.is_synchronized,
+            clock_offset_ms=environment.clock_offset_ms,
             withdrawals_available=withdrawals_available,
             withdrawal_policy_ok=policy_ok,
             safety_mode=safety.mode.value,
@@ -234,12 +234,13 @@ class BinanceSpotTestnetEmergencyControl:
     # --- control ----------------------------------------------------------
 
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
         """Cancel every open order for the instrument. Never retried, never assumed successful."""
         del occurred_at
+        self._preflight = None
         try:
-            self.runtime.client.verify_environment(symbol=self.client.symbol)
+            preflight = self.preflight(safety=safety)
         except BinanceTestnetError as exc:
             return VenueControlOutcome(
                 disposition="unavailable",
@@ -256,6 +257,7 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="UNKNOWN_PENDING_RECONCILIATION",
                 detail="the cancel outcome is unknown; it was NOT retried and the epoch requires "
                 "reconciliation",
+                preflight=preflight,
             )
         except BinanceTestnetError as exc:
             return VenueControlOutcome(
@@ -263,6 +265,7 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="venue_cancel_rejected",
                 detail=f"the venue rejected the cancel deterministically ({type(exc).__name__}); "
                 "reconciliation is still required to confirm the resulting order state",
+                preflight=preflight,
             )
         references = tuple(order.client_order_id for order in orders)
         self._order_references.extend(
@@ -274,7 +277,7 @@ class BinanceSpotTestnetEmergencyControl:
             reason_code="cancel_confirmed",
             detail=f"{len(references)} open order(s) were cancelled through the safety path",
             cancelled_order_references=references,
-            preflight=self._preflight,
+            preflight=preflight,
         )
 
     def venue_reports(self) -> Sequence[VenueOrderReport]:

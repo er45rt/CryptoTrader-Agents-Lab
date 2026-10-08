@@ -269,3 +269,38 @@ def test_the_mainnet_package_has_no_repository_mutation_capability():
     for file in files:
         violations = _repository_mutation_violations(file)
         assert not violations, f"{file.name} can mutate repository/process state: {violations}"
+
+
+def test_soak_runner_has_no_runtime_dependency_on_test_fixtures():
+    source = (MAINNET_DIR / "soak_runner.py").read_text(encoding="utf-8")
+
+    assert "crypto_trader.tests" not in source
+    assert "mainnet_fixtures" not in source
+
+
+def test_soak_runner_imports_when_test_package_is_blocked():
+    import os
+    import subprocess
+    import sys
+
+    code = r"""
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name.startswith("crypto_trader.tests"):
+        raise ImportError("test package blocked")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import crypto_trader.mainnet.soak_runner
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PACKAGE_DIR.parent)
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr

@@ -503,10 +503,17 @@ class BinanceSpotTestnetClient:
         """
         existing = self._orders.get(request.client_order_id)
         if existing is not None:
-            current = self.order_status(
-                request.symbol, request.client_order_id, wait=wait
-            )
-            self._orders[current.client_order_id] = current
+            try:
+                current = self.adopt_order_status(
+                    request,
+                    expected_venue_order_id=existing.venue_order_id,
+                    wait=wait,
+                )
+            except BinanceTestnetError as exc:
+                raise AmbiguousOrderError(
+                    "the cached client-order identity could not be proven to match the venue "
+                    "order economics; refusing adoption without another write."
+                ) from exc
             return PreparedTestnetOrder(
                 client_order_id=request.client_order_id,
                 symbol=request.symbol,
@@ -778,10 +785,20 @@ class BinanceSpotTestnetClient:
             # venue view. The write is never retried (this POST count stays at one) and the durable
             # attempt marker stays in place for reconciliation.
             try:
-                order = self.order_status(
-                    prepared.symbol,
-                    prepared.client_order_id,
-                    require_exact_identity=True,
+                order = self.adopt_order_status(
+                    TestnetOrderRequest(
+                        client_order_id=prepared.client_order_id,
+                        symbol=prepared.symbol,
+                        side=prepared.side.upper(),
+                        order_type=prepared.order_type.upper(),
+                        quantity=prepared.quantity,
+                        price=prepared.limit_price,
+                        time_in_force=(
+                            prepared.time_in_force.upper()
+                            if prepared.order_type.lower() == "limit"
+                            else None
+                        ),
+                    ),
                     wait=False,
                 )
             except BinanceTestnetError as exc:
@@ -879,6 +896,92 @@ class BinanceSpotTestnetClient:
                 "and the cancellation is not retried."
             ) from exc
         self._orders[client_order_id] = order
+        return order
+
+    def adopt_order_status(
+        self,
+        request: TestnetOrderRequest,
+        *,
+        expected_venue_order_id: str | None = None,
+        wait: bool = True,
+    ) -> TestnetOrder:
+        """Strictly re-read and adopt an existing order without cache mutation on mismatch."""
+        body = self._request(
+            PATH_ORDER,
+            {"symbol": request.symbol, "origClientOrderId": request.client_order_id},
+            weight=_WEIGHT_READ_ORDER,
+            is_write=False,
+            signed=True,
+            wait=wait,
+        )
+        expected_id = expected_venue_order_id
+        if expected_id is None:
+            cached = self._orders.get(request.client_order_id)
+            if cached is not None and cached.venue_order_id is not None:
+                expected_id = cached.venue_order_id
+        try:
+            order = self._validate_adoption_response(
+                body, request, expected_venue_order_id=expected_id
+            )
+        except BinanceTestnetError:
+            raise
+        except Exception as exc:
+            raise BinanceTestnetError("order adoption response was malformed.") from exc
+        self._orders[order.client_order_id] = order
+        return order
+
+    def _validate_adoption_response(
+        self,
+        body: Any,
+        request: TestnetOrderRequest,
+        *,
+        expected_venue_order_id: str | None = None,
+    ) -> TestnetOrder:
+        if not isinstance(body, Mapping):
+            raise BinanceTestnetError("order adoption response must be an object.")
+        for name in ("origQty", "executedQty"):
+            raw = body.get(name)
+            if isinstance(raw, (bool, float)) or not isinstance(raw, (str, int)):
+                raise BinanceTestnetError(
+                    f"order adoption {name} must be a canonical decimal value."
+                )
+
+        strict = self._parse_startup_order(body, request.symbol, request.client_order_id)
+        if strict.side != request.side:
+            raise BinanceTestnetError("order adoption side contradicts the prepared order.")
+        if strict.original_quantity != request.quantity:
+            raise BinanceTestnetError("order adoption quantity contradicts the prepared order.")
+        if (
+            expected_venue_order_id is not None
+            and strict.venue_order_id != expected_venue_order_id
+        ):
+            raise BinanceTestnetError("order adoption venue identity changed unexpectedly.")
+        if body.get("type") != request.order_type:
+            raise BinanceTestnetError("order adoption type contradicts the prepared order.")
+        raw_tif = body.get("timeInForce")
+        if not isinstance(raw_tif, str):
+            raise BinanceTestnetError("order adoption timeInForce is missing or malformed.")
+        if request.order_type == "LIMIT":
+            if raw_tif != request.time_in_force:
+                raise BinanceTestnetError(
+                    "order adoption timeInForce contradicts the prepared order."
+                )
+            if strict.price != request.price:
+                raise BinanceTestnetError("order adoption price contradicts the prepared order.")
+
+        # Strict proof above prevents the legacy parser's permissive defaults from hiding missing
+        # fields, while this parse preserves fills and venue timestamps for downstream recording.
+        order = replace(self._parse_order(body), side=strict.side)
+        if (
+            order.client_order_id != request.client_order_id
+            or order.symbol != request.symbol
+            or order.venue_order_id != strict.venue_order_id
+            or order.status != strict.status
+            or order.side != strict.side
+            or order.original_quantity != strict.original_quantity
+            or order.executed_quantity != strict.executed_quantity
+        ):
+            raise BinanceTestnetError("order adoption parsing changed validated identity/economics.")
         return order
 
     def order_status(

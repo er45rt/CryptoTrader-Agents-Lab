@@ -1136,3 +1136,111 @@ def test_venue_account_snapshot_rejects_update_time_after_fetch_time():
                 VenueAssetBalance(asset="BTC", free=Decimal("1"), locked=Decimal("0")),
             ),
         )
+
+
+def test_cached_adoption_rejects_economic_mismatch_without_cache_mutation():
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW").body)
+    bad["side"] = "SELL"
+    transport = ScriptedTransport(
+        responses=[
+            fx.exchange_info_response(),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW"),
+            fx.response(200, bad),
+        ]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    request = fx.limit_order_request(CLIENT_ORDER_ID)
+
+    fx.place_order(client, request)
+    before = client.known_orders()
+
+    with pytest.raises(AmbiguousOrderError):
+        client.prepare_order(request)
+
+    assert client.known_orders() == before
+    assert len([item for item in transport.requests if item.method == "POST"]) == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda body: {k: v for k, v in body.items() if k != "status"}, id="missing_status"),
+        pytest.param(lambda body: {k: v for k, v in body.items() if k != "type"}, id="missing_type"),
+        pytest.param(lambda body: {k: v for k, v in body.items() if k != "timeInForce"}, id="missing_tif"),
+        pytest.param(lambda body: {**body, "origQty": 0.001}, id="float_orig_qty"),
+    ],
+)
+def test_cached_adoption_rejects_missing_or_noncanonical_required_fields(mutate):
+    reread = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW").body)
+    transport = ScriptedTransport(
+        responses=[
+            fx.exchange_info_response(),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW"),
+            fx.response(200, mutate(reread)),
+        ]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    request = fx.limit_order_request(CLIENT_ORDER_ID)
+    fx.place_order(client, request)
+    before = client.known_orders()
+
+    with pytest.raises(AmbiguousOrderError):
+        client.prepare_order(request)
+
+    assert client.known_orders() == before
+    assert len([item for item in transport.requests if item.method == "POST"]) == 1
+
+
+def test_cached_adoption_malformed_side_is_typed_ambiguous_and_preserves_cache():
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=42).body)
+    bad["side"] = []
+    transport = ScriptedTransport(
+        responses=[
+            fx.exchange_info_response(),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=42),
+            fx.response(200, bad),
+        ]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    request = fx.limit_order_request(CLIENT_ORDER_ID)
+
+    fx.place_order(client, request)
+    before = client.known_orders()
+
+    with pytest.raises(AmbiguousOrderError):
+        client.prepare_order(request)
+
+    assert client.known_orders() == before
+    assert len([item for item in transport.requests if item.method == "POST"]) == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda body: {**body, "side": []}, id="side_list"),
+        pytest.param(lambda body: {**body, "side": {}}, id="side_mapping"),
+        pytest.param(lambda body: {**body, "fills": [1]}, id="fills_scalar"),
+        pytest.param(lambda body: {**body, "transactTime": 10**30}, id="timestamp_overflow"),
+        pytest.param(lambda body: {**body, "updateTime": -(10**18), "transactTime": None}, id="timestamp_oserror"),
+    ],
+)
+def test_cached_adoption_malformed_payloads_are_typed_ambiguous(mutate):
+    good = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=42)
+    bad = mutate(dict(good.body))
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), good, fx.response(200, bad)]
+    )
+    client = fx.client(transport)
+    client.clock.synchronize(fx.SERVER_TIME_MS)
+    request = fx.limit_order_request(CLIENT_ORDER_ID)
+    fx.place_order(client, request)
+    before = client.known_orders()
+
+    with pytest.raises(AmbiguousOrderError):
+        client.prepare_order(request)
+
+    assert client.known_orders() == before
+    assert len([item for item in transport.requests if item.method == "POST"]) == 1
