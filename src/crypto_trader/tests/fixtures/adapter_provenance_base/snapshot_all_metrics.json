@@ -1,0 +1,184 @@
+{
+  "expected": {
+    "analysis": {
+      "snapshot": {
+        "assessed_at": 1791080000000,
+        "confidence_adjustment": "none",
+        "may_support_primary_trade_thesis": false,
+        "observations": {
+          "current_funding_context": {
+            "availability_provenance": "live_fetch",
+            "available_at": 1791080000000,
+            "confidence_adjustment": "none",
+            "event_time": 1791080000000,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 60.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "current_funding_context",
+            "period": null,
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": true,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "advisory_only",
+            "value": {
+              "index_price": "1999",
+              "interval": {
+                "available_at": 1791080000000,
+                "default_version": null,
+                "fetched_at": 1791080000000,
+                "hours": 1,
+                "interval_source": "fundingInfo"
+              },
+              "last_funding_rate": "0.0001",
+              "mark_price": "2000",
+              "next_funding_time": 1791083599000,
+              "time": 1791080000000
+            }
+          },
+          "current_open_interest": {
+            "availability_provenance": "live_fetch",
+            "available_at": 1791080000000,
+            "confidence_adjustment": "none",
+            "event_time": 1791079999000,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 120.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "current_open_interest",
+            "period": null,
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": true,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "advisory_only",
+            "value": {
+              "amount": "1234",
+              "quote_value": null
+            }
+          },
+          "funding_interval": {
+            "availability_provenance": "live_fetch",
+            "available_at": 1791080000000,
+            "confidence_adjustment": "none",
+            "event_time": null,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 180.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "funding_interval",
+            "period": null,
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": true,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "advisory_only",
+            "value": {
+              "available_at": 1791080000000,
+              "default_version": null,
+              "fetched_at": 1791080000000,
+              "hours": 1,
+              "interval_source": "fundingInfo"
+            }
+          },
+          "global_long_short_account_ratio": {
+            "availability_provenance": "unknown_historical_api",
+            "available_at": null,
+            "confidence_adjustment": "none",
+            "event_time": 1791079700000,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 660.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "global_long_short_account_ratio",
+            "period": "5m",
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": false,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "exploratory_only",
+            "value": {
+              "long_account": "0.6000",
+              "long_short_ratio": "1.5000",
+              "short_account": "0.4000"
+            }
+          },
+          "historical_open_interest": {
+            "availability_provenance": "unknown_historical_api",
+            "available_at": null,
+            "confidence_adjustment": "none",
+            "event_time": 1791079700000,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 660.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "historical_open_interest",
+            "period": "5m",
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": false,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "exploratory_only",
+            "value": {
+              "amount": "1200",
+              "quote_value": "2400000"
+            }
+          },
+          "settled_funding_history": {
+            "availability_provenance": "unknown_historical_api",
+            "available_at": null,
+            "confidence_adjustment": "none",
+            "event_time": 1791079999000,
+            "fetched_at": 1791080000000,
+            "max_age_seconds": 4500.0,
+            "may_support_primary_trade_thesis": false,
+            "metric": "settled_funding_history",
+            "period": null,
+            "provider": "binance_usdm_public",
+            "quality_reason": null,
+            "replay_eligible": false,
+            "schema_version": 1,
+            "status": "available",
+            "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+            "symbol": "ETHUSDT",
+            "usage": "exploratory_only",
+            "value": {
+              "funding_rate": "0.0002",
+              "mark_price": "1980"
+            }
+          }
+        },
+        "provider": "binance_usdm_public",
+        "quality_checks": [],
+        "replay_eligible": false,
+        "schema_version": 1,
+        "status": "available",
+        "strict_ab_adoption_gate": {
+          "counts_are_not_adoption_evidence": true,
+          "eligible": false,
+          "historical_exploratory_observation_count": 3,
+          "reason": "causal_archive_and_evaluation_evidence_not_verified",
+          "replay_eligible_observation_count": 3,
+          "replay_ineligible_observation_count": 3,
+          "status": "NOT YET ELIGIBLE",
+          "total_observation_count": 6
+        }
+      }
+    },
+    "sleeps": [],
+    "transport_calls": 6
+  },
+  "generated_from_commit": "b3ce6364db48cd50a8c04e6098e2d0426ce18dec",
+  "scenario": "snapshot_all_metrics"
+}

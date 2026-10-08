@@ -3,6 +3,8 @@
 One process-shared cache, admission policy, cooldown and rolling attempt limiter.
 No background polling or archival. HTTP timeout is a connect/read timeout; it is
 not a total wall-clock deadline. All failures suppress values and reduce confidence.
+Raw provenance bodies are retained with cached analysis responses even without
+an observer, bounded per response by MAX_PROVENANCE_BODY_BYTES, not by key count.
 """
 from __future__ import annotations
 
@@ -12,11 +14,13 @@ from datetime import timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 import json
+import inspect
 import math
 import re
 import threading
 import time
 from typing import Any, Literal, Type
+from uuid import uuid4
 
 import requests
 from crewai.tools import BaseTool
@@ -52,11 +56,139 @@ class RawResult:
     reason: str | None = None
     attempts: int = 0
 
+# Provenance retention policy, not provider payload validity. One MiB permits
+# ordinary bounded public responses without retaining unbounded bodies in cache.
+# Oversize bodies are never truncated; analysis still parses the original body.
+MAX_PROVENANCE_BODY_BYTES = 1_048_576
+# HTTP Date is floored to whole seconds; elapsed transport includes library
+# processing. Two additional seconds conservatively cover local scheduling and
+# timestamp error, without claiming sub-second synchronization or verifying NTP.
+HTTP_DATE_PRECISION_MS = 1_000
+HTTP_DATE_SKEW_TOLERANCE_MS = 2_000
+# Keep observer diagnostics bounded and client-local; never log exception text.
+OBSERVER_DIAGNOSTIC_LIMIT = 32
+
+
+@dataclass(frozen=True)
+class ResponseProvenance:
+    response_id: str
+    outcome: str
+    fetched_at: int | None
+    http_status: int | None
+    raw_body: bytes | None
+    raw_body_size: int | None
+    http_date: str | None
+    retry_after: str | None
+    rtt_ms: float | None
+    clock_quality: str
+    clock_window_ms: tuple[int, int] | None
+    capture_reason: str | None
+
+
+@dataclass(frozen=True)
+class AttemptEvent:
+    phase: Literal["before_transport", "after_outcome"]
+    attempt_id: str
+    attempt: int
+    metric: str
+    parameters: tuple[tuple[str, Any], ...]
+    attempted_at: int
+    transport_invoked: bool
+    outcome: str | None = None
+    decided_at: int | None = None
+    response: ResponseProvenance | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ObserverDiagnostic:
+    phase: str
+    attempt_id: str
+    exception_type: str
+
+
+@dataclass(frozen=True)
+class RequestProvenance:
+    events: tuple[AttemptEvent, ...]
+    decided_at: int | None
+
+
+@dataclass(frozen=True)
+class RawDelivery:
+    """Separate from RawResult and normalized analysis/replay contracts.
+
+    Failure deliveries use decided_at, never a market-observation fetched_at.
+    A completed HTTP error response can still have physical receipt evidence in
+    events[].response; that is operational evidence, not a fabricated market value.
+    cache/shared_waiter deliveries preserve the same immutable response evidence.
+    """
+    result: RawResult
+    delivery_source: Literal["network_owner", "shared_waiter", "cache", "local_decision"]
+    cache_hit: bool
+    read_at: int
+    cache_origin_at: int | None
+    provenance: RequestProvenance
+
+    @property
+    def response(self) -> ResponseProvenance | None:
+        return self.provenance.events[-1].response if self.provenance.events else None
+
+    @property
+    def response_id(self) -> str | None:
+        return self.response.response_id if self.response else None
+
+    @property
+    def outcome(self) -> str:
+        if self.result.reason:
+            return self.result.reason
+        if self.response and self.response.capture_reason:
+            return "provenance_unavailable"
+        return self.response.outcome if self.response else "provenance_unavailable"
+
+    @property
+    def fetched_at(self) -> int | None:
+        if self.outcome != "response_received":
+            return None
+        return self.response.fetched_at
+
+    @property
+    def decided_at(self) -> int | None:
+        if self.provenance.decided_at is not None:
+            return self.provenance.decided_at
+        if self.response and self.response.capture_reason:
+            return self.provenance.events[-1].decided_at
+        return None
+
+    @property
+    def provenance_status(self) -> str:
+        return "available" if self.response and self.response.capture_reason is None else "unavailable"
+
+
+def _clock_evidence(date_header: str | None, fetched_at: int | None,
+                    rtt_ms: float | None) -> tuple[str, tuple[int, int] | None]:
+    if date_header is None:
+        return "http_date_missing", None
+    try:
+        date = parsedate_to_datetime(date_header)
+        if date.tzinfo is None:
+            raise ValueError("date_timezone_missing")
+        date_ms = int(date.timestamp() * ds.MS_PER_SECOND)
+    except (ValueError, TypeError, OverflowError, OSError, IndexError):
+        return "http_date_malformed", None
+    if fetched_at is None or rtt_ms is None:
+        return "clock_timing_unavailable", None
+    window = (date_ms - HTTP_DATE_SKEW_TOLERANCE_MS,
+              date_ms + HTTP_DATE_PRECISION_MS + math.ceil(rtt_ms) + HTTP_DATE_SKEW_TOLERANCE_MS)
+    return ("http_date_window_consistent" if window[0] <= fetched_at <= window[1]
+            else "clock_skew_exceeds_tolerance"), window
+
 
 @dataclass(frozen=True)
 class CacheEntry:
     result: RawResult
     expires_at: float
+    provenance: RequestProvenance | None = None
+    origin_at: int | None = None
 
 
 class SharedPublicState:
@@ -88,7 +220,7 @@ class SharedPublicState:
             self.leases[symbol] = now + ds.ADMISSION_LEASE_SECONDS
             return True
 
-    def reserve_attempt(self) -> str | None:
+    def reserve_attempt(self, *, check_only: bool = False) -> str | None:
         with self.lock:
             now = self.monotonic()
             if now < self.cooldown_until:
@@ -97,7 +229,8 @@ class SharedPublicState:
                 self.attempts.popleft()
             if len(self.attempts) >= ds.LOCAL_MAX_RPM:
                 return "local_rate_limit_exhausted"
-            self.attempts.append(now)
+            if not check_only:
+                self.attempts.append(now)
             return None
 
     def cooldown(self, seconds: float | None) -> None:
@@ -150,22 +283,130 @@ def _number(value: Any) -> Decimal:
 
 
 class BinanceFuturesPublicClient:
-    def __init__(self, *, state: SharedPublicState | None = None, transport=None):
+    def __init__(self, *, state: SharedPublicState | None = None, transport=None, observer=None):
         self.state = SHARED_STATE if state is None else state
         self.transport = transport or _public_get
+        # Synchronous advisory hook. Exceptions (including interrupts raised
+        # inside the callback) are isolated. Caller controls latency and any I/O
+        # in its callback; this adapter supplies no writer/background dispatcher.
+        if observer is not None and (not callable(observer) or inspect.iscoroutinefunction(observer)
+                                     or inspect.iscoroutinefunction(getattr(observer, "__call__", None))
+                                     or inspect.isasyncgenfunction(observer)
+                                     or inspect.isasyncgenfunction(getattr(observer, "__call__", None))):
+            raise ValueError("observer_must_be_synchronous")
+        self.observer = observer
+        self.observer_diagnostics: deque[ObserverDiagnostic] = deque(maxlen=OBSERVER_DIAGNOSTIC_LIMIT)
 
-    def _http(self, metric: ds.Metric, parameters: dict[str, Any]) -> RawResult:
+    def _event(self, trace: list[AttemptEvent], event: AttemptEvent) -> None:
+        trace.append(event)
+        if self.observer is not None:
+            try:
+                outcome = self.observer(event)
+                if inspect.isasyncgen(outcome):
+                    # Refuse without iterating or scheduling asynchronous cleanup.
+                    raise TypeError("observer_returned_async_generator")
+                if inspect.isawaitable(outcome):
+                    if inspect.iscoroutine(outcome):
+                        outcome.close()
+                    raise TypeError("observer_returned_awaitable")
+            except BaseException as error:
+                self.observer_diagnostics.append(ObserverDiagnostic(
+                    event.phase, event.attempt_id, type(error).__name__))
+
+    def _capture_response(self, response, status, response_id: str, started: float) -> ResponseProvenance:
+        """Capture before JSON. Never consume an unsupported deferred response.
+
+        _public_get uses Requests' default stream=False: complete content decoding
+        happens before transport returns. Only the inherited, cached Requests
+        content property is safe here; arbitrary injected objects may consume data
+        on attribute access and remain analysis-compatible but archive-ineligible.
+        """
+        body = None
+        size = fetched = None
+        reason = None
+        try:
+            supported = (issubclass(type(response), requests.Response)
+                         and getattr(type(response), "content", None) is requests.Response.content)
+            if not supported:
+                reason = "raw_response_type_unsupported"
+            elif type(response._content) is not bytes:
+                reason = "response_body_not_buffered"
+            else:
+                content = response.content
+                # First host timestamp after complete decoded body availability,
+                # strictly before JSON parsing/normalization.
+                fetched = self.state.wall_ms()
+                size = len(content)
+                if size > MAX_PROVENANCE_BODY_BYTES:
+                    reason = "raw_body_exceeds_provenance_cap"
+                else:
+                    body = content
+        except Exception:
+            reason = "raw_body_capture_unavailable"
+        try:
+            elapsed = (self.state.monotonic() - started) * ds.MS_PER_SECOND
+            rtt = elapsed if math.isfinite(elapsed) and elapsed >= 0 else None
+        except Exception:
+            rtt = None
+        date = retry = None
+        if reason not in ("raw_response_type_unsupported", "response_body_not_buffered"):
+            try:
+                # Do not invoke arbitrary headers properties or mapping overrides.
+                headers = vars(response).get("headers")
+                if type(headers) not in (dict, requests.structures.CaseInsensitiveDict):
+                    raise TypeError("unsupported_response_headers")
+                date, retry = headers.get("Date"), headers.get("Retry-After")
+                date = date if isinstance(date, str) else None
+                retry = retry if isinstance(retry, str) else None
+            except Exception:
+                reason = reason or "response_headers_unavailable"
+        quality, window = _clock_evidence(date, fetched, rtt)
+        return ResponseProvenance(response_id,
+            "response_received" if fetched is not None else "provenance_unavailable",
+            fetched, status if type(status) is int else None, body, size, date, retry,
+            rtt, quality, window, reason)
+
+    def _http(self, metric: ds.Metric, parameters: dict[str, Any],
+              trace: list[AttemptEvent] | None = None) -> RawResult:
+        trace = [] if trace is None else trace
         for attempt in range(1, ds.TOTAL_ATTEMPTS + 1):
-            reason = self.state.reserve_attempt()
+            attempt_id, attempted_at = uuid4().hex, self.state.wall_ms()
+            reason = (self.state.reserve_attempt(check_only=True) if self.observer is not None
+                      else self.state.reserve_attempt())
+            identity = tuple(sorted(parameters.items()))
             if reason:
+                self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                    identity, attempted_at, False, "local_decision", self.state.wall_ms(), reason=reason))
                 return RawResult(None, self.state.wall_ms(), reason, attempt - 1)
+            self._event(trace, AttemptEvent("before_transport", attempt_id, attempt, metric.value,
+                identity, attempted_at, False))
+            # A synchronous journal may take time: reserve at actual invocation,
+            # rechecking cooldown/budget rather than spending an expired slot.
+            if self.observer is not None:
+                reason = self.state.reserve_attempt()
+                if reason:
+                    self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                        identity, attempted_at, False, "local_decision", self.state.wall_ms(), reason=reason))
+                    return RawResult(None, self.state.wall_ms(), reason, attempt - 1)
+            # Observer has completed before measuring or invoking the transport.
+            # No SharedPublicState map lock is held around either observer.
+            started = self.state.monotonic()
+            outcome_emitted = False
             try:
                 response = self.transport(ENDPOINTS[metric], parameters)
+                response_id = uuid4().hex
                 status = response.status_code
+                provenance = self._capture_response(response, status, response_id, started)
                 if status in (429, 418):
                     fetched = self.state.wall_ms()
                     delay = _retry_after(response.headers.get("Retry-After"), fetched)
+                    # Publish provider cooldown before a caller-controlled observer.
                     self.state.cooldown(delay)
+                self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                    identity, attempted_at, True, provenance.outcome, self.state.wall_ms(),
+                    provenance, provenance.capture_reason if status == 200 else "provider_http_error"))
+                outcome_emitted = True
+                if status in (429, 418):
                     if status == 418:
                         return RawResult(None, fetched, "provider_ip_banned", attempt)
                     if delay is None:
@@ -188,25 +429,37 @@ class BinanceFuturesPublicClient:
                 # Availability is after body receipt/decoding, never request send.
                 return RawResult(payload, self.state.wall_ms(), attempts=attempt)
             except requests.exceptions.Timeout:
-                reason = "timeout_retry_budget_exhausted"
+                reason, outcome = "timeout_retry_budget_exhausted", "timeout"
             except requests.exceptions.ConnectionError:
-                reason = "provider_down_retry_budget_exhausted"
+                reason, outcome = "provider_down_retry_budget_exhausted", "connection_failure"
             except requests.exceptions.RequestException:
-                return RawResult(None, self.state.wall_ms(), "provider_transport_error", attempt)
+                reason, outcome = "provider_transport_error", "transport_error"
+                if not outcome_emitted:
+                    self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                        identity, attempted_at, True, outcome, self.state.wall_ms(), reason=reason))
+                return RawResult(None, self.state.wall_ms(), reason, attempt)
             except Exception:
-                return RawResult(None, self.state.wall_ms(), "internal_error", attempt)
+                reason, outcome = "internal_error", "internal_error"
+                if not outcome_emitted:
+                    self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                        identity, attempted_at, True, outcome, self.state.wall_ms(), reason=reason))
+                return RawResult(None, self.state.wall_ms(), reason, attempt)
+            if not outcome_emitted:
+                self._event(trace, AttemptEvent("after_outcome", attempt_id, attempt, metric.value,
+                    identity, attempted_at, True, outcome, self.state.wall_ms(), reason=reason))
             if attempt == ds.TOTAL_ATTEMPTS:
                 return RawResult(None, self.state.wall_ms(), reason, attempt)
         raise AssertionError("bounded_request_loop")
 
-    def _raw(self, metric: ds.Metric, symbol: str, parameters: dict[str, Any]) -> RawResult:
+    def _delivery(self, metric: ds.Metric, symbol: str, parameters: dict[str, Any]) -> RawDelivery:
         key = (ds.PROVIDER, symbol, metric.value, parameters.get("period"), tuple(sorted(parameters.items())))
         with self.state.lock:
             now = self.state.monotonic()
             self.state.cache = {item: cached for item, cached in self.state.cache.items() if now < cached.expires_at}
             entry = self.state.cache.get(key)
             if entry and self.state.monotonic() < entry.expires_at:
-                return entry.result
+                return RawDelivery(entry.result, "cache", True, self.state.wall_ms(),
+                                   entry.origin_at, entry.provenance or RequestProvenance((), None))
             event = self.state.in_flight.get(key)
             owner = event is None
             if owner:
@@ -214,18 +467,26 @@ class BinanceFuturesPublicClient:
                 self.state.in_flight[key] = event
         if not owner:
             if not event.wait(timeout=ds.IN_FLIGHT_WAIT_SECONDS):
-                return RawResult(None, self.state.wall_ms(), "in_flight_wait_budget_exhausted")
+                result = RawResult(None, self.state.wall_ms(), "in_flight_wait_budget_exhausted")
+                return RawDelivery(result, "shared_waiter", False, self.state.wall_ms(), None,
+                                   RequestProvenance((), result.fetched_at))
             with self.state.lock:
                 entry = self.state.cache.get(key)
-                return entry.result if entry else RawResult(None, self.state.wall_ms(), "missing_shared_result")
+                if entry:
+                    return RawDelivery(entry.result, "shared_waiter", False, self.state.wall_ms(),
+                                       entry.origin_at, entry.provenance or RequestProvenance((), None))
+                result = RawResult(None, self.state.wall_ms(), "missing_shared_result")
+                return RawDelivery(result, "shared_waiter", False, self.state.wall_ms(), None,
+                                   RequestProvenance((), result.fetched_at))
         result = RawResult(None, self.state.wall_ms(), "provider_transport_error")
+        trace: list[AttemptEvent] = []
+        origin = None
         try:
-            result = self._http(metric, parameters)
-            return result
+            result = self._http(metric, parameters, trace)
         except Exception:
             result = RawResult(None, self.state.wall_ms(), "internal_error")
-            return result
         finally:
+            provenance = RequestProvenance(tuple(trace), self.state.wall_ms() if result.reason else None)
             ttl = self.state.policy.ttl(metric)
             if parameters.get("endTime") is not None:
                 ttl = max(ttl, ds.CLOSED_HISTORY_TTL_SECONDS)
@@ -235,9 +496,59 @@ class BinanceFuturesPublicClient:
                     ttl = min(ttl, max(ds.FAILURE_TTL_SECONDS, self.state.cooldown_until - now))
                 # A no-send local denial is not a provider observation to cache.
                 if result.attempts:
-                    self.state.cache[key] = CacheEntry(result, now + ttl)
+                    origin = self.state.wall_ms()
+                    self.state.cache[key] = CacheEntry(result, now + ttl, provenance, origin)
                 self.state.in_flight.pop(key, None)
                 event.set()
+        source = "network_owner" if any(event.transport_invoked for event in trace) else "local_decision"
+        return RawDelivery(result, source, False, self.state.wall_ms(), origin, provenance)
+
+    def _raw(self, metric: ds.Metric, symbol: str, parameters: dict[str, Any]) -> RawResult:
+        return self._delivery(metric, symbol, parameters).result
+
+    def raw_delivery(self, metric: ds.Metric, symbol: str, *, period: str = ds.DEFAULT_PERIOD,
+                     limit: int = ds.DEFAULT_HISTORY_LIMIT, start_time: int | None = None,
+                     end_time: int | None = None) -> RawDelivery:
+        """Read-only unnormalized evidence; same admission/cache/transport as analysis.
+
+        No funding dependencies or normalized/replay claims. Callbacks must avoid
+        reentering the same key: existing bounded single-flight wait still applies.
+        The real symbol is admitted even for the shared funding metadata key.
+        """
+        def denied(reason):
+            result = RawResult(None, self.state.wall_ms(), reason)
+            return RawDelivery(result, "local_decision", False, self.state.wall_ms(), None,
+                               RequestProvenance((), result.fetched_at))
+        if not isinstance(metric, ds.Metric):
+            return denied("invalid_query")
+        if metric == ds.Metric.FUNDING_INTERVAL:
+            if not isinstance(symbol, str) or not SYMBOL_PATTERN.fullmatch(symbol):
+                return denied("invalid_symbol")
+            if not self.state.admit(symbol):
+                return denied("steady_state_request_budget_exceeded")
+            return self._delivery(metric, "*", {})
+        if (not isinstance(symbol, str) or not SYMBOL_PATTERN.fullmatch(symbol)
+                or period not in ds.PERIOD_SECONDS):
+            return denied("invalid_query")
+        maximum = ds.MAX_FUNDING_HISTORY_LIMIT if metric == ds.Metric.SETTLED_FUNDING else ds.MAX_STATISTICS_HISTORY_LIMIT
+        if (type(limit) is not int or not 1 <= limit <= maximum
+                or any(item is not None and not ds.valid_timestamp(item) for item in (start_time, end_time))
+                or (end_time is not None and end_time > self.state.wall_ms())
+                or (start_time is not None and end_time is not None and start_time > end_time)
+                or (metric not in ds.HISTORICAL_METRICS and (start_time is not None or end_time is not None))):
+            return denied("invalid_query")
+        if not self.state.admit(symbol):
+            return denied("steady_state_request_budget_exceeded")
+        parameters: dict[str, Any] = {"symbol": symbol}
+        if metric in ds.HISTORICAL_METRICS:
+            parameters["limit"] = limit
+            if metric != ds.Metric.SETTLED_FUNDING:
+                parameters["period"] = period
+            if start_time is not None:
+                parameters["startTime"] = start_time
+            if end_time is not None:
+                parameters["endTime"] = end_time
+        return self._delivery(metric, symbol, parameters)
 
     def _unavailable(self, symbol: str, metric: ds.Metric, reason: str,
                      fetched: int | None = None, period: str | None = None) -> ds.Observation:
