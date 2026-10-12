@@ -21,9 +21,13 @@ Introduce read-only crash audit and fail-closed recovery evidence: identify clea
 
 Regression proof: interrupted frame, fsync failure, duplicate writer, bad historical segment, stale or absent heartbeat, clock jump, failed gap record; require full offline pytest and separate exact-path C-02 commit.
 
-## C-03 — Backup, restore, and storage safety (not started)
+## C-03 — Backup, restore, and storage safety (capacity/compression probe only; backup automation NOT approved)
 
 Define an explicitly authorized local/external backup destination outside Git and outside the active DARC root; immutable SHA256-verified copies with complete manifest, backup completion markers and periodic verified restore drill. Address disk capacity/alerts, disk-full and power-loss tests, access controls and retention policy. Never prune or replace original DARC segments; never mistake a copied archive for a new market receipt.
+
+**Measured 2026-10-12, Windows:** free C: 62,811,582,464 bytes (Disk 0, TS128GMSA720 SSD); free D: 411,945,062,400 bytes (physically distinct Disk 1, WDC WD10JPVT HDD). Raw ETHUSDT pilot archive: 15,580,678 bytes / 3600 s, equivalent to ~374 MB/day, 11.22 GB/30 days and 136.5 GB/365 days per symbol **uncompressed** (decimal GB); overhead and additional symbols not included. C: holds ~5.6 such 30-day symbol-months before reserve. Proposal only: `D:\DerivArchive-Backups` for secondary local immutable backups, plus another encrypted off-host/offsite copy; D: protects against C: disk failure but not common-host loss. No destination is yet provisioned or authorized as an operational backup job.
+
+**Zstandard level-3 non-destructive probe:** `D:\DerivArchive-C03-Probe\probe-report.json`; isolated `pilot-copy.darc` 15,580,678 B -> `.zst` 104,570 B (99.33% smaller, 149:1); decompressed 15,580,678 B with exact original SHA256 `6fe6d97ba1ff4ac706f93ff5883135bc8ed7befd27d211dd5f46e30bfa48c9f7`. Compressed SHA256 `fe498a1c69d17d55207a88984e9fb51be35b083f01c0e930409269fca0d6a79c`. These results apply **only to this one highly compressible pilot**, never assume that ratio as the capacity budget. Originals untouched; full C-03 and CONTINUOUS remain NO-GO.
 
 Regression proof: failed/delayed copy, checksum mismatch, missing/corrupt segment, insufficient space, interrupted copy and hash-matched restore. Full offline pytest, separate C-03 commit.
 
