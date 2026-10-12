@@ -16,6 +16,8 @@ _MAX_NS = 2**63 - 1
 _MAX_SAMPLES = 2048
 _MAX_FOLDS = 32
 _DOMAIN = "crypto-trader-walk-forward-layout-v1"
+# Any canonical-encoding contract change requires a new _DOMAIN and _SEMANTICS
+# version; historical content digests must remain interpretable.
 _SEMANTICS = "synthetic-halfopen-prevalidation-strict-purge-v1"
 _REASONS = ("synthetic_metadata_unverified", "anchor_missing")
 

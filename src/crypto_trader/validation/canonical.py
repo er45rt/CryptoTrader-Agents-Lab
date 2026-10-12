@@ -153,6 +153,11 @@ def input_manifest(values: Mapping[str, str], *, allowed_paths: tuple[str, ...])
 
 
 def content_hash(domain: str, value) -> str:
+    """Version-bound canonical digest; encode ns beyond 53-bit JSON as strings.
+
+    The domain is part of the preimage. Semantic or serializer revisions
+    require a new hash domain/version; historical digests stay unchanged.
+    """
     _nfc(domain)
     if not domain or len(domain) > 128:
         raise CanonicalError("invalid domain")

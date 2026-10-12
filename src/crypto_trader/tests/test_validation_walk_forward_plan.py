@@ -595,6 +595,19 @@ def test_mixed_gap_cutoff_inside_training_window_is_conservative():
     assert codes["decision_at_cutoff"] == "PURGED_GAP_OVERLAP"
 
 
+def test_canonical_hash_domain_and_large_nanosecond_string_contract():
+    from crypto_trader.validation.canonical import CanonicalError, content_hash
+    hi = 2**63 - 1
+    assert content_hash("domain-v1", {"ns": str(hi)}) == content_hash(
+        "domain-v1", {"ns": str(hi)}
+    )
+    assert content_hash("domain-v1", {"ns": str(hi)}) != content_hash(
+        "domain-v2", {"ns": str(hi)}
+    )
+    with pytest.raises(CanonicalError, match="invalid canonical payload"):
+        content_hash("domain-v1", {"ns": hi})
+
+
 def test_fixed_known_answer_hashes_for_valid_synthetic_fixture():
     # The independent research manifest pins both values across runs.
     report = plan_synthetic_folds(*valid())
