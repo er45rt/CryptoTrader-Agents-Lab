@@ -6,7 +6,9 @@ authors = [{ name = "Your Name", email = "you@example.com" }]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "crewai[tools]>=0.120.1,<1.0.0",
-    "requests>=2.31.0",
+    "requests>=2.33.0,<3",
+    "urllib3==2.8.0",
+    "protobuf==5.29.6",
     "python-dotenv>=1.0.0",
     "nautilus_trader==1.231.0"
 ]
