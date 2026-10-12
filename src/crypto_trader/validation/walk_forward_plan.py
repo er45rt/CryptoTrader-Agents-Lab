@@ -54,6 +54,20 @@ class FoldLayout:
     validation_ids: tuple[str, ...]
     pair_codes: tuple[tuple[str, str], ...]
 
+    def __post_init__(self):
+        if (type(self.fold_id) is not str or len(self.fold_id) != 64
+                or any(char not in "0123456789abcdef" for char in self.fold_id)
+                or type(self.window) is not FoldWindow
+                or type(self.train_ids) is not tuple
+                or type(self.validation_ids) is not tuple
+                or not self.train_ids or not self.validation_ids
+                or any(type(row) is not str for row in self.train_ids + self.validation_ids)
+                or type(self.pair_codes) is not tuple
+                or any(type(v) is not tuple or len(v) != 2
+                       or type(v[0]) is not str or type(v[1]) is not str
+                       for v in self.pair_codes)):
+            raise SplitPlanError("noncanonical synthetic fold layout")
+
 
 @dataclass(frozen=True)
 class SplitLayoutReport:
@@ -71,6 +85,8 @@ class SplitLayoutReport:
                 or self.label is not SplitLabel.EXPLORATORY_SPLIT_ONLY
                 or type(self.reasons) is not tuple or self.reasons != _REASONS
                 or type(self.folds) is not tuple
+                or not self.folds
+                or any(type(fold) is not FoldLayout for fold in self.folds)
                 or type(self.split_layout_digest) is not str
                 or len(self.split_layout_digest) != 64):
             raise SplitPlanError("noncanonical synthetic layout report")

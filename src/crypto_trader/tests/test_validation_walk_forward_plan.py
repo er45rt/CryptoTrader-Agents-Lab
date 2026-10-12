@@ -248,7 +248,8 @@ def _strict_planner_scanner(tree):
         "permits_trial_allocation", "pre_validation_gap_ns", "reasons",
         "revision_first_seen_utc_ns", "sample_id", "split_layout_digest",
         "train_end_utc_ns", "train_start_utc_ns", "validation_end_utc_ns",
-        "validation_start_utc_ns", "value",
+        "validation_start_utc_ns", "train_ids", "validation_ids", "pair_codes",
+        "window", "value",
     }
     # No implicit builtins, module globals, or undeclared names. This is a
     # deliberately frozen source-surface allowlist for the audited planner.
@@ -575,14 +576,19 @@ def test_fixed_known_answer_hashes_for_valid_synthetic_fixture():
     )
 
 
-def test_report_constructor_is_not_a_trust_boundary():
-    # Document a P2 representational weakness without claiming privileges.
-    forged = SplitLayoutReport((), "x" * 64)
-    assert forged.folds == ()
-    assert forged.permits_causal_use is False
-    assert forged.permits_trial_allocation is False
-    assert forged.permits_promotion is False
-    assert forged.permits_trading is False
+def test_layout_constructors_reject_empty_or_malformed_representation():
+    rows, folds = valid()
+    report = plan_synthetic_folds(rows, folds)
+    with pytest.raises(SplitPlanError, match="noncanonical synthetic layout report"):
+        SplitLayoutReport((), report.split_layout_digest)
+    with pytest.raises(SplitPlanError, match="noncanonical synthetic layout report"):
+        SplitLayoutReport((object(),), report.split_layout_digest)
+    with pytest.raises(SplitPlanError, match="noncanonical synthetic fold layout"):
+        replace(report.folds[0], window="forged")
+    with pytest.raises(SplitPlanError, match="noncanonical synthetic fold layout"):
+        replace(report.folds[0], fold_id="x" * 64)
+    assert report.folds[0].train_ids == ("train",)
+    assert report.permits_trading is False
 
 @pytest.mark.parametrize("specimen", (
     "license()",
