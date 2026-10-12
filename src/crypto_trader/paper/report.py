@@ -183,6 +183,10 @@ def report_from_journal(
             return -1
 
     for event in events:
+        # A journal may contain multiple sessions. Never attribute another
+        # session's decisions, fills, risk or time range to this replay.
+        if event.correlation_id != session_id:
+            continue
         occurred_at = event.occurred_at
         started_at = occurred_at if started_at is None or occurred_at < started_at else started_at
         ended_at = occurred_at if ended_at is None or occurred_at > ended_at else ended_at
