@@ -337,6 +337,19 @@ def test_planner_scanner_rejects_unreviewed_async_definitions(source):
     with pytest.raises(AssertionError, match="unreviewed async function definition"):
         _strict_planner_scanner(ast.parse(source))
 
+@pytest.mark.parametrize(("specimen", "reason"), (
+    ("match 1:\n    case 1:\n        pass", "unsupported structural match"),
+    ("FoldLayout(**dict())", "unreviewed keyword argument"),
+    ("def unreviewed():\n    pass", "unreviewed function definition"),
+    ("from dataclasses import dataclass as alias", "aliased import"),
+    ("def _id(unknown):\n    pass", "unreviewed function parameter"),
+))
+def test_scanner_isolates_individual_rejection_rules(specimen, reason):
+    # Parse-only: each specimen has one distinct AST policy violation.
+    with pytest.raises(AssertionError, match=reason):
+        _strict_planner_scanner(ast.parse(specimen))
+
+
 def test_new_source_isolation_ast_including_adversarial_specimens():
     tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
     _strict_planner_scanner(tree)
