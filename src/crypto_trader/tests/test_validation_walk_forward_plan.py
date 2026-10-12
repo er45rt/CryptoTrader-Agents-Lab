@@ -768,3 +768,46 @@ def test_v8_constructor_changes_preserve_historical_hash_preimages():
     assert replace(report.folds[0]) == report.folds[0]
     # Added evidence enables recomputation; it grants no sample custody.
     assert report.sample_digest == report.folds[0].sample_digest
+
+
+def test_v8_sample_snapshot_survives_caller_mutation_during_hash(monkeypatch):
+    from crypto_trader.validation import walk_forward_plan as planner
+    rows, folds = valid()
+    expected = planner.plan_synthetic_folds(rows, folds)
+    original_hash = planner.content_hash
+    mutations = []
+
+    def mutate_caller_after_sample_evidence(domain, value):
+        if domain.endswith("-samples"):
+            object.__setattr__(rows[0], "sample_id", "changed")
+            object.__setattr__(rows[0], "decision_utc_ns", BASE + 100)
+            object.__setattr__(rows[0], "feature_available_utc_ns", BASE + 101)
+            object.__setattr__(rows[0], "exposure_end_utc_ns", BASE + 102)
+            mutations.append(True)
+        return original_hash(domain, value)
+
+    monkeypatch.setattr(planner, "content_hash", mutate_caller_after_sample_evidence)
+    assert planner.plan_synthetic_folds(rows, folds) == expected
+    assert mutations == [True]
+    assert rows[0].sample_id == "changed"
+
+
+def test_v8_sample_snapshot_used_for_duplicate_check_and_hashing(monkeypatch):
+    from crypto_trader.validation import walk_forward_plan as planner
+    rows, folds = valid()
+    expected = planner.plan_synthetic_folds(rows, folds)
+    original_validate = planner._validated_sample
+    copies = []
+
+    def mutate_caller_after_validation(row):
+        copy = original_validate(row)
+        assert copy is not row
+        copies.append(copy)
+        if row is rows[0]:
+            object.__setattr__(row, "sample_id", "valid")
+            object.__setattr__(row, "revision_first_seen_utc_ns", BASE + 200)
+        return copy
+
+    monkeypatch.setattr(planner, "_validated_sample", mutate_caller_after_validation)
+    assert planner.plan_synthetic_folds(rows, folds) == expected
+    assert tuple(copy.sample_id for copy in copies) == ("train", "valid")

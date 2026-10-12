@@ -164,14 +164,16 @@ def _id(value: object) -> str:
 def _validated_sample(sample: object) -> SampleWindow:
     if type(sample) is not SampleWindow:
         raise SplitPlanError("unexpected synthetic sample type")
-    _id(sample.sample_id)
+    sample_id = _id(sample.sample_id)
     d = _time(sample.decision_utc_ns)
     f = _time(sample.feature_available_utc_ns)
     r = _time(sample.revision_first_seen_utc_ns)
     e = _time(sample.exposure_end_utc_ns)
     if f > d or r > d or e <= d:
         raise SplitPlanError("future availability or invalid half-open exposure")
-    return sample
+    # Read and validate each scalar once. All subsequent phases use this owned
+    # value copy, even if a caller mutates its frozen dataclass during the call.
+    return SampleWindow(sample_id, d, f, r, e)
 
 
 def _validated_fold(fold: object) -> FoldWindow:
@@ -227,7 +229,7 @@ def plan_synthetic_folds(
     rows: list[SampleWindow] = []
     seen: set[str] = set()
     for row in samples:
-        _validated_sample(row)
+        row = _validated_sample(row)
         if row.sample_id in seen:
             raise SplitPlanError("duplicate sample ID")
         seen.add(row.sample_id)
