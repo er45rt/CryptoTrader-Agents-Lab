@@ -106,8 +106,8 @@ def _id(value: object) -> str:
     if type(value) is not str or not 1 <= len(value) <= 128:
         raise SplitPlanError("invalid synthetic sample ID")
     for char in value:
-        if category(char) in ("Cc", "Cs"):
-            raise SplitPlanError("control/surrogate in sample ID")
+        if category(char) in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            raise SplitPlanError("unsafe Unicode category in sample ID")
     if normalize("NFC", value) != value:
         raise SplitPlanError("sample IDs must already be NFC")
     return value

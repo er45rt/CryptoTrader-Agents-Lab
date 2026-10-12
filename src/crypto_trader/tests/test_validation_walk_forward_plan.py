@@ -87,6 +87,18 @@ def test_invalid_sample_fails_closed(row):
         plan_synthetic_folds((row(),) + valid()[0], valid()[1])
 
 
+@pytest.mark.parametrize("identifier", (
+    "a\u202eb",  # Bidi format control (Cf).
+    "a\u200bb",  # Zero-width format (Cf).
+    "a\ue000b",  # Private-use (Co).
+    "a\u0378b",  # Unassigned (Cn).
+))
+def test_sample_identifier_rejects_unsafe_unicode_categories(identifier):
+    rows, folds = valid()
+    with pytest.raises(SplitPlanError, match="unsafe Unicode category"):
+        plan_synthetic_folds(rows + (sample(identifier, BASE + 10),), folds)
+
+
 def test_invalid_row_rejects_entire_call():
     rows, fs = valid()
     with pytest.raises(SplitPlanError):
