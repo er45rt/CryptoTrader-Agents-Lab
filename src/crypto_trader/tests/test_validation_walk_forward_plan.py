@@ -634,6 +634,21 @@ def test_fixed_known_answer_hashes_for_valid_synthetic_fixture():
     )
 
 
+@pytest.mark.parametrize(("field", "invalid"), (
+    ("train_ids", ()),
+    ("validation_ids", ()),
+    ("train_ids", ("train", 123)),
+    ("pair_codes", ("train",)),
+    ("pair_codes", (("train",),)),
+    ("window", None),
+    ("fold_id", "f" * 63),
+))
+def test_fold_layout_constructor_rejects_malformed_fields(field, invalid):
+    report = plan_synthetic_folds(*valid())
+    with pytest.raises(SplitPlanError, match="noncanonical synthetic fold layout"):
+        replace(report.folds[0], **{field: invalid})
+
+
 def test_layout_constructors_reject_empty_or_malformed_representation():
     rows, folds = valid()
     report = plan_synthetic_folds(rows, folds)
