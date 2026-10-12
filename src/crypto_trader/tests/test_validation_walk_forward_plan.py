@@ -282,7 +282,7 @@ def _strict_planner_scanner(tree):
         "revision_first_seen_utc_ns", "sample_id", "split_layout_digest",
         "train_end_utc_ns", "train_start_utc_ns", "validation_end_utc_ns",
         "validation_start_utc_ns", "train_ids", "validation_ids", "pair_codes",
-        "window", "value",
+        "window", "value", "sample_digest",
     }
     # No implicit builtins, module globals, or undeclared names. This is a
     # deliberately frozen source-surface allowlist for the audited planner.
@@ -713,3 +713,58 @@ def test_planner_scanner_rejects_unreviewed_ast_string_fields(specimen):
 def test_planner_scanner_accepts_reviewed_keyword_contract():
     _strict_planner_scanner(ast.parse("FoldLayout(key=value)"))
     _strict_planner_scanner(ast.parse("FoldLayout(frozen=True)"))
+
+
+@pytest.mark.parametrize(("field", "invalid"), (
+    ("split_layout_digest", "x" * 64),
+    ("split_layout_digest", "0" * 64),
+    ("sample_digest", "f" * 64),
+    ("folds", ()),
+))
+def test_v8_report_constructor_rejects_inconsistent_commitments(field, invalid):
+    report = plan_synthetic_folds(*valid())
+    with pytest.raises(SplitPlanError):
+        replace(report, **{field: invalid})
+
+
+@pytest.mark.parametrize(("field", "invalid"), (
+    ("fold_id", "0" * 64),
+    ("sample_digest", "f" * 64),
+    ("train_ids", ("valid",)),
+    ("validation_ids", ("train",)),
+    ("train_ids", ("train", "train")),
+    ("pair_codes", (("train", "INVALID"), ("valid", "VALIDATION"))),
+    ("pair_codes", (("train", "TRAIN"), ("train", "VALIDATION"))),
+    ("pair_codes", (("valid", "VALIDATION"), ("train", "TRAIN"))),
+    ("window", fold(start=20, end=20)),
+    ("window", fold(gap=1)),
+))
+def test_v8_fold_constructor_rejects_incoherent_fields(field, invalid):
+    layout = plan_synthetic_folds(*valid()).folds[0]
+    with pytest.raises(SplitPlanError):
+        replace(layout, **{field: invalid})
+
+
+def test_v8_report_rejects_equal_but_nonexact_reason_types():
+    class Reason(str):
+        pass
+    report = plan_synthetic_folds(*valid())
+    with pytest.raises(SplitPlanError):
+        replace(report, reasons=tuple(Reason(reason) for reason in report.reasons))
+
+
+def test_v8_report_revalidates_mutated_fold_and_requires_ordered_windows():
+    report = plan_synthetic_folds(*valid())
+    with pytest.raises(SplitPlanError):
+        replace(report, folds=report.folds * 2)
+    object.__setattr__(report.folds[0], "train_ids", ("valid",))
+    with pytest.raises(SplitPlanError):
+        replace(report)
+
+
+def test_v8_constructor_changes_preserve_historical_hash_preimages():
+    report = plan_synthetic_folds(*valid())
+    assert replace(report) == report
+    assert replace(report.folds[0]) == report.folds[0]
+    # Added evidence enables recomputation; it grants no sample custody.
+    assert report.sample_digest == report.folds[0].sample_digest

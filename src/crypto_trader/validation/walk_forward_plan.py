@@ -55,6 +55,8 @@ class FoldLayout:
     train_ids: tuple[str, ...]
     validation_ids: tuple[str, ...]
     pair_codes: tuple[tuple[str, str], ...]
+    # Evidence commitment only, not custody or source authentication.
+    sample_digest: str = ""
 
     def __post_init__(self):
         if (type(self.fold_id) is not str or len(self.fold_id) != 64
@@ -69,12 +71,31 @@ class FoldLayout:
                        or type(v[0]) is not str or type(v[1]) is not str
                        for v in self.pair_codes)):
             raise SplitPlanError("noncanonical synthetic fold layout")
+        _validated_fold(self.window)
+        if (not 1 <= len(self.pair_codes) <= _MAX_SAMPLES
+                or type(self.sample_digest) is not str or len(self.sample_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.sample_digest)
+                or tuple(row[0] for row in self.pair_codes) != tuple(sorted(
+                    set(row[0] for row in self.pair_codes)))
+                or any(row[1] not in ("TRAIN", "VALIDATION", "PURGED_GAP_OVERLAP",
+                                     "OUTSIDE_WINDOWS") for row in self.pair_codes)
+                or self.train_ids != tuple(row[0] for row in self.pair_codes if row[1] == "TRAIN")
+                or self.validation_ids != tuple(row[0] for row in self.pair_codes if row[1] == "VALIDATION")):
+            raise SplitPlanError("inconsistent synthetic fold layout")
+        for row in self.pair_codes:
+            _id(row[0])
+        if self.fold_id != content_hash(
+                _DOMAIN + "-fold",
+                {"semantics_version": _SEMANTICS, "sample_manifest": self.sample_digest,
+                 "window": _fold_evidence(self.window), "pair_codes": self.pair_codes}):
+            raise SplitPlanError("synthetic fold digest mismatch")
 
 
 @dataclass(frozen=True)
 class SplitLayoutReport:
     folds: tuple[FoldLayout, ...]
     split_layout_digest: str
+    sample_digest: str = ""
     label: SplitLabel = SplitLabel.EXPLORATORY_SPLIT_ONLY
     reasons: tuple[str, str] = _REASONS
     permits_causal_use: bool = False
@@ -85,17 +106,42 @@ class SplitLayoutReport:
     def __post_init__(self):
         if (type(self.label) is not SplitLabel
                 or self.label is not SplitLabel.EXPLORATORY_SPLIT_ONLY
-                or type(self.reasons) is not tuple or self.reasons != _REASONS
+                or type(self.reasons) is not tuple
+                or any(type(row) is not str for row in self.reasons)
+                or self.reasons != _REASONS
                 or type(self.folds) is not tuple
-                or not self.folds
+                or not 1 <= len(self.folds) <= _MAX_FOLDS
                 or any(type(fold) is not FoldLayout for fold in self.folds)
                 or type(self.split_layout_digest) is not str
-                or len(self.split_layout_digest) != 64):
+                or len(self.split_layout_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.split_layout_digest)
+                or type(self.sample_digest) is not str or len(self.sample_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.sample_digest)):
             raise SplitPlanError("noncanonical synthetic layout report")
         if any(type(v) is not bool or v is not False for v in (
                 self.permits_causal_use, self.permits_trial_allocation,
                 self.permits_promotion, self.permits_trading)):
             raise SplitPlanError("synthetic layout cannot grant permissions")
+        prev_validation_end = 0
+        for fold in self.folds:
+            # Revalidate caller-supplied layouts, including tampered frozen rows.
+            FoldLayout(fold.fold_id, fold.window, fold.train_ids, fold.validation_ids,
+                       fold.pair_codes, fold.sample_digest)
+            if (fold.sample_digest != self.sample_digest
+                    or tuple(row[0] for row in fold.pair_codes) != tuple(
+                        row[0] for row in self.folds[0].pair_codes)
+                    or fold.window.validation_start_utc_ns < prev_validation_end):
+                raise SplitPlanError("inconsistent synthetic report folds")
+            prev_validation_end = fold.window.validation_end_utc_ns
+        if self.split_layout_digest != content_hash(
+                _DOMAIN + "-aggregate",
+                {"semantics_version": _SEMANTICS, "synthetic": True,
+                 "sample_manifest": self.sample_digest,
+                 "fold_ids": [fold.fold_id for fold in self.folds],
+                 "label": self.label.value, "reasons": self.reasons,
+                 "permits_causal_use": False, "permits_trial_allocation": False,
+                 "permits_promotion": False, "permits_trading": False}):
+            raise SplitPlanError("synthetic report digest mismatch")
 
 
 def _time(value: object, *, allow_zero: bool = False) -> int:
@@ -235,7 +281,7 @@ def plan_synthetic_folds(
              "window": _fold_evidence(fold), "pair_codes": pairs},
         )
         fold_layouts.append(FoldLayout(
-            fold_id, fold, tuple(train), tuple(validation), pairs,
+            fold_id, fold, tuple(train), tuple(validation), pairs, sample_digest,
         ))
 
     layouts = tuple(fold_layouts)
@@ -249,4 +295,4 @@ def plan_synthetic_folds(
          "permits_causal_use": False, "permits_trial_allocation": False,
          "permits_promotion": False, "permits_trading": False},
     )
-    return SplitLayoutReport(layouts, digest)
+    return SplitLayoutReport(layouts, digest, sample_digest)
