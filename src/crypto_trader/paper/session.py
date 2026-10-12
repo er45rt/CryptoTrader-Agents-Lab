@@ -225,6 +225,14 @@ class TradingSession:
             self.config.places_simulated_orders
             and isinstance(self.simulator, TemporalExecutionSimulator)
         )
+        if temporal:
+            # Validate the complete frozen timeline BEFORE starting the native engine
+            # or writing journal events; equal event times are not causally ordered.
+            for previous, current in zip(entries, entries[1:]):
+                if current.observed_at <= previous.observed_at:
+                    raise PaperStateError(
+                        "temporal market observations must have strictly increasing timestamps."
+                    )
         if temporal and start_index:
             raise PaperStateError(
                 "temporal execution resume requires verified journal, risk peak and engine state."
