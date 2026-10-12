@@ -75,7 +75,9 @@ from .errors import PaperStateError
 from .feed import MarketDataFeed, MarketObservation
 from .modes import TradingMode
 from .report import DecisionRecord, FillSummary, OrderSummary, RunReport
-from .simulation import ExecutionSimulator, SimulationOutcome, TemporalExecutionSimulator
+from .simulation import (
+    ExecutionSimulator, SimulationOutcome, TemporalExecutionSimulator, scripted_order_uuid,
+)
 
 __all__ = ["TradingSession"]
 
@@ -560,7 +562,28 @@ class TradingSession:
         return self._risk_cache[1]
 
     def _journal_simulation(self, outcome: SimulationOutcome) -> None:
+        # Existing Phase-3 causation_id records the original persisted intent event.
+        # The order-state payload contains no order quantity, so replay needs this
+        # proven link to reconstruct the leaves of an accepted, unfilled order.
+        # Both mappings are deterministic and engine-independent here.
+        by_order: dict[UUID, UUID] = {}
+        for observation in outcome.observations:
+            origin = _stable_id(str(observation.intent_id), "intent-event")
+            for key in (
+                uuid5(_ORDER_ID_NAMESPACE, observation.order_reference),
+                scripted_order_uuid(observation.order_reference),
+            ):
+                prior = by_order.setdefault(key, origin)
+                if prior != origin:
+                    raise PaperStateError("ambiguous simulated order-to-intent identity.")
         for event in outcome.phase3_events:
+            origin = by_order.get(event.order_id)
+            if origin is not None and event.event_type in {
+                ORDER_STATE_EVENT_TYPE, EXECUTION_FILL_EVENT_TYPE,
+            }:
+                if event.causation_id not in (None, origin):
+                    raise PaperStateError("simulated event has conflicting intent provenance.")
+                event = event.model_copy(update={"causation_id": origin})
             self.journal.append(event)
 
     # --- translation helpers ---

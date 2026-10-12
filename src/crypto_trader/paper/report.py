@@ -27,6 +27,7 @@ from crypto_trader.events import (
     RISK_DECISION_EVENT_TYPE,
     SAFETY_EVENT_TYPE,
     STRATEGY_DECISION_EVENT_TYPE,
+    TRADE_INTENT_EVENT_TYPE,
     VALIDITY_EVENT_TYPE,
 )
 from crypto_trader.recovery.models import OrderStateName
@@ -164,6 +165,8 @@ def report_from_journal(
     order_state: dict[str, str] = {}
     filled: dict[str, Decimal] = {}
     remaining: dict[str, Decimal] = {}
+    order_origins: dict[str, UUID] = {}
+    intent_quantities: dict[UUID, Decimal] = {}
     fills: list[tuple[datetime, str, FillSummary]] = []
     validity_counts: dict[str, int] = {}
     risk_counts: dict[str, int] = {}
@@ -195,6 +198,8 @@ def report_from_journal(
         event_type = event.event_type
         if event_type == STRATEGY_DECISION_EVENT_TYPE:
             decisions.append((event.payload.action, event.payload.confidence))
+        elif event_type == TRADE_INTENT_EVENT_TYPE:
+            intent_quantities[event.event_id] = event.payload.quantity
         elif event_type == VALIDITY_EVENT_TYPE:
             disposition = event.payload.disposition
             validity_counts[disposition] = validity_counts.get(disposition, 0) + 1
@@ -210,6 +215,11 @@ def report_from_journal(
             risk_counts[key] = risk_counts.get(key, 0) + 1
         elif event_type == ORDER_STATE_EVENT_TYPE:
             key = str(event.order_id)
+            origin_id = getattr(event, "causation_id", None)
+            if origin_id is not None:
+                prior = order_origins.setdefault(key, origin_id)
+                if prior != origin_id:
+                    raise PaperStateError("conflicting order-to-intent provenance during replay.")
             current = order_state.get(key)
             if current is None or lifecycle_rank(event.payload.state) >= lifecycle_rank(current):
                 order_state[key] = event.payload.state
@@ -242,6 +252,24 @@ def report_from_journal(
 
     ordered_fills = [item[2] for item in sorted(fills, key=lambda item: (item[0], item[1]))]
 
+    def replay_remaining(reference: str, state: str) -> Decimal:
+        seen_filled = filled.get(reference, Decimal("0"))
+        origin = order_origins.get(reference)
+        original = intent_quantities.get(origin) if origin is not None else None
+        if reference in remaining:
+            leaves = remaining[reference]
+            if leaves < 0 or (original is not None and seen_filled + leaves != original):
+                raise PaperStateError("journal fill quantity does not reconcile to order intent.")
+            return leaves
+        if state in {"canceled", "rejected", "expired"}:
+            # Terminal failures have no active leaves, regardless of unfilled intent.
+            return Decimal("0")
+        if state not in {"created", "submitted", "accepted"} or original is None:
+            raise PaperStateError("cannot reconstruct unfilled order quantity without intent provenance.")
+        if seen_filled:
+            raise PaperStateError("missing persisted partial fill for unfilled order.")
+        return original
+
     return RunReport(
         session_id=session_id,
         mode=mode,
@@ -265,7 +293,7 @@ def report_from_journal(
                 symbol=symbol,
                 state=state,
                 filled_quantity=filled.get(reference, Decimal("0")),
-                remaining_quantity=remaining.get(reference, Decimal("0")),
+                remaining_quantity=replay_remaining(reference, state),
             )
             for reference, state in sorted(order_state.items())
         ),
