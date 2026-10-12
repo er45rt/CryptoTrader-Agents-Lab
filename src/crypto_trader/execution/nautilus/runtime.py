@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import deque
 from decimal import Decimal
 from typing import Any, Callable, Sequence
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from nautilus_trader.backtest.config import BacktestEngineConfig
 from nautilus_trader.backtest.engine import BacktestEngine
@@ -46,6 +46,7 @@ from .guard import (
 __all__ = ["NautilusExecutionRuntime"]
 
 _NS_PER_MS = 1_000_000
+_EVENT_NAMESPACE = UUID("bd6f93ac-3f6b-4f87-866b-749ad0d50d8e")
 _BASE_TS_MS = 1_767_225_600_000  # 2026-01-01T00:00:00Z, deterministic simulated base time
 
 
@@ -69,10 +70,10 @@ class _TranslationStrategy(Strategy):
         self.subscribe_trade_ticks(instrument_id)
 
     def on_order_book_deltas(self, deltas: OrderBookDeltas) -> None:
-        self._runtime._submit_queued(self)
+        self._runtime._submit_queued(self, int(deltas.ts_init))
 
     def on_trade_tick(self, tick: TradeTick) -> None:
-        self._runtime._submit_queued(self)
+        self._runtime._submit_queued(self, int(tick.ts_init))
 
     # --- lifecycle callbacks: translate only, never infer ---
 
@@ -93,6 +94,9 @@ class _TranslationStrategy(Strategy):
 
     def on_order_rejected(self, event) -> None:
         self._record_from_order("order_rejected", event)
+
+    def on_order_expired(self, event) -> None:
+        self._record_from_order("order_expired", event)
 
     def on_order_filled(self, event) -> None:
         self._runtime._record_fill_event(self, event)
@@ -123,7 +127,11 @@ class NautilusExecutionRuntime:
         self._state = ExecutionRuntimeState.STOPPED
         self._engine: BacktestEngine | None = None
         self._strategy: _TranslationStrategy | None = None
-        self._queued: deque[ExecutionRequest] = deque()
+        self._queued: deque[tuple[ExecutionRequest, int | None]] = deque()
+        self._temporal_mode = False
+        self._order_state_counts: dict[str, int] = {}
+        self._seen_native_fill_ids: set[UUID] = set()
+        self._seen_native_state_keys: set[tuple[UUID, str, int, str]] = set()
         self._pending: dict[str, ExecutionRequest] = {}
         self._observations: list[ExecutionObservation] = []
         self._phase3_events: list[Any] = []
@@ -140,6 +148,12 @@ class NautilusExecutionRuntime:
             require_queue_aware_settings(self._queue_settings)
         self._observations.clear()
         self._phase3_events.clear()
+        self._queued.clear()
+        self._pending.clear()
+        self._order_state_counts.clear()
+        self._seen_native_fill_ids.clear()
+        self._seen_native_state_keys.clear()
+        self._temporal_mode = False
         self._engine = self._build_engine()
         self._strategy = _TranslationStrategy(
             StrategyConfig(strategy_id="phase4-execution"),
@@ -153,10 +167,60 @@ class NautilusExecutionRuntime:
         """Validate and queue an engine-independent request (fail closed)."""
         if self._state is not ExecutionRuntimeState.RUNNING:
             raise RuntimeStateError("runtime must be started before submitting requests.")
+        if self._temporal_mode:
+            raise RuntimeStateError("untimed submit is forbidden in temporal simulation.")
         request.validate_for(self._instrument)
         reference = f"REQ-{request.intent_id.hex[:12]}"
-        self._queued.append(request)
+        self._queued.append((request, None))
         return reference
+
+    def enable_temporal(self) -> None:
+        """Enable fail-closed time-gated submission without changing the shared port."""
+        if self._state is not ExecutionRuntimeState.RUNNING or self._queued:
+            raise RuntimeStateError("temporal mode requires a running, empty runtime.")
+        self._temporal_mode = True
+
+    def submit_timed(self, request: ExecutionRequest, *, decided_ns: int) -> str:
+        if self._state is not ExecutionRuntimeState.RUNNING or not self._temporal_mode:
+            raise RuntimeStateError("timed submit requires an active temporal runtime.")
+        if type(decided_ns) is not int or decided_ns <= 0:
+            raise RuntimeStateError("decision timestamp must be positive nanoseconds.")
+        request.validate_for(self._instrument)
+        self._queued.append((request, decided_ns))
+        return f"REQ-{request.intent_id.hex[:12]}"
+
+    def run_until(self, *, end_ns: int) -> None:
+        """Advance the same preloaded simulated engine, preserving venue state."""
+        if not self._temporal_mode or self._engine is None:
+            raise RuntimeStateError("run_until requires temporal simulation.")
+        if type(end_ns) is not int or end_ns <= 0:
+            raise RuntimeStateError("invalid simulation boundary.")
+        self._engine.run(end=end_ns, streaming=True)
+
+    def has_unsettled_orders(self) -> bool:
+        """Conservatively check in-flight simulated orders before risk snapshots."""
+        if self._queued:
+            return True
+        terminal = {
+            OrderLifecycleState.FILLED,
+            OrderLifecycleState.CANCELED,
+            OrderLifecycleState.REJECTED,
+            OrderLifecycleState.EXPIRED,
+        }
+        latest = {
+            item.intent_id: item.state
+            for item in self._observations
+            if item.state is not None
+        }
+        return any(
+            latest.get(request.intent_id) not in terminal
+            for request in self._pending.values()
+        )
+
+    def end_temporal(self) -> None:
+        if not self._temporal_mode or self._engine is None:
+            raise RuntimeStateError("temporal simulation is not active.")
+        self._engine.end()
 
     def feed_market_data(
         self,
@@ -253,12 +317,21 @@ class NautilusExecutionRuntime:
             taker_fee=Decimal("0.0004"),
         )
 
-    def _submit_queued(self, strategy: _TranslationStrategy) -> None:
+    def _submit_queued(self, strategy: _TranslationStrategy, event_ns: int) -> None:
         while self._queued:
-            request = self._queued.popleft()
+            request, decided_ns = self._queued[0]
+            if decided_ns is not None and event_ns <= decided_ns:
+                break
+            self._queued.popleft()
             order = inbound.build_order(strategy.order_factory, self._instrument, request)
             self._pending[str(order.client_order_id)] = request
             strategy.submit_order(order)
+
+    def _state_event_id(self, request: ExecutionRequest, reference: str, label: str) -> UUID:
+        key = f"{request.correlation_id}|{reference}"
+        ordinal = self._order_state_counts.get(key, 0)
+        self._order_state_counts[key] = ordinal + 1
+        return uuid5(_EVENT_NAMESPACE, f"state-v1|{key}|{ordinal}|{label}")
 
     def _request_for(self, event) -> ExecutionRequest | None:
         return self._pending.get(str(event.client_order_id))
@@ -277,8 +350,38 @@ class NautilusExecutionRuntime:
             symbol=request.symbol,
             producer=self._producer,
         )
+        native_key = (
+            request.intent_id, label, int(getattr(event, "ts_event", 0)),
+            observation.order_reference,
+        )
+        if native_key in self._seen_native_state_keys:
+            raise RuntimeStateError("duplicate native order lifecycle callback.")
+        reason = None
+        if observation.state is OrderLifecycleState.REJECTED:
+            # The native OrderRejected carries an explicit rejection reason.
+            native_reason = getattr(event, "reason", None)
+            if not isinstance(native_reason, str) or not native_reason.strip():
+                raise outbound.TranslationError("native rejection is missing its source reason.")
+            reason = native_reason
+        elif observation.state in {OrderLifecycleState.CANCELED, OrderLifecycleState.EXPIRED}:
+            native_reason = getattr(event, "reason", None)
+            if isinstance(native_reason, str) and native_reason.strip():
+                reason = native_reason
+            else:
+                native_source = {
+                    "order_canceled": "OrderCanceled",
+                    "order_expired": "OrderExpired",
+                }.get(label)
+                if native_source is None:
+                    raise outbound.TranslationError("terminal source callback is unrecognized.")
+                reason = f"source_event={native_source}; venue_reason=not supplied"
+        identity = self._state_event_id(request, observation.order_reference, label)
+        translated = outbound.to_phase3_order_state_event(
+            observation, event_id=identity, reason=reason
+        )
+        self._seen_native_state_keys.add(native_key)
         self._observations.append(observation)
-        self._phase3_events.append(outbound.to_phase3_order_state_event(observation))
+        self._phase3_events.append(translated)
 
     def _record_fill_event(self, strategy: _TranslationStrategy, event) -> None:
         request = self._request_for(event)
@@ -299,6 +402,21 @@ class NautilusExecutionRuntime:
             state=state,
             producer=self._producer,
         )
+        trade_id = getattr(event, "trade_id", None)
+        if trade_id is None or not str(trade_id):
+            raise RuntimeStateError("native trade identity missing; refusing random fill id.")
+        identity = uuid5(
+            _EVENT_NAMESPACE,
+            f"fill-v1|{request.correlation_id}|{observation.order_reference}|{trade_id}",
+        )
+        if identity in self._seen_native_fill_ids:
+            raise RuntimeStateError("duplicate native fill id; refusing duplicate ledger effect.")
+        self._seen_native_fill_ids.add(identity)
         self._observations.append(observation)
-        self._phase3_events.append(outbound.to_phase3_order_state_event(observation))
-        self._phase3_events.append(outbound.to_phase3_fill_event(observation))
+        self._phase3_events.append(
+            outbound.to_phase3_order_state_event(
+                observation,
+                event_id=self._state_event_id(request, observation.order_reference, "order_filled"),
+            )
+        )
+        self._phase3_events.append(outbound.to_phase3_fill_event(observation, event_id=identity))

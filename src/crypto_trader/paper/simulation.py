@@ -5,10 +5,9 @@ implementation lives under ``crypto_trader.execution.nautilus`` (infrastructure)
 contains only engine-independent types, so no engine name, type or import leaks into the
 paper/shadow domain path.
 
-Design note (documented limitation): the decision pass produces the approved execution requests
-for the session and the simulated pass then replays them against the frozen market data. Simulated
-fills are therefore applied to the position ledger *after* the decision pass, so intra-session
-risk feedback (risk re-evaluating against its own simulated fills) is not yet modelled.
+The original scripted simulator is a legacy deterministic test double with batch-only semantics.
+The separate TemporalExecutionSimulator protocol supports incremental, causal Paper replay
+against a persistent execution engine; synthetic test-double fills are not performance evidence.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from .errors import SimulationError
 
 __all__ = [
     "ExecutionSimulator",
+    "TemporalExecutionSimulator",
     "SCRIPTED_SIM_NAMESPACE",
     "ScriptedSimulationRunner",
     "SimulationOutcome",
@@ -75,6 +75,17 @@ class ExecutionSimulator(Protocol):
     """The only simulated-execution surface the paper session may depend on."""
 
     def simulate(self, requests: Sequence[ExecutionRequest]) -> SimulationOutcome: ...
+
+
+@runtime_checkable
+class TemporalExecutionSimulator(ExecutionSimulator, Protocol):
+    """Paper-only streaming surface, not a venue-writing execution port."""
+
+    def start_temporal(self) -> None: ...
+    def advance_until(self, timestamp_ns: int) -> SimulationOutcome: ...
+    def submit_temporal(self, request: ExecutionRequest, *, decided_ns: int) -> None: ...
+    def finish_temporal(self) -> SimulationOutcome: ...
+    def abort_temporal(self) -> None: ...
 
 
 @dataclass(frozen=True)

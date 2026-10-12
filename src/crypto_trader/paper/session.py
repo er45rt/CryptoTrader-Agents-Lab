@@ -17,8 +17,8 @@ so re-running the same session over the same frozen feed produces identical sema
 journal stays idempotent. ``resume_index`` lets a restarted process continue exactly where the
 recorded journal stops without duplicating effects.
 
-Documented limitation: the decision pass produces the session's approved requests and the simulated
-pass then replays them, so simulated fills reach the position ledger after the decision pass.
+Nautilus Paper follows a chronological, persistent-engine simulation; the scripted offline
+test double retains its legacy batch behavior and is not causal backtest evidence.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from uuid import UUID, uuid5
 
 from crypto_trader.events import (
     STRATEGY_DECISION_EVENT_TYPE,
+    EXECUTION_FILL_EVENT_TYPE,
+    ORDER_STATE_EVENT_TYPE,
     StrategyDecisionPayload,
     StrategyDecisionRecorded,
     TradeIntentCreated,
@@ -70,12 +72,14 @@ from .errors import PaperStateError
 from .feed import MarketDataFeed, MarketObservation
 from .modes import TradingMode
 from .report import DecisionRecord, FillSummary, OrderSummary, RunReport
-from .simulation import ExecutionSimulator, SimulationOutcome
+from .simulation import ExecutionSimulator, SimulationOutcome, TemporalExecutionSimulator
 
 __all__ = ["TradingSession"]
 
 _SESSION_NAMESPACE = UUID("7d4f2b91-3c6a-4e58-9b2f-1a9d5c8e7f30")
 _ZERO = Decimal("0")
+# Existing Phase-3 native order-reference mapping; keep independent of the engine.
+_ORDER_ID_NAMESPACE = UUID("6f2c1e2a-9a1e-4c7f-9a6c-2f1b6d4e5a10")
 
 
 def _stable_id(*parts: str) -> UUID:
@@ -99,6 +103,10 @@ class TradingSession:
     _reservations: dict[UUID, tuple[Side, Decimal, Decimal]] = field(default_factory=dict)
     _pending: PendingIntentRegistry = field(default_factory=PendingIntentRegistry)
     _risk_cache: tuple[tuple[str, bool], HardRiskEngine] | None = None
+    _peak_equity_quote: Decimal | None = None
+    _temporal_decided_ns: dict[UUID, int] = field(default_factory=dict)
+    _temporal_terminal_intents: set[UUID] = field(default_factory=set)
+    _temporal_seen_event_ids: set[UUID] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.config.places_simulated_orders and self.simulator is None:
@@ -129,6 +137,10 @@ class TradingSession:
         self._reservations = {}
         self._pending = PendingIntentRegistry()
         self._risk_cache = None
+        self._peak_equity_quote = ledger.starting_equity_quote
+        self._temporal_decided_ns = {}
+        self._temporal_terminal_intents = set()
+        self._temporal_seen_event_ids = set()
         prior_intents = {
             _stable_id(str(self.config.session_id), entry.market_reference, "intent")
             for entry in entries[:start_index]
@@ -167,47 +179,116 @@ class TradingSession:
         safety_blocked = 0
         safety_events: list[str] = []
 
-        for index in range(start_index, len(entries)):
-            observation = entries[index]
-            decision = self.decisions.decide(observation)
-            now = decision.decided_at or observation.observed_at
-            if now.tzinfo is None or now.utcoffset() is None:
-                raise PaperStateError("a decision timestamp must be timezone-aware.")
-
-            self._record_decision(observation, decision)
-            record = self._process(
-                index=index,
-                observation=observation,
-                decision=decision,
-                now=now,
-                market_state=market_state,
-                ledger=ledger,
-                requests=requests,
-                safety_events=safety_events,
+        # The approved paper bridge uses one persistent temporal engine. The legacy scripted
+        # double intentionally remains a synthetic test fixture, not backtest evidence.
+        temporal = bool(
+            self.config.places_simulated_orders
+            and isinstance(self.simulator, TemporalExecutionSimulator)
+        )
+        if temporal and start_index:
+            raise PaperStateError(
+                "temporal execution resume requires verified journal, risk peak and engine state."
             )
-            market_state.advance(self.config.symbol)
-            records.append(record)
-            if record.validity_disposition is not None:
-                key = record.validity_disposition
-                validity_counts[key] = validity_counts.get(key, 0) + 1
-                if key == "stale":
-                    stale.append(observation.market_reference)
-                elif key == "superseded":
-                    superseded.append(observation.market_reference)
-                elif key == "backpressure_rejected":
-                    backpressure += 1
-            if record.risk_decision is not None:
-                key = record.risk_decision
-                risk_counts[key] = risk_counts.get(key, 0) + 1
-            if record.submission == "blocked_by_safety":
-                safety_blocked += 1
+        simulator = self.simulator
+        if temporal:
+            simulator.start_temporal()
 
-        outcome = SimulationOutcome()
-        placements = requests if self.config.places_simulated_orders else []
-        if placements and self.simulator is not None:
-            outcome = self.simulator.simulate(placements)
-            self._journal_simulation(outcome)
-            self._apply_fills(outcome, requests, ledger)
+        seen_observations = 0
+        seen_events = 0
+
+        def capture(current: SimulationOutcome, *, boundary_ns: int) -> None:
+            nonlocal seen_observations, seen_events
+            if (
+                len(current.observations) < seen_observations
+                or len(current.phase3_events) < seen_events
+            ):
+                raise PaperStateError("temporal simulation output moved backwards.")
+            delta = SimulationOutcome(
+                observations=current.observations[seen_observations:],
+                phase3_events=current.phase3_events[seen_events:],
+            )
+            closed, event_ids = self._validate_temporal_delta(
+                delta, requests, boundary_ns=boundary_ns
+            )
+            self._journal_simulation(delta)
+            self._apply_fills(delta, requests, ledger)
+            self._reconcile_temporal_reservations(delta)
+            self._temporal_terminal_intents = closed
+            self._temporal_seen_event_ids.update(event_ids)
+            seen_observations = len(current.observations)
+            seen_events = len(current.phase3_events)
+
+        temporal_finished = False
+        try:
+            for index in range(start_index, len(entries)):
+                observation = entries[index]
+                if temporal:
+                    observed_ns = self._timestamp_ns(observation.observed_at)
+                    capture(simulator.advance_until(observed_ns), boundary_ns=observed_ns)
+                decision = self.decisions.decide(observation)
+                now = decision.decided_at or observation.observed_at
+                if now.tzinfo is None or now.utcoffset() is None:
+                    raise PaperStateError("a decision timestamp must be timezone-aware.")
+                if temporal:
+                    if now < observation.observed_at:
+                        raise PaperStateError("decision completion predates the market observation.")
+                    if index + 1 < len(entries) and now > entries[index + 1].observed_at:
+                        raise PaperStateError(
+                            "temporal decision overlaps the next market observation."
+                        )
+                    capture(simulator.advance_until(self._timestamp_ns(now)), boundary_ns=self._timestamp_ns(now))
+                self._update_peak(ledger, observation.price)
+                self._record_decision(observation, decision)
+                record = self._process(
+                    index=index,
+                    observation=observation,
+                    decision=decision,
+                    now=now,
+                    market_state=market_state,
+                    ledger=ledger,
+                    requests=requests,
+                    safety_events=safety_events,
+                )
+                if temporal and record.submission == "submitted_to_simulator":
+                    request = requests[-1]
+                    stamp_ns = self._timestamp_ns(now)
+                    self._temporal_decided_ns[request.intent_id] = stamp_ns
+                    simulator.submit_temporal(request, decided_ns=stamp_ns)
+                market_state.advance(self.config.symbol)
+                records.append(record)
+                if record.validity_disposition is not None:
+                    key = record.validity_disposition
+                    validity_counts[key] = validity_counts.get(key, 0) + 1
+                    if key == "stale":
+                        stale.append(observation.market_reference)
+                    elif key == "superseded":
+                        superseded.append(observation.market_reference)
+                    elif key == "backpressure_rejected":
+                        backpressure += 1
+                if record.risk_decision is not None:
+                    key = record.risk_decision
+                    risk_counts[key] = risk_counts.get(key, 0) + 1
+                if record.submission == "blocked_by_safety":
+                    safety_blocked += 1
+
+            outcome = SimulationOutcome()
+            placements = requests if self.config.places_simulated_orders else []
+            if temporal:
+                outcome = simulator.finish_temporal()
+                temporal_finished = True
+                horizon_method = getattr(simulator, "market_horizon_ns", None)
+                horizon_ns = (
+                    horizon_method() if callable(horizon_method) else
+                    (self._timestamp_ns(entries[-1].observed_at) if entries else 0)
+                )
+                capture(outcome, boundary_ns=horizon_ns)
+            elif placements and simulator is not None:
+                outcome = simulator.simulate(placements)
+                self._journal_simulation(outcome)
+                self._apply_fills(outcome, requests, ledger)
+        finally:
+            if temporal and not temporal_finished:
+                simulator.abort_temporal()
 
         marks = {self.config.symbol: entries[-1].price} if entries else {}
         recovery_events: tuple[str, ...] = ()
@@ -220,7 +301,11 @@ class TradingSession:
             "SIMULATED ACCOUNTING: not a performance claim and not a safety certification.",
             "L2 MBP cannot reveal hidden/iceberg liquidity; true venue queue rank is unknown.",
             "Dynamic latency customization is PARTIAL in 1.231.0 (static per-command only).",
-            "The decision pass precedes the simulated pass, so fills land after the decisions.",
+            (
+                "Temporal paper simulation applies fills before subsequent risk decisions."
+                if temporal else
+                "The legacy scripted test double applies fills after the decision pass."
+            ),
         )
         return RunReport(
             session_id=self.config.session_id,
@@ -455,6 +540,21 @@ class TradingSession:
             order_type=decision.order_type,
         )
 
+    def _update_peak(self, ledger: PositionLedger, mark: Decimal) -> Decimal:
+        """Maintain the in-session equity high-water mark from point-in-time marks."""
+        equity = ledger.equity_quote({self.config.symbol: mark})
+        if equity < 0:
+            raise PaperStateError("negative marked equity; risk snapshot is unavailable.")
+        self._peak_equity_quote = max(self._peak_equity_quote or equity, equity)
+        return equity
+
+    @staticmethod
+    def _timestamp_ns(stamp: datetime) -> int:
+        if stamp.tzinfo is None or stamp.utcoffset() is None:
+            raise PaperStateError("temporal timestamps must be timezone-aware.")
+        seconds = int(stamp.timestamp())
+        return seconds * 1_000_000_000 + stamp.microsecond * 1_000
+
     def _risk_state(
         self, ledger: PositionLedger, observation: MarketObservation, now: datetime
     ) -> RiskStateSnapshot:
@@ -467,10 +567,10 @@ class TradingSession:
             quantity * max(price, observation.price) * (1 if side is Side.BUY else -1)
             for side, quantity, price in self._reservations.values()
         )
-        equity = ledger.starting_equity_quote + ledger.realized_pnl_quote()
+        equity = self._update_peak(ledger, observation.price)
         return RiskStateSnapshot(
             equity_quote=equity,
-            peak_equity_quote=max(equity, ledger.starting_equity_quote),
+            peak_equity_quote=self._peak_equity_quote or equity,
             realized_pnl_quote=ledger.realized_pnl_quote(),
             gross_exposure_quote=abs(position.quantity * observation.price) + sum(
                 quantity * max(price, observation.price)
@@ -502,6 +602,146 @@ class TradingSession:
             intent_id=intent_id,
         )
 
+    def _validate_temporal_delta(
+        self,
+        delta: SimulationOutcome,
+        requests: Sequence[ExecutionRequest],
+        *,
+        boundary_ns: int,
+    ) -> tuple[set[UUID], set[UUID]]:
+        """Validate all native observations AND durable events before any journal write.
+
+        This checks quantities, terminal transitions, deterministic event pairing,
+        duplicate identities, fees and decision-time bounds without mutating state.
+        """
+        known = {request.intent_id: request for request in requests}
+        remaining = {
+            intent_id: quantity
+            for intent_id, (_, quantity, _) in self._reservations.items()
+        }
+        terminal = set(self._temporal_terminal_intents)
+        expected: list[tuple[Any, ...]] = []
+        for item in delta.observations:
+            if item.intent_id not in known:
+                raise PaperStateError("simulated observation for unknown intent.")
+            decision_ns = self._temporal_decided_ns.get(item.intent_id)
+            if decision_ns is None or type(item.ts_ns) is not int:
+                raise PaperStateError("execution observation missing a verified causal timestamp.")
+            if item.ts_ns <= decision_ns:
+                raise PaperStateError("simulated fill occurred before its decision completed.")
+            if item.ts_ns > boundary_ns:
+                raise PaperStateError("execution observation is beyond the market time boundary.")
+            if item.symbol != self.config.symbol or item.correlation_id != self.config.session_id:
+                raise PaperStateError("execution observation has mismatched scope.")
+            if not item.order_reference or item.state is None:
+                raise PaperStateError("execution observation lacks order identity or state.")
+            if item.intent_id in terminal:
+                raise PaperStateError("execution observed after terminal order state.")
+            if (
+                item.remaining_quantity is not None
+                and (
+                    not item.remaining_quantity.is_finite()
+                    or item.remaining_quantity < _ZERO
+                )
+            ):
+                raise PaperStateError("invalid remaining execution quantity.")
+            fee = item.fee if item.fee is not None else _ZERO
+            if not isinstance(fee, Decimal) or not fee.is_finite() or fee < _ZERO:
+                raise PaperStateError("simulated fee must be finite and non-negative.")
+            current = remaining.get(item.intent_id, _ZERO)
+            if item.last_fill_quantity is not None:
+                qty = item.last_fill_quantity
+                price = item.last_fill_price
+                if (
+                    not qty.is_finite() or qty <= _ZERO or qty > current
+                    or price is None or not price.is_finite() or price <= _ZERO
+                ):
+                    raise PaperStateError("invalid simulated fill or reserved quantity.")
+                current -= qty
+                remaining[item.intent_id] = current
+            # Each native observation must agree exactly with the paper reservation
+            # and the order's cumulative fill progress, not only the event payload.
+            original_qty = known[item.intent_id].quantity
+            if (
+                not isinstance(item.remaining_quantity, Decimal)
+                or not item.remaining_quantity.is_finite()
+                or item.remaining_quantity != current
+            ):
+                raise PaperStateError(
+                    "native remaining quantity does not match the reserved quantity."
+                )
+            if (
+                not isinstance(item.filled_quantity, Decimal)
+                or not item.filled_quantity.is_finite()
+                or item.filled_quantity != original_qty - current
+            ):
+                raise PaperStateError(
+                    "native cumulative filled quantity does not match order progress."
+                )
+            if item.state.value == "filled" and current != _ZERO:
+                raise PaperStateError("terminal filled state conflicts with outstanding quantity.")
+            if item.state.value in {"filled", "canceled", "rejected", "expired"}:
+                terminal.add(item.intent_id)
+                remaining[item.intent_id] = _ZERO
+            from datetime import timezone
+            occurred = datetime.fromtimestamp(item.ts_ns / 1_000_000_000, tz=timezone.utc)
+            common = (
+                uuid5(_ORDER_ID_NAMESPACE, item.order_reference),
+                item.correlation_id,
+                item.symbol,
+                item.producer,
+                occurred,
+            )
+            expected.append((ORDER_STATE_EVENT_TYPE, *common, item.state.value))
+            if item.last_fill_quantity is not None:
+                expected.append((
+                    EXECUTION_FILL_EVENT_TYPE, *common,
+                    item.last_fill_quantity,
+                    item.last_fill_price,
+                    fee,
+                    item.fee_asset,
+                    item.remaining_quantity,
+                ))
+
+        new_ids: set[UUID] = set()
+        actual: list[tuple[Any, ...]] = []
+        for event in delta.phase3_events:
+            if event.event_id in new_ids or event.event_id in self._temporal_seen_event_ids:
+                raise PaperStateError("duplicate native execution event id.")
+            new_ids.add(event.event_id)
+            if event.correlation_id != self.config.session_id or event.symbol != self.config.symbol:
+                raise PaperStateError("journal event has mismatched correlation/symbol.")
+            at_ns = self._timestamp_ns(event.occurred_at)
+            if at_ns > boundary_ns:
+                raise PaperStateError("journal execution event is beyond current market horizon.")
+            common = (
+                event.order_id,
+                event.correlation_id,
+                event.symbol,
+                event.producer,
+                event.occurred_at,
+            )
+            if event.event_type == ORDER_STATE_EVENT_TYPE:
+                signature = (ORDER_STATE_EVENT_TYPE, *common, event.payload.state)
+            elif event.event_type == EXECUTION_FILL_EVENT_TYPE:
+                signature = (
+                    EXECUTION_FILL_EVENT_TYPE, *common,
+                    event.payload.quantity,
+                    event.payload.price,
+                    event.payload.fee,
+                    event.payload.fee_asset,
+                    event.payload.remaining_quantity,
+                )
+            else:
+                raise PaperStateError("unexpected execution event type in temporal delta.")
+            actual.append(signature)
+
+        if actual != expected:
+            raise PaperStateError(
+                "execution journal event order/sequence does not match native observations."
+            )
+        return terminal, new_ids
+
     def _apply_fills(
         self,
         outcome: SimulationOutcome,
@@ -517,6 +757,9 @@ class TradingSession:
                 raise PaperStateError(
                     f"simulated fill for unknown intent {observation.intent_id}; refusing to guess."
                 )
+            deadline = self._temporal_decided_ns.get(observation.intent_id)
+            if deadline is not None and observation.ts_ns <= deadline:
+                raise PaperStateError("simulated fill occurred before its decision completed.")
             ledger.apply_fill(
                 symbol=observation.symbol,
                 side="buy" if request.side is ExecutionSide.BUY else "sell",
@@ -524,6 +767,35 @@ class TradingSession:
                 price=observation.last_fill_price or request.limit_price or _ZERO,
                 fee=observation.fee or _ZERO,
             )
+
+    def _reconcile_temporal_reservations(self, delta: SimulationOutcome) -> None:
+        """Release only filled/canceled exposure; protect remaining partial quantity."""
+        for item in delta.observations:
+            existing = self._reservations.get(item.intent_id)
+            if existing is None:
+                continue
+            side, quantity, price = existing
+            if item.last_fill_quantity is not None:
+                if item.last_fill_quantity <= 0 or item.last_fill_quantity > quantity:
+                    raise PaperStateError("simulated partial fill exceeds reserved quantity.")
+                quantity -= item.last_fill_quantity
+            if item.state is not None and item.state.value in {
+                "canceled", "rejected", "expired"
+            }:
+                quantity = _ZERO
+            if quantity == _ZERO:
+                self._reservations.pop(item.intent_id, None)
+                self._pending.remove(item.intent_id)
+            elif quantity != existing[1]:
+                self._reservations[item.intent_id] = (side, quantity, price)
+                self._pending.register(PendingIntent(
+                    intent_id=item.intent_id,
+                    symbol=self.config.symbol,
+                    strategy_id=self.config.strategy_id,
+                    side=side,
+                    quantity=quantity,
+                    notional=quantity * price,
+                ))
 
     @staticmethod
     def _order_summaries(outcome: SimulationOutcome) -> tuple[OrderSummary, ...]:

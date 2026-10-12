@@ -1,0 +1,232 @@
+"""Pure synthetic temporal layout planner; no causal or execution authority.
+
+A split layout digest asserts deterministic metadata/layout identity only. It does
+not attest source code, market timestamp correctness, strategy evaluation, custody,
+holdout independence, or admission. External reviewers must bind code bytes.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from unicodedata import category, normalize
+
+from .canonical import content_hash
+
+_MAX_NS = 2**63 - 1
+_MAX_SAMPLES = 2048
+_MAX_FOLDS = 32
+_DOMAIN = "crypto-trader-walk-forward-layout-v1"
+_SEMANTICS = "synthetic-halfopen-prevalidation-strict-purge-v1"
+_REASONS = ("synthetic_metadata_unverified", "anchor_missing")
+
+
+class SplitPlanError(ValueError):
+    """Fail the entire synthetic request. No partial layout is returned."""
+
+
+class SplitLabel(str, Enum):
+    EXPLORATORY_SPLIT_ONLY = "EXPLORATORY_SPLIT_ONLY"
+
+
+@dataclass(frozen=True)
+class SampleWindow:
+    sample_id: str
+    decision_utc_ns: int
+    feature_available_utc_ns: int
+    revision_first_seen_utc_ns: int
+    exposure_end_utc_ns: int
+
+
+@dataclass(frozen=True)
+class FoldWindow:
+    train_start_utc_ns: int
+    train_end_utc_ns: int
+    validation_start_utc_ns: int
+    validation_end_utc_ns: int
+    pre_validation_gap_ns: int
+
+
+@dataclass(frozen=True)
+class FoldLayout:
+    fold_id: str
+    window: FoldWindow
+    train_ids: tuple[str, ...]
+    validation_ids: tuple[str, ...]
+    pair_codes: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class SplitLayoutReport:
+    folds: tuple[FoldLayout, ...]
+    split_layout_digest: str
+    label: SplitLabel = SplitLabel.EXPLORATORY_SPLIT_ONLY
+    reasons: tuple[str, str] = _REASONS
+    permits_causal_use: bool = False
+    permits_trial_allocation: bool = False
+    permits_promotion: bool = False
+    permits_trading: bool = False
+
+    def __post_init__(self):
+        if (type(self.label) is not SplitLabel
+                or self.label is not SplitLabel.EXPLORATORY_SPLIT_ONLY
+                or type(self.reasons) is not tuple or self.reasons != _REASONS
+                or type(self.folds) is not tuple
+                or type(self.split_layout_digest) is not str
+                or len(self.split_layout_digest) != 64):
+            raise SplitPlanError("noncanonical synthetic layout report")
+        if any(type(v) is not bool or v is not False for v in (
+                self.permits_causal_use, self.permits_trial_allocation,
+                self.permits_promotion, self.permits_trading)):
+            raise SplitPlanError("synthetic layout cannot grant permissions")
+
+
+def _time(value: object, *, allow_zero: bool = False) -> int:
+    if type(value) is not int or not (0 if allow_zero else 1) <= value <= _MAX_NS:
+        raise SplitPlanError("require bounded exact-integer nanoseconds")
+    return value
+
+
+def _id(value: object) -> str:
+    if type(value) is not str or not 1 <= len(value) <= 128:
+        raise SplitPlanError("invalid synthetic sample ID")
+    for char in value:
+        if category(char) in ("Cc", "Cs"):
+            raise SplitPlanError("control/surrogate in sample ID")
+    if normalize("NFC", value) != value:
+        raise SplitPlanError("sample IDs must already be NFC")
+    return value
+
+
+def _validated_sample(sample: object) -> SampleWindow:
+    if type(sample) is not SampleWindow:
+        raise SplitPlanError("unexpected synthetic sample type")
+    _id(sample.sample_id)
+    d = _time(sample.decision_utc_ns)
+    f = _time(sample.feature_available_utc_ns)
+    r = _time(sample.revision_first_seen_utc_ns)
+    e = _time(sample.exposure_end_utc_ns)
+    if f > d or r > d or e <= d:
+        raise SplitPlanError("future availability or invalid half-open exposure")
+    return sample
+
+
+def _validated_fold(fold: object) -> FoldWindow:
+    if type(fold) is not FoldWindow:
+        raise SplitPlanError("unexpected synthetic fold type")
+    a = _time(fold.train_start_utc_ns)
+    b = _time(fold.train_end_utc_ns)
+    c = _time(fold.validation_start_utc_ns)
+    d = _time(fold.validation_end_utc_ns)
+    gap = _time(fold.pre_validation_gap_ns, allow_zero=True)
+    if not (a < b <= c < d) or c - gap <= a:
+        raise SplitPlanError("invalid training / validation / pre-validation gap")
+    return fold
+
+
+def _sample_evidence(row: SampleWindow) -> dict[str, str]:
+    return {
+        "sample_id": row.sample_id,
+        "decision_utc_ns": str(row.decision_utc_ns),
+        "feature_available_utc_ns": str(row.feature_available_utc_ns),
+        "revision_first_seen_utc_ns": str(row.revision_first_seen_utc_ns),
+        "exposure_end_utc_ns": str(row.exposure_end_utc_ns),
+    }
+
+
+def _fold_evidence(fold: FoldWindow) -> dict[str, str]:
+    return {
+        "train_start_utc_ns": str(fold.train_start_utc_ns),
+        "train_end_utc_ns": str(fold.train_end_utc_ns),
+        "validation_start_utc_ns": str(fold.validation_start_utc_ns),
+        "validation_end_utc_ns": str(fold.validation_end_utc_ns),
+        "pre_validation_gap_ns": str(fold.pre_validation_gap_ns),
+    }
+
+
+def plan_synthetic_folds(
+    samples: tuple[SampleWindow, ...],
+    folds: tuple[FoldWindow, ...],
+) -> SplitLayoutReport:
+    """Layout synthetic metadata only. Any invalid row or fold rejects all output.
+
+    Windows and exposures are half-open. Training exposure must end STRICTLY
+    before the pre-validation cutoff: equality is conservatively purged.
+    Post-test embargo, real data admission and statistical independence are
+    explicitly out of scope.
+    """
+    if (type(samples) is not tuple or not 1 <= len(samples) <= _MAX_SAMPLES
+            or type(folds) is not tuple or not 1 <= len(folds) <= _MAX_FOLDS):
+        raise SplitPlanError("sample/fold tuple size outside approved bounds")
+
+    rows: list[SampleWindow] = []
+    seen: set[str] = set()
+    for row in samples:
+        _validated_sample(row)
+        if row.sample_id in seen:
+            raise SplitPlanError("duplicate sample ID")
+        seen.add(row.sample_id)
+        rows.append(row)
+
+    ordered_rows = tuple(sorted(rows, key=lambda row: row.sample_id))
+    prev_validation_end = 0
+    checked_folds: list[FoldWindow] = []
+    for fold in folds:
+        _validated_fold(fold)
+        if fold.validation_start_utc_ns < prev_validation_end:
+            raise SplitPlanError("validation windows overlap or are unordered")
+        prev_validation_end = fold.validation_end_utc_ns
+        checked_folds.append(fold)
+
+    sample_digest = content_hash(
+        _DOMAIN + "-samples",
+        {"semantics_version": _SEMANTICS,
+         "samples": [_sample_evidence(row) for row in ordered_rows]},
+    )
+    fold_layouts: list[FoldLayout] = []
+    for fold in checked_folds:
+        cutoff = fold.validation_start_utc_ns - fold.pre_validation_gap_ns
+        train: list[str] = []
+        validation: list[str] = []
+        codes: list[tuple[str, str]] = []
+
+        for row in ordered_rows:
+            decision = row.decision_utc_ns
+            if fold.validation_start_utc_ns <= decision < fold.validation_end_utc_ns:
+                if row.exposure_end_utc_ns > fold.validation_end_utc_ns:
+                    raise SplitPlanError("validation exposure overruns its fold")
+                validation.append(row.sample_id)
+                code = "VALIDATION"
+            elif fold.train_start_utc_ns <= decision < fold.train_end_utc_ns:
+                if row.exposure_end_utc_ns < cutoff:
+                    train.append(row.sample_id)
+                    code = "TRAIN"
+                else:
+                    code = "PURGED_GAP_OVERLAP"
+            else:
+                code = "OUTSIDE_WINDOWS"
+            codes.append((row.sample_id, code))
+
+        if not train or not validation:
+            raise SplitPlanError("empty training or validation fold")
+        pairs = tuple(codes)
+        fold_id = content_hash(
+            _DOMAIN + "-fold",
+            {"semantics_version": _SEMANTICS, "sample_manifest": sample_digest,
+             "window": _fold_evidence(fold), "pair_codes": pairs},
+        )
+        fold_layouts.append(FoldLayout(
+            fold_id, fold, tuple(train), tuple(validation), pairs,
+        ))
+
+    layouts = tuple(fold_layouts)
+    digest = content_hash(
+        _DOMAIN + "-aggregate",
+        {"semantics_version": _SEMANTICS, "synthetic": True,
+         "sample_manifest": sample_digest,
+         "fold_ids": [fold.fold_id for fold in layouts],
+         "label": SplitLabel.EXPLORATORY_SPLIT_ONLY.value,
+         "reasons": _REASONS,
+         "permits_causal_use": False, "permits_trial_allocation": False,
+         "permits_promotion": False, "permits_trading": False},
+    )
+    return SplitLayoutReport(layouts, digest)
