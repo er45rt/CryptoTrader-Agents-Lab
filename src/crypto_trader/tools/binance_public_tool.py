@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Literal, Optional, Type
 import requests
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
+from crypto_trader.input_security import require_https_base_url
 
 logger = logging.getLogger("crypto_trader.tools.binance")
 
@@ -156,7 +157,7 @@ class BinancePublicTool(BaseTool):
 
         if not self.base_url:
             self.base_url = os.getenv("BINANCE_API_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-        self.base_url = self.base_url.rstrip("/")
+        self.base_url = require_https_base_url(self.base_url)
 
         if self.timeout_seconds is None:
             self.timeout_seconds = _env_float("BINANCE_HTTP_TIMEOUT", DEFAULT_TIMEOUT_SECONDS)
