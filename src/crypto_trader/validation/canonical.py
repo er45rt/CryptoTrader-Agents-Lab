@@ -14,7 +14,7 @@ SCHEMA_ID = "cryptotrader.validation.v1"
 SERIALIZER_ID = "strict-json-decimal-utc9-v1"
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _DEC = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
-_TS = re.compile(r"(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d)\.(\d{9})Z\Z")
+_TS = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2}:[0-9]{2}:[0-9]{2})\.([0-9]{9})Z\Z")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 

@@ -71,6 +71,34 @@ def test_timestamp_uuid_and_manifest_strictness():
             input_manifest(bad, allowed_paths=_spec().allowed_paths)
 
 
+@pytest.mark.parametrize("fraction", (
+    "١٢٣٤٥٦٧٨٩", "۱۲۳۴۵۶۷۸۹", "१२३४५६७८९", "１２３４５６７８９",
+    *("123456789"[:position] + "١" + "123456789"[position + 1:] for position in range(9)),
+))
+def test_v8_utc9_rejects_non_ascii_fractional_digits(fraction):
+    with pytest.raises(CanonicalError, match="require UTC nanosecond timestamp"):
+        utc_nanoseconds("2026-01-01T00:00:00." + fraction + "Z")
+
+
+@pytest.mark.parametrize("timestamp", (
+    "2026-01-01T00:00:00.000000000Z", "2026-01-01T00:00:00.999999999Z",
+    "2024-02-29T23:59:59.123456789Z",
+))
+def test_v8_utc9_preserves_exact_ascii_representation(timestamp):
+    assert utc_nanoseconds(timestamp) == timestamp
+
+
+@pytest.mark.parametrize("timestamp", (
+    "2026-01-01T00:00:00.12345678Z", "2026-01-01T00:00:00.1234567890Z",
+    "2026-01-01T00:00:00.123456789Z\n", "2026-02-29T00:00:00.123456789Z",
+    "2026-01-01T00:00:60.123456789Z", "２０２６-01-01T00:00:00.123456789Z",
+    "2026-٠١-01T00:00:00.123456789Z", "2026-01-01T٠٠:00:00.123456789Z",
+))
+def test_v8_utc9_still_rejects_calendar_width_and_non_ascii_fields(timestamp):
+    with pytest.raises(CanonicalError):
+        utc_nanoseconds(timestamp)
+
+
 def test_study_allocations_budget_and_unrefunded_retries(tmp_path):
     reg = _create(tmp_path, capacity=2)
     a = reg.allocate(_spec().study_id, {"alpha": "1"}, _manifest())
