@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import os
+import sys
 from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
@@ -230,12 +232,16 @@ def test_two_disjoint_validation_folds():
     assert result.folds[0].fold_id != result.folds[1].fold_id
 
 
-def test_exact_capacity_with_duplicate_names_refuses_early():
+def test_duplicate_id_refused_at_exact_2048_capacity():
     rows, fs = valid()
-    with pytest.raises(SplitPlanError):
-        plan_synthetic_folds(rows * 1025, fs)
-    with pytest.raises(SplitPlanError):
-        plan_synthetic_folds(rows, fs * 33)
+    extra = tuple(
+        sample(f"outside_{i:04d}", BASE + 5000 + i)
+        for i in range(2045)
+    )
+    at_capacity = rows + extra + (rows[0],)
+    assert len(at_capacity) == 2048
+    with pytest.raises(SplitPlanError, match="duplicate sample ID"):
+        plan_synthetic_folds(at_capacity, fs)
 
 
 def _strict_planner_scanner(tree):
@@ -448,6 +454,18 @@ def test_malformed_ns_and_identity_classes_not_coerced():
         plan_synthetic_folds((replace(rows[0], sample_id=42), rows[1]), fs)
     with pytest.raises(SplitPlanError):
         plan_synthetic_folds((replace(rows[0], sample_id="\u0080"), rows[1]), fs)
+
+
+def test_subprocess_import_uses_authorized_snapshot_path():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(MODULE_PATH.parents[2])
+    result = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import crypto_trader.validation.walk_forward_plan as module; print(module.__file__)"],
+        env=env, capture_output=True, text=True, timeout=90, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).resolve() == MODULE_PATH
 
 
 def test_no_existing_validation_source_depends_on_new_planner():
