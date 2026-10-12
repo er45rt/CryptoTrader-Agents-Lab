@@ -262,6 +262,7 @@ def test_only_authorized_public_tools_and_derivatives_contract_exist():
     assert tool_modules == {
         "__init__.py", "binance_public_tool.py",
         "binance_futures_public_tool.py", "derivatives_schema.py",
+        "safe_scrape_tool.py",
     }
 
 

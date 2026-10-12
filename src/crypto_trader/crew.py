@@ -7,7 +7,8 @@ from crewai.project import CrewBase, agent, crew, task
 # Import existing and new tools
 from .tools.binance_public_tool import BinancePublicTool
 from .tools.binance_futures_public_tool import BinanceFuturesPublicTool
-from crewai_tools import SerperDevTool, ScrapeWebsiteTool
+from crewai_tools import SerperDevTool
+from .tools.safe_scrape_tool import SafeScrapeWebsiteTool
 
 # Centralized LLM layer (Phase 2). Only the canary agent uses it for now; the
 # remaining agents keep their existing YAML-configured model until migrated.
@@ -66,15 +67,10 @@ class ToolManager:
                 raise
         return self._tools['serper']
     
-    def get_scrape_tool(self) -> ScrapeWebsiteTool:
-        """Get or create the website scraping tool instance"""
-        if 'scrape' not in self._tools:
-            try:
-                self._tools['scrape'] = ScrapeWebsiteTool()
-                logger.debug("ScrapeWebsiteTool initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize ScrapeWebsiteTool: {e}")
-                raise
+    def get_scrape_tool(self) -> SafeScrapeWebsiteTool:
+        """Provide only the bounded, DNS-pinned, proxy-free HTTPS reader."""
+        if 'scrape' not in self._tools or not isinstance(self._tools['scrape'], SafeScrapeWebsiteTool):
+            self._tools['scrape'] = SafeScrapeWebsiteTool()
         return self._tools['scrape']
 
 @CrewBase
