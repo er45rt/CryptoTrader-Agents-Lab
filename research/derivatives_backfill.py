@@ -23,6 +23,9 @@ PERIOD = "5m"
 STEP_MS = 300_000
 DAY_MS = 86_400_000
 WINDOW_MS = 30 * DAY_MS
+# The oldest bucket may age out while another endpoint is fetched.
+# Reserve one hour to avoid Binance -1130 at the rolling 30-day edge.
+RETENTION_MARGIN_MS = 60 * 60 * 1000
 MAX_BODY = 4_000_000
 PACING_SECONDS = 1.25
 FUNDING_MAX_PAGES = 80
@@ -122,7 +125,7 @@ def validate_rows(name: str, rows: list[dict], start: int, end: int) -> list[dic
 
 
 def retrieve_stats(name: str, now_ms: int, transport) -> tuple[list[dict], dict]:
-    start = ((now_ms - WINDOW_MS + STEP_MS - 1) // STEP_MS) * STEP_MS
+    start = ((now_ms - WINDOW_MS + RETENTION_MARGIN_MS + STEP_MS - 1) // STEP_MS) * STEP_MS
     cursor = start
     records: dict[int, dict] = {}
     pages = 0
@@ -139,33 +142,44 @@ def retrieve_stats(name: str, now_ms: int, transport) -> tuple[list[dict], dict]
             records[ts] = row
         pages += 1
         cursor = end + 1
-    return [records[k] for k in sorted(records)], {"requests": pages, "window_start": iso(start), "window_end": iso(now_ms), "period": PERIOD}
+    return [records[k] for k in sorted(records)], {"requests": pages, "window_start": iso(start), "window_end": iso(now_ms), "period": PERIOD, "retention_safety_margin_minutes": RETENTION_MARGIN_MS // 60_000}
 
 
 def retrieve_funding(now_ms: int, transport) -> tuple[list[dict], dict]:
-    # An explicit zero start asks Binance for the oldest available USD-M record.
-    cursor = 0
+    # Binance may return a silently capped recent tail when requested across
+    # many years. Date-bounded 90-day windows force historical traversal.
+    # Jan 2018 predates USD-M futures; empty early windows are preserved.
+    earliest_probe_ms = 1_514_764_800_000
+    window_ms = 90 * DAY_MS
+    pending = []
+    start = earliest_probe_ms
+    while start <= now_ms:
+        end = min(start + window_ms - 1, now_ms)
+        pending.append((start, end))
+        start = end + 1
     unique = {}
-    pages = 0
-    while cursor <= now_ms:
-        if pages >= FUNDING_MAX_PAGES:
+    requests = 0
+    while pending:
+        if requests >= FUNDING_MAX_PAGES:
             raise RuntimeError("funding_page_cap")
-        params = {"symbol": SYMBOL, "startTime": cursor, "endTime": now_ms, "limit": 1000}
-        rows = validate_rows("fundingRate", transport(ENDPOINTS["fundingRate"][0], params), cursor, now_ms)
-        pages += 1
-        if not rows:
-            break
+        start, end = pending.pop(0)
+        params = {"symbol": SYMBOL, "startTime": start, "endTime": end, "limit": 1000}
+        rows = validate_rows("fundingRate", transport(ENDPOINTS["fundingRate"][0], params), start, end)
+        requests += 1
+        # Conservative guard against undocumented 500-row provider caps.
+        if len(rows) >= 500:
+            if end - start < DAY_MS:
+                raise RuntimeError("funding_window_still_truncated")
+            halfway = start + (end - start) // 2
+            pending.insert(0, (halfway + 1, end))
+            pending.insert(0, (start, halfway))
+            continue
         for row in rows:
             key = (row["fundingTime"], row.get("rateType"), row.get("fundingRate"), row.get("markPrice"))
             unique[key] = row
-        last = max(row["fundingTime"] for row in rows)
-        if last < cursor:
-            raise RuntimeError("nonprogressing_funding_history")
-        cursor = last + 1
-        if len(rows) < 1000:
-            break
     ordered = [unique[k] for k in sorted(unique)]
-    return ordered, {"requests": pages, "history_requested_from": "earliest_available", "cursor_finished": iso(min(cursor, now_ms))}
+    return ordered, {"requests": requests, "history_requested_from": iso(earliest_probe_ms),
+                     "window_days": 90, "cursor_finished": iso(now_ms)}
 
 
 def gaps(name: str, rows: list[dict]) -> list[dict]:
@@ -176,7 +190,8 @@ def gaps(name: str, rows: list[dict]) -> list[dict]:
     expected = STEP_MS if name != "fundingRate" else 8 * 60 * 60 * 1000
     output = []
     for a, b in zip(times, times[1:]):
-        if b - a > expected:
+        tolerance = 60_000 if name == "fundingRate" else 0
+        if b - a > expected + tolerance:
             output.append({"after": iso(a), "before": iso(b),
                            "duration_minutes": (b - a) / 60000,
                            "missing_periods_estimate": (b - a) // expected - 1,

@@ -69,16 +69,30 @@ def test_three_endpoints_fully_paged_30_days_and_earliest_funding(tmp_path):
     oi = report["results"]["openInterestHist"]
     ratio = report["results"]["globalLongShortAccountRatio"]
     funding = report["results"]["fundingRate"]
-    assert oi["rows"] == ratio["rows"] == 8641
+    assert oi["rows"] == ratio["rows"] == 8629
     assert funding["rows"] == 3
     assert oi["requests"] == ratio["requests"] == 18
-    assert funding["requests"] == 1
+    assert 25 <= funding["requests"] <= b.FUNDING_MAX_PAGES
+    funding_calls = [params for endpoint, params in transport.calls if endpoint.endswith("fundingRate")]
+    assert all(params["endTime"] - params["startTime"] < 90 * b.DAY_MS for params in funding_calls)
+    assert min(params["startTime"] for params in funding_calls) == 1_514_764_800_000
     assert all(x["gap_count"] == 0 for x in (oi, ratio, funding))
-    assert len(transport.calls) == 37
+    assert len(transport.calls) == 36 + funding["requests"]
     assert all(".darc" not in x.name for x in (tmp_path / "backfill").iterdir())
     output = json.loads((tmp_path / "backfill" / oi["file"]).read_text("utf-8"))
-    assert len(output["records"]) == 8641
+    assert len(output["records"]) == 8629
     assert output["metadata"]["note"].startswith("historical_api_availability_unknown")
+
+
+def test_stats_window_keeps_one_hour_margin_against_rolling_30_day_400():
+    transport = FixtureTransport()
+    rows, report = b.retrieve_stats("globalLongShortAccountRatio", NOW, transport)
+    start = NOW - b.WINDOW_MS + b.RETENTION_MARGIN_MS
+    assert b.RETENTION_MARGIN_MS == 3_600_000
+    assert transport.calls[0][1]["startTime"] >= start
+    assert report["retention_safety_margin_minutes"] == 60
+    assert rows[0]["timestamp"] >= start
+    assert rows[-1]["timestamp"] == NOW
 
 
 def test_missing_5m_intervals_reported_explicitly(tmp_path):
@@ -130,6 +144,23 @@ def test_failed_endpoint_does_not_suppress_other_two(tmp_path):
     assert report["results"]["globalLongShortAccountRatio"]["status"] == "captured"
     assert report["results"]["fundingRate"]["status"] == "captured"
     assert not any(p.name.startswith("openInterestHist-") for p in (tmp_path / "backfill").iterdir())
+
+
+def test_provider_silent_funding_cap_does_not_count_as_full_history():
+    class FakeCapped:
+        def __call__(self, endpoint, params):
+            assert endpoint.endswith("fundingRate")
+            return [{"fundingTime": params["startTime"] + 1, "symbol": "ETHUSDT",
+                     "fundingRate": "0.0001"} for _ in range(500)]
+
+    with pytest.raises(RuntimeError, match="funding_window_still_truncated"):
+        b.retrieve_funding(NOW, FakeCapped())
+
+
+def test_small_funding_clock_jitter_does_not_create_a_gap():
+    rows = [{"fundingTime": 1_000, "symbol": "ETHUSDT"},
+            {"fundingTime": 1_000 + 8 * 60 * 60 * 1000 + 6_000, "symbol": "ETHUSDT"}]
+    assert b.gaps("fundingRate", rows) == []
 
 
 def test_funding_interval_change_not_treated_as_definite_missing():
