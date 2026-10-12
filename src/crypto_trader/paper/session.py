@@ -174,6 +174,8 @@ class TradingSession:
         entries = list(self.feed.observations())
         if not isinstance(start_index, int) or not 0 <= start_index <= len(entries):
             raise PaperStateError("start_index must be within the feed.")
+        if any(entry.symbol != self.config.symbol for entry in entries):
+            raise PaperStateError("market observation symbol must match the session symbol.")
 
         ledger = PositionLedger(Decimal(self.config.starting_equity_quote))
         self._reservations = {}
