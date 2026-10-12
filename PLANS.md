@@ -69,4 +69,16 @@ The production-independent `ScriptedSimulationRunner` in `src/crypto_trader/pape
 
 The approved **Nautilus** path is `NautilusSimulationRunner` implementing `TemporalExecutionSimulator` in `src/crypto_trader/execution/nautilus/simulation.py`, driven by `TradingSession.run()`'s `start_temporal/advance_until/submit_temporal/finish_temporal` flow. This path **rejects** nonzero `start_index` with `PaperStateError` unless engine/journal/risk peak recovery is separately verified and implemented. P-06 verifies offline **journal read-back** of persisted partial quantities after interruption; it does **not** authorize restarting an unverified native engine or submitting an order again. Legacy batch-resume deficiencies remain outside the current Nautilus Paper acceptance candidate; any future promotion requires an independently approved P-07 implementation scope and regression proof, not a silent fallback.
 
+## Deferred P-05 fixture improvements (backlog; no silent release waiver)
+
+These items were explicitly deferred by the owner for a **later, separately approved** research iteration; they are not claimed implemented or tested here:
+
+- Validate fixture `schema_version` and consume declared `decision` values rather than duplicating scripted buy/hold choices in the test.
+- Pass fixture `starting_equity_quote` explicitly into the session instead of relying on a matching hard-coded test default.
+- Use integer timestamp arithmetic for nanosecond fixture offsets rather than `datetime.timestamp()` floating-point multiplication.
+- Expand replay reconciliation to include reconstructed inventory, fees, realized/unrealized PnL, outstanding leaves and equity, not just fills and order states; retain independent journal-to-report calculations.
+- Review portable fixture byte hashing across `core.autocrlf` configurations and consider a separately authorized `.gitattributes` rule if needed; never silently re-normalize the already pinned fixture.
+
+Deferral does not change the immutable P-05 fixture SHA256, bypass verified safety invariants, or imply independent reviewer acceptance. Any reviewer-proven release blocker remains a blocker pending the standard adjudication gate.
+
 For each P-0x: **smallest bounded fix -> targeted red/green test -> complete offline pytest -> independent named-files-only commit -> next item**. Preserve all protected WIP and immutable DARC data. If any defect or governance conflict falsifies the plan, record it rather than lowering the acceptance gate. Paper has no auto-start or broker authorization.
