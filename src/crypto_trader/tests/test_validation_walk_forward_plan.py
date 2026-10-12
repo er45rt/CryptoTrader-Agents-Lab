@@ -265,7 +265,7 @@ def _strict_planner_scanner(tree):
         "__future__": ("annotations",),
         "dataclasses": ("dataclass",),
         "enum": ("Enum",),
-        "unicodedata": ("category", "normalize"),
+        "unicodedata": ("category", "normalize", "unidata_version"),
         "canonical": ("content_hash",),
     }
     forbidden_names = {
@@ -290,7 +290,8 @@ def _strict_planner_scanner(tree):
         "EXPLORATORY_SPLIT_ONLY", "Enum", "FoldLayout", "FoldWindow",
         "SampleWindow", "SplitLabel", "SplitLayoutReport", "SplitPlanError",
         "ValueError", "_DOMAIN", "_MAX_FOLDS", "_MAX_NS", "_MAX_SAMPLES",
-        "_REASONS", "_SEMANTICS", "_fold_evidence", "_id", "_sample_evidence",
+        "_REASONS", "_SEMANTICS", "_UNICODE_VERSION", "unidata_version",
+        "_fold_evidence", "_id", "_sample_evidence",
         "_time", "_validated_fold", "_validated_sample", "a", "allow_zero",
         "any", "b", "bool", "c", "category", "char", "checked_folds", "code",
         "codes", "content_hash", "cutoff", "d", "dataclass", "decision",
@@ -627,10 +628,10 @@ def test_fixed_known_answer_hashes_for_valid_synthetic_fixture():
     # The independent research manifest pins both values across runs.
     report = plan_synthetic_folds(*valid())
     assert report.split_layout_digest == (
-        "cf822a7ff539998260b7f5c831fca7bb07f96121c87bff8f8816ea2030e8e998"
+        "5252b3838e313fdc7693e3a108ae12ad7a1cb7baa3a8e79cf356290702fac5c9"
     )
     assert report.folds[0].fold_id == (
-        "0c39d99a1332f27e0f18f7eb8c9949631754fe88d48327fe1e7743f3289490fd"
+        "1e29a74600b2109044c2ceb902d64d15360a6d86ab2f81d99da317e3215f1523"
     )
 
 
@@ -762,7 +763,7 @@ def test_v8_report_revalidates_mutated_fold_and_requires_ordered_windows():
         replace(report)
 
 
-def test_v8_constructor_changes_preserve_historical_hash_preimages():
+def test_v8_constructor_roundtrip_keeps_commitments():
     report = plan_synthetic_folds(*valid())
     assert replace(report) == report
     assert replace(report.folds[0]) == report.folds[0]
@@ -811,3 +812,55 @@ def test_v8_sample_snapshot_used_for_duplicate_check_and_hashing(monkeypatch):
     monkeypatch.setattr(planner, "_validated_sample", mutate_caller_after_validation)
     assert planner.plan_synthetic_folds(rows, folds) == expected
     assert tuple(copy.sample_id for copy in copies) == ("train", "valid")
+
+
+@pytest.mark.parametrize("database_version", ("14.0.0", "16.0.0", "", None))
+def test_v8_unicode_database_mismatch_refuses_even_ascii_layout(monkeypatch, database_version):
+    from crypto_trader.validation import walk_forward_plan as planner
+    monkeypatch.setattr(planner, "unidata_version", database_version)
+    with pytest.raises(SplitPlanError, match="pinned Unicode database 15.0.0"):
+        planner.plan_synthetic_folds(*valid())
+
+
+@pytest.mark.parametrize("identifier", ("é", "عينة", "\U0001fae8"))
+def test_v8_pinned_unicode_identifiers_preserve_input_bytes(identifier):
+    from crypto_trader.validation import walk_forward_plan as planner
+    assert planner.unidata_version == "15.0.0"
+    rows, folds = valid()
+    report = planner.plan_synthetic_folds((replace(rows[0], sample_id=identifier), rows[1]), folds)
+    assert report.folds[0].train_ids == (identifier,)
+    assert planner._SEMANTICS.endswith("unicode15.0.0-v2")
+    assert planner._DOMAIN.endswith("-v2")
+    assert planner.plan_synthetic_folds((rows[1], replace(rows[0], sample_id=identifier)), folds) == report
+
+
+def test_v8_rejects_normalization_without_rewriting_sample_identifier():
+    rows, folds = valid()
+    noncanonical = replace(rows[0], sample_id="A\u030a")
+    with pytest.raises(SplitPlanError, match="already be NFC"):
+        plan_synthetic_folds((noncanonical, rows[1]), folds)
+    assert noncanonical.sample_id == "A\u030a"
+
+
+def test_v8_unicode_v2_does_not_reinterpret_historical_v1_preimage():
+    from crypto_trader.validation.canonical import content_hash
+    rows, folds = valid()
+    # Literal historical sample/fold evidence; no current planner constants.
+    semantics = "synthetic-halfopen-prevalidation-strict-purge-v1"
+    samples = [{"sample_id": row.sample_id, "decision_utc_ns": str(row.decision_utc_ns),
+                "feature_available_utc_ns": str(row.feature_available_utc_ns),
+                "revision_first_seen_utc_ns": str(row.revision_first_seen_utc_ns),
+                "exposure_end_utc_ns": str(row.exposure_end_utc_ns)} for row in rows]
+    manifest = content_hash("crypto-trader-walk-forward-layout-v1-samples",
+                            {"semantics_version": semantics, "samples": samples})
+    window = {"train_start_utc_ns": str(BASE), "train_end_utc_ns": str(BASE + 20),
+              "validation_start_utc_ns": str(BASE + 30), "validation_end_utc_ns": str(BASE + 50),
+              "pre_validation_gap_ns": "0"}
+    historical = content_hash("crypto-trader-walk-forward-layout-v1-fold",
+                              {"semantics_version": semantics, "sample_manifest": manifest,
+                               "window": window, "pair_codes": (("train", "TRAIN"), ("valid", "VALIDATION"))})
+    assert manifest == "960b2d456543aa2c88418d2e99cdb382016d7150c2ccdf18ca6c58d034109c3e"
+    assert historical == "0c39d99a1332f27e0f18f7eb8c9949631754fe88d48327fe1e7743f3289490fd"
+    report = plan_synthetic_folds(rows, folds)
+    assert report.folds[0].fold_id != historical
+    assert report.sample_digest == "3bbce16e5452432b3c8bbfb97783268121bad152d55b143c1df5a901a24297fe"

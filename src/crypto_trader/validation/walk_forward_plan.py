@@ -8,17 +8,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from unicodedata import category, normalize
+from unicodedata import category, normalize, unidata_version
 
 from .canonical import content_hash
 
 _MAX_NS = 2**63 - 1
 _MAX_SAMPLES = 2048
 _MAX_FOLDS = 32
-_DOMAIN = "crypto-trader-walk-forward-layout-v1"
+_DOMAIN = "crypto-trader-walk-forward-layout-v2"
 # Any canonical-encoding contract change requires a new _DOMAIN and _SEMANTICS
 # version; historical content digests must remain interpretable.
-_SEMANTICS = "synthetic-halfopen-prevalidation-strict-purge-v1"
+_UNICODE_VERSION = "15.0.0"
+_SEMANTICS = "synthetic-halfopen-prevalidation-strict-purge-unicode15.0.0-v2"
 _REASONS = ("synthetic_metadata_unverified", "anchor_missing")
 
 
@@ -151,6 +152,11 @@ def _time(value: object, *, allow_zero: bool = False) -> int:
 
 
 def _id(value: object) -> str:
+    # Python 3.12's Unicode database is part of this versioned acceptance
+    # contract. Refuse other databases rather than silently reinterpret IDs.
+    # Historical v1 digests retain their original domain/semantics preimages.
+    if unidata_version != _UNICODE_VERSION:
+        raise SplitPlanError("require pinned Unicode database 15.0.0")
     if type(value) is not str or not 1 <= len(value) <= 128:
         raise SplitPlanError("invalid synthetic sample ID")
     for char in value:
