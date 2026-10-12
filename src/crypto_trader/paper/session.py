@@ -32,6 +32,9 @@ from uuid import UUID, uuid5
 
 from crypto_trader.events import (
     STRATEGY_DECISION_EVENT_TYPE,
+    TRADE_INTENT_EVENT_TYPE,
+    VALIDITY_EVENT_TYPE,
+    RISK_DECISION_EVENT_TYPE,
     EXECUTION_FILL_EVENT_TYPE,
     ORDER_STATE_EVENT_TYPE,
     StrategyDecisionPayload,
@@ -115,14 +118,51 @@ class TradingSession:
     # --- resume support ---
 
     def resume_index(self) -> int:
-        """How many observations this session already processed (derived from the journal)."""
+        """Return only a contiguous prefix with complete persisted decision stages.
+
+        A crash may happen *after* strategy.decision.recorded but *before*
+        validity/risk journaling. Counting decisions alone would skip work
+        after restart. Resolve stable IDs by market reference, not by journal
+        iteration order (journals may sort equal-time events by UUID).
+        """
+        entries = tuple(self.feed.observations())
+        events = tuple(self.journal.read_by_correlation(self.config.session_id))
+        by_id = {event.event_id: event for event in events}
+        known_decisions: set[UUID] = set()
         processed = 0
-        for event in self.journal.read_by_correlation(self.config.session_id):
-            if (
-                event.event_type == STRATEGY_DECISION_EVENT_TYPE
-                and event.producer == self.config.producer
-            ):
-                processed += 1
+        saw_gap = False
+
+        def require_stage(event_id: UUID, event_type: str) -> Any:
+            candidate = by_id.get(event_id)
+            if candidate is None or candidate.event_type != event_type:
+                raise PaperStateError("incomplete journal stage: refusing to advance replay cursor.")
+            return candidate
+
+        for entry in entries:
+            decision_id = _stable_id(str(self.config.session_id), entry.market_reference, "decision")
+            known_decisions.add(decision_id)
+            event = by_id.get(decision_id)
+            if event is None:
+                saw_gap = True
+                continue
+            if saw_gap:
+                raise PaperStateError("incomplete journal: non-contiguous decision prefix.")
+            if event.event_type != STRATEGY_DECISION_EVENT_TYPE or event.producer != self.config.producer:
+                raise PaperStateError("incomplete or mismatched journal decision identity.")
+            if event.payload.action != "hold":
+                intent_id = _stable_id(str(self.config.session_id), entry.market_reference, "intent")
+                require_stage(_stable_id(str(intent_id), "intent-event"), TRADE_INTENT_EVENT_TYPE)
+                validity = require_stage(_stable_id(str(intent_id), "validity"), VALIDITY_EVENT_TYPE)
+                if validity.payload.disposition == "accepted":
+                    require_stage(_stable_id(str(intent_id), "risk"), RISK_DECISION_EVENT_TYPE)
+                    require_stage(_stable_id(str(intent_id), "risk-evaluation"), "risk.evaluation.recorded")
+            processed += 1
+
+        for event in events:
+            if (event.event_type == STRATEGY_DECISION_EVENT_TYPE
+                    and event.producer == self.config.producer
+                    and event.event_id not in known_decisions):
+                raise PaperStateError("incomplete journal: decision does not match the frozen feed.")
         return processed
 
     # --- run ---
