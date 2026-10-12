@@ -42,3 +42,23 @@ Regression proof: reboot/crash simulator, startup lock contention, time unsynced
 Each C-0x is completed **one by one**: smallest approved change → focused offline regression test → full offline pytest (0 failed) → own named-files-only Git commit → next. Do not bundle multiple items into one commit, touch unrelated WIP, or run git reset/checkout/clean/push/merge. This plan **does not authorize executing its items**. Request explicit operational approval and required independent review for each sensitive implementation.
 
 Continuous GO requires **all** C-01 through C-04 evidence, reproducible recovery and restore drill, compliant rate budget, actual monitored pilot with durable `clean_stop`, reliable clock verification, relevant code/tree/hash binding, then a **separate express human authorization** to deploy/enable at boot. Until then: **CONTINUOUS NO-GO**. Stage3A v8 remains its final edition; no Stage3A v9.
+
+---
+
+# Paper + NautilusTrader — offline acceptance and item sequence
+
+**Status: PAPER NO-GO pending P-01 to P-05.** V8 research GO does not grant Paper/live deployment. The user authorized implementation and tests of the **offline simulated** paper path only. No external venue connection, credentials, signed requests, production OMS/Execution, Testnet/Mainnet orders or network-based broker paper endpoint. Every submitted order must remain wholly inside the NautilusTrader 1.231.0 simulator against frozen synthetic/public-shaped market input.
+
+## Paper acceptance criteria — defined before implementation
+
+The **Paper research GO** gate requires all of: (1) a hard, tested authenticated-I/O boundary and explicit mode/queue settings; (2) genuine deterministic offline NautilusTrader L2_MBP queue-aware engine fills and partial/unfilled cases, with validated quantities/fees; (3) temporal eligibility of observations, decisions and fills plus fail-closed stale/gap/overlap handling, with realized/unrealized equity/risk reconciliation; (4) append-only journal crash/resume/replay correctness, stable event identities and zero duplicate fills; (5) a reproducible end-to-end offline ETHUSDT fixture with independently checked journal/report totals and code/tree/fixture hashes; (6) focused red/green proof per changed item, **full offline pytest exit 0 before each named-path-only commit**, and a once-at-end independently sourced review/adjudication with zero proven blockers. A passing mock-only test, a dry-run intent or a claim of fills is not sufficient evidence. A Paper research GO is **not** permission to trade or enable any external adapter.
+
+## Paper item order
+
+- **P-01 (boundary/config):** verify explicit mode, no authenticated client, no external order method reachability; reject unsafe queue-aware overrides and unknown/malformed config. Negative tests must fail closed.
+- **P-02 (Nautilus execution):** pin real 1.231.0 adapter, L2_MBP queue position and liquidity consumption, deterministic filled/partially-filled/unfilled fixtures; no external requests.
+- **P-03 (causality/accounting):** observations, decisions and fill timestamps strictly ordered; stale/gap and overlapping inputs rejected; fees, inventory, reservations and exposure reconcile to the journal.
+- **P-04 (crash/recovery):** simulate interruption and resumed replay against persisted journal; reject missing engine state when pending temporal fills exist; prevent duplicate event/fill IDs.
+- **P-05 (end-to-end evidence and final review):** freeze a complete offline ETHUSDT run and independent reconciliation of positions, equity, journal, report, hashes; then run one end-of-paper independent reviewer batch and adjudication. No GO without accepted evidence.
+
+For each P-0x: **smallest bounded fix -> targeted red/green test -> complete offline pytest -> independent named-files-only commit -> next item**. Preserve all protected WIP and immutable DARC data. If any defect or governance conflict falsifies the plan, record it rather than lowering the acceptance gate. Paper has no auto-start or broker authorization.
