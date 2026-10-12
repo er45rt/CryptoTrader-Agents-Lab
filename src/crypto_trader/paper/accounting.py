@@ -39,7 +39,9 @@ class PositionLedger:
     _positions: dict[str, PositionState] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.starting_equity_quote, Decimal) or self.starting_equity_quote <= 0:
+        if (not isinstance(self.starting_equity_quote, Decimal)
+                or not self.starting_equity_quote.is_finite()
+                or self.starting_equity_quote <= 0):
             raise PaperStateError("starting equity must be a positive Decimal.")
 
     def position(self, symbol: str) -> PositionState:
@@ -66,11 +68,11 @@ class PositionLedger:
         """Apply one simulated fill (``side`` is the order's side: buy/sell)."""
         if side not in {"buy", "sell"}:
             raise PaperStateError(f"unknown fill side {side!r}.")
-        if not isinstance(quantity, Decimal) or quantity <= 0:
+        if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0:
             raise PaperStateError("fill quantity must be a positive Decimal.")
-        if not isinstance(price, Decimal) or price <= 0:
+        if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
             raise PaperStateError("fill price must be a positive Decimal.")
-        if not isinstance(fee, Decimal) or fee < 0:
+        if not isinstance(fee, Decimal) or not fee.is_finite() or fee < 0:
             raise PaperStateError("fee must be a non-negative Decimal.")
 
         current = self.position(symbol)
@@ -111,21 +113,27 @@ class PositionLedger:
     def positions(self) -> dict[str, PositionState]:
         return dict(self._positions)
 
+    @staticmethod
+    def _checked_mark(marks: dict[str, Decimal], symbol: str) -> Decimal:
+        mark = marks.get(symbol)
+        if not isinstance(mark, Decimal) or not mark.is_finite() or mark <= ZERO:
+            raise PaperStateError("active position requires a finite positive market mark.")
+        return mark
+
     def gross_exposure_quote(self, marks: dict[str, Decimal]) -> Decimal:
         total = ZERO
         for symbol, state in self._positions.items():
-            mark = marks.get(symbol)
-            if mark is None or state.quantity == ZERO:
+            if state.quantity == ZERO:
                 continue
-            total += abs(state.quantity) * mark
+            total += abs(state.quantity) * self._checked_mark(marks, symbol)
         return total
 
     def unrealized_pnl_quote(self, marks: dict[str, Decimal]) -> Decimal:
         total = ZERO
         for symbol, state in self._positions.items():
-            mark = marks.get(symbol)
-            if mark is None or state.quantity == ZERO:
+            if state.quantity == ZERO:
                 continue
+            mark = self._checked_mark(marks, symbol)
             total += (mark - state.average_cost) * state.quantity
         return total
 
