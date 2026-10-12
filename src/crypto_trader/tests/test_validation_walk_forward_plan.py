@@ -302,6 +302,9 @@ def _strict_planner_scanner(tree):
                 "samples", "self", "value",
             }:
                 raise AssertionError(("unreviewed function parameter", node.arg))
+        if isinstance(node, ast.AsyncFunctionDef):
+            # No asynchronous definitions are approved in the pinned planner.
+            raise AssertionError(("unreviewed async function definition", node.name))
         if isinstance(node, ast.FunctionDef):
             if node.name not in {
                 "__post_init__", "_fold_evidence", "_id", "_sample_evidence",
@@ -325,6 +328,14 @@ def _strict_planner_scanner(tree):
             if node.attr in {"open", "system", "popen", "connect", "allocate", "place_order"}:
                 raise AssertionError(("forbidden attribute", node.attr))
 
+
+@pytest.mark.parametrize("source", [
+    "async def unreviewed():\n    pass",
+    "async def _id(value):\n    pass",
+])
+def test_planner_scanner_rejects_unreviewed_async_definitions(source):
+    with pytest.raises(AssertionError, match="unreviewed async function definition"):
+        _strict_planner_scanner(ast.parse(source))
 
 def test_new_source_isolation_ast_including_adversarial_specimens():
     tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
