@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from crypto_trader.paper.simulation import ExecutionSimulator, SimulationOutcome
 
 from ..ports import ExecutionRequest, InstrumentSpec, MarketBookUpdate, MarketTrade
-from .guard import QueueAwareSettings, tested_queue_aware_settings
+from ..errors import QueueAwareConfigurationError
+from .guard import (
+    QueueAwareSettings, require_queue_aware_settings, tested_queue_aware_settings,
+)
 from .runtime import NautilusExecutionRuntime
 
 __all__ = ["NautilusSimulationRunner"]
@@ -70,6 +73,9 @@ class NautilusSimulationRunner:
     def start_temporal(self) -> None:
         if getattr(self, "_temporal_runtime", None) is not None:
             raise RuntimeError("temporal simulation is already started.")
+        if self.queue_aware is not True:
+            raise QueueAwareConfigurationError("temporal Paper requires queue-aware simulation.")
+        require_queue_aware_settings(self.queue_settings)
         runtime = NautilusExecutionRuntime(
             self.instrument,
             queue_aware=self.queue_aware,
