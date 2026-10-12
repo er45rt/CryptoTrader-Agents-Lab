@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from crypto_trader.paper.simulation import ExecutionSimulator, SimulationOutcome
+from crypto_trader.paper.errors import PaperStateError
 
 from ..ports import ExecutionRequest, InstrumentSpec, MarketBookUpdate, MarketTrade
 from ..errors import QueueAwareConfigurationError
@@ -154,6 +155,11 @@ class NautilusSimulationRunner:
             if self._temporal_cursor < len(self._temporal_timeline):
                 runtime.run_until(end_ns=self._temporal_timeline[-1] + 1)
                 self._temporal_cursor = len(self._temporal_timeline)
+            if runtime.has_queued_orders():
+                raise PaperStateError(
+                    "temporal simulation ended with unsubmitted queued intents: "
+                    "no later market event can certify submission."
+                )
             if self._temporal_timeline:
                 runtime.end_temporal()
             return self._temporal_snapshot()

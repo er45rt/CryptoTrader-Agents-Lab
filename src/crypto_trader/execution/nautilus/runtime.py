@@ -197,6 +197,10 @@ class NautilusExecutionRuntime:
             raise RuntimeStateError("invalid simulation boundary.")
         self._engine.run(end=end_ns, streaming=True)
 
+    def has_queued_orders(self) -> bool:
+        """Whether approved requests still await a native submission callback."""
+        return bool(self._queued)
+
     def has_unsettled_orders(self) -> bool:
         """Conservatively check in-flight simulated orders before risk snapshots."""
         if self._queued:

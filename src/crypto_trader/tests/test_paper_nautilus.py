@@ -166,13 +166,15 @@ def test_runner_requires_a_non_queue_aware_opt_in_for_other_book_types():
 
 def test_phase10_fill_must_follow_decision_completion(journal):
     """P0 regression: never replay a midnight fill against a noon decision."""
+    from crypto_trader.paper import PaperStateError
     session = fx.session(
         journal,
         decisions=fx.scripted(fx.buy_decision(quantity="1")),
         data_feed=fx.feed("2700.00"),
         simulator=runner(),
     )
-    session.run()
+    with pytest.raises(PaperStateError, match="unsubmitted queued intents"):
+        session.run()
     events = tuple(journal.read_range())
     decisions = [event for event in events if event.event_type == "strategy.decision.recorded"]
     fills = [event for event in events if event.event_type == "execution.fill.recorded"]
@@ -226,6 +228,7 @@ def test_phase10_native_event_ids_repeat_across_fresh_simulations():
 
 def test_phase10_next_risk_decision_observes_prior_fill(journal, monkeypatch):
     """Second risk decision must see the first fill, fees, and new mark."""
+    from crypto_trader.paper import PaperStateError
     from crypto_trader.paper.session import TradingSession
 
     snapshots = []
@@ -246,8 +249,12 @@ def test_phase10_next_risk_decision_observes_prior_fill(journal, monkeypatch):
         data_feed=fx.feed("2700.00", "2705.00"),
         simulator=aligned_runner(),
     )
-    report = session.run()
-    assert len(report.fills) == 1
+    # The second approved intent is beyond this tape. Fail closed at finish,
+    # while preserving the first fill and the second decision's risk snapshot.
+    with pytest.raises(PaperStateError, match="unsubmitted queued intents"):
+        session.run()
+    assert sum(event.event_type == "execution.fill.recorded"
+               for event in journal.read_range()) == 1
     assert len(snapshots) == 2
     assert snapshots[0].equity_quote == Decimal("100000")
     assert snapshots[1].equity_quote > Decimal("100000")
