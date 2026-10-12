@@ -138,7 +138,9 @@ def _validated_fold(fold: object) -> FoldWindow:
     gap = _time(fold.pre_validation_gap_ns, allow_zero=True)
     if not (a < b <= c < d) or c - gap <= a:
         raise SplitPlanError("invalid training / validation / pre-validation gap")
-    return fold
+    # Independent frozen copy of the validated values: FoldLayout.window must
+    # never alias a caller-owned object that could later diverge from fold_id.
+    return FoldWindow(a, b, c, d, gap)
 
 
 def _sample_evidence(row: SampleWindow) -> dict[str, str]:
@@ -189,7 +191,7 @@ def plan_synthetic_folds(
     prev_validation_end = 0
     checked_folds: list[FoldWindow] = []
     for fold in folds:
-        _validated_fold(fold)
+        fold = _validated_fold(fold)
         if fold.validation_start_utc_ns < prev_validation_end:
             raise SplitPlanError("validation windows overlap or are unordered")
         prev_validation_end = fold.validation_end_utc_ns

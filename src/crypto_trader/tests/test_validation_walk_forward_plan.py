@@ -196,6 +196,21 @@ def test_mutated_frozen_dataclass_revalidated_at_call_entry():
         plan_synthetic_folds((x, rows[1]), fs)
 
 
+def test_caller_fold_mutation_after_planning_does_not_alter_layout_window():
+    rows, _ = valid()
+    caller_fold = fold()
+    report = plan_synthetic_folds(rows, (caller_fold,))
+    layout = report.folds[0]
+    assert layout.window is not caller_fold
+    assert layout.window == fold()
+    object.__setattr__(caller_fold, "train_start_utc_ns", BASE + 7)
+    object.__setattr__(caller_fold, "pre_validation_gap_ns", 9)
+    assert layout.window == fold()
+    assert layout.window.train_start_utc_ns == BASE
+    assert layout.window.pre_validation_gap_ns == 0
+    assert plan_synthetic_folds(rows, (fold(),)) == report
+
+
 def test_non_authority_flags_constructor_and_unknown_kwargs():
     rows, fs = valid()
     result = plan_synthetic_folds(rows, fs)
