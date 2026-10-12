@@ -57,14 +57,16 @@ class SessionConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.mode, TradingMode):
             raise PaperConfigError("mode must be a TradingMode.")
-        if not _SYMBOL_PATTERN.match(self.symbol):
+        if not isinstance(self.symbol, str) or _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
             raise PaperConfigError(
                 f"symbol must be an uppercase market symbol such as ETHUSDT; got {self.symbol!r}."
             )
-        if not self.strategy_id:
-            raise PaperConfigError("strategy_id is required.")
-        if not self.producer:
-            raise PaperConfigError("producer is required.")
+        if not isinstance(self.strategy_id, str) or not self.strategy_id.strip():
+            raise PaperConfigError("strategy_id must be a nonempty string.")
+        if not isinstance(self.producer, str) or not self.producer.strip():
+            raise PaperConfigError("producer must be a nonempty string.")
+        if not isinstance(self.session_id, UUID):
+            raise PaperConfigError("session_id must be a UUID.")
         if not isinstance(self.shadow_submits, bool) or not isinstance(self.queue_aware, bool):
             raise PaperConfigError("shadow_submits and queue_aware must be booleans.")
         if self.places_simulated_orders and not self.queue_aware:
@@ -138,10 +140,10 @@ def load_session_config(config: Mapping[str, Any]) -> SessionConfig:
 
     return SessionConfig(
         mode=mode,
-        symbol=str(config["symbol"]),
-        strategy_id=str(config["strategy_id"]),
+        symbol=config["symbol"],
+        strategy_id=config["strategy_id"],
         session_id=session_id or uuid4(),
-        producer=str(config.get("producer", "application.paper")),
+        producer=config.get("producer", "application.paper"),
         shadow_submits=_strict_bool(config.get("shadow_submits", False), "shadow_submits"),
         queue_aware=_strict_bool(config.get("queue_aware", True), "queue_aware"),
         queue=queue,

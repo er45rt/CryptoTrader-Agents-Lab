@@ -214,3 +214,29 @@ def test_market_observation_validation():
         MarketObservation("ETHUSDT", Decimal("1"), BASE, "")
     with pytest.raises(PaperConfigError):
         MarketObservation("ETHUSDT", Decimal("1"), BASE, "ref#0", volume=Decimal("-1"))
+
+
+# P-01: malformed identifiers must fail closed before a Paper session is created.
+@pytest.mark.parametrize("symbol", ["ETHUSDT\n", "ETHUSDT\r\n", 12345])
+def test_p01_symbol_requires_exact_ascii_match(symbol):
+    with pytest.raises(PaperConfigError):
+        load_session_config({"mode": "paper", "symbol": symbol, "strategy_id": "s1"})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("strategy_id", 123),
+    ("producer", 456),
+    ("strategy_id", "  "),
+    ("producer", "\n"),
+])
+def test_p01_rejects_invalid_identifiers_before_string_conversion(field, value):
+    config = {"mode": "paper", "symbol": "ETHUSDT", "strategy_id": "s1"}
+    config[field] = value
+    with pytest.raises(PaperConfigError):
+        load_session_config(config)
+
+
+def test_p01_direct_session_config_validates_uuid_type():
+    from crypto_trader.paper import SessionConfig
+    with pytest.raises(PaperConfigError, match="session_id"):
+        SessionConfig(mode=TradingMode.PAPER, symbol="ETHUSDT", strategy_id="s1", session_id="invalid")
