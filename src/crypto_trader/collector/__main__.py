@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--check-startup", action="store_true",
                         help="validate guarded imports only; never poll or open archive")
     parser.add_argument("--archive", help="absolute external archive directory")
+    parser.add_argument("--pilot-seconds", type=int, choices=(3600,),
+                        help="one-hour supervised run; monotonic stop and durable clean_stop")
     parser.add_argument("--host-time-sync-acknowledged", action="store_true",
                         help="operator acknowledges required host time synchronization")
     args = parser.parse_args()
@@ -70,7 +72,8 @@ def main():
                     handlers[sig] = signal.getsignal(sig)
                     signal.signal(sig, lambda signum, frame: collector.request_stop(
                         "signal_" + str(signum)))
-                return collector.run()
+                return collector.run(max_duration_ns=(args.pilot_seconds * 1_000_000_000
+                                                       if args.pilot_seconds else None))
             finally:
                 journal.close()
                 for sig, handler in handlers.items():

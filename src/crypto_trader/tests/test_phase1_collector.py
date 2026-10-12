@@ -107,6 +107,27 @@ def make_collector(tmp_path, transport=None, sync=None, factory=None):
     return collector, clock, calls
 
 
+def test_supervised_pilot_duration_stops_on_monotonic_clock_and_cleanly_closes(tmp_path):
+    collector, clock, calls = make_collector(tmp_path)
+    status = collector.run(max_duration_ns=2 * p.NS_PER_SECOND)
+    saved = records(collector.journal.path)
+    assert status == 0
+    assert clock.mono >= 2 * p.NS_PER_SECOND
+    assert clock.mono < 3 * p.NS_PER_SECOND
+    assert len(calls) == len(p.DEFAULT_INTERVALS)
+    assert saved[0]["record_type"] == "bootstrap"
+    assert saved[-1]["record_type"] == "clean_stop"
+    assert saved[-1]["shutdown_reason"] == "pilot_duration_elapsed"
+
+
+def test_invalid_pilot_duration_fails_before_polling(tmp_path):
+    collector, clock, calls = make_collector(tmp_path)
+    with pytest.raises(ValueError, match="invalid_pilot_duration"):
+        collector.run(max_duration_ns=0)
+    assert calls == []
+    collector.journal.close()
+
+
 @pytest.mark.parametrize("metric,seconds", p.DEFAULT_INTERVALS)
 def test_scheduled_cadence_gives_network_owner_and_preserves_body(tmp_path, metric, seconds):
     c, clock, calls = make_collector(tmp_path)

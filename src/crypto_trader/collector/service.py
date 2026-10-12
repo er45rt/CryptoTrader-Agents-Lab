@@ -224,12 +224,19 @@ class Collector:
                      last_successful_fetched_at=dict(self.last_success),
                      recent_failure=self.last_failure, recent_gap=self.last_gap)
 
-    def run(self):
+    def run(self, *, max_duration_ns=None):
+        if max_duration_ns is not None and (type(max_duration_ns) is not int or max_duration_ns <= 0):
+            raise ValueError("invalid_pilot_duration")
         try:
             self.start()
+            stop_at = (self.clock.mono_ns() + max_duration_ns
+                       if max_duration_ns is not None else None)
             due = {metric: self.clock.mono_ns() for metric, _ in self.config.intervals}
             heartbeat_due = self.clock.mono_ns() + int(HEARTBEAT_SECONDS * NS_PER_SECOND)
             while not self.stop_requested:
+                if stop_at is not None and self.clock.mono_ns() >= stop_at:
+                    self.request_stop("pilot_duration_elapsed")
+                    break
                 for metric, seconds in self.config.intervals:
                     if self.stop_requested:
                         break
