@@ -1,3 +1,16 @@
+# Owner-approved project priority order — research roadmap
+
+The five-step order was approved earlier and reconfirmed on 2026-10-13. It records priorities; it does not assert that every earlier milestone is closed, and it grants no implementation, trading, or deployment authority.
+
+1. **Causal timing of decisions, orders and fills.** Establish correct temporal causality in offline simulation.
+2. **B1–B8 approved corrections.** Complete and verify the previously approved fixes within their established scope: focused regressions, full offline pytest and named-files-only commits per item; independent seven-reviewer assessment once at the end of the version, not after every item.
+3. **Portfolio, risk, ledger, reconciliation and recovery.** Following priorities 1 and 2, this is the next area to investigate after the sealed Paper V8 research closure. Begin with a read-only M0 evidence inventory (no code changes): compare Paper P-03/P-04/P-06 against outstanding requirements (see the 'Paper item order' section below). Examine a source-observed risk-event contract conflict, pinned to code commit bf5c39a8d0df00f388ff19a76e393e2085dffd55: src/crypto_trader/risk/engine.py lines 234, 449, 466 emit base_quantity, which src/crypto_trader/events/contracts.py line 625 does not admit. This observation is not an authority to change risk code.
+4. **Strategy approval gate.** Trial Registry, walk-forward, blind holdout, Probability of Backtest Overfitting (PBO) and Deflated Sharpe Ratio (DSR). This is a research validation gate, not an operational-readiness or trading-enablement gate.
+5. **Strategy evaluation, then offline Paper.** Evaluate only strategies that have passed the priority 4 research validation gate; only then collect additional offline Paper research evidence. The earlier Paper V8 research GO (closure commit 291a041c65d9082105ea20a19527544a631d4b94, reviewed Code Tree 745da9716c215d9f71082a15eedbc49a4d4e01c1) is a sealed historical decision, not an external-broker or live authorization.
+
+**Sequence and separation:** The priority order is 1 → 2 → 3 → 4 → 5. Priority 3 precedes new priority 4/5 work; the owner will choose its next approved scope after M0. DerivArchive C-01 through C-04 remains a separately scoped side track, not the next default release; unattended collection remains NO-GO under the 'DerivArchive — continuous operation readiness plan' section below, and there is no Stage3A v9 (see its 'Gates and sequence' section). Sensitive changes and commits require their own human approval and evidence under the pinned policy: repository_policy_id cryptotrader-agents-lab, governance_schema_version 1, repository_policy_version 2 (engineering_rules.md at commit 291a041c65d9082105ea20a19527544a631d4b94). This plan grants no Push, Merge, Deploy, Testnet, Mainnet, Live, unattended collection, or automatic strategy promotion.
+
+---
 # DerivArchive — continuous operation readiness plan
 
 Status: **NO-GO for unattended or continuous collection**, as of 2026-10-12. The only currently approved live data activity is a bounded, monitored, one-hour ETHUSDT public-data pilot under `--pilot-seconds 3600`. No trading credentials, orders, Testnet, Mainnet, OMS, execution, or promotion.
