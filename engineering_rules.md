@@ -55,7 +55,7 @@ exceptions. Read-only investigation does not lower the affected path's tier.
 {
   "governance_schema_version": 1,
   "repository_policy_id": "cryptotrader-agents-lab",
-  "repository_policy_version": 1,
+  "repository_policy_version": 2,
   "tiers": {
     "ROUTINE": 1,
     "SENSITIVE": 2

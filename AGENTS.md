@@ -42,3 +42,26 @@ Inspect applicable loading overrides; missing required rules, ambiguity or confl
 8. بعد GO فقط، يُكتب **commit إغلاق الإصدار المعتمد** ويُثبت SHA الـcommit والـTree الفعلي ومطابقته لشجرة الإصدار المقصودة. لا يُعمل push أو merge أو نشر أو ترقية تشغيلية دون تصريح منفصل.
 9. هذا AGENTS.md وسائر ملفات الحوكمة **مستبعدة من بصمات نطاق الكود الخاصة بـv6 وv7** ومن commits البنود البرمجية؛ عند تعديل الحوكمة يجري تثبيت مصدرها ومراجعتها مستقلاً عن حزمة الإصدار. حماية WIP أولوية: لا reset/checkout/clean، لا staging شامل، ولا تعديل أو commit للملفات غير المعتمدة.
 10. امتثال السلامة دائم: Research-only لا يمنح صلاحية التداول الفعلي أو Paper/Testnet/Live، ولا OMS/Execution أو مفاتيح أو Billing، ومراجعة الإصدار ليست ترخيصًا لهذه العمليات. المنع الأمني لا يُتجاوز.
+
+## توزيع المراجعين والمنصات
+
+This is the mandatory reviewer model, execution-provider and provenance routing, approved by the owner on 2026-10-13. The table is copied verbatim from the verified user-level Claude policy; this section is authoritative for Codex and repository agents.
+
+| Reviewer | REQUIRED platform/account | Role |
+| --- | --- | --- |
+| GPT-6.1 Sol Medium | OpenAI / Codex | Defect discovery, dispute resolution, final adjudication |
+| Claude Opus 5.5 | Anthropic / Claude | Architecture and governance |
+| Claude Sonnet 5.5 | Anthropic / Claude | Safety, security, edge-case tests |
+| Claude Opus 4.6 — Thinking required, subject to runtime verification — Google Antigravity only | Google Antigravity, NOT Claude CLI | Additional independent adversarial review |
+| Claude Sonnet 4.6 — Thinking required, subject to runtime verification — Google Antigravity only | Google Antigravity, NOT Claude CLI | Source-code and vulnerability review |
+| Gemini 3.1 Pro High | Google | Algorithms, mathematical checks, fingerprints |
+| DeepSeek "Saeed" | DeepSeek account/service | Independent vulnerability and contradiction review |
+
+### Mandatory runtime verification and prior-review treatment
+
+1. Verify the ACTUAL serving model identity, model's supported thinking setting, platform, and account BEFORE invoking any reviewer. Names alone are not sufficient. Do not silently substitute provider, model, or route. If Google Antigravity is inaccessible, STOP its assigned review and report the obstacle; never route either 4.6 Thinking reviewer to Anthropic Claude CLI/API. If Thinking cannot be proven from runtime settings or a trusted log for either 4.6 reviewer, STOP that review and report; never run it without Thinking or label it as Thinking.
+2. Use Saeed's strongest model ACTUALLY available to the account at the time, with its maximum supported reasoning configuration (if any). The owner expressly authorizes consuming existing PAID DeepSeek credit for reviews. Do not automatically top up or alter billing/credentials. Do not call Flash the strongest without checking availability.
+3. The owner ACCEPTED earlier completed 4.6 reviews performed via Claude CLI notwithstanding their provider mismatch. Do not repeat them solely because of that historical provider mismatch. Preserve original provenance: do not relabel them as Google reviews.
+4. This routing approval does NOT override the engineering/release gate: each independent report must genuinely exist, be source/Git-Tree-pinned, and distinguish observed evidence from speculation. GPT-6.1 Sol adjudicates only from verified reports. NO-GO stays in force when any required evidence or blocker closure is missing. No release approval commit just because routing was approved.
+5. No real/live/testnet trading orders, no push/merge/deploy, no touching unrelated protected WIP, no reset/checkout/clean, never read, print, log, or copy secret values; using already-configured credentials through their official tools is allowed. Respect repo AGENTS.md and engineering_rules.md and explicit scope/authorization for sensitive files.
+6. The assistant/ChatGPT is the coordinator and not a substitute for any of the seven external reviewers. Cost/usage must be accurately attributed to the platform actually used.
