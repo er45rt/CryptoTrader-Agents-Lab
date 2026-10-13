@@ -87,6 +87,10 @@ __all__ = [
     "ValidityDispositionRecorded",
     "RiskEvaluationPayload",
     "RiskEvaluationRecorded",
+    "RiskEvaluationPayloadV2",
+    "RiskEvaluationRecordedV2",
+    "RiskRuleResultPayloadV2",
+    "V2_CONTRACTS",
     "RiskRuleResultPayload",
     "RiskRuleUnit",
     "SAFETY_EVENT_TYPE",
@@ -677,6 +681,29 @@ class RiskEvaluationRecorded(DomainEvent):
     payload: RiskEvaluationPayload
 
 
+class RiskRuleResultPayloadV2(RiskRuleResultPayload):
+    """V2 adds base-asset quantities without reinterpreting any V1 unit."""
+
+    unit: Literal["quote_currency", "count", "percent", "base_quantity"] = Field(
+        description="Explicit economic unit of 'actual' and 'limit'."
+    )
+
+
+class RiskEvaluationPayloadV2(RiskEvaluationPayload):
+    """V2 rule audit; all inherited fields retain their V1 meanings."""
+
+    rule_results: list[RiskRuleResultPayloadV2] = Field(
+        min_length=1, description="Per-rule results, in evaluation order."
+    )
+
+
+class RiskEvaluationRecordedV2(RiskEvaluationRecorded):
+    """Explicit V2 audit. V1 stays registered and is never silently upgraded."""
+
+    schema_version: Literal[2] = 2
+    payload: RiskEvaluationPayloadV2
+
+
 # --- 9. Operational safety state (Phase 9, additive) -----------------------
 
 class SafetyStateChangePayload(EventPayload):
@@ -896,3 +923,5 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     OperatorCommandRecorded,
     StreamLifecycleRecorded,
 )
+
+V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2,)

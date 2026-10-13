@@ -25,7 +25,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .base import FIRST_SCHEMA_VERSION, EventEnvelope, is_valid_event_type
-from .contracts import V1_CONTRACTS
+from .contracts import V1_CONTRACTS, V2_CONTRACTS
 from .errors import (
     DuplicateEventRegistrationError,
     EventContractError,
@@ -213,9 +213,9 @@ def _format_validation_error(error: ValidationError) -> list[str]:
 
 
 def build_default_registry() -> EventRegistry:
-    """Build a fresh registry containing every V1 contract in this build."""
+    """Register V1 unchanged and the explicitly supported V2 contracts."""
     registry = EventRegistry()
-    for contract in V1_CONTRACTS:
+    for contract in (*V1_CONTRACTS, *V2_CONTRACTS):
         registry.register_model(contract)
     return registry
 

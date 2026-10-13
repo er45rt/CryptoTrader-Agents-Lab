@@ -27,6 +27,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from os.path import normcase
+from pathlib import Path
+from threading import Lock, get_ident
 from typing import Any
 from uuid import UUID, uuid5
 
@@ -47,7 +50,7 @@ from crypto_trader.execution import (
     ExecutionRequest,
     ExecutionSide,
 )
-from crypto_trader.persistence import EventJournal
+from crypto_trader.persistence import EventJournal, JournalRevision
 from crypto_trader.risk import (
     HardRiskEngine,
     PendingIntent,
@@ -87,6 +90,50 @@ _ZERO = Decimal("0")
 _ORDER_ID_NAMESPACE = UUID("6f2c1e2a-9a1e-4c7f-9a6c-2f1b6d4e5a10")
 
 
+@dataclass
+class _JournalOwnership:
+    lock: Any = field(default_factory=Lock)
+    stopped: bool = False
+
+
+_OWNERSHIP_LOCK = Lock()
+_JOURNAL_OWNERS: dict[tuple[str, Any], _JournalOwnership] = {}
+
+
+def _journal_owner(journal: EventJournal) -> _JournalOwnership:
+    """Process-local ownership, NOT distributed fencing or restart recovery.
+
+    Persistent journals share a canonical path across connections/wrappers.
+    Stop entries are deliberately retained for this process lifetime so a new
+    TradingSession cannot bypass a failed risk audit. Multiple Paper processes
+    are not authorized by R-01; conditional writes are not distributed leases.
+    """
+    path = getattr(journal, "path", None)
+    file_key = None
+    if path is None:
+        key = ("object", id(journal))
+    elif str(path) == ":memory:":
+        key = ("memory", id(getattr(journal, "_conn", journal)))
+    else:
+        resolved = Path(path).resolve()
+        key = ("path", normcase(str(resolved)))
+        # Also recognize two names for the same existing journal file. This
+        # does not authorize SQLite access through hard links or multiple writers.
+        stat = resolved.stat()
+        if stat.st_ino:
+            file_key = ("file", (stat.st_dev, stat.st_ino))
+    with _OWNERSHIP_LOCK:
+        owner = _JOURNAL_OWNERS.get(key)
+        if owner is None and file_key is not None:
+            owner = _JOURNAL_OWNERS.get(file_key)
+        if owner is None:
+            owner = _JournalOwnership()
+        _JOURNAL_OWNERS[key] = owner
+        if file_key is not None:
+            _JOURNAL_OWNERS[file_key] = owner
+        return owner
+
+
 def _stable_id(*parts: str) -> UUID:
     return uuid5(_SESSION_NAMESPACE, "|".join(parts))
 
@@ -112,6 +159,10 @@ class TradingSession:
     _temporal_decided_ns: dict[UUID, int] = field(default_factory=dict)
     _temporal_terminal_intents: set[UUID] = field(default_factory=set)
     _temporal_seen_event_ids: set[UUID] = field(default_factory=set)
+    _owner: _JournalOwnership | None = field(default=None, init=False, repr=False)
+    _owner_thread: int | None = field(default=None, init=False, repr=False)
+    _processing: bool = field(default=False, init=False, repr=False)
+    _risk_revision: JournalRevision | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.config.places_simulated_orders and self.simulator is None:
@@ -170,7 +221,28 @@ class TradingSession:
     # --- run ---
 
     def run(self, *, start_index: int = 0) -> RunReport:
+        """Own the journal before any reset; retain ownership through cleanup."""
+        if self._owner is not None:
+            raise PaperStateError("concurrent/reentrant use of this Paper session refused.")
+        owner = _journal_owner(self.journal)
+        if not owner.lock.acquire(blocking=False):
+            raise PaperStateError("Paper journal already owned; concurrent/reentrant run refused.")
+        try:
+            if owner.stopped:
+                raise PaperStateError("Paper journal stopped after failed or uncertain risk audit.")
+            self._owner, self._owner_thread = owner, get_ident()
+            return self._run_owned(start_index=start_index)
+        finally:
+            self._owner, self._owner_thread = None, None
+            owner.lock.release()
+
+    def _require_owner(self) -> None:
+        if self._owner is None or self._owner_thread != get_ident() or self._owner.stopped:
+            raise PaperStateError("Paper decision requires active, non-stopped journal ownership.")
+
+    def _run_owned(self, *, start_index: int = 0) -> RunReport:
         """Process the feed from ``start_index`` and return the session report."""
+        self._require_owner()
         entries = list(self.feed.observations())
         if not isinstance(start_index, int) or not 0 <= start_index <= len(entries):
             raise PaperStateError("start_index must be within the feed.")
@@ -390,7 +462,17 @@ class TradingSession:
 
     # --- pipeline steps ---
 
-    def _process(
+    def _process(self, **kwargs: Any) -> DecisionRecord:
+        self._require_owner()
+        if self._processing:
+            raise PaperStateError("reentrant Paper decision refused.")
+        self._processing = True
+        try:
+            return self._process_owned(**kwargs)
+        finally:
+            self._processing = False
+
+    def _process_owned(
         self,
         *,
         index: int,
@@ -402,6 +484,7 @@ class TradingSession:
         requests: list[ExecutionRequest],
         safety_events: list[str],
     ) -> DecisionRecord:
+        self._require_owner()
         base: dict[str, Any] = {
             "index": index,
             "market_reference": observation.market_reference,
@@ -449,12 +532,22 @@ class TradingSession:
             )
 
         safety_events.append(self.safety.mode.value)
-        risk = self._risk_engine().evaluate(
-            self._risk_request(observation, decision, intent_id),
-            self._risk_state(ledger, observation, now),
-            now=now,
-        )
-        self._record_risk(risk, now)
+        try:
+            # Strategy, intent and validity writes are complete. Bind the risk
+            # state/evaluation to this revision BEFORE evaluate registers its
+            # PendingIntent. Design B preserves that reservation on all failures.
+            self._risk_revision = self.journal.revision()
+            risk = self._risk_engine().evaluate(
+                self._risk_request(observation, decision, intent_id),
+                self._risk_state(ledger, observation, now),
+                now=now,
+            )
+            self._record_risk(risk, now)
+        except BaseException:
+            self._owner.stopped = True
+            raise
+        finally:
+            self._risk_revision = None
         if not risk.allowed:
             reasons = set(risk.reason_codes)
             blocked_by_safety = bool(reasons & {"trading_halted", "reduce_only_violation"})
@@ -537,6 +630,9 @@ class TradingSession:
         )
 
     def _record_risk(self, risk: RiskDecision, now: datetime) -> None:
+        self._require_owner()
+        if self._risk_revision is None:
+            raise PaperStateError("risk audit requires the pre-evaluation journal revision.")
         record_risk_decision(
             self.journal,
             risk,
@@ -544,6 +640,7 @@ class TradingSession:
             producer=self.config.producer,
             event_id=_stable_id(str(risk.intent_id), "risk"),
             evaluation_event_id=_stable_id(str(risk.intent_id), "risk-evaluation"),
+            expected_revision=self._risk_revision,
         )
 
     def _risk_engine(self) -> HardRiskEngine:

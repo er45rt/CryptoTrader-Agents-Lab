@@ -70,7 +70,10 @@ def test_default_registry_registers_every_v1_contract():
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:
-        assert registry.supported_versions(contract.model_fields["event_type"].default) == (1,)
+        event_type = contract.model_fields["event_type"].default
+        assert registry.supported_versions(event_type) == (
+            (1, 2) if event_type == "risk.evaluation.recorded" else (1,)
+        )
 
 
 def test_valid_registration_and_explicit_lookup():

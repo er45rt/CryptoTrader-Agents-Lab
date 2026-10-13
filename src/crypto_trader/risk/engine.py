@@ -21,7 +21,9 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
-from crypto_trader.events import RiskEvaluationPayload, RiskEvaluationRecorded, RiskRuleResultPayload
+from crypto_trader.events import (
+    RiskEvaluationPayloadV2, RiskEvaluationRecordedV2, RiskRuleResultPayloadV2,
+)
 
 from .errors import RiskConfigError, RiskStateError
 from .limits import RiskLimits
@@ -587,21 +589,21 @@ class HardRiskEngine:
         *,
         occurred_at: datetime,
         event_id: UUID | None = None,
-    ) -> RiskEvaluationRecorded:
-        """Translate the decision into the additive ``risk.evaluation.recorded`` contract.
+    ) -> RiskEvaluationRecordedV2:
+        """Translate the decision into explicit ``risk.evaluation.recorded`` V2.
 
         ``occurred_at`` is supplied by the caller so the engine itself never reads a clock and the
         recorded evaluation stays deterministic and replayable.
         """
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             raise RiskConfigError("risk evaluation occurred_at must be timezone-aware.")
-        return RiskEvaluationRecorded(
+        return RiskEvaluationRecordedV2(
             event_id=event_id or uuid4(),
             occurred_at=occurred_at.astimezone(timezone.utc),
             correlation_id=decision.correlation_id,
             producer="application.risk",
             symbol=decision.symbol,
-            payload=RiskEvaluationPayload(
+            payload=RiskEvaluationPayloadV2(
                 limits_version=decision.limits_version,
                 intent_id=decision.intent_id,
                 symbol=decision.symbol,
@@ -612,7 +614,7 @@ class HardRiskEngine:
                 decision="allowed" if decision.allowed else "rejected",
                 reason_codes=list(decision.reason_codes),
                 rule_results=[
-                    RiskRuleResultPayload(
+                    RiskRuleResultPayloadV2(
                         rule_id=result.rule_id,
                         allowed=result.allowed,
                         reason_code=result.reason_code,
