@@ -1,0 +1,32 @@
+{
+  "session_log_path": "C:/Users/Jamal/.dsh/sessions/--C-Users-Jamal-Documents-Codex-2026-10-13-claude-opus-5-5-commit-agents--/session-63bf336b-fc51-49e0-8b29-efa2a58d371d/session.v4.jsonl.zstd",
+  "session_log_sha256": "4f8b7dcf0e37174589ad41c6d699d0915681e348c0ac2f5b020a0b9fd751eda8",
+  "request_headers": [
+    {
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "reasoningEffort": "max"
+    }
+  ],
+  "turn_end": [
+    {
+      "reason": {
+        "kind": "completed"
+      }
+    }
+  ],
+  "event_count": 19,
+  "assistant_source": {
+    "provider": "deepseek-account",
+    "model": "deepseek-flash"
+  },
+  "final_text_sha256_utf8": "006030579dc3b01805e6d5bcad550f4d76b5bcc8e6e7febbcdae5f400c81c7d1",
+  "final_text_chars": 7134,
+  "usage": {
+    "inputTokens": 749549,
+    "outputTokens": 42098,
+    "cacheReadTokens": 5504,
+    "cacheWriteTokens": 0,
+    "totalTokens": 797151
+  }
+}

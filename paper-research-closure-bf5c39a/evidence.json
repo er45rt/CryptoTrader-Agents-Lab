@@ -1,0 +1,320 @@
+{
+  "decision": "GO",
+  "scope": "PAPER_RESEARCH_ONLY_NO_EXTERNAL_ORDERS",
+  "code_head": "bf5c39a8d0df00f388ff19a76e393e2085dffd55",
+  "reviewed_code_tree": "745da9716c215d9f71082a15eedbc49a4d4e01c1",
+  "closure_base_commit": "6e227effb85d37a5204ced179291fb0c8f6377d0",
+  "closure_base_tree": "c1b7f5d4acc6afe2e3d3a9e153ce0f21ef10457c",
+  "repository_policy_id": "cryptotrader-agents-lab",
+  "governance_schema_version": 1,
+  "repository_policy_version": 2,
+  "governance_blob_sha256": {
+    "AGENTS.md": "09da6d7a0c99dbc3a5854f401553ae41e734669a674e41a7c560261650f33b7c",
+    "engineering_rules.md": "18b2942b4ee93442d450e2b28caa97abe8d8ec75bbc0e90babfc754ce3f9c88f"
+  },
+  "packet_zip_sha256": "75493451bc8a08e02961242b9d63afbafcc7ea784e19f752d3e746b83999bb6d",
+  "packet_manifest_sha256": "ec59a3749dc050c98100c181a087188f5cb8f06de85c18b6be373b8620d248b0",
+  "original_review_head": "55f9a8693cc57f69354ddfb1ab2d9b48101b1999",
+  "original_review_tree": "01c5059dffde04b75db4b3a56704ccd70244ec57",
+  "reports": [
+    {
+      "reviewer": "GPT-6.1 Sol",
+      "scope_and_provenance": "corrected candidate",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\sol-reverify\\01-sol-result.txt",
+      "source_sha256": "58a6d003e0f0c7b3463788f73f3941a0701582fba3f35cbd1d3c9abf40be10ac",
+      "closure_path": "paper-research-closure-bf5c39a/reports/01-sol-corrective.json",
+      "closure_sha256": "9e21beebc83f3a0afa340b95f22eba695376b54fabb694b374e6eb47044f9147",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "Claude Opus 5.5",
+      "scope_and_provenance": "corrected candidate",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus55-reverify\\02-opus55-result.txt",
+      "source_sha256": "8489df94c8ba87a20b7fbcc9f729602c5f7bdda79ce36c8ca3761caa7d63b95a",
+      "closure_path": "paper-research-closure-bf5c39a/reports/02-opus55.json",
+      "closure_sha256": "742d0d60178c326f1a3b7bddfa1d31cd7006afe27089443900f923b10c602281",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "Claude Sonnet 5.5",
+      "scope_and_provenance": "original candidate, applicability adjudicated; not relabeled",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\legacy\\claude_sonnet55-report.txt",
+      "source_sha256": "fc71c18a5657dece7778fe10c96287a4e3383294f836195a6432c72026136c44",
+      "closure_path": "paper-research-closure-bf5c39a/reports/03-sonnet55-retained.json",
+      "closure_sha256": "82e68fd88023e4cc647b333fa8c5f5e2bbd516c48fdbc961fb57132c4ba55bfc",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "Claude Opus 4.6",
+      "scope_and_provenance": "17-part corrected review; historical Claude CLI provenance accepted",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-complete-retry-20261013T030616Z\\04-opus46-claude-result.txt",
+      "source_sha256": "464ea95ecf0ed5f31e27a6fc6990030eca2cfc0aad5eddd0c9f055407bee4a3d",
+      "closure_path": "paper-research-closure-bf5c39a/reports/04-opus46-final.json",
+      "closure_sha256": "bf2a6638e45ac0c39fc949595d32cca6fd7d6860e4d86ea020e11269ce136fde",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "Claude Sonnet 4.6",
+      "scope_and_provenance": "original candidate; historical Claude CLI provenance accepted",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\legacy\\claude_sonnet46-report.txt",
+      "source_sha256": "abc5009bfac69338d756146f6942367d0038877ef4a07b0e810ddcd3afb433d8",
+      "closure_path": "paper-research-closure-bf5c39a/reports/05-sonnet46-retained.json",
+      "closure_sha256": "bef8eca7f43a09d47e74cdab4d03196da86b8f7651fef987cfcd93bec4fb3a1f",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "Gemini 3.1 Pro",
+      "scope_and_provenance": "original candidate, unchanged relevant scope",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\legacy\\06-gemini-result.txt",
+      "source_sha256": "3ee0ea5c921da26bdaffd5ffb2602af0a6b4c259d512c6c790ff1b8f0a0d41c9",
+      "closure_path": "paper-research-closure-bf5c39a/reports/06-gemini-retained.json",
+      "closure_sha256": "a6cbb82d72d6482b9f66d5694823ad3fec5a8d3a64d7405ec30eaf796516ac64",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "DeepSeek Saeed",
+      "scope_and_provenance": "corrected full supplied packet; Flash max expressly accepted",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-13\\claude-opus-5-5-commit-agents\\outputs\\saeed-v41flash-max-20261013\\07-saeed-independent-review-final.txt",
+      "source_sha256": "a40933f305eb99b7627a1275e4c3958ab4a9ae595419422d8ba53d8dc123609d",
+      "closure_path": "paper-research-closure-bf5c39a/reports/07-saeed-flash-max.json",
+      "closure_sha256": "688d96340614db190e7c07617f4b8e5b155e0a3adbff7253dce98cec1f470781",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "GPT-6.1 Sol",
+      "scope_and_provenance": "historical NO-GO for absent Saeed, superseded by final decision",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\final-sol-adjudication-compact-20261013T031229Z\\08-adjudication-result.txt",
+      "source_sha256": "0576e033d12f1c3e0b270678043d3a0d3bc2a7600694a54624b56f0f3b2e6ca4",
+      "closure_path": "paper-research-closure-bf5c39a/reports/08-sol-prior-adjudication.json",
+      "closure_sha256": "38f1c36430d5d5f4b237eb730bd9a452da53d74b233976490930c29901ede648",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    },
+    {
+      "reviewer": "GPT-6.1 Sol Medium",
+      "scope_and_provenance": "final seven-reviewer GO",
+      "source_path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-13\\claude-opus-5-5-commit-agents\\outputs\\saeed-v41flash-max-20261013\\08-sol-final-decision.txt",
+      "source_sha256": "2aecb71d8b8f0326830b1d65d42228ada0c980660a04da6912ca5738a234187e",
+      "closure_path": "paper-research-closure-bf5c39a/reports/09-sol-final-go.json",
+      "closure_sha256": "e83936bcf71b6425f2516adc618f98637adda5ca2bf7f36da86d63fb203ea8c3",
+      "byte_transform": "Original bytes preserved exactly as base64; report_text is a readable view with normalized line endings"
+    }
+  ],
+  "opus46_accepted_parts": [
+    {
+      "part": 1,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-01\\04-opus46-claude-result.txt",
+      "source_sha256": "ee1031b6b34d937df70e74cb65cb407f68ef00202e8a9d69e9d49d85f2597396"
+    },
+    {
+      "part": 2,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-02\\04-opus46-claude-result.txt",
+      "source_sha256": "f9ef8919438446c097adcc597160695a865bf20781459a9a1189028ecf9b3b6a"
+    },
+    {
+      "part": 3,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-03\\04-opus46-claude-result.txt",
+      "source_sha256": "b3dbe84266f87e615ae0b20d625fc465c9c1c9f159f793cd2c10586d129d40b7"
+    },
+    {
+      "part": 4,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-04\\04-opus46-claude-result.txt",
+      "source_sha256": "3591d58da712cacb0778d8bf7d07522d633c93b53574079d5066c05f36f1684a"
+    },
+    {
+      "part": 5,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-05\\04-opus46-claude-result.txt",
+      "source_sha256": "339f74b5524ddacb29706d1fd5825bc737a8456aa5ca704684efab739de3c1b6"
+    },
+    {
+      "part": 6,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-06-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "e2f71b0fdcb92f2e8b45963b0a8d6ac382f5d45b33173ef2fa0411bd202fc6df"
+    },
+    {
+      "part": 7,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-07-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "e523651ba8d4311a460933946cd25d61ab91e0880c28af951acef64ddbe9bdaf"
+    },
+    {
+      "part": 8,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-08-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "9eb8f062ace172a2600955d29e315cc278721d95741307071a92fd7cb28ddec6"
+    },
+    {
+      "part": 9,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-09-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "d11618518b04c439b92b94516e7596273acff06a2e96e6f83149fcbda36ed533"
+    },
+    {
+      "part": 10,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-10-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "f97f113d0ef9f39c594b87fcfaa4d36afd4c00d294e7604a9c108ca0ab9f9b27"
+    },
+    {
+      "part": 11,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-11-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "35eae2a0a5def1aa9b7ea2999bf101299d9ab34a8422a9b01ff34019d82f6597"
+    },
+    {
+      "part": 12,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-12-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "5668fdd39662d9932e31c8c9f4ab37d684f685a205d56b9f2b9007cf914fa9ac"
+    },
+    {
+      "part": 13,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-13-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "39844760a4344a662dfb5f94dc046ac34fd7803e9b767fe4a85f590bf74490f7"
+    },
+    {
+      "part": 14,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-14-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "912857db098ec6f1156fed2a9adeb08ebed8bff8c71c502442636e2fe5261eb0"
+    },
+    {
+      "part": 15,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-15-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "9e75a007b370242450dc8f41d26ba43cec93b2701bde9e7a1db383917a1badbf"
+    },
+    {
+      "part": 16,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-16-retry-20261012T220924Z\\04-opus46-claude-result.txt",
+      "source_sha256": "1eaf3d6a4ea85beca161979ff6ece92f077d39721ba4c2623f42ba9209ce5110"
+    },
+    {
+      "part": 17,
+      "path": "C:\\Users\\Jamal\\Documents\\Codex\\2026-10-12\\paper-nautilustrader-v8-head-55f9a8693cc57f69354ddfb1ab2d9b48101b1999-git\\outputs\\paper-fixes\\review\\opus46-part-17-retry-20261013T030616Z\\04-opus46-claude-result.txt",
+      "source_sha256": "559f232e7c7851eb7ab478abc127c305e6d675236f3b33a561b94456af913616"
+    }
+  ],
+  "items": [
+    {
+      "item": "P-08",
+      "commit": "cc4716cc2e3150f1211afb2143cf4173546bc843",
+      "tree": "ef2183379b2eedc1a54587ea9d56a3ff128982d9",
+      "full_pytest_exit": 0,
+      "full_pytest_tail": "SKIPPED [1] src\\crypto_trader\\tests\\test_mainnet_live_readonly.py:194: live mainnet read-only validation requires CRYPTO_TRADER_RUN_MAINNET_READONLY=1 plus the read-only key pair\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:265: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:280: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:365: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:385: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:161: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:175: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:183: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:203: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:231: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:266: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:281: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_validation_darc_frames.py:87: symlink unavailable on host\n2882 passed, 22 skipped, 83 warnings in 211.95s (0:03:31)",
+      "evidence_sha256": "e5a1c68cf67fb313ae5301b82ea0c3f350ace21c973b2baab97c845ab70f48aa",
+      "log_sha256": "13d453a2083a65c19ec10ae78b69d019027d611af8df1bd0bca884350638dddf"
+    },
+    {
+      "item": "P-09",
+      "commit": "3405af3468c540c54995099cbcf477cf2e569d47",
+      "tree": "e4db3060d807618cd0a8956bdbdedef5afdea02b",
+      "full_pytest_exit": 0,
+      "full_pytest_tail": "SKIPPED [1] src\\crypto_trader\\tests\\test_mainnet_live_readonly.py:194: live mainnet read-only validation requires CRYPTO_TRADER_RUN_MAINNET_READONLY=1 plus the read-only key pair\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:265: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:280: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:365: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:385: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:161: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:175: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:183: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:203: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:231: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:266: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:281: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_validation_darc_frames.py:87: symlink unavailable on host\n2884 passed, 22 skipped, 83 warnings in 205.27s (0:03:25)",
+      "evidence_sha256": "87e1ed0dc1d95016824947ebd96a91c6c158d30098b4c97e07b025ff8870820e",
+      "log_sha256": "5094a6f4f1c43021bfc5c39c48e42b87ede128b51801a37efd3ddf809e647e98"
+    },
+    {
+      "item": "P-10",
+      "commit": "bf5c39a8d0df00f388ff19a76e393e2085dffd55",
+      "tree": "745da9716c215d9f71082a15eedbc49a4d4e01c1",
+      "full_pytest_exit": 0,
+      "full_pytest_tail": "SKIPPED [1] src\\crypto_trader\\tests\\test_mainnet_live_readonly.py:194: live mainnet read-only validation requires CRYPTO_TRADER_RUN_MAINNET_READONLY=1 plus the read-only key pair\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:265: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:280: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:365: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_production_live_testnet.py:385: live validation requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:161: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:175: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:183: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:203: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:231: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:266: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_testnet_live_integration.py:281: live testnet integration requires CRYPTO_TRADER_RUN_TESTNET=1 plus testnet credentials\nSKIPPED [1] src\\crypto_trader\\tests\\test_validation_darc_frames.py:87: symlink unavailable on host\n2888 passed, 22 skipped, 88 warnings in 203.31s (0:03:23)",
+      "evidence_sha256": "9b40e133a0a6d09ec1f75a44985f4b498056f456b7d5e25b95b4064ed2527f8c",
+      "log_sha256": "9d3a06c7484972f583714ec7a8da18208171bb492259527a30056cf69e69f73c"
+    }
+  ],
+  "saeed": {
+    "kind": "SAEED_FULL_READONLY_REVIEW_REAL_MODEL",
+    "source_code_head": "bf5c39a8d0df00f388ff19a76e393e2085dffd55",
+    "source_code_tree": "745da9716c215d9f71082a15eedbc49a4d4e01c1",
+    "governance_head": "6e227effb85d37a5204ced179291fb0c8f6377d0",
+    "repository_policy_version": 2,
+    "source_packet_zip_sha256": "75493451bc8a08e02961242b9d63afbafcc7ea784e19f752d3e746b83999bb6d",
+    "prompt_sha256": "732861121e16b45aaca17ac75e3b1ede6cde224bb7022d3991c7453cfc3bc551",
+    "report_sha256": "a40933f305eb99b7627a1275e4c3958ab4a9ae595419422d8ba53d8dc123609d",
+    "provider_verified_from_request_header": "deepseek-account",
+    "model_verified_from_request_header": "deepseek-flash",
+    "reasoning_effort_verified_from_request_header": "max",
+    "session_id": "session-63bf336b-fc51-49e0-8b29-efa2a58d371d",
+    "run_exit_code": 0,
+    "runtime_end_reason": "completed",
+    "usage": {
+      "total_tokens": 797151,
+      "output_tokens": 42098,
+      "input_tokens": 749549,
+      "cache_read_tokens": 5504
+    },
+    "report_chars": 7158,
+    "full_report_exists": true,
+    "findings_model_reported": "zero verified blockers; 7 nonblocker findings plus evidence limitations requiring final Sol adjudication",
+    "wip_sha256_preserved": "10ee32d2bf4d378c19ad84cbc9140779b93a0c443a6d3623dd03d800e1065458",
+    "no_commit_no_push_no_trading": true,
+    "runtime_proof": {
+      "session_log_path": "C:/Users/Jamal/.dsh/sessions/--C-Users-Jamal-Documents-Codex-2026-10-13-claude-opus-5-5-commit-agents--/session-63bf336b-fc51-49e0-8b29-efa2a58d371d/session.v4.jsonl.zstd",
+      "session_log_sha256": "4f8b7dcf0e37174589ad41c6d699d0915681e348c0ac2f5b020a0b9fd751eda8",
+      "request_headers": [
+        {
+          "provider": "deepseek-account",
+          "model": "deepseek-flash",
+          "reasoningEffort": "max"
+        }
+      ],
+      "turn_end": [
+        {
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      ],
+      "event_count": 19,
+      "assistant_source": {
+        "provider": "deepseek-account",
+        "model": "deepseek-flash"
+      },
+      "final_text_sha256_utf8": "006030579dc3b01805e6d5bcad550f4d76b5bcc8e6e7febbcdae5f400c81c7d1",
+      "final_text_chars": 7134,
+      "usage": {
+        "inputTokens": 749549,
+        "outputTokens": 42098,
+        "cacheReadTokens": 5504,
+        "cacheWriteTokens": 0,
+        "totalTokens": 797151
+      }
+    },
+    "owner_accepts_flash_max_for_this_stage_only": true,
+    "not_claimed_strongest_available": true
+  },
+  "sol_final": {
+    "exit_code": 0,
+    "start_local": "2026-10-13T07:46:59.0329914+03:00",
+    "end_local": "2026-10-13T07:48:08.7575610+03:00",
+    "prompt_sha256": "c9d29a23bc0d6142c0dd2c3d6cf006b03e66813e63175cfb760dd3251dc08c8d",
+    "sol_model_requested": "gpt-6.1-sol",
+    "sol_effort_requested": "medium",
+    "write_or_trade_authority": false,
+    "report_sha256": "2aecb71d8b8f0326830b1d65d42228ada0c980660a04da6912ca5738a234187e",
+    "runtime_model_header": "gpt-6.1-sol",
+    "runtime_provider_header": "openai",
+    "runtime_effort_header": "medium",
+    "serving_backend_identity_not_independently_attested": true,
+    "stdout_encoding_reconciliation": "OEM437 mojibake reversed in memory for comparison; authoritative UTF8 output-last-message retained"
+  },
+  "owner_authorization": {
+    "date": "2026-10-13 Asia/Riyadh",
+    "explicit_go_and_one_independent_closure_commit": true,
+    "flash_v41_max_accepted_no_pro_retry": true,
+    "future_deepseek_strongest_with_fresh_runtime_evidence": true,
+    "future_substitution_requires_owner_approval": true,
+    "no_governance_edit": true,
+    "no_push_merge_deploy_or_trading": true
+  },
+  "verification": {
+    "source_files": 175,
+    "evidence_files": 23,
+    "zero_verified_blockers": true,
+    "full_pytest_result": "2888 passed, 22 skipped; exit 0; preserved prior execution, not rerun",
+    "wip_sha256": "10ee32d2bf4d378c19ad84cbc9140779b93a0c443a6d3623dd03d800e1065458",
+    "wip_excluded": true,
+    "new_code_changes": false,
+    "reviewers_rerun": false
+  },
+  "limitations_preserved": [
+    "Reviewer reports assess supplied text; original versus corrected source pins retained.",
+    "Historical Opus and Sonnet 4.6 Claude CLI routes are owner-accepted, not Google relabels; Thinking claims are not upgraded.",
+    "Exact Sol/Gemini backend serving identities are not newly attested.",
+    "Saeed source artifact has OEM437 mojibake; compared reversibly to the real session text, original artifact hash preserved.",
+    "Nonblocking backlog and uncertainty limitations remain as adjudicated in the final Sol report."
+  ]
+}
