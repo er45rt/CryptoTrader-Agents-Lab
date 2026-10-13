@@ -24,9 +24,10 @@ test double retains its legacy batch behavior and is not causal backtest evidenc
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, localcontext, ROUND_HALF_EVEN
+import hashlib
 from os.path import normcase
 from pathlib import Path
 from threading import Lock, get_ident
@@ -71,9 +72,9 @@ from crypto_trader.validity import (
     record_validity_decision,
 )
 
-from .accounting import PositionLedger
+from .accounting import PositionLedger, SpotCashLedger
 from .config import SessionConfig
-from .decisions import DecisionSource, StrategyDecision
+from .decisions import DecisionSource, StrategyDecision, FrozenRunInputs, input_json
 from .errors import PaperStateError
 from .feed import MarketDataFeed, MarketObservation
 from .modes import TradingMode
@@ -151,6 +152,8 @@ class TradingSession:
     safety: SafetyController
     simulator: ExecutionSimulator | None = None
     recovery_run: Any | None = None
+    historical_attempt: Any | None = None
+    _r02_ledger: Any | None = field(default=None, init=False, repr=False)
     # Reserve approved exposure until the deferred simulation pass resolves it.
     _reservations: dict[UUID, tuple[Side, Decimal, Decimal]] = field(default_factory=dict)
     _pending: PendingIntentRegistry = field(default_factory=PendingIntentRegistry)
@@ -231,6 +234,20 @@ class TradingSession:
             if owner.stopped:
                 raise PaperStateError("Paper journal stopped after failed or uncertain risk audit.")
             self._owner, self._owner_thread = owner, get_ident()
+            if self.config.historical is not None:
+                with localcontext() as context:
+                    context.prec, context.rounding = 34, ROUND_HALF_EVEN
+                    return self._run_historical(start_index=start_index)
+            from .report import reserved_historical_path
+            if reserved_historical_path(self.journal):
+                raise PaperStateError("R-02 reserved journal is diagnostic-only for Legacy.")
+            try:
+                if any(event.event_type.startswith("paper.run.") for event in self.journal.read_range()):
+                    raise PaperStateError("R-02 journal cannot execute through Legacy.")
+            except PaperStateError:
+                raise
+            except Exception as exc:
+                raise PaperStateError("historical/unknown journal contract cannot execute through Legacy.") from exc
             return self._run_owned(start_index=start_index)
         finally:
             self._owner, self._owner_thread = None, None
@@ -239,6 +256,93 @@ class TradingSession:
     def _require_owner(self) -> None:
         if self._owner is None or self._owner_thread != get_ident() or self._owner.stopped:
             raise PaperStateError("Paper decision requires active, non-stopped journal ownership.")
+
+    def _run_historical(self, *, start_index):
+        from .report import (HistoricalAttempt, HistoricalRecordingJournal, PaperRunStarted,
+            RunStartedPayload, PaperRunCompleted, RunCompletedPayload,
+            reconstruct_historical_economics, validate_native_cash, verify_historical_completion)
+        from .simulation import HistoricalCashSimulator
+        from .feed import FrozenMarketDataFeed
+        from crypto_trader.risk import load_limits
+        from crypto_trader.validity import load_policy
+        self._require_owner()
+        original = self.journal
+        try:
+            if start_index != 0 or type(self.historical_attempt) is not HistoricalAttempt:
+                raise PaperStateError("R-02 requires a fresh reserved attempt, never resume.")
+            self.historical_attempt.consume(original, self.config.session_id)
+            bundle = FrozenRunInputs.approved(self.config.historical)
+            doc = bundle.document()
+            settings = asdict(self.config)
+            settings.pop("historical")
+            settings.pop("session_id")
+            settings.update(settings.pop("queue"))
+            if input_json(settings) != input_json(doc["session"]):
+                raise PaperStateError("R-02 session settings differ from approved inputs.")
+            if input_json(self.limits) != input_json(doc["limits"]) or input_json(self.validity_gate.policy) != input_json(doc["validity"]) or self.safety.mode.value != doc["safety_mode"] or self.safety.kill_switch_engaged:
+                raise PaperStateError("R-02 risk/validity/safety settings differ from approved inputs.")
+            frozen_source = bundle.decision_source()
+            if type(self.decisions) is not type(frozen_source) or self.decisions != frozen_source or tuple(self.feed.observations()) != bundle.observations():
+                raise PaperStateError("R-02 refuses dynamic or unapproved decision/market sources.")
+            simulator = self.simulator
+            if not isinstance(simulator, HistoricalCashSimulator) or type(simulator).__module__ != "crypto_trader.execution.nautilus.simulation" or type(simulator).__name__ != "NautilusSimulationRunner":
+                raise PaperStateError("R-02 requires the pinned native cash simulator.")
+            simulator.configure_frozen(bundle)
+            self.feed = FrozenMarketDataFeed(entries=bundle.observations(), feed_id=bundle.sha256)
+            self.decisions = frozen_source
+            started = PaperRunStarted(event_id=uuid5(self.config.session_id, "paper.run.started"),
+                occurred_at=bundle.observations()[0].observed_at - timedelta(microseconds=1),
+                correlation_id=self.config.session_id, producer=self.config.producer,
+                symbol=self.config.symbol, payload=RunStartedPayload(run_id=self.config.session_id,
+                    inputs_sha256=bundle.sha256, code_tree=doc["provenance"]["code_tree"],
+                    reservation_sha256=self.historical_attempt.reservation_sha256,
+                    replay_of_run_id=self.historical_attempt.replay_of_run_id))
+            empty = original.revision()
+            if empty.count:
+                raise PaperStateError("R-02 cannot adopt a nonempty journal.")
+            result = original.append_batch_if_revision([started], expected=empty, require_all_new=True)
+            if result.inserted != 1 or original.read_by_id(started.event_id) != started or result.before != empty or original.revision() != result.after:
+                raise PaperStateError("R-02 started write acknowledgment is uncertain.")
+            recording = HistoricalRecordingJournal(original, started)
+            self.journal = recording
+            report = self._run_owned(start_index=0)
+            if self._reservations or len(self._pending) or self._r02_ledger._cash_locks:
+                raise PaperStateError("R-02 has unresolved reservations at completion.")
+            events = {event.event_id: event for event in original.read_range()}
+            revision = original.revision()
+            if len(recording.order) != len(set(recording.order)) or set(recording.order) != set(revision.event_ids):
+                raise PaperStateError("R-02 ordered event coverage/revision is incomplete.")
+            ordered = tuple(events[identity] for identity in recording.order)
+            state, execution = reconstruct_historical_economics(ordered, bundle, self.config.session_id)
+            actual = self._r02_ledger.economic_state(bundle.observations()[-1].price)
+            if state != actual or report.equity_quote != state["equity_quote"] or report.realized_pnl_quote != state["realized_pnl_quote"] or report.unrealized_pnl_quote != state["unrealized_pnl_quote"]:
+                raise PaperStateError("R-02 journal/report/ledger accounting mismatch.")
+            native = asdict(simulator.cash_end_evidence())
+            validate_native_cash(native, state, Decimal(doc["cash"]["initial_quote"]))
+            native = {key: str(value) if isinstance(value, Decimal) else value for key, value in native.items()}
+            hashes = dict(revision.entries)
+            completed = PaperRunCompleted(event_id=uuid5(self.config.session_id, "paper.run.completed"),
+                occurred_at=max(event.occurred_at for event in ordered) + timedelta(microseconds=1),
+                correlation_id=self.config.session_id, causation_id=started.event_id,
+                producer=self.config.producer, symbol=self.config.symbol,
+                payload=RunCompletedPayload(run_id=self.config.session_id, inputs_sha256=bundle.sha256,
+                    started_event_id=started.event_id, pre_revision_entries=revision.entries,
+                    pre_revision_fingerprint=revision.fingerprint,
+                    event_order=tuple((identity, hashes[identity]) for identity in recording.order),
+                    economic_state={key: str(value) for key, value in state.items()},
+                    economic_execution=execution, native_cash=native,
+                    report_json=report.to_json(),
+                    report_sha256=hashlib.sha256(report.to_json().encode()).hexdigest()))
+            result = original.append_batch_if_revision([completed], expected=revision, require_all_new=True)
+            if result.inserted != 1 or result.before != revision or original.revision() != result.after:
+                raise PaperStateError("R-02 completion acknowledgment is uncertain.")
+            verify_historical_completion(original, bundle)
+            return report
+        except BaseException:
+            self._owner.stopped = True
+            raise
+        finally:
+            self.journal = original
 
     def _run_owned(self, *, start_index: int = 0) -> RunReport:
         """Process the feed from ``start_index`` and return the session report."""
@@ -249,7 +353,15 @@ class TradingSession:
         if any(entry.symbol != self.config.symbol for entry in entries):
             raise PaperStateError("market observation symbol must match the session symbol.")
 
-        ledger = PositionLedger(Decimal(self.config.starting_equity_quote))
+        if self.config.historical is not None:
+            cash = self.simulator._cash_settings
+            instrument = self.simulator.instrument
+            ledger = SpotCashLedger(cash.initial_quote, symbol=self.config.symbol,
+                base_asset=instrument.base_currency, quote_asset=instrument.quote_currency,
+                fee_rate=max(cash.maker_fee, cash.taker_fee))
+            self._r02_ledger = ledger
+        else:
+            ledger = PositionLedger(Decimal(self.config.starting_equity_quote))
         self._reservations = {}
         self._pending = PendingIntentRegistry()
         self._risk_cache = None
@@ -537,6 +649,9 @@ class TradingSession:
             # state/evaluation to this revision BEFORE evaluate registers its
             # PendingIntent. Design B preserves that reservation on all failures.
             self._risk_revision = self.journal.revision()
+            if isinstance(ledger, SpotCashLedger):
+                ledger.check_admission(decision.action, decision.quantity,
+                                       decision.limit_price or observation.price)
             risk = self._risk_engine().evaluate(
                 self._risk_request(observation, decision, intent_id),
                 self._risk_state(ledger, observation, now),
@@ -564,6 +679,8 @@ class TradingSession:
         self._reservations[intent_id] = (
             risk.side, risk.quantity, max(risk.price, observation.price)
         )
+        if isinstance(ledger, SpotCashLedger):
+            ledger.reserve(intent_id, decision.action, risk.quantity, risk.price)
         request = self._execution_request(observation, decision, intent_id)
         if self.config.mode is TradingMode.SHADOW and not self.config.shadow_submits:
             return DecisionRecord(
@@ -936,6 +1053,9 @@ class TradingSession:
                 quantity=observation.last_fill_quantity,
                 price=observation.last_fill_price or request.limit_price or _ZERO,
                 fee=observation.fee or _ZERO,
+                **({"fee_asset": observation.fee_asset, "intent_id": observation.intent_id}
+                   if isinstance(ledger, SpotCashLedger) and self.config.historical is not None else
+                   {"fee_asset": observation.fee_asset} if isinstance(ledger, SpotCashLedger) else {}),
             )
 
     def _reconcile_temporal_reservations(self, delta: SimulationOutcome) -> None:
@@ -954,6 +1074,8 @@ class TradingSession:
             }:
                 quantity = _ZERO
             if quantity == _ZERO:
+                if self._r02_ledger is not None:
+                    self._r02_ledger.release(item.intent_id)
                 self._reservations.pop(item.intent_id, None)
                 self._pending.remove(item.intent_id)
             elif quantity != existing[1]:

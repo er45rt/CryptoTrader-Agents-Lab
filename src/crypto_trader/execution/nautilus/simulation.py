@@ -37,6 +37,31 @@ class NautilusSimulationRunner:
     trades: Sequence[MarketTrade] = ()
     queue_aware: bool = True
     queue_settings: QueueAwareSettings = field(default_factory=tested_queue_aware_settings)
+    _cash_settings: object | None = field(default=None, init=False, repr=False)
+    _cash_end: object | None = field(default=None, init=False, repr=False)
+
+    def configure_frozen(self, bundle):
+        from decimal import Decimal
+        from crypto_trader.execution import BookLevel
+        from crypto_trader.paper.config import SpotCashSettings
+        from crypto_trader.paper.decisions import FrozenRunInputs
+        if type(bundle) is not FrozenRunInputs or getattr(self, "_temporal_runtime", None) is not None:
+            raise PaperStateError("invalid frozen simulator configuration.")
+        doc = bundle.document()
+        self.instrument = InstrumentSpec(**doc["instrument"])
+        self.book_updates = tuple(MarketBookUpdate(
+            levels=tuple(BookLevel(**{k: Decimal(v) if k in {"price", "size"} else v for k, v in level.items()})
+                         for level in row["levels"]), ts_ns=row["ts_ns"],
+            sequence=row["sequence"], action=row["action"]) for row in doc["book_updates"])
+        self.trades = tuple(MarketTrade(**{k: Decimal(v) if k in {"price", "size"} else v for k, v in row.items()}) for row in doc["trades"])
+        self._cash_settings = SpotCashSettings(**{k: Decimal(v) if k != "random_seed" else v for k, v in doc["cash"].items()})
+        self.queue_aware, self.queue_settings = True, tested_queue_aware_settings()
+        self._cash_end = None
+
+    def cash_end_evidence(self):
+        if self._cash_end is None or getattr(self, "_temporal_runtime", None) is not None:
+            raise PaperStateError("native cash completion evidence is unavailable.")
+        return self._cash_end
 
     def __post_init__(self) -> None:
         if isinstance(self, ExecutionSimulator):  # structural conformance, checked eagerly
@@ -81,6 +106,7 @@ class NautilusSimulationRunner:
             self.instrument,
             queue_aware=self.queue_aware,
             queue_settings=self.queue_settings,
+            cash_settings=self._cash_settings,
         )
         runtime.start()
         try:
@@ -162,6 +188,8 @@ class NautilusSimulationRunner:
                 )
             if self._temporal_timeline:
                 runtime.end_temporal()
+            if self._cash_settings is not None:
+                self._cash_end = runtime.cash_end_evidence()
             return self._temporal_snapshot()
         finally:
             runtime.stop()

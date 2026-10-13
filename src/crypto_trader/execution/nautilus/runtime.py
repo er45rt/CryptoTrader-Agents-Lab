@@ -10,6 +10,7 @@ Offline only: a simulated backtest venue with no exchange connectivity whatsoeve
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Callable, Sequence
 from uuid import UUID, uuid5
@@ -117,6 +118,7 @@ class NautilusExecutionRuntime:
         producer: str = outbound.PHASE3_PRODUCER,
         latency_model: Any | None = None,
         fill_model: Any | None = None,
+        cash_settings: Any | None = None,
     ) -> None:
         self._instrument = instrument
         self._queue_aware = queue_aware
@@ -124,6 +126,7 @@ class NautilusExecutionRuntime:
         self._producer = producer
         self._latency_model = latency_model
         self._fill_model = fill_model
+        self._cash_settings = cash_settings
         self._state = ExecutionRuntimeState.STOPPED
         self._engine: BacktestEngine | None = None
         self._strategy: _TranslationStrategy | None = None
@@ -283,6 +286,17 @@ class NautilusExecutionRuntime:
             "trade_execution": True,
             "bar_execution": False,
         }
+        if self._cash_settings is not None:
+            from nautilus_trader.backtest.models import FillModel
+            cash = self._cash_settings
+            venue_kwargs.update(account_type=AccountType.CASH, allow_cash_borrowing=False,
+                default_leverage=Decimal("1"), frozen_account=False, use_random_ids=False,
+                starting_balances=[Money.from_str(f"{cash.initial_quote} {spec.quote_currency}"),
+                                   Money.from_str(f"0 {spec.base_currency}")],
+                fill_model=FillModel(prob_fill_on_limit=1.0, prob_slippage=0.0,
+                                     random_seed=cash.random_seed))
+            if self._fill_model is not None or self._latency_model is not None:
+                raise RuntimeStateError("R-02 rejects unpinned custom behavioral models.")
         if self._queue_aware:
             # Tested combination: queue_position + liquidity_consumption + L2_MBP.
             venue_kwargs.update(
@@ -317,9 +331,37 @@ class NautilusExecutionRuntime:
             lot_size=Quantity.from_str(str(Decimal(1).scaleb(-spec.size_precision))),
             ts_event=start_ns,
             ts_init=start_ns,
-            maker_fee=Decimal("0.0002"),
-            taker_fee=Decimal("0.0004"),
+            maker_fee=self._cash_settings.maker_fee if self._cash_settings else Decimal("0.0002"),
+            taker_fee=self._cash_settings.taker_fee if self._cash_settings else Decimal("0.0004"),
         )
+
+    def cash_end_evidence(self):
+        from crypto_trader.paper.simulation import CashEndEvidence
+        if self._cash_settings is None or self._engine is None:
+            raise RuntimeStateError("cash evidence requires a running R-02 native engine.")
+        account = self._engine.cache.account_for_venue(Venue(self._instrument.venue))
+        if account is None or account.type != AccountType.CASH or account.allow_borrowing:
+            raise RuntimeStateError("native cash account identity is unavailable.")
+        base = Currency.from_str(self._instrument.base_currency)
+        quote = Currency.from_str(self._instrument.quote_currency)
+        for currency, amount in account.commissions().items():
+            if currency != quote and amount.as_decimal() != 0:
+                raise RuntimeStateError("unsupported native fee asset.")
+        def amount(method, currency):
+            value = method(currency)
+            if value is None:
+                raise RuntimeStateError("native cash balance is missing.")
+            return value.as_decimal()
+        cache = self._engine.cache
+        positions = cache.positions_open(venue=Venue(self._instrument.venue))
+        position = sum((p.signed_decimal_qty() for p in positions), Decimal("0"))
+        fee = account.commission(quote)
+        return CashEndEvidence(self._cash_settings.initial_quote,
+            amount(account.balance_total, base), amount(account.balance_free, base),
+            amount(account.balance_locked, base), amount(account.balance_total, quote),
+            amount(account.balance_free, quote), amount(account.balance_locked, quote),
+            fee.as_decimal() if fee is not None else Decimal("0"), position,
+            self.has_unsettled_orders() or bool(cache.orders_open()) or bool(cache.orders_inflight()))
 
     def _submit_queued(self, strategy: _TranslationStrategy, event_ns: int) -> None:
         while self._queued:
@@ -406,6 +448,16 @@ class NautilusExecutionRuntime:
             state=state,
             producer=self._producer,
         )
+        if self._cash_settings is not None:
+            # 1.231.0 Money exposes as_decimal(), not the legacy optional amount
+            # attribute. Preserve the legacy converter; R-02 records native fees.
+            commission = event.commission
+            if commission is None or commission.currency.code != self._instrument.quote_currency:
+                raise RuntimeStateError("R-02 requires native Quote commission evidence.")
+            fee = commission.as_decimal()
+            if not fee.is_finite() or fee < 0:
+                raise RuntimeStateError("R-02 does not support negative/nonfinite fees.")
+            observation = replace(observation, fee=fee, fee_asset=commission.currency.code)
         trade_id = getattr(event, "trade_id", None)
         if trade_id is None or not str(trade_id):
             raise RuntimeStateError("native trade identity missing; refusing random fill id.")

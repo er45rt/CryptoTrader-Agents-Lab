@@ -70,6 +70,30 @@ class SimulationOutcome:
         return tuple(seen)
 
 
+@dataclass(frozen=True)
+class CashEndEvidence:
+    """Transient native final accounting, not a recoverable engine checkpoint."""
+
+    initial_quote: Decimal
+    base_total: Decimal
+    base_free: Decimal
+    base_locked: Decimal
+    quote_total: Decimal
+    quote_free: Decimal
+    quote_locked: Decimal
+    fees_quote: Decimal
+    position_quantity: Decimal
+    unsettled: bool
+    account_type: str = "CASH"
+    allow_borrowing: bool = False
+
+
+@runtime_checkable
+class HistoricalCashSimulator(Protocol):
+    def configure_frozen(self, bundle: Any) -> None: ...
+    def cash_end_evidence(self) -> CashEndEvidence: ...
+
+
 @runtime_checkable
 class ExecutionSimulator(Protocol):
     """The only simulated-execution surface the paper session may depend on."""

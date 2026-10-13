@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID, uuid4
+from pathlib import Path
 
 from .errors import PaperConfigError
 from .modes import (
@@ -23,6 +24,43 @@ from .modes import (
 )
 
 __all__ = ["SessionConfig", "load_session_config"]
+
+
+@dataclass(frozen=True)
+class SpotCashSettings:
+    """R-02 opt-in settings. Legacy MARGIN defaults are deliberately unchanged."""
+
+    initial_quote: Decimal
+    initial_base: Decimal = Decimal("0")
+    maker_fee: Decimal = Decimal("0.0002")
+    taker_fee: Decimal = Decimal("0.0004")
+    random_seed: int = 0
+
+    def __post_init__(self):
+        for name in ("initial_quote", "initial_base", "maker_fee", "taker_fee"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+                raise PaperConfigError(f"cash {name} must be a finite nonnegative Decimal.")
+        if self.initial_quote <= 0 or self.initial_base != 0:
+            raise PaperConfigError("R-02 requires positive Quote and zero opening Base.")
+        if max(self.maker_fee, self.taker_fee) >= 1 or type(self.random_seed) is not int:
+            raise PaperConfigError("invalid cash fee or random seed.")
+
+
+@dataclass(frozen=True)
+class HistoricalRunSpec:
+    """Independent approval pins; never inferred from the file being validated."""
+
+    inputs_path: Path
+    expected_inputs_sha256: str
+    expected_code_tree: str
+
+    def __post_init__(self):
+        if not Path(self.inputs_path).is_absolute():
+            raise PaperConfigError("historical inputs path must be absolute.")
+        for value, size in ((self.expected_inputs_sha256, 64), (self.expected_code_tree, 40)):
+            if not isinstance(value, str) or re.fullmatch(f"[0-9a-f]{{{size}}}", value) is None:
+                raise PaperConfigError("invalid historical approval fingerprint.")
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{5,20}$")
 _ALLOWED_KEYS = {
@@ -37,6 +75,7 @@ _ALLOWED_KEYS = {
     "liquidity_consumption",
     "book_type",
     "starting_equity_quote",
+    "historical",
 }
 
 
@@ -53,8 +92,13 @@ class SessionConfig:
     queue_aware: bool = True
     queue: QueueAwareSettings = field(default_factory=tested_queue_aware_settings)
     starting_equity_quote: str = "100000"
+    historical: HistoricalRunSpec | None = None
 
     def __post_init__(self) -> None:
+        if self.historical is not None and not isinstance(self.historical, HistoricalRunSpec):
+            raise PaperConfigError("historical must be an explicit HistoricalRunSpec.")
+        if self.historical is not None and (self.mode is not TradingMode.PAPER or self.shadow_submits):
+            raise PaperConfigError("historical cash requires Paper without shadow submission.")
         if not isinstance(self.mode, TradingMode):
             raise PaperConfigError("mode must be a TradingMode.")
         if not isinstance(self.symbol, str) or _SYMBOL_PATTERN.fullmatch(self.symbol) is None:
@@ -148,4 +192,5 @@ def load_session_config(config: Mapping[str, Any]) -> SessionConfig:
         queue_aware=_strict_bool(config.get("queue_aware", True), "queue_aware"),
         queue=queue,
         starting_equity_quote=str(config.get("starting_equity_quote", "100000")),
+        historical=config.get("historical"),
     )
