@@ -63,7 +63,7 @@ from crypto_trader.risk import (
     Side,
     record_risk_decision,
 )
-from crypto_trader.safety import SafetyController, risk_limits_for_safety
+from crypto_trader.safety import SafetyController, SafetyMode, safety_state_events, risk_limits_for_safety
 from crypto_trader.validity import (
     DecisionValidityGate,
     MarketObservation as ValidityMarketObservation,
@@ -72,7 +72,7 @@ from crypto_trader.validity import (
     record_validity_decision,
 )
 
-from .accounting import PositionLedger, SpotCashLedger
+from .accounting import PositionLedger, SpotCashLedger, CurrentCashReading
 from .config import SessionConfig
 from .decisions import DecisionSource, StrategyDecision, FrozenRunInputs, input_json
 from .errors import PaperStateError
@@ -154,6 +154,8 @@ class TradingSession:
     recovery_run: Any | None = None
     historical_attempt: Any | None = None
     _r02_ledger: Any | None = field(default=None, init=False, repr=False)
+    _cash_reading: Any | None = field(default=None, init=False, repr=False)
+    _cash_proof: Any | None = field(default=None, init=False, repr=False)
     # Reserve approved exposure until the deferred simulation pass resolves it.
     _reservations: dict[UUID, tuple[Side, Decimal, Decimal]] = field(default_factory=dict)
     _pending: PendingIntentRegistry = field(default_factory=PendingIntentRegistry)
@@ -489,7 +491,19 @@ class TradingSession:
                     request = requests[-1]
                     stamp_ns = self._timestamp_ns(now)
                     self._temporal_decided_ns[request.intent_id] = stamp_ns
-                    simulator.submit_temporal(request, decided_ns=stamp_ns)
+                    try:
+                        simulator.submit_temporal(request, decided_ns=stamp_ns,
+                            **({"cash_reading": self._cash_reading} if self.config.historical is not None else {}))
+                    except Exception as exc:
+                        if self.config.historical is None:
+                            raise
+                        proof = {"cash_gate": "r02.cash_admission.v1", "allowed": False,
+                            "ledger_free_quote": ledger.quote_free, "native_free_quote": None,
+                            "admissible_free_quote": None, "boundary_ns": stamp_ns,
+                            "selection_reason": "native_cash_unverified_at_submission",
+                            "rejection_reason": "cash_or_submission_result_uncertain",
+                            "last_verified_reading": self._cash_proof, "error_type": type(exc).__name__}
+                        self._refuse_cash(proof, now, request.intent_id, exc)
                 market_state.advance(self.config.symbol)
                 records.append(record)
                 if record.validity_disposition is not None:
@@ -627,11 +641,41 @@ class TradingSession:
             now=now,
             capacity_available=True,
         )
+        cash_proof, cash_error = None, None
+        if self.config.historical is not None and validity.disposition.value == "accepted":
+            cash_proof = {"cash_gate": "r02.cash_admission.v1", "market_reference": observation.market_reference,
+                "boundary_ns": self._timestamp_ns(now), "allowed": False,
+                "ledger_free_quote": ledger.quote_free, "native_free_quote": None,
+                "admissible_free_quote": None, "selection_reason": "native_cash_unavailable"}
+            try:
+                reading = self.simulator.current_cash_reading(boundary_ns=self._timestamp_ns(now))
+                previous = self._cash_reading
+                if (type(reading) is not CurrentCashReading or reading.boundary_ns != self._timestamp_ns(now)
+                        or type(reading.sequence) is not int or reading.sequence <= 0
+                        or not isinstance(reading.runtime_id, UUID) or reading.runtime_id.version != 4
+                        or previous is not None and (reading.runtime_id != previous.runtime_id
+                                                   or reading.sequence <= previous.sequence)):
+                    raise PaperStateError("native cash reading is stale, foreign or uncertain.")
+                ledger.validate_native_state(reading.native, reading.reflected_intents)
+                cash_proof.update(ledger.admission_evidence(decision.action, decision.quantity,
+                    decision.limit_price or observation.price, native_quote_free=reading.native.quote_free,
+                    native_base_free=reading.native.base_free, reflected_intents=reading.reflected_intents))
+                cash_proof.update(runtime_id=str(reading.runtime_id), read_sequence=reading.sequence,
+                    native_cash=asdict(reading.native),
+                    reflected_intents=sorted(str(identity) for identity in reading.reflected_intents))
+                self._cash_reading = reading
+                if not cash_proof["allowed"]:
+                    cash_error = PaperStateError(cash_proof["rejection_reason"])
+            except Exception as exc:
+                cash_error = exc
+                cash_proof.update(allowed=False, rejection_reason="native_cash_read_unverified",
+                                  error_type=type(exc).__name__)
+            self._cash_proof = cash_proof
         record_validity_decision(
             self.journal,
             validity,
             producer=self.config.producer,
-            notes=observation.market_reference,
+            notes=input_json(cash_proof).decode() if cash_proof is not None else observation.market_reference,
             event_id=_stable_id(str(intent_id), "validity"),
         )
         if validity.disposition.value != "accepted":
@@ -642,6 +686,8 @@ class TradingSession:
                 validity_reason=validity.reason_code,
                 submission="stopped_by_validity",
             )
+        if cash_error is not None:
+            self._refuse_cash(cash_proof, now, intent_id, cash_error)
 
         safety_events.append(self.safety.mode.value)
         try:
@@ -649,7 +695,7 @@ class TradingSession:
             # state/evaluation to this revision BEFORE evaluate registers its
             # PendingIntent. Design B preserves that reservation on all failures.
             self._risk_revision = self.journal.revision()
-            if isinstance(ledger, SpotCashLedger):
+            if isinstance(ledger, SpotCashLedger) and self.config.historical is None:
                 ledger.check_admission(decision.action, decision.quantity,
                                        decision.limit_price or observation.price)
             risk = self._risk_engine().evaluate(
@@ -702,6 +748,23 @@ class TradingSession:
             risk_reason_codes=tuple(risk.reason_codes),
             submission="submitted_to_simulator",
         )
+
+    def _refuse_cash(self, proof, now, intent_id, error):
+        # A real operational halt, not a fabricated Hard Risk evaluation.
+        # Keep all existing approvals/reservations after any submission ambiguity.
+        self._owner.stopped = True
+        transition = self.safety.set_mode(SafetyMode.HALT_NEW_RISK,
+            reason_code="paper_cash_admission_refused", reason=input_json(proof).decode(), trigger="system")
+        events = [event.model_copy(update={"symbol": self.config.symbol,
+                   "causation_id": _stable_id(str(intent_id), "intent-event")})
+                  for event in safety_state_events(transition, occurred_at=now,
+                    correlation_id=self.config.session_id, producer=self.config.producer,
+                    event_id=_stable_id(str(intent_id), "cash-refusal"))]
+        expected = self.journal.revision()
+        result = self.journal.append_batch_if_revision(events, expected=expected, require_all_new=True)
+        if result.inserted != len(events) or result.before != expected or self.journal.revision() != result.after:
+            raise PaperStateError("uncertain cash refusal audit; Paper remains stopped.")
+        raise PaperStateError(f"cash admission refused: {proof.get('rejection_reason')}") from error
 
     # --- journaling helpers ---
 

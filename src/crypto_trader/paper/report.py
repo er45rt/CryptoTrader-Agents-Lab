@@ -456,6 +456,78 @@ def reconstruct_historical_economics(events, bundle, run_id):
         return _reconstruct_historical_economics(events, bundle, run_id)
 
 
+def _verify_cash_admission_trace(events, bundle, run_id):
+    """Replay cash-gate context against prior fills/commitments in journal order.
+
+    Native observations are persisted witnesses, not an independent signed
+    checkpoint; their consistency and boundary are rechecked here.
+    """
+    from .session import _stable_id
+    from .simulation import CashEndEvidence
+    doc = bundle.document()
+    instrument, cash = doc["instrument"], doc["cash"]
+    ledger = SpotCashLedger(Decimal(cash["initial_quote"]), symbol=instrument["symbol"],
+        base_asset=instrument["base_currency"], quote_asset=instrument["quote_currency"],
+        fee_rate=max(Decimal(cash["maker_fee"]), Decimal(cash["taker_fee"])))
+    decisions, origins, risk_ids, validity_ids = {}, {}, {}, {}
+    for obs, row in zip(bundle.observations(), doc["decisions"]):
+        decision = bundle._decision(row["decision"])
+        if decision.action == "hold":
+            continue
+        identity = _stable_id(str(run_id), obs.market_reference, "intent")
+        decisions[identity] = (obs, decision)
+        origins[_stable_id(str(identity), "intent-event")] = identity
+        risk_ids[_stable_id(str(identity), "risk")] = identity
+        validity_ids[_stable_id(str(identity), "validity")] = identity
+    active, sequence, runtime_id = set(), 0, None
+    for event in events:
+        if event.event_type == VALIDITY_EVENT_TYPE and event.payload.disposition == "accepted":
+            identity = validity_ids[event.event_id]
+            obs, decision = decisions[identity]
+            proof = json.loads(event.payload.notes)
+            native = dict(proof["native_cash"])
+            for key in ("initial_quote", "base_total", "base_free", "base_locked", "quote_total",
+                        "quote_free", "quote_locked", "fees_quote", "position_quantity"):
+                native[key] = Decimal(native[key])
+            native = CashEndEvidence(**native)
+            reflected = frozenset(UUID(value) for value in proof["reflected_intents"])
+            ledger.validate_native_state(native, reflected)
+            if reflected != frozenset(active):
+                raise PaperStateError("cash gate native acknowledgments conflict with journal stages.")
+            stamp = decision.decided_at
+            boundary = int(stamp.timestamp()) * 1_000_000_000 + stamp.microsecond * 1000
+            current_id = UUID(proof["runtime_id"])
+            if (proof["cash_gate"] != "r02.cash_admission.v1" or proof["market_reference"] != obs.market_reference
+                    or proof["boundary_ns"] != boundary or type(proof["read_sequence"]) is not int
+                    or proof["read_sequence"] <= sequence or current_id.version != 4
+                    or runtime_id is not None and runtime_id != current_id):
+                raise PaperStateError("cash gate current-read identity/boundary is inconsistent.")
+            sequence, runtime_id = proof["read_sequence"], current_id
+            expected = ledger.admission_evidence(decision.action, decision.quantity, decision.limit_price,
+                native_quote_free=native.quote_free, native_base_free=native.base_free, reflected_intents=reflected)
+            if any(proof[key] != json.loads(input_json(value)) for key, value in expected.items()) or not expected["allowed"]:
+                raise PaperStateError("cash gate evidence does not reconcile to current commitments.")
+        elif event.event_type == RISK_DECISION_EVENT_TYPE and event.payload.approved:
+            identity = risk_ids[event.event_id]
+            _, decision = decisions[identity]
+            ledger.reserve(identity, decision.action, decision.quantity, decision.limit_price)
+        elif event.event_type == ORDER_STATE_EVENT_TYPE:
+            identity = origins[event.causation_id]
+            if event.payload.state in {"accepted", "partially_filled"}:
+                active.add(identity)
+            elif event.payload.state in {"filled", "rejected", "canceled", "expired"}:
+                active.discard(identity)
+                if event.payload.state != "filled":
+                    ledger.release(identity)
+        elif event.event_type == EXECUTION_FILL_EVENT_TYPE:
+            identity = origins[event.causation_id]
+            _, decision = decisions[identity]
+            ledger.apply_fill(symbol=event.symbol, side=decision.action, quantity=event.payload.quantity,
+                price=event.payload.price, fee=event.payload.fee, fee_asset=event.payload.fee_asset, intent_id=identity)
+    if active or ledger._cash_locks:
+        raise PaperStateError("cash admission trace contains unresolved native/ledger commitments.")
+
+
 def _reconstruct_historical_economics(events, bundle, run_id):
     """Validate stage coverage/provenance and independently replay persisted cash fills."""
     from .session import _stable_id
@@ -562,6 +634,7 @@ def _reconstruct_historical_economics(events, bundle, run_id):
     for order, state in latest.items():
         if state == "filled" and filled.get(order, Decimal("0")) != approved[order_origins[order]][1].quantity:
             raise PaperStateError("R-02 terminal order is missing fills.")
+    _verify_cash_admission_trace(events, bundle, run_id)
     return ledger.economic_state(bundle.observations()[-1].price), tuple(execution)
 
 
@@ -578,6 +651,86 @@ def validate_native_cash(native, state, initial_quote):
             raise PaperStateError("R-02 native cash accounting mismatch.")
 
 
+def _verify_historical_report(report, events, bundle, run_id, state):
+    """Cross-check embedded report references, not just its self-contained hash."""
+    from .session import _stable_id
+    doc = bundle.document()
+    symbol = doc["instrument"]["symbol"]
+    by_id = {event.event_id: event for event in events}
+    records, validity_counts, risk_counts, safety_modes = [], {}, {}, []
+    for index, (obs, row) in enumerate(zip(bundle.observations(), doc["decisions"])):
+        decision = bundle._decision(row["decision"])
+        fields = dict(index=index, market_reference=obs.market_reference, observed_at=obs.observed_at,
+                      action=decision.action, confidence=decision.confidence, rationale=decision.rationale)
+        if decision.action == "hold":
+            records.append(DecisionRecord(**fields, submission="hold"))
+            continue
+        intent_id = _stable_id(str(run_id), obs.market_reference, "intent")
+        validity = by_id[_stable_id(str(intent_id), "validity")].payload
+        disposition = validity.disposition
+        validity_counts[disposition] = validity_counts.get(disposition, 0) + 1
+        fields.update(intent_id=intent_id, validity_disposition=disposition, validity_reason=validity.reason_code)
+        if disposition != "accepted":
+            records.append(DecisionRecord(**fields, submission="stopped_by_validity"))
+            continue
+        audit = by_id[_stable_id(str(intent_id), "risk-evaluation")].payload
+        risk_counts[audit.decision] = risk_counts.get(audit.decision, 0) + 1
+        safety_modes.append(doc["safety_mode"])
+        blocked = bool(set(audit.reason_codes) & {"trading_halted", "reduce_only_violation"})
+        records.append(DecisionRecord(**fields, risk_decision=audit.decision,
+            risk_reason_codes=tuple(audit.reason_codes), submission="submitted_to_simulator"
+            if audit.decision == "allowed" else "blocked_by_safety" if blocked else "stopped_by_risk"))
+    expected = RunReport(run_id, "paper", symbol, doc["session"]["strategy_id"],
+        decisions=tuple(records)).to_dict()["decisions"]
+    observations = bundle.observations()
+    if (report["decisions"] != expected or report["strategy_id"] != doc["session"]["strategy_id"]
+            or report["validity_counts"] != validity_counts or report["risk_counts"] != risk_counts
+            or report["started_at"] != str(observations[0].observed_at)
+            or report["ended_at"] != str(observations[-1].observed_at)
+            or report["engine_version"] != doc["provenance"]["engine_version"]
+            or report["book_type"] != "L2_MBP" or report["queue_aware"] is not True
+            or report["safety_events"] != safety_modes):
+        raise PaperStateError("R-02 report decision/settings references mismatch.")
+    for key, disposition in (("stale_decisions", "stale"), ("superseded_decisions", "superseded")):
+        if report[key] != [record.market_reference for record in records if record.validity_disposition == disposition]:
+            raise PaperStateError("R-02 report validity references mismatch.")
+    if report["backpressure_rejections"] != validity_counts.get("backpressure_rejected", 0) or report["safety_blocked"] != sum(r.submission == "blocked_by_safety" for r in records):
+        raise PaperStateError("R-02 report pipeline counts mismatch.")
+    fills = [event for event in events if event.event_type == EXECUTION_FILL_EVENT_TYPE]
+    positions = {symbol: state["base_total"]} if fills else {}
+    if {key: Decimal(value) for key, value in report["positions"].items()} != positions:
+        raise PaperStateError("R-02 report positions mismatch.")
+    # This namespace is the existing persisted native reference -> domain UUID
+    # mapping. No native engine import or new identity contract is introduced.
+    namespace = UUID("6f2c1e2a-9a1e-4c7f-9a6c-2f1b6d4e5a10")
+    states = {event.order_id: event for event in events if event.event_type == ORDER_STATE_EVENT_TYPE}
+    reported_orders = {}
+    for order in report["orders"]:
+        identity = uuid5(namespace, order["order_reference"])
+        if identity in reported_orders or identity not in states:
+            raise PaperStateError("R-02 report order reference is missing or duplicated.")
+        event = states[identity]
+        origin = by_id[event.causation_id]
+        intent_id = next(r.intent_id for r in records
+            if r.intent_id is not None and _stable_id(str(r.intent_id), "intent-event") == origin.event_id)
+        quantity = sum((fill.payload.quantity for fill in fills if fill.order_id == identity), Decimal("0"))
+        leaves = Decimal(order["remaining_quantity"])
+        if (order["intent_id"] != str(intent_id) or order["correlation_id"] != str(run_id)
+                or order["symbol"] != symbol or order["state"] != event.payload.state
+                or Decimal(order["filled_quantity"]) != quantity or not leaves.is_finite()
+                or leaves < 0 or leaves > origin.payload.quantity - quantity
+                or event.payload.state == "filled" and leaves != 0):
+            raise PaperStateError("R-02 report order economics/state mismatch.")
+        reported_orders[identity] = order
+    if set(reported_orders) != set(states) or len(report["fills"]) != len(fills):
+        raise PaperStateError("R-02 report execution coverage mismatch.")
+    for recorded, event in zip(report["fills"], fills):
+        order = reported_orders[event.order_id]
+        if any(recorded[key] != order[key] for key in ("order_reference", "intent_id", "correlation_id", "symbol")) or any(
+            Decimal(recorded[key]) != getattr(event.payload, key) for key in ("quantity", "price", "remaining_quantity")):
+            raise PaperStateError("R-02 report fill references/economics mismatch.")
+
+
 def verify_historical_completion(journal, bundle):
     before = journal.revision()
     events = tuple(journal.read_range())
@@ -588,6 +741,8 @@ def verify_historical_completion(journal, bundle):
     seal, start = completions[0], starts[0]
     payload = seal.payload
     run_id = payload.run_id
+    if start.symbol != bundle.document()["instrument"]["symbol"] or seal.symbol != start.symbol:
+        raise PaperStateError("R-02 run boundary symbol mismatch.")
     if start.event_id != uuid5(run_id, "paper.run.started") or seal.event_id != uuid5(run_id, "paper.run.completed") or start.producer != bundle.document()["session"]["producer"] or seal.producer != start.producer:
         raise PaperStateError("R-02 run contract provenance mismatch.")
     if start.payload.run_id != run_id or start.correlation_id != run_id or seal.correlation_id != run_id or start.payload.inputs_sha256 != bundle.sha256 or payload.inputs_sha256 != bundle.sha256 or payload.started_event_id != start.event_id or seal.causation_id != start.event_id or start.payload.code_tree != bundle.document()["provenance"]["code_tree"]:
@@ -615,28 +770,61 @@ def verify_historical_completion(journal, bundle):
     for key in ("realized_pnl_quote", "unrealized_pnl_quote", "equity_quote"):
         if Decimal(report[key]) != state[key]:
             raise PaperStateError("R-02 report economic mismatch.")
+    _verify_historical_report(report, ordered, bundle, run_id, state)
     if journal.revision() != before:
         raise PaperStateError("R-02 journal changed during completion verification.")
     return seal
 
 
 def read_historical_completion(path, spec):
-    """Read-only SQLite diagnostics; no schema setup, PRAGMAs or engine startup."""
+    """Read-only diagnostics of evidence consistency, not an external attestation.
+
+    Approval pins are supplied independently by the caller. Native cash is a
+    persisted observation, not a separately signed engine checkpoint. A whole
+    artifact set can be moved if its reservation identity remains verifiable;
+    neither this schema nor its hash proves the original absolute root path.
+    Only closed, stable artifacts without SQLite sidecars are accepted. Immutable
+    read mode prevents SQLite from creating/updating WAL shared-memory evidence;
+    an extant WAL is refused, never ignored, replayed or checkpointed here.
+    """
     import sqlite3
     from contextlib import closing
     bundle = FrozenRunInputs.approved(spec)
     registry = historical_registry()
     path = Path(path).resolve()
     try:
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
-            rows = connection.execute("SELECT event_id,payload_json,payload_sha256 FROM events").fetchall()
+        def stable_digest():
+            if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
+                raise PaperStateError("R-02 diagnostics require closed evidence without SQLite sidecars.")
+            with path.open("rb") as handle:
+                return hashlib.file_digest(handle, "sha256").hexdigest()
+        evidence_digest = stable_digest()
+        marker = path.parent / "reservation.json"
+        reservation_bytes = marker.read_bytes()
+        if len(reservation_bytes) > 4096 or marker.is_symlink() or not marker.is_file():
+            raise PaperStateError("R-02 reservation file is invalid.")
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN")  # one read snapshot; no schema/settings changes
+            version = connection.execute("SELECT value FROM journal_meta WHERE key='schema_version'").fetchall()
+            if len(version) != 1 or version[0][0] != "1":
+                raise PaperStateError("R-02 journal schema evidence is invalid.")
+            rows = connection.execute("SELECT * FROM events ORDER BY rowid").fetchall()
             events = []
             entries = []
-            for identity, raw, stored in rows:
+            for row in rows:
+                identity, raw, stored = row["event_id"], row["payload_json"], row["payload_sha256"]
                 digest = hashlib.sha256(raw.encode()).hexdigest()
                 event = registry.decode(raw)
                 if digest != stored or str(event.event_id) != identity:
                     raise PaperStateError("R-02 journal checksum/identity corruption.")
+                fields = {name: getattr(event, name) for name in ("event_type", "schema_version", "producer", "strategy_id", "symbol", "sequence_number")}
+                fields.update({name: None if getattr(event, name) is None else str(getattr(event, name))
+                               for name in ("correlation_id", "causation_id", "order_id")})
+                fields.update(occurred_at_ns=int(event.occurred_at.timestamp() * 1_000_000_000),
+                              occurred_at_iso=event.occurred_at.astimezone(timezone.utc).isoformat())
+                if any(row[name] != value for name, value in fields.items()):
+                    raise PaperStateError("R-02 journal indexed metadata conflicts with payload.")
                 events.append(event)
                 entries.append((event.event_id, digest))
         entries = tuple(sorted(entries, key=lambda row: str(row[0])))
@@ -644,7 +832,32 @@ def read_historical_completion(path, spec):
         class ReadView:
             def revision(self): return revision
             def read_range(self): return events
-        return verify_historical_completion(ReadView(), bundle)
+        seal = verify_historical_completion(ReadView(), bundle)
+        if tuple(event.event_id for event in events) != tuple(identity for identity, _ in seal.payload.event_order) + (seal.event_id,):
+            raise PaperStateError("R-02 physical journal order conflicts with completion evidence.")
+        start = events[0]
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise PaperStateError("R-02 reservation has duplicate identity fields.")
+                result[key] = value
+            return result
+        reservation = json.loads(reservation_bytes, object_pairs_hook=unique)
+        if not isinstance(reservation, dict) or set(reservation) != {"policy", "run_id", "nonce", "replay_of_run_id"} or input_json(reservation) != reservation_bytes:
+            raise PaperStateError("R-02 reservation structure is invalid.")
+        run_id, nonce = UUID(reservation["run_id"]), UUID(reservation["nonce"])
+        replay = reservation["replay_of_run_id"]
+        if (reservation["policy"] != "R-02" or run_id.version != 4 or nonce.version != 4
+                or str(run_id) != reservation["run_id"] or str(nonce) != reservation["nonce"]
+                or run_id != start.payload.run_id or path.parent.name != f"r02-{run_id}"
+                or path.name != "journal.sqlite"
+                or replay != (str(start.payload.replay_of_run_id) if start.payload.replay_of_run_id else None)
+                or replay == str(run_id)
+                or hashlib.sha256(reservation_bytes).hexdigest() != start.payload.reservation_sha256
+                or marker.read_bytes() != reservation_bytes or stable_digest() != evidence_digest):
+            raise PaperStateError("R-02 reservation identity/path/fingerprint mismatch.")
+        return seal
     except PaperStateError:
         raise
     except Exception as exc:

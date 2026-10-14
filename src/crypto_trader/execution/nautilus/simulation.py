@@ -63,6 +63,29 @@ class NautilusSimulationRunner:
             raise PaperStateError("native cash completion evidence is unavailable.")
         return self._cash_end
 
+    def current_cash_reading(self, *, boundary_ns):
+        from uuid import uuid4
+        from crypto_trader.paper.accounting import CurrentCashReading
+        runtime = getattr(self, "_temporal_runtime", None)
+        if (runtime is None or self._cash_settings is None or type(boundary_ns) is not int
+                or boundary_ns <= 0 or boundary_ns != self._temporal_boundary
+                or runtime.engine_version() != "1.231.0"):
+            raise PaperStateError("current native cash boundary/version is unavailable or stale.")
+        observations = tuple(runtime.observations())
+        native = runtime.cash_end_evidence()  # reads this LIVE runtime, not _cash_end
+        if observations != tuple(runtime.observations()):
+            raise PaperStateError("native cash changed during the current read.")
+        latest = {item.intent_id: item.state for item in observations}
+        reflected = frozenset(identity for identity, state in latest.items()
+                              if state is not None and state.value in {"accepted", "partially_filled"})
+        if not hasattr(self, "_cash_runtime_id"):
+            self._cash_runtime_id = uuid4()
+        self._cash_read_sequence = getattr(self, "_cash_read_sequence", 0) + 1
+        reading = CurrentCashReading(boundary_ns, self._cash_runtime_id, self._cash_read_sequence,
+                                     native, reflected)
+        self._last_cash_reading, self._cash_observations = reading, observations
+        return reading
+
     def __post_init__(self) -> None:
         if isinstance(self, ExecutionSimulator):  # structural conformance, checked eagerly
             return
@@ -123,6 +146,9 @@ class NautilusSimulationRunner:
         )
         self._temporal_cursor = 0
         self._temporal_boundary = 0
+        from uuid import uuid4
+        self._cash_runtime_id, self._cash_read_sequence = uuid4(), 0
+        self._last_cash_reading = None
 
     def _temporal_snapshot(self) -> SimulationOutcome:
         runtime = getattr(self, "_temporal_runtime", None)
@@ -163,10 +189,18 @@ class NautilusSimulationRunner:
         self._temporal_boundary = timestamp_ns
         return self._temporal_snapshot()
 
-    def submit_temporal(self, request: ExecutionRequest, *, decided_ns: int) -> None:
+    def submit_temporal(self, request: ExecutionRequest, *, decided_ns: int, cash_reading=None) -> None:
         runtime = getattr(self, "_temporal_runtime", None)
         if runtime is None or type(decided_ns) is not int or decided_ns != self._temporal_boundary:
             raise RuntimeError("timed submission must follow an advance to decision completion.")
+        if self._cash_settings is not None:
+            if (cash_reading is None or self._last_cash_reading is not cash_reading
+                    or cash_reading.boundary_ns != decided_ns
+                    or self._cash_runtime_id != cash_reading.runtime_id
+                    or tuple(runtime.observations()) != self._cash_observations
+                    or runtime.cash_end_evidence() != cash_reading.native):
+                raise PaperStateError("current native cash proof changed before submission.")
+            self._last_cash_reading = None  # consumed even if submission result is uncertain
         runtime.submit_timed(request, decided_ns=decided_ns)
 
     def market_horizon_ns(self) -> int:

@@ -104,3 +104,76 @@ def test_cash_cannot_borrow_for_sale_fee():
     with pytest.raises(PaperStateError, match="quote"):
         fill(ledger, "sell", "1", "10", "11")
     assert ledger.base_total == Decimal("1") and ledger.quote_total == Decimal("0")
+
+
+def admission(ledger, quantity, native_free, reflected=()):
+    method = getattr(ledger, "admission_evidence", None)
+    if method is None:
+        # Actual pre-fix admission behavior, not a missing-API failure.
+        ledger.check_admission("buy", Decimal(quantity), Decimal("1"))
+        return {"allowed": True, "admissible_free_quote": ledger.quote_free}
+    return method("buy", Decimal(quantity), Decimal("1"),
+        native_quote_free=Decimal(native_free), native_base_free=ledger.base_free,
+        reflected_intents=frozenset(reflected))
+
+
+def test_cash_admission_uses_actual_native_free_after_partial():
+    ledger = cash("1000")
+    identity = uuid4()
+    ledger.reserve(identity, "buy", Decimal("300"), Decimal("1"))
+    ledger.apply_fill(symbol="ETHUSDT", side="buy", quantity=Decimal("90"),
+        price=Decimal("1"), fee=Decimal("0"), fee_asset="USDT", intent_id=identity)
+    assert ledger.quote_free == 700 and ledger.quote_locked == 210
+    evidence = admission(ledger, "650", "610", [identity])
+    assert evidence["allowed"] is False
+    assert evidence["admissible_free_quote"] == 610
+
+
+def test_unreflected_competing_commitments_cannot_double_spend():
+    ledger = cash("1000")
+    first, queued = uuid4(), uuid4()
+    ledger.reserve(first, "buy", Decimal("300"), Decimal("1"))
+    ledger.apply_fill(symbol="ETHUSDT", side="buy", quantity=Decimal("90"),
+        price=Decimal("1"), fee=Decimal("0"), fee_asset="USDT", intent_id=first)
+    ledger.reserve(queued, "buy", Decimal("100"), Decimal("1"))
+    evidence = admission(ledger, "550", "610", [first])
+    assert evidence["allowed"] is False
+    assert evidence["unreflected_principal_quote"] == 100
+    assert evidence["spendable_free_quote"] == 510
+
+
+def test_reflected_and_unreflected_reservations_are_not_deducted_twice():
+    for reflected, native_free in ((False, "1000"), (True, "700")):
+        ledger = cash("1000")
+        identity = uuid4()
+        ledger.reserve(identity, "buy", Decimal("300"), Decimal("1"))
+        evidence = admission(ledger, "700", native_free, [identity] if reflected else [])
+        assert evidence["allowed"] is True
+        if "spendable_free_quote" in evidence:
+            assert evidence["spendable_free_quote"] == 700
+
+
+@pytest.mark.parametrize("state", [OrderLifecycleState.FILLED, OrderLifecycleState.CANCELED,
+                                  OrderLifecycleState.REJECTED, OrderLifecycleState.EXPIRED])
+def test_terminal_evidence_releases_both_commitment_records(tmp_path, state):
+    from crypto_trader.persistence import SQLiteEventJournal
+    from crypto_trader.risk import PendingIntent, Side
+    identity = uuid4()
+    ledger = cash("100")
+    ledger.reserve(identity, "buy", Decimal("1"), Decimal("10"))
+    with SQLiteEventJournal(tmp_path / "terminal.db") as journal:
+        session = fx.session(journal, decisions=fx.scripted(fx.hold_decision()), data_feed=fx.feed("10"), simulator=ScriptedSimulationRunner())
+        session._r02_ledger = ledger
+        session._reservations[identity] = (Side.BUY, Decimal("1"), Decimal("10"))
+        session._pending.register(PendingIntent(identity, "ETHUSDT", session.config.strategy_id, Side.BUY,
+                                              Decimal("1"), Decimal("10")))
+        observation = ExecutionObservation(order_reference="test-terminal", intent_id=identity,
+            correlation_id=fx.SESSION_ID, symbol="ETHUSDT", state=state,
+            filled_quantity=Decimal("1") if state is OrderLifecycleState.FILLED else Decimal("0"),
+            remaining_quantity=Decimal("0"), last_fill_quantity=Decimal("1") if state is OrderLifecycleState.FILLED else None)
+        if state is OrderLifecycleState.FILLED:
+            ledger.apply_fill(symbol="ETHUSDT", side="buy", quantity=Decimal("1"), price=Decimal("10"),
+                              fee=Decimal("0"), fee_asset="USDT", intent_id=identity)
+        session._reconcile_temporal_reservations(SimulationOutcome(observations=(observation,)))
+        assert not session._reservations and not len(session._pending)
+        assert not ledger._cash_locks and not ledger._original_cash_locks

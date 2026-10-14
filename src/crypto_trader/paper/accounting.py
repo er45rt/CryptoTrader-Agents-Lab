@@ -11,12 +11,24 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, localcontext, ROUND_HALF_EVEN
 from uuid import UUID
+from typing import Any
 
 from .errors import PaperStateError
 
 __all__ = ["PositionLedger", "PositionState"]
 
 ZERO = Decimal("0")
+
+
+@dataclass(frozen=True)
+class CurrentCashReading:
+    """Transient cash observation from the active engine, never a restart token."""
+
+    boundary_ns: int
+    runtime_id: UUID
+    sequence: int
+    native: Any
+    reflected_intents: frozenset[UUID]
 
 
 @dataclass(frozen=True)
@@ -155,7 +167,7 @@ class PositionLedger:
 class SpotCashLedger(PositionLedger):
     """R-02 cash inventory with separate cash locks and conservative fee admission.
 
-    Locks are principal only (as in the native CASH account); fee headroom is
+    Ledger locks represent REMAINING commitments, not native cash locks. Fee headroom is
     an application admission reserve, never mislabelled as native locked cash.
     Legacy PositionLedger retains its historical short/flip semantics.
     """
@@ -169,6 +181,7 @@ class SpotCashLedger(PositionLedger):
         self.fee_rate = fee_rate
         self.quote_total = starting_equity_quote
         self._cash_locks: dict[UUID, tuple[str, Decimal, Decimal]] = {}
+        self._original_cash_locks: dict[UUID, tuple[str, Decimal, Decimal]] = {}
 
     @property
     def quote_locked(self):
@@ -204,9 +217,69 @@ class SpotCashLedger(PositionLedger):
             raise PaperStateError("duplicate cash reservation.")
         self.check_admission(side, quantity, price)
         self._cash_locks[intent_id] = (side, quantity, price)
+        self._original_cash_locks[intent_id] = (side, quantity, price)
 
     def release(self, intent_id):
         self._cash_locks.pop(intent_id, None)
+        self._original_cash_locks.pop(intent_id, None)
+
+    def validate_native_state(self, native, reflected_intents):
+        """Pin native 1.231.0 ORIGINAL-quantity locks; retain remaining commitments."""
+        if type(reflected_intents) is not frozenset or not reflected_intents <= self._cash_locks.keys():
+            raise PaperStateError("native cash reflection identities are unknown.")
+        fields = ("initial_quote", "base_total", "base_free", "base_locked", "quote_total",
+                  "quote_free", "quote_locked", "fees_quote", "position_quantity")
+        if any(not isinstance(getattr(native, name), Decimal) or not getattr(native, name).is_finite()
+               or getattr(native, name) < 0 for name in fields):
+            raise PaperStateError("native cash balance is nonfinite or negative.")
+        if native.account_type != "CASH" or native.allow_borrowing is not False:
+            raise PaperStateError("native cash account identity is unsupported.")
+        if type(native.unsettled) is not bool or native.unsettled != bool(self._cash_locks):
+            raise PaperStateError("native unresolved-order evidence conflicts with current commitments.")
+        if (native.initial_quote != self.starting_equity_quote or native.quote_total != self.quote_total
+                or native.base_total != self.base_total or native.position_quantity != self.base_total
+                or native.fees_quote != self.fees_quote()
+                or native.quote_free + native.quote_locked != native.quote_total
+                or native.base_free + native.base_locked != native.base_total):
+            raise PaperStateError("current native cash and processed journal accounting disagree.")
+        quote_lock = sum((q * p for identity, (side, q, p) in self._original_cash_locks.items()
+                          if identity in reflected_intents and side == "buy"), ZERO)
+        base_lock = sum((q for identity, (side, q, _) in self._original_cash_locks.items()
+                         if identity in reflected_intents and side == "sell"), ZERO)
+        if native.quote_locked != min(quote_lock, self.quote_total) or native.base_locked != min(base_lock, self.base_total):
+            raise PaperStateError("Nautilus 1.231.0 original-quantity cash lock behavior changed or is uncertain.")
+
+    def admission_evidence(self, side, quantity, price, *, native_quote_free,
+                           native_base_free, reflected_intents):
+        if side not in {"buy", "sell"} or any(not isinstance(v, Decimal) or not v.is_finite() or v < 0
+            for v in (quantity, price, native_quote_free, native_base_free)) or quantity == 0 or price == 0:
+            raise PaperStateError("cash admission evidence is invalid.")
+        if type(reflected_intents) is not frozenset or not reflected_intents <= self._cash_locks.keys():
+            raise PaperStateError("cash admission has unknown native reservation identities.")
+        unreflected = sum((q * p for identity, (direction, q, p) in self._cash_locks.items()
+                           if direction == "buy" and identity not in reflected_intents), ZERO)
+        base_unreflected = sum((q for identity, (direction, q, _) in self._cash_locks.items()
+                                if direction == "sell" and identity not in reflected_intents), ZERO)
+        admissible = min(self.quote_free, native_quote_free)
+        # Align the native view with obligations it has not reflected yet, THEN
+        # take the minimum. Do not subtract all commitments from that minimum.
+        spendable = min(self.quote_free, native_quote_free - unreflected)
+        fee_headroom = self.quote_locked * self.fee_rate
+        required = quantity * price * (1 + self.fee_rate)
+        base_available = min(self.base_free, native_base_free - base_unreflected)
+        allowed = required + fee_headroom <= spendable if side == "buy" else quantity <= base_available
+        return {"ledger_free_quote": self.quote_free, "native_free_quote": native_quote_free,
+            "admissible_free_quote": admissible, "spendable_free_quote": spendable,
+            "remaining_order_commitment_quote": self.quote_locked,
+            "unreflected_principal_quote": unreflected, "remaining_fee_headroom_quote": fee_headroom,
+            "required_quote_including_fee": required,
+            "ledger_free_base": self.base_free, "native_free_base": native_base_free,
+            "unreflected_base_quantity": base_unreflected, "spendable_free_base": base_available,
+            "selection_reason": "native_free_lower" if native_quote_free < self.quote_free else
+                                "ledger_free_lower" if self.quote_free < native_quote_free else "sources_equal",
+            "allowed": allowed, "rejection_reason": None if allowed else
+                "insufficient_admissible_quote_including_fees_and_pending" if side == "buy" else
+                "insufficient_admissible_base_inventory"}
 
     def apply_fill(self, *, symbol, side, quantity, price, fee=ZERO,
                    fee_asset=None, intent_id=None):
