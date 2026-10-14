@@ -108,7 +108,7 @@ For each P-0x: **smallest bounded fix -> targeted red/green test -> complete off
 
 ## مهام إلزامية قبل Testnet — معلقة، دون تفويض تنفيذ
 
-- **جاهزية SQLite قبل Attempt:** في `ports.py`، فحص جاهزية SQLite FULL قبل حفظ Attempt لأي `SQLiteEventJournal`، لمنع تسجيل محاولة وهمية، بما في ذلك Journal غير مثبت التأسيس.
+- **جاهزية SQLite قبل Attempt:** في `ports.py`، فحص جاهزية SQLite FULL قبل حفظ Attempt لأي `SQLiteEventJournal`، لمنع تسجيل محاولة وهمية، بما في ذلك Journal غير مثبت التأسيس. **الحالة: منفذة ومقبولة محليًا بقرار المالك**؛ Commit الإصلاح: `2804f215193cde5d20421339557b746b1a9ebd54`.
 - **كتّاب Journal ونافذة الانقطاع:** حصر الكتّاب الآخرين في Journal الإرسال، وتحليل خطر توقف الأداة بعد حفظ Attempt وقبل POST.
 - **أسباب أخطاء الاختبارات:** تشديد Assertions لاختبارات collision وeconomics وdowngraded_writer وnormal_origin للتحقق من نوع الخطأ وسببه الصحيح.
 - **إجراء تأسيس Journal:** توثيق إجراء المشغّل عند انقطاع عملية تأسيس Journal.
