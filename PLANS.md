@@ -95,3 +95,35 @@ These items were explicitly deferred by the owner for a **later, separately appr
 Deferral does not change the immutable P-05 fixture SHA256, bypass verified safety invariants, or imply independent reviewer acceptance. Any reviewer-proven release blocker remains a blocker pending the standard adjudication gate.
 
 For each P-0x: **smallest bounded fix -> targeted red/green test -> complete offline pytest -> independent named-files-only commit -> next item**. Preserve all protected WIP and immutable DARC data. If any defect or governance conflict falsifies the plan, record it rather than lowering the acceptance gate. Paper has no auto-start or broker authorization.
+
+---
+
+# R-03a — Durable submission / Intent provenance
+
+## R-03a-1a — Accepted Locally بقرار المالك
+
+**قرار المالك النهائي بتاريخ 2026-10-14: R-03a-1a = Accepted Locally** للـCommitين `b9952bc007685d812740dde94485a05832a44bdb` و`d07f7b68a2a07199740abe8639164a773d3dec93`، وشجرة التصحيح `072d8ec59688e31e4ce752fad41ccf0eb4564e0b`.
+
+يشمل القبول Durable Attempt وAt-Most-Once POST، وSQLite WAL/FULL Genesis، وCAS وWriter Fence، وRecovery/Reconciliation، والتعرض داخل Hard Risk، ومطابقة الهوية الصريحة وربط Paper المشتق. **لا يشمل القبول إثبات منشأ Intent** أو إغلاق R-03a-1b، ولا يمنح تصريح Testnet/Live/Mainnet أو إغلاق الإصدار.
+
+## مهام إلزامية قبل Testnet — معلقة، دون تفويض تنفيذ
+
+- **جاهزية SQLite قبل Attempt:** في `ports.py`، فحص جاهزية SQLite FULL قبل حفظ Attempt لأي `SQLiteEventJournal`، لمنع تسجيل محاولة وهمية، بما في ذلك Journal غير مثبت التأسيس.
+- **كتّاب Journal ونافذة الانقطاع:** حصر الكتّاب الآخرين في Journal الإرسال، وتحليل خطر توقف الأداة بعد حفظ Attempt وقبل POST.
+- **أسباب أخطاء الاختبارات:** تشديد Assertions لاختبارات collision وeconomics وdowngraded_writer وnormal_origin للتحقق من نوع الخطأ وسببه الصحيح.
+- **إجراء تأسيس Journal:** توثيق إجراء المشغّل عند انقطاع عملية تأسيس Journal.
+- **سبب رفض Intent القديم:** تحديث `test_r03_old_persisted_intent_without_attempt_is_abandoned_after_restart` للتحقق من سبب الرفض الزمني الحقيقي، دون الادعاء بأنه يثبت مطابقة الهوية.
+- **عقود الهوية الصريحة:** توثيق وإثبات إلزامية `payload.intent_id` وصحة قيمته في Attempted وRisk V1/V2 وValidity، مع اختبار رفض البيانات غير الصالحة ضمن مرحلة التنفيذ المناسبة.
+
+## مانع إضافي قبل Live — معلّق
+
+- قياس أداء فحص أدلة الجلسة عند نمو Journal، وتحديد معالجة آمنة إذا ظهرت مشكلة توسع.
+
+## البنود المفتوحة والبوابات
+
+- **R-03a-1b — Intent Provenance Binding:** مفتوح ومانع إلزامي لـLive/Mainnet؛ يُصمم مع منتج Intents الفعلي ونموذج الثقة ومصدر الهوية الملزم. دليل الفجوة محفوظ خارج Commit التصحيح في `C:/Users/Jamal/.codex/visualizations/2026/10/14/01a13834-4016-7ee1-93cd-163af2e0817e/r03a1a-corrective-20261014/r03a1b-contract-event-remaining.patch`، SHA256 `cdc537e226bbb4e1597deb3c07cbeaa066bffa1a24046cba32070438d45fe14a`. يبقى تعديل اختبار R-03a-1b غير الملتزم به محفوظًا كما هو، دون Stash أو Staging.
+- **R-03a-2:** تصميم فقط، دون تنفيذ.
+- **Testnet / Live / Mainnet:** NO-GO.
+- **الإصدار النهائي:** NO-GO.
+
+هذا القسم يسجل قرار المالك والمهام المؤجلة فقط؛ لا يغير المهام السابقة ولا يبدأ تنفيذ أي مهمة معلقة. كل تنفيذ لاحق يحتاج نطاقًا معتمدًا وأدلته؛ لا Push/Merge/Deploy أو أوامر تداول بهذا التحديث.
