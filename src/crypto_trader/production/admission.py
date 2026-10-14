@@ -172,6 +172,8 @@ class ProductionAdmissionController:
         with self._lock:
             now = self._now()
             self._evict_locked(now)
+            if self._runtime._intent_predates_session(intent):
+                return False, "prior_session_intent"
             time_rejection = self._time_rejection_reason(intent, now)
             if time_rejection is not None:
                 return False, time_rejection

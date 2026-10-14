@@ -467,7 +467,7 @@ def test_approved_durable_path_is_accepted_and_keeps_marker_authorization_send(t
     )
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
-    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
         port = OrderRuntime(client=client, instrument=PRODUCTION_INSTRUMENT, journal=journal)
         state_dir = tmp_path / "state"
         seed_canonical_equity_root(journal)
@@ -587,7 +587,7 @@ def test_durable_reduce_only_reduction_keeps_marker_then_single_send(tmp_path):
     client = fx.client(transport)
     client.clock.synchronize(fx.SERVER_TIME_MS)
 
-    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
         state_dir = tmp_path / "state"
         _seed_owned_long_position(journal)
         control = control_for(journal, state_dir)

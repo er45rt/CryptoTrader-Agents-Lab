@@ -60,6 +60,205 @@ def seed(journal, *, quantity="0.001", symbol="BTCUSDT"):
     return event
 
 
+def test_r03_old_persisted_intent_without_attempt_is_abandoned_after_restart(tmp_path, record_property):
+    from datetime import timedelta
+    from crypto_trader.events import TradeIntentCreated, TradeIntentPayload
+    from crypto_trader.tests.production_fixtures import (
+        BASE, intent, seed_canonical_equity_root, bind_test_admission,
+        canonical_risk_refresh_responses,
+    )
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    target = intent("r03-prior-session")
+    path = tmp_path / "prior.db"
+    with _r03_journal(path) as journal:
+        seed_canonical_equity_root(journal)
+        journal.append(TradeIntentCreated(
+            event_id=target.intent_id, occurred_at=BASE, correlation_id=target.correlation_id,
+            producer="offline.r03", symbol=target.symbol, strategy_id=target.strategy_id,
+            payload=TradeIntentPayload(side="buy", quantity=target.quantity,
+                                       order_type="limit", limit_price=target.limit_price),
+        ))
+    with _r03_journal(path) as journal:
+        runtime, port, client, transport = wired(
+            journal, tmp_path,
+            [*startup_responses(), *canonical_risk_refresh_responses(),
+             fx.order_response(f"ct-{target.intent_id.hex[:20]}", orig_qty="0.01000")],
+            when=BASE + timedelta(seconds=2), bind_admission=False,
+        )
+        admission = bind_test_admission(runtime, when=BASE + timedelta(seconds=2))
+        runtime.start()
+        accepted, reason = admission.offer(target)
+        if accepted:
+            admission.run_once()
+        written = [r for r in transport.requests if r.method == "POST"]
+        record_property("accepted_after_restart", accepted)
+        record_property("post_count", len(written))
+        assert accepted is False, "old persisted intent was redelivered and accepted after restart"
+        assert written == []
+
+
+def test_r03_lost_attempt_commit_ack_keeps_pending_economics(tmp_path, monkeypatch, record_property):
+    from crypto_trader.events import OrderSubmissionAttempted
+    from crypto_trader.tests.production_fixtures import (
+        intent, admitted_prepare, admitted_submit, canonical_risk_refresh_responses,
+        seed_canonical_equity_root,
+    )
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    with _r03_journal(tmp_path / "ack.db") as journal:
+        seed_canonical_equity_root(journal)
+        runtime, port, client, transport = wired(
+            journal, tmp_path, [*startup_responses(), *canonical_risk_refresh_responses()],
+        )
+        runtime.start()
+        preparation = admitted_prepare(runtime, intent("r03-lost-ack"))
+        append = journal.append
+        conditional = journal.append_batch_if_revision
+        def lose_append(event):
+            result = append(event)
+            if isinstance(event, OrderSubmissionAttempted):
+                raise RuntimeError("r03 lost commit acknowledgment")
+            return result
+        def lose_conditional(events, **kwargs):
+            result = conditional(events, **kwargs)
+            if any(isinstance(e, OrderSubmissionAttempted) for e in events):
+                raise RuntimeError("r03 lost commit acknowledgment")
+            return result
+        monkeypatch.setattr(journal, "append", lose_append)
+        monkeypatch.setattr(journal, "append_batch_if_revision", lose_conditional)
+        with pytest.raises(RuntimeError, match="lost commit acknowledgment"):
+            admitted_submit(runtime, preparation)
+        attempts = [e for e in journal.read_range() if isinstance(e, OrderSubmissionAttempted)]
+        record_property("attempt_count", len(attempts))
+        record_property("pending_count", len(runtime._pending))
+        assert len(attempts) == 1
+        assert not [r for r in transport.requests if r.method == "POST"]
+        assert len(runtime._pending) == 1, "ambiguous committed attempt must keep its risk reservation"
+
+
+def test_r03_attempt_recorded_after_risk_preparation_keeps_pending_on_refusal(tmp_path):
+    from crypto_trader.tests.production_fixtures import (
+        intent, admitted_prepare, admitted_submit, canonical_risk_refresh_responses,
+        seed_canonical_equity_root,
+    )
+    from crypto_trader.production import ProductionStateError
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    with _r03_journal(tmp_path / "risk-drift.db") as journal:
+        seed_canonical_equity_root(journal)
+        runtime, port, _, transport = wired(
+            journal, tmp_path, [*startup_responses(), *canonical_risk_refresh_responses()],
+        )
+        runtime.start()
+        preparation = admitted_prepare(runtime, intent("r03-risk-drift"))
+        from crypto_trader.execution import ExecutionRequest
+        request = ExecutionRequest(
+            intent_id=preparation.intent_id, correlation_id=preparation.correlation_id,
+            symbol=preparation.symbol, strategy_id=preparation.strategy_id,
+            side=preparation.side, order_type=preparation.order_type,
+            quantity=preparation.quantity, limit_price=preparation.limit_price,
+            time_in_force=preparation.time_in_force,
+        )
+        prepared = port._prepare_durable_write(request)
+        # Durable evidence arrives after Hard Risk, as it can from another writer.
+        journal.append(port._durable_attempt_event(prepared, request))
+        with pytest.raises(ProductionStateError, match="journal changed"):
+            admitted_submit(runtime, preparation)
+        assert not [r for r in transport.requests if r.method == "POST"]
+        assert len(runtime._pending) == 1
+        assert preparation.intent_id not in runtime._issued_preparations
+
+
+@pytest.mark.parametrize("resolution", ["not_found", "open", "partial", "filled"])
+def test_r03_post_crash_restart_new_snapshot_buy_requires_reconciliation_and_exposure(
+    tmp_path, resolution, record_property,
+):
+    from datetime import timedelta
+    from crypto_trader.tests.production_fixtures import (
+        BASE, intent, admitted_execute, admitted_prepare, canonical_risk_refresh_responses,
+        seed_canonical_equity_root, limits,
+    )
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    from crypto_trader.validity import MarketObservation, ReplayMarketStateProvider
+    from crypto_trader.production import ProductionStateError
+    class Crash(BaseException):
+        pass
+    class CrashTransport(fx.ScriptedTransport):
+        def send(self, request):
+            if request.method == "POST":
+                self.requests.append(request)
+                raise Crash("offline crash after POST, before response")
+            return super().send(request)
+    old = intent("r03-crash-old", quantity=Decimal("0.00100"))
+    reference = f"ct-{old.intent_id.hex[:20]}"
+    path = tmp_path / "crash.db"
+    with _r03_journal(path) as journal:
+        seed_canonical_equity_root(journal)
+        first, port, client, _ = wired(journal, tmp_path)
+        crash_transport = CrashTransport([*startup_responses(), *canonical_risk_refresh_responses()])
+        client.transport = crash_transport
+        port.clock = lambda: datetime.fromtimestamp((fx.SERVER_TIME_MS + 2) / 1000, tz=timezone.utc)
+        first.start()
+        with pytest.raises(Crash):
+            admitted_execute(first, old)
+        assert len([r for r in crash_transport.requests if r.method == "POST"]) == 1
+        assert len(first._pending) == 1
+        assert len([e for e in journal.read_range() if e.event_type == "order.submission.attempted"]) == 1
+        first.stop()
+    now = BASE + timedelta(seconds=2)
+    new = intent("r03-crash-new", quantity=Decimal("0.00100"),
+                 decision_started_at=now, decision_completed_at=now, market_event_ts=now,
+                 market_reference="r03-new-snapshot")
+    market = ReplayMarketStateProvider([MarketObservation(
+        symbol=new.symbol, price=new.reference_price, market_event_ts=now,
+        local_ingest_ts=now, market_reference=new.market_reference, sequence=2,
+    )])
+    executed = {"not_found": "0", "open": "0", "partial": "0.0005", "filled": "0.001"}[resolution]
+    status = {"not_found": "NEW", "open": "NEW", "partial": "PARTIALLY_FILLED", "filled": "FILLED"}[resolution]
+    opened = fx.open_orders_response(reference, status=status, executed_qty=executed) if resolution in {"open", "partial"} else fx.open_orders_response()
+    fills = (fx.fill(qty=executed, commission="0", asset="USDT"),) if Decimal(executed) else ()
+    authoritative = fx.order_response(reference, status=status, executed_qty=executed,
+                                      fills=fills, order_id=100, transact_time=fx.SERVER_TIME_MS + 2000)
+    lookup = [fx.rejected(-2013)] if resolution == "not_found" else ([authoritative] if resolution == "filled" else [])
+    account = fx.account_response()
+    for balance in account.body["balances"]:
+        if balance["asset"] == "BTC":
+            balance.update(free=executed, locked="0")
+        elif balance["asset"] == "USDT":
+            balance.update(free="99973", locked=format((Decimal("0.001")-Decimal(executed))*Decimal("27000"), "f"))
+    risk_reads = [fx.time_response(fx.SERVER_TIME_MS + 4000), opened, account,
+                  fx.price_response("27000.00"), opened]
+    replies = [fx.time_response(), opened, *lookup, *fx.environment_responses(),
+               authoritative, *risk_reads, *risk_reads]
+    with _r03_journal(path) as journal:
+        restarted, port, client, transport = wired(
+            journal, tmp_path, replies, when=now, market=market,
+            limits_value=replace(limits(), max_symbol_exposure_quote=Decimal("40")),
+        )
+        if resolution == "not_found":
+            with pytest.raises(ProductionRecoveryRequiredError):
+                restarted.start()
+            with pytest.raises(ProductionStateError):
+                admitted_prepare(restarted, new)
+            assert not [r for r in transport.requests if r.method == "POST"]
+            record_property("restart_post_count", 0)
+            return
+        restarted.start()
+        assert not [r for r in transport.requests if r.method == "POST"]
+        assert port.recover_order(old.intent_id, correlation_id=old.correlation_id) is not None
+        snapshot, _ = restarted._risk_state_provider(
+            now, guard=restarted._guard, correlation_id=new.correlation_id,
+        )
+        record_property("earlier_symbol_exposure", str(snapshot.symbol_exposure_quote[new.symbol]))
+        record_property("earlier_position", str(snapshot.position_quantity[new.symbol]))
+        record_property("earlier_open_orders", snapshot.open_orders)
+        assert snapshot.symbol_exposure_quote[new.symbol] == Decimal("27")
+        assert snapshot.position_quantity[new.symbol] == Decimal(executed)
+        preparation = admitted_prepare(restarted, new)
+        assert not preparation.approved
+        assert "max_symbol_exposure_exceeded" in preparation.blocked_reason_code
+        assert not [r for r in transport.requests if r.method == "POST"]
+        record_property("restart_post_count", 0)
+
+
 def assert_stopped(runtime, transport):
     assert runtime.state().value == "stopped"
     assert runtime.startup_report() is None

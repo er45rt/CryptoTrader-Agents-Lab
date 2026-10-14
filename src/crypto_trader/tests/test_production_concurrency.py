@@ -106,3 +106,39 @@ def test_lock_error_refuses_ownership_mutation(tmp_path,monkeypatch):
     monkeypatch.setattr(ownership.sqlite3,'connect',fail)
     with pytest.raises(OwnershipStateError,match='lock unavailable'):_takeover(tmp_path/'ownership.json','one')
     assert not (tmp_path/'ownership.json').exists()
+
+
+def test_r03_competing_journal_writers_commit_one_attempt_and_post_once(tmp_path, record_property):
+    from crypto_trader.tests.test_testnet_durable_submission import (
+        _r03_journal, started, execution_request, CLIENT_ORDER_ID, attempt_events, posts,
+    )
+    from crypto_trader.tests import testnet_fixtures as fx
+    path = tmp_path / "competing.db"
+    with _r03_journal(path):
+        pass
+    barrier = Barrier(2)
+    def writer(_index):
+        transport = fx.ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
+        with _r03_journal(path) as journal:
+            port = started(transport, journal)
+            prepare = port._prepare_durable_write
+            def rendezvous(request):
+                prepared = prepare(request)
+                barrier.wait(10)
+                return prepared
+            port._prepare_durable_write = rendezvous
+            try:
+                port.submit(execution_request())
+                result = "sent"
+            except Exception as exc:
+                result = type(exc).__name__
+            return len(posts(transport)), result
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(writer, range(2)))
+    with _r03_journal(path) as journal:
+        attempts = attempt_events(journal)
+    total = sum(count for count, _result in results)
+    record_property("post_count", total)
+    record_property("attempt_count", len(attempts))
+    assert total == 1, results
+    assert len(attempts) == 1

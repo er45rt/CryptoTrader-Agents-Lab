@@ -183,12 +183,13 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             ),
         )
 
+        prior_attempt = self._has_durable_attempt(client_order_id, request=request)
         self._intents[client_order_id] = request.intent_id
         self._correlations[client_order_id] = request.correlation_id
 
         if (
             client_order_id in self._pending_submissions
-            or self._has_durable_attempt(client_order_id)
+            or prior_attempt
         ):
             try:
                 order = self.client.adopt_order_status(order_request, wait=False)
@@ -329,7 +330,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
         ):
             self.journal.append(event)
 
-    def _has_durable_attempt(self, client_order_id: str) -> bool:
+    def _has_durable_attempt(self, client_order_id: str, *, request: ExecutionRequest | None = None) -> bool:
         """True when this deterministic venue identity has ever crossed the durable send boundary."""
         assert self.journal is not None
         read_range = getattr(self.journal, "read_range", None)
@@ -337,11 +338,22 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             raise AttemptJournalRequiredError(
                 "the durable journal cannot prove prior submission attempts; refusing a venue write."
             )
-        return any(
-            isinstance(event, OrderSubmissionAttempted)
-            and event.payload.venue_reference == client_order_id
-            for event in read_range()
-        )
+        attempts = [event for event in read_range() if isinstance(event, OrderSubmissionAttempted)
+                    and event.payload.venue_reference == client_order_id]
+        if len(attempts) > 1:
+            raise AmbiguousOrderError("multiple durable attempts reserve the same venue identity.")
+        if attempts and request is not None:
+            event = attempts[0]
+            payload = event.payload
+            if (payload.intent_id, event.correlation_id, event.symbol, event.strategy_id,
+                payload.side, payload.order_type, payload.quantity, payload.limit_price,
+                payload.time_in_force) != (
+                request.intent_id, request.correlation_id, request.symbol, request.strategy_id,
+                request.side.value, request.order_type.value, request.quantity, request.limit_price,
+                request.time_in_force.value,
+            ):
+                raise AmbiguousOrderError("full intent UUID or persisted attempt economics do not match.")
+        return bool(attempts)
 
     def _now(self) -> datetime:
         stamp = self.clock() if self.clock is not None else datetime.now(timezone.utc)

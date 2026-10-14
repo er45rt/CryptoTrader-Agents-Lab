@@ -43,6 +43,7 @@ from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterG
 from crypto_trader.events import (
     ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
+    OrderSubmissionAttempted,
 )
 from crypto_trader.execution import (
     DurableVenueWritePort,
@@ -521,6 +522,9 @@ class ProductionRuntime:
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._pending = pending if pending is not None else PendingIntentRegistry()
         self._issued_preparations: dict[UUID, tuple[IntentPreparation, datetime]] = {}
+        self._prepared_revisions = {}
+        self._prior_session_intents: frozenset[UUID] = frozenset()
+        self._session_evidence: tuple[tuple[UUID, str], ...] = ()
         self._admission_token: object | None = None
         self._producer = producer
         self._control = (
@@ -677,6 +681,10 @@ class ProductionRuntime:
                 authorize_startup_fence(fence)
                 phase = "venue_evidence"
                 view = JournalView.capture(self._journal, self._instrument.symbol)
+                prior_intents = frozenset(
+                    identity for identity, contents in view.contents
+                    if json.loads(contents)["event_type"] == "trade.intent.created"
+                )
                 batch = collector.collect(
                     nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
                 )
@@ -750,8 +758,21 @@ class ProductionRuntime:
                 )
                 # A successful fully-resolved startup supersedes any in-memory reservation from
                 # the previous run; durable journal/venue state is authoritative after recovery.
-                self._pending.clear()
+                if writing:
+                    # A resolved order-status report alone is not complete economic evidence.
+                    # Keep attempted reservations until canonical risk refresh proves coverage.
+                    for item in self._pending.items():
+                        if not self._attempt_may_exist(item.intent_id):
+                            self._pending.remove(item.intent_id)
+                    self._prior_session_intents = prior_intents
+                    self._session_evidence = tuple(
+                        (identity, canonical_event(self._journal.read_by_id(identity)))
+                        for identity in run.journaled_event_ids
+                    )
+                else:
+                    self._pending.clear()
                 self._issued_preparations.clear()
+                self._prepared_revisions.clear()
                 self._state = ExecutionRuntimeState.RUNNING
             return self._startup
         except Exception as exc:
@@ -792,6 +813,10 @@ class ProductionRuntime:
         self._expire_preparations(now)
         controller = self._control.load_safety_state().controller
         stages: list[str] = []
+        if self._durable_venue_writes:
+            self._require_session_evidence()
+            if self._intent_predates_session(intent):
+                return self._blocked(intent, ["session:abandoned"], "prior_session_intent", controller, now)
         if (
             controller.kill_switch_engaged
             or controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}
@@ -834,6 +859,12 @@ class ProductionRuntime:
                 guard=self._guard,
                 correlation_id=intent.correlation_id,
             )
+            if self._durable_venue_writes:
+                # The canonical source validated journal fills, balances and venue open orders.
+                # Transfer only prior attempted reservations into that proven exposure snapshot.
+                for item in self._pending.items():
+                    if item.intent_id not in self._issued_preparations and self._attempt_may_exist(item.intent_id):
+                        self._pending.remove(item.intent_id)
         else:
             risk_state = self._risk_state_provider(now)
             risk_now = now
@@ -877,6 +908,8 @@ class ProductionRuntime:
             preparation,
             intent_deadline(intent, self._validity_gate.policy),
         )
+        if self._durable_venue_writes:
+            self._prepared_revisions[intent.intent_id] = self._journal.revision()
         return preparation
 
     def submit_prepared(
@@ -950,6 +983,7 @@ class ProductionRuntime:
                 raise NonDurableExecutionError("execution journal changed after construction")
             if self._durable_venue_writes:
                 self._require_canonical_risk_binding()
+                self._require_session_evidence()
         except Exception:
             if release_on_failure:
                 self._release_preparation(preparation.intent_id)
@@ -972,6 +1006,9 @@ class ProductionRuntime:
             raise
 
         self._last_fence = check
+        if self._durable_venue_writes and self._journal.revision() != self._prepared_revisions.get(preparation.intent_id):
+            self._release_preparation(preparation.intent_id)
+            raise ProductionStateError("journal changed after Hard Risk preparation; new decision required.")
         request = ExecutionRequest(
             intent_id=preparation.intent_id,
             correlation_id=preparation.correlation_id,
@@ -995,6 +1032,7 @@ class ProductionRuntime:
             # issued object but KEEP its economic pending reservation until recovery/startup
             # establishes authoritative outcome.
             self._issued_preparations.pop(preparation.intent_id, None)
+            self._prepared_revisions.pop(preparation.intent_id, None)
             reason_code = getattr(exc, "reason_code", None)
             self._last_outcome = (
                 "unknown_pending_reconciliation"
@@ -1003,9 +1041,14 @@ class ProductionRuntime:
             )
             raise
         except Exception:
-            self._release_preparation(preparation.intent_id)
+            if self._durable_venue_writes and self._attempt_may_exist(preparation.intent_id):
+                self._issued_preparations.pop(preparation.intent_id, None)
+                self._prepared_revisions.pop(preparation.intent_id, None)
+                self._last_outcome = "unknown_pending_reconciliation"
+            else:
+                self._release_preparation(preparation.intent_id)
             raise
-        self._release_preparation(preparation.intent_id)
+        self._release_preparation(preparation.intent_id, submitted=True)
         self._last_outcome = "submitted"
         self._last_refusal = None
         return ProductionSubmitResult(
@@ -1093,9 +1136,11 @@ class ProductionRuntime:
                 "thread; producer threads must use the admission controller."
             )
 
-    def _release_preparation(self, intent_id: UUID) -> None:
+    def _release_preparation(self, intent_id: UUID, *, submitted: bool = False) -> None:
         self._issued_preparations.pop(intent_id, None)
-        self._pending.remove(intent_id)
+        self._prepared_revisions.pop(intent_id, None)
+        if submitted or not self._durable_venue_writes or not self._attempt_may_exist(intent_id):
+            self._pending.remove(intent_id)
 
     def _expire_preparations(self, now: datetime) -> None:
         expired = [
@@ -1104,7 +1149,33 @@ class ProductionRuntime:
             if now > expires_at
         ]
         for intent_id in expired:
-            self._release_preparation(intent_id)
+            if self._durable_venue_writes and self._attempt_may_exist(intent_id):
+                self._issued_preparations.pop(intent_id, None)
+                self._prepared_revisions.pop(intent_id, None)
+            else:
+                self._release_preparation(intent_id)
+
+    def _attempt_may_exist(self, intent_id: UUID) -> bool:
+        try:
+            return any(isinstance(event, OrderSubmissionAttempted) and event.payload.intent_id == intent_id
+                       for event in self._journal.read_range())
+        except Exception:
+            return True  # Failure to prove absence never releases economic risk.
+
+    def _intent_predates_session(self, intent: ProductionIntent) -> bool:
+        """Cheap producer-thread check, bound to persisted startup evidence at consumption."""
+        if not self._durable_venue_writes or self._startup is None:
+            return False
+        boundary = self._startup.started_at
+        return (intent.intent_id in self._prior_session_intents
+                or intent.decision_completed_at < boundary or intent.market_event_ts < boundary)
+
+    def _require_session_evidence(self) -> None:
+        if not self._session_evidence or any(
+            (event := self._journal.read_by_id(identity)) is None or canonical_event(event) != contents
+            for identity, contents in self._session_evidence
+        ):
+            raise ProductionStateError("persisted startup session boundary is missing or changed.")
 
     def _require_canonical_risk_binding(self) -> ProductionRiskStateSource:
         """Fail closed unless venue writes and canonical risk evidence share one authority path."""

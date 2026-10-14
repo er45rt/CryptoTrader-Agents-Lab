@@ -177,11 +177,13 @@ class DurableVenueWritePort(ABC):
 
     def submit_durably(self, request: ExecutionRequest) -> str:
         """The ONLY approved venue-write entry: marker -> authorization -> one send."""
+        journal = self.durable_attempt_journal()
+        revision = getattr(journal, "revision", None)
+        expected = revision() if callable(revision) else None
         prepared = self._prepare_durable_write(request)
         if not prepared.requires_write:
             return str(prepared.adopted_reference)
         marker = self._durable_attempt_event(prepared, request)
-        journal = self.durable_attempt_journal()
         if journal is None or not isinstance(journal, DurableAttemptJournal):
             raise NonDurableExecutionError(
                 "the durable venue-write boundary requires a durable attempt journal; none is "
@@ -191,14 +193,39 @@ class DurableVenueWritePort(ABC):
 
         if not isinstance(marker, OrderSubmissionAttempted):
             raise NonDurableExecutionError("the durable marker must be an OrderSubmissionAttempted")
-        journal.append(marker)
+        from crypto_trader.persistence.journal import SQLiteEventJournal
+        import hashlib
+
+        if isinstance(journal, SQLiteEventJournal) and journal.has_full_foundation():
+            journal.require_venue_write_ready()
+        if expected is not None:
+            result = journal.append_batch_if_revision([marker], expected=expected, require_all_new=True)
+            entries = tuple(sorted((*expected.entries,
+                                    (marker.event_id, hashlib.sha256(marker.to_json().encode()).hexdigest())),
+                                   key=lambda entry: str(entry[0])))
+            if (result.inserted != 1 or result.before != expected
+                or result.after.entries != entries or journal.revision() != result.after):
+                raise NonDurableExecutionError("attempt commit revision could not be independently verified.")
+        else:
+            # Preserve non-writing failure probes: a structurally shaped journal can surface its
+            # append/readback failure, but can never acquire SQLite venue authorization below.
+            journal.append(marker)
         stored = journal.read_by_id(marker.event_id)
         if not isinstance(stored, OrderSubmissionAttempted) or stored != marker:
             raise NonDurableExecutionError(
                 "the durable submission-attempt marker could not be read back after the append; "
                 "refusing to send any request."
             )
+        if not isinstance(journal, SQLiteEventJournal):
+            raise NonDurableExecutionError("venue POST requires the verified SQLite writer.")
+        try:
+            journal.require_venue_write_ready()
+        except Exception as exc:
+            raise NonDurableExecutionError("journal has no proven FULL venue-write authority.") from exc
         authorized = self._bind_durable_authorization(prepared, marker)
+        journal.require_venue_write_ready()
+        if expected is not None and journal.revision() != result.after:
+            raise NonDurableExecutionError("journal changed before the authorized send.")
         return self._send_authorized_write(authorized, request)
 
 

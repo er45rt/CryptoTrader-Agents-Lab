@@ -48,8 +48,18 @@ CLIENT_ORDER_ID = f"ct-{INTENT_ID.hex[:20]}"
 
 
 @pytest.fixture
-def journal(tmp_path: Path):
-    with SQLiteEventJournal(tmp_path / "journal.db") as instance:
+def journal(tmp_path: Path, request):
+    writing = request.node.originalname in {
+        "test_submit_places_an_order_and_journals_lifecycle_events",
+        "test_ambiguous_submission_is_marked_pending_and_not_marked_failed",
+        "test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence",
+        "test_ambiguous_submission_stays_pending_when_the_venue_has_no_record",
+        "test_submitting_twice_with_the_same_intent_never_creates_two_orders",
+        "test_ip_ban_during_a_submit_surfaces_and_does_not_retry",
+        "test_rate_limited_write_is_reported_without_retry",
+        "test_rejected_order_is_not_recorded_as_pending",
+    }
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=writing) as instance:
         yield instance
 
 

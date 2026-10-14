@@ -60,8 +60,17 @@ START_CORRELATION_ID = UUID("2f0a1d84-6c37-4a19-9d52-7e3b8c04a1f6")
 
 
 @pytest.fixture
-def journal(tmp_path: Path):
-    with SQLiteEventJournal(tmp_path / "journal.db") as active:
+def journal(tmp_path: Path, request):
+    writing = request.node.originalname in {
+        "test_bound_admission_is_the_only_writing_decision_ingress",
+        "test_testnet_execution_flows_through_the_production_runtime",
+        "test_an_ambiguous_submit_stays_unknown_pending_reconciliation",
+        "test_post_send_rate_limit_keeps_production_reservation_unknown",
+        "test_ambiguous_preparation_is_one_shot_and_cannot_drop_its_reservation",
+        "test_no_credential_value_leaks_into_records_or_the_journal",
+        "test_cancel_open_emergency_behavior_remains_available",
+    }
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=writing) as active:
         yield active
 
 
@@ -658,7 +667,7 @@ def _deterministic_run(root: Path):
     journal_path = root / "journal.db"
     state_dir = root / "state"
     intent_obj = intent("determinism-1")
-    with SQLiteEventJournal(journal_path) as journal:
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
         transport = fx.ScriptedTransport(
             [*startup_responses(), fx.order_response(_reference_for(intent_obj))]
         )

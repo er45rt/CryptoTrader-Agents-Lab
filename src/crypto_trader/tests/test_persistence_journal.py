@@ -60,12 +60,68 @@ def journal(tmp_path: Path):
 
 # --- basics ---
 
+def test_r03_full_foundation_header_and_schema_roll_back_together(tmp_path, monkeypatch):
+    path = tmp_path / "interrupted-genesis.db"
+    connect = sqlite3.connect
+
+    class InterruptedFoundation(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("PRAGMA application_id="):
+                assert self.in_transaction
+                assert super().execute("PRAGMA synchronous").fetchone()[0] == 2
+                raise RuntimeError("offline interrupted founding transaction")
+            return result
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(
+            *args, **kwargs, factory=InterruptedFoundation,
+        ))
+        with pytest.raises(RuntimeError, match="interrupted founding"):
+            SQLiteEventJournal(path, venue_writes=True)
+    with connect(path) as reader:
+        assert reader.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert reader.execute("SELECT name FROM sqlite_schema").fetchall() == []
+    with pytest.raises(JournalSchemaError, match="retrospective"):
+        SQLiteEventJournal(path, venue_writes=True)
+
+
 def test_append_and_read_back_round_trip(journal):
     event = decision()
 
     assert journal.append(event) is True
     assert journal.count() == 1
     assert journal.read_by_id(event.event_id) == event
+
+
+def test_r03_full_foundation_active_connection_and_header(tmp_path, record_property):
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    with _r03_journal(tmp_path / "full.db") as journal:
+        synchronous = journal._conn.execute("PRAGMA synchronous").fetchone()[0]
+        application = journal._conn.execute("PRAGMA application_id").fetchone()[0]
+        record_property("synchronous", synchronous)
+        record_property("application_id", application)
+        assert journal.journal_mode().lower() == "wal"
+        assert synchronous == 2
+        assert application == 0x43544647
+        assert journal._conn.execute("PRAGMA user_version").fetchone()[0] == 0
+        journal.append(decision())
+
+
+def test_r03_refuse_full_stamp_on_populated_legacy_journal(tmp_path):
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    path = tmp_path / "legacy.db"
+    original = decision()
+    with SQLiteEventJournal(path) as journal:
+        journal.append(original)
+    with pytest.raises(JournalSchemaError):
+        with _r03_journal(path):
+            pass
+    with SQLiteEventJournal(path) as journal:
+        assert journal.read_by_id(original.event_id) == original
+        assert journal.count() == 1
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert journal._conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
 
 def test_duplicate_append_is_idempotent(journal):

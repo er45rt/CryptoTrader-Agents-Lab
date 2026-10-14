@@ -42,6 +42,10 @@ __all__ = [
 #: Schema version of the journal database itself (not of any event).
 JOURNAL_SCHEMA_VERSION = 1
 
+# SQLite header marker: CTFG (CryptoTrader FULL Genesis), not a cryptographic signature.
+# Trust is limited to the storage boundary, and every send checks the active connection too.
+FULL_GENESIS_APPLICATION_ID = 0x43544647
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS journal_meta (
     key   TEXT PRIMARY KEY,
@@ -187,17 +191,76 @@ class SQLiteEventJournal:
         *,
         registry: EventRegistry | None = None,
         timeout_seconds: float = 10.0,
+        venue_writes: bool = False,
     ) -> None:
         self.path = str(path)
+        was_new = self.path != ":memory:" and not Path(self.path).exists()
         self._registry = registry if registry is not None else get_default_registry()
         self._conn = sqlite3.connect(self.path, timeout=timeout_seconds)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA synchronous=FULL;" if venue_writes else "PRAGMA synchronous=NORMAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._ensure_schema()
+        try:
+            if venue_writes:
+                self._ensure_full_foundation(was_new=was_new)
+            else:
+                self._ensure_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     # --- schema ---
+
+    def has_full_foundation(self) -> bool:
+        return self._conn.execute("PRAGMA application_id").fetchone()[0] == FULL_GENESIS_APPLICATION_ID
+
+    def require_venue_write_ready(self) -> None:
+        """Prove founding provenance and current writer durability, without changing either."""
+        if (
+            not self.has_full_foundation()
+            or self._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal"
+            or self._conn.execute("PRAGMA synchronous").fetchone()[0] != 2
+            or self._conn.execute("PRAGMA user_version").fetchone()[0] != 0
+        ):
+            raise JournalSchemaError("venue POST requires a FULL-founded journal and active WAL/FULL writer.")
+
+    def _ensure_full_foundation(self, *, was_new: bool) -> None:
+        if self._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            raise JournalSchemaError("venue journal requires file-backed SQLite WAL.")
+        if self._conn.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            raise JournalSchemaError("FULL was not established on the founding writer.")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            application = self._conn.execute("PRAGMA application_id").fetchone()[0]
+            user_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if user_version != 0:
+                raise JournalSchemaError("reserved SQLite user_version; refusing FULL founding.")
+            if application == FULL_GENESIS_APPLICATION_ID:
+                row = self._conn.execute("SELECT value FROM journal_meta WHERE key='schema_version'").fetchone()
+                if row is None or int(row[0]) != JOURNAL_SCHEMA_VERSION:
+                    raise JournalSchemaError("FULL-founded journal schema is missing or unsupported.")
+            else:
+                if (
+                    not was_new or application != 0
+                    or self._conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone() is not None
+                ):
+                    raise JournalSchemaError("refusing retrospective FULL founding of an existing journal.")
+                # executescript implicitly commits: execute the existing static DDL statements
+                # individually so header, unchanged schema and schema version commit atomically.
+                for statement in _SCHEMA_SQL.split(";"):
+                    if statement.strip():
+                        self._conn.execute(statement)
+                self._conn.execute("INSERT INTO journal_meta(key,value) VALUES('schema_version',?)",
+                                   (str(JOURNAL_SCHEMA_VERSION),))
+                self._conn.execute(f"PRAGMA application_id={FULL_GENESIS_APPLICATION_ID}")
+            self.require_venue_write_ready()
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        self.require_venue_write_ready()
 
     def _ensure_schema(self) -> None:
         with self._conn:

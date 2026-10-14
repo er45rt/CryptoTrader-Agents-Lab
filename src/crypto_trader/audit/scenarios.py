@@ -441,7 +441,7 @@ def scenario_cancel_failure(workspace: Path) -> ScenarioResult:
     # Stage 2: the fresh order is created through the production runtime path (prepare -> durable
     # attempt marker -> one send) with a temporary journal inside the scenario workspace. The
     # audit never authorizes a prepared order or calls the client's write boundary directly.
-    with SQLiteEventJournal(workspace / "cancel_failure_journal.db") as journal:
+    with SQLiteEventJournal(workspace / "cancel_failure_journal.db", venue_writes=True) as journal:
         runtime = TestnetOrderRuntime(
             client=client, instrument=_audit_runtime_instrument(), journal=journal
         )
@@ -511,7 +511,7 @@ def scenario_network_interruption(workspace: Path) -> ScenarioResult:
     )
     write_ambiguous = False
     # Stage 2: the interrupted write traverses the SAME runtime -> client -> transport.send path.
-    with SQLiteEventJournal(workspace / "network_interruption_journal.db") as journal:
+    with SQLiteEventJournal(workspace / "network_interruption_journal.db", venue_writes=True) as journal:
         write_runtime = TestnetOrderRuntime(
             client=write_client, instrument=_audit_runtime_instrument(), journal=journal
         )
