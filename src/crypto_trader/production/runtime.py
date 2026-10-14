@@ -37,12 +37,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
 from crypto_trader.events import (
     ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
+    RISK_EVALUATION_EVENT_TYPE, VALIDITY_EVENT_TYPE, TRADE_INTENT_EVENT_TYPE,
     OrderSubmissionAttempted,
 )
 from crypto_trader.execution import (
@@ -524,6 +525,7 @@ class ProductionRuntime:
         self._issued_preparations: dict[UUID, tuple[IntentPreparation, datetime]] = {}
         self._prepared_revisions = {}
         self._prior_session_intents: frozenset[UUID] = frozenset()
+        self._prior_session_trade_intents: dict[UUID, str] = {}
         self._session_evidence: tuple[tuple[UUID, str], ...] = ()
         self._admission_token: object | None = None
         self._producer = producer
@@ -681,9 +683,21 @@ class ProductionRuntime:
                 authorize_startup_fence(fence)
                 phase = "venue_evidence"
                 view = JournalView.capture(self._journal, self._instrument.symbol)
+                explicit_identity_types = {
+                    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+                    RISK_EVALUATION_EVENT_TYPE, VALIDITY_EVENT_TYPE,
+                }
+                prior_events = tuple((identity, contents, json.loads(contents))
+                                     for identity, contents in view.contents)
                 prior_intents = frozenset(
-                    identity for identity, contents in view.contents
-                    if json.loads(contents)["event_type"] == "trade.intent.created"
+                    UUID(event["payload"]["intent_id"]) for _, _, event in prior_events
+                    if event["event_type"] in explicit_identity_types
+                )
+                prior_trade_intents = {identity: contents for identity, contents, event in prior_events
+                                       if event["event_type"] == TRADE_INTENT_EVENT_TYPE}
+                prior_identity_evidence = tuple(
+                    (identity, contents) for identity, contents, event in prior_events
+                    if event["event_type"] in explicit_identity_types | {TRADE_INTENT_EVENT_TYPE}
                 )
                 batch = collector.collect(
                     nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
@@ -765,7 +779,8 @@ class ProductionRuntime:
                         if not self._attempt_may_exist(item.intent_id):
                             self._pending.remove(item.intent_id)
                     self._prior_session_intents = prior_intents
-                    self._session_evidence = tuple(
+                    self._prior_session_trade_intents = prior_trade_intents
+                    self._session_evidence = prior_identity_evidence + tuple(
                         (identity, canonical_event(self._journal.read_by_id(identity)))
                         for identity in run.journaled_event_ids
                     )
@@ -1163,12 +1178,31 @@ class ProductionRuntime:
             return True  # Failure to prove absence never releases economic risk.
 
     def _intent_predates_session(self, intent: ProductionIntent) -> bool:
-        """Cheap producer-thread check, bound to persisted startup evidence at consumption."""
+        """Known persisted identities only; general producer provenance is R-03a-1b."""
         if not self._durable_venue_writes or self._startup is None:
             return False
         boundary = self._startup.started_at
-        return (intent.intent_id in self._prior_session_intents
-                or intent.decision_completed_at < boundary or intent.market_event_ts < boundary)
+        if (intent.intent_id in self._prior_session_intents
+                or intent.decision_completed_at < boundary or intent.market_event_ts < boundary):
+            return True
+        if self._prior_session_trade_intents:
+            # Paper _stable_id: preserve its namespace and "|" separator without importing
+            # the Paper execution substrate. UUID5 is not producer authentication.
+            derived_event_id = uuid5(UUID("7d4f2b91-3c6a-4e58-9b2f-1a9d5c8e7f30"),
+                                     f"{intent.intent_id}|intent-event")
+            contents = self._prior_session_trade_intents.get(derived_event_id)
+            if contents is not None:
+                event = json.loads(contents)
+                payload = event["payload"]
+                if (event["event_type"], event["symbol"], event["strategy_id"], event["correlation_id"],
+                    payload["side"], payload["order_type"], Decimal(payload["quantity"]),
+                    None if payload["limit_price"] is None else Decimal(payload["limit_price"])) != (
+                    TRADE_INTENT_EVENT_TYPE, intent.symbol, intent.strategy_id, str(intent.correlation_id),
+                    intent.side.value, intent.order_type.value, intent.quantity, intent.limit_price,
+                ):
+                    raise ProductionStateError("derived historical intent identity has mismatched economics.")
+                return True
+        return False
 
     def _require_session_evidence(self) -> None:
         if not self._session_evidence or any(

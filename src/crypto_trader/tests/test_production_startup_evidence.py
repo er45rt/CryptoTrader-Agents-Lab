@@ -97,6 +97,219 @@ def test_r03_old_persisted_intent_without_attempt_is_abandoned_after_restart(tmp
         assert written == []
 
 
+def test_r03_paper_derived_identity_refuses_freshened_redelivery(
+    tmp_path, record_property,
+):
+    from datetime import timedelta
+    from crypto_trader.events import TradeIntentCreated
+    from crypto_trader.paper.config import SessionConfig
+    from crypto_trader.paper.decisions import ScriptedDecisionSource, StrategyDecision
+    from crypto_trader.paper.feed import FrozenMarketDataFeed, MarketObservation as PaperObservation
+    from crypto_trader.paper.modes import TradingMode
+    from crypto_trader.paper.session import TradingSession, _stable_id
+    from crypto_trader.safety import SafetyController
+    from crypto_trader.tests.production_fixtures import (
+        BASE, intent, seed_canonical_equity_root, bind_test_admission,
+        canonical_risk_refresh_responses, validity_gate, limits,
+    )
+    from crypto_trader.validity import MarketObservation, ReplayMarketStateProvider
+
+    session_id = uuid4()
+    old_reference = "identity-prior-snapshot"
+    target = intent(
+        "identity-prior-intent", correlation_id=session_id,
+        intent_id=_stable_id(str(session_id), old_reference, "intent"),
+        market_reference=old_reference,
+    )
+    observation = PaperObservation(
+        symbol=target.symbol, price=target.reference_price,
+        observed_at=BASE, market_reference=old_reference,
+    )
+    decision = StrategyDecision(
+        action="buy", confidence="high", rationale="offline identity audit",
+        quantity=target.quantity, limit_price=target.limit_price,
+    )
+    path = tmp_path / "identity-restart.db"
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        seed_canonical_equity_root(journal)
+        session = TradingSession(
+            config=SessionConfig(mode=TradingMode.SHADOW, symbol=target.symbol,
+                                 strategy_id=target.strategy_id, session_id=session_id),
+            journal=journal, feed=FrozenMarketDataFeed((observation,)),
+            decisions=ScriptedDecisionSource({old_reference: decision}),
+            validity_gate=validity_gate(), limits=limits(), safety=SafetyController(),
+        )
+        session._record_decision(observation, decision)
+        session._record_intent(observation, decision, target.intent_id)
+        stored = next(e for e in journal.read_range() if isinstance(e, TradeIntentCreated))
+        assert stored.event_id == _stable_id(str(target.intent_id), "intent-event")
+        assert stored.event_id != target.intent_id
+        assert stored.correlation_id != target.intent_id
+        assert stored.causation_id != target.intent_id
+        assert not any(e.event_type in {"order.submission.attempted",
+                       "risk.evaluation.recorded", "validity.disposition.recorded"}
+                       for e in journal.read_range())
+
+    now = BASE + timedelta(seconds=2)
+    redelivered = replace(target, decision_started_at=now, decision_completed_at=now,
+                          market_event_ts=now, market_reference="identity-fresh-snapshot")
+    market = ReplayMarketStateProvider([MarketObservation(
+        symbol=target.symbol, price=target.reference_price, market_event_ts=now,
+        local_ingest_ts=now, market_reference=redelivered.market_reference, sequence=2,
+    )])
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        assert journal.read_by_id(stored.event_id) == stored
+        runtime, _, _, transport = wired(
+            journal, tmp_path,
+            [*startup_responses(), *canonical_risk_refresh_responses(),
+             fx.order_response(f"ct-{target.intent_id.hex[:20]}", orig_qty="0.01000")],
+            when=now, market=market, bind_admission=False,
+        )
+        admission = bind_test_admission(runtime, when=now)
+        report = runtime.start()
+        assert redelivered.decision_completed_at >= report.started_at
+        assert redelivered.market_event_ts >= report.started_at
+        assert admission._time_rejection_reason(redelivered, now) is None
+        accepted, reason = admission.offer(redelivered)
+        outcome = admission.run_once() if accepted else None
+        record_property("origin", "paper_derived")
+        record_property("identity_binding", "paper_uuid5_intent_event")
+        record_property("stored_event_id", str(stored.event_id))
+        record_property("full_intent_id", str(target.intent_id))
+        record_property("refusal_or_admission_reason", reason)
+        record_property("accepted_after_restart", accepted)
+        record_property("submitted_after_restart", bool(outcome and outcome.submitted))
+        record_property("post_count", len([r for r in transport.requests if r.method == "POST"]))
+        assert reason == "prior_session_intent", "identity refusal must not be supplied by a time gate"
+        assert accepted is False
+        assert not [r for r in transport.requests if r.method == "POST"]
+
+        from crypto_trader.production import ProductionStateError
+        with pytest.raises(ProductionStateError, match="derived historical intent identity has mismatched economics"):
+            admission.offer(replace(redelivered, quantity=redelivered.quantity * 2))
+        assert not [r for r in transport.requests if r.method == "POST"]
+
+
+def _r03_check_explicit_identity_after_restart(tmp_path, target, source, record_property):
+    from datetime import timedelta
+    from crypto_trader.tests.production_fixtures import BASE, bind_test_admission
+    from crypto_trader.validity import MarketObservation, ReplayMarketStateProvider
+    path = tmp_path / "explicit-identity.db"
+    explicit_types = {"order.submission.attempted", "risk.evaluation.recorded",
+                      "validity.disposition.recorded"}
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        identities = [e for e in journal.read_range() if e.event_type in explicit_types]
+        assert len(identities) == 1
+        stored = identities[0]
+        assert stored.event_type == source
+        assert stored.payload.intent_id == target.intent_id
+        assert stored.event_id != target.intent_id
+        assert not any(e.event_type == "trade.intent.created" for e in journal.read_range())
+    now = BASE + timedelta(seconds=2)
+    refreshed = replace(target, decision_started_at=now, decision_completed_at=now,
+                        market_event_ts=now, market_reference="explicit-fresh-snapshot")
+    market = ReplayMarketStateProvider([MarketObservation(
+        symbol=target.symbol, price=target.reference_price, market_event_ts=now,
+        local_ingest_ts=now, market_reference=refreshed.market_reference, sequence=2,
+    )])
+    reference = f"ct-{target.intent_id.hex[:20]}"
+    responses = startup_responses() if source != "order.submission.attempted" else [
+        fx.time_response(), fx.open_orders_response(),
+        fx.order_response(reference, status="CANCELED", orig_qty="0.01000"),
+        *fx.environment_responses(),
+    ]
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        assert journal.read_by_id(stored.event_id) == stored
+        runtime, _, _, transport = wired(journal, tmp_path, responses, when=now,
+                                          market=market, bind_admission=False)
+        admission = bind_test_admission(runtime, when=now)
+        report = runtime.start()
+        assert refreshed.decision_completed_at >= report.started_at
+        assert refreshed.market_event_ts >= report.started_at
+        assert admission._time_rejection_reason(refreshed, now) is None
+        accepted, reason = admission.offer(refreshed)
+        # Deliberately no run_once: the adapter's duplicate-POST gate cannot cause this refusal.
+        record_property("identity_source", source)
+        record_property("stored_intent_uuid", str(stored.payload.intent_id))
+        record_property("source_event_uuid", str(stored.event_id))
+        record_property("accepted", accepted)
+        record_property("reason", reason)
+        record_property("post_count", len([r for r in transport.requests if r.method == "POST"]))
+        assert reason == "prior_session_intent"
+        assert accepted is False
+        assert not [r for r in transport.requests if r.method == "POST"]
+        assert admission.offer(replace(refreshed, intent_id=uuid4())) == (True, "accepted")
+        # A later loss of the sole persisted origin must invalidate consumer authority.
+        journal._conn.execute("DELETE FROM events WHERE event_id=?", (str(stored.event_id),))
+        journal._conn.commit()
+        from crypto_trader.production import ProductionStateError
+        with pytest.raises(ProductionStateError, match="persisted startup session boundary is missing or changed") as missing:
+            admission.run_once()
+        record_property("origin_loss_reason", str(missing.value))
+        assert not [r for r in transport.requests if r.method == "POST"]
+
+
+def test_r03_attempt_identity_alone_refuses_freshened_redelivery(tmp_path, record_property):
+    from crypto_trader.tests.production_fixtures import BASE, intent, seed_canonical_equity_root
+    from crypto_trader.tests.test_testnet_durable_submission import started
+    from crypto_trader.execution import ExecutionRequest
+    target = intent("explicit-attempt-identity")
+    with SQLiteEventJournal(tmp_path / "explicit-identity.db", venue_writes=True) as journal:
+        seed_canonical_equity_root(journal)
+        port = started(fx.ScriptedTransport(fx.environment_responses()), journal)
+        port.clock = lambda: BASE
+        request = ExecutionRequest(
+            intent_id=target.intent_id, correlation_id=target.correlation_id,
+            symbol=target.symbol, strategy_id=target.strategy_id, side=target.side,
+            order_type=target.order_type, quantity=target.quantity,
+            limit_price=target.limit_price, time_in_force=target.time_in_force,
+        )
+        journal.append(port._durable_attempt_event(port._prepare_durable_write(request), request))
+        port.stop()
+    _r03_check_explicit_identity_after_restart(
+        tmp_path, target, "order.submission.attempted", record_property,
+    )
+
+
+def test_r03_risk_identity_alone_refuses_freshened_redelivery(tmp_path, record_property):
+    from crypto_trader.tests.production_fixtures import (
+        BASE, intent, seed_canonical_equity_root, limits, risk_state,
+    )
+    from crypto_trader.risk import HardRiskEngine, RiskRequest, Side, record_risk_decision
+    target = intent("explicit-risk-identity")
+    with SQLiteEventJournal(tmp_path / "explicit-identity.db", venue_writes=True) as journal:
+        seed_canonical_equity_root(journal)
+        decision = HardRiskEngine(limits()).evaluate(RiskRequest(
+            intent_id=target.intent_id, correlation_id=target.correlation_id,
+            symbol=target.symbol, strategy_id=target.strategy_id, side=Side.BUY,
+            quantity=target.quantity, price=target.reference_price,
+        ), risk_state(), now=BASE)
+        assert decision.allowed
+        # Preserve the real R-01 atomic semantic/evaluation pair; semantic has no intent UUID.
+        record_risk_decision(journal, decision, occurred_at=BASE)
+    _r03_check_explicit_identity_after_restart(
+        tmp_path, target, "risk.evaluation.recorded", record_property,
+    )
+
+
+def test_r03_validity_identity_alone_refuses_freshened_redelivery(tmp_path, record_property):
+    from crypto_trader.tests.production_fixtures import (
+        BASE, intent, seed_canonical_equity_root, validity_gate, market_state,
+    )
+    from crypto_trader.production.runtime import validity_request_for
+    from crypto_trader.validity import record_validity_decision
+    target = intent("explicit-validity-identity")
+    with SQLiteEventJournal(tmp_path / "explicit-identity.db", venue_writes=True) as journal:
+        seed_canonical_equity_root(journal)
+        decision = validity_gate().evaluate(validity_request_for(target),
+                                             market_state=market_state(), now=BASE)
+        assert decision.disposition.value == "accepted"
+        record_validity_decision(journal, decision, recorded_at=BASE)
+    _r03_check_explicit_identity_after_restart(
+        tmp_path, target, "validity.disposition.recorded", record_property,
+    )
+
+
 def test_r03_lost_attempt_commit_ack_keeps_pending_economics(tmp_path, monkeypatch, record_property):
     from crypto_trader.events import OrderSubmissionAttempted
     from crypto_trader.tests.production_fixtures import (
