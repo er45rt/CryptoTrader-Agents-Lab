@@ -196,8 +196,11 @@ class DurableVenueWritePort(ABC):
         from crypto_trader.persistence.journal import SQLiteEventJournal
         import hashlib
 
-        if isinstance(journal, SQLiteEventJournal) and journal.has_full_foundation():
-            journal.require_venue_write_ready()
+        if isinstance(journal, SQLiteEventJournal):
+            try:
+                journal.require_venue_write_ready()
+            except Exception as exc:
+                raise NonDurableExecutionError("journal has no proven FULL venue-write authority.") from exc
         if expected is not None:
             result = journal.append_batch_if_revision([marker], expected=expected, require_all_new=True)
             entries = tuple(sorted((*expected.entries,

@@ -66,6 +66,45 @@ def _r03_journal(path):
     return SQLiteEventJournal(path, **options)
 
 
+@pytest.mark.parametrize("writer_mode", ["NORMAL", "FULL"])
+def test_r03_unfounded_journal_refused_before_attempt(tmp_path, record_property, writer_mode):
+    from crypto_trader.execution import NonDurableExecutionError
+    from crypto_trader.persistence.journal import JournalSchemaError
+    from crypto_trader.tests.test_persistence_journal import decision
+
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
+    with SQLiteEventJournal(tmp_path / "unfounded.db") as journal:
+        journal.append(decision())
+        journal._conn.execute(f"PRAGMA synchronous={writer_mode}")
+        port = started(transport, journal)
+        before = journal.revision()
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert journal._conn.execute("PRAGMA synchronous").fetchone()[0] == (
+            1 if writer_mode == "NORMAL" else 2
+        )
+        assert attempt_events(journal) == []
+        failure = None
+        try:
+            port.submit(execution_request())
+        except Exception as exc:
+            failure = exc
+        record_property("writer_mode", writer_mode)
+        record_property("new_attempt_count", len(attempt_events(journal)))
+        record_property("post_count", len(posts(transport)))
+        record_property("exception_type", type(failure).__name__)
+        record_property("exception_message", str(failure))
+        assert attempt_events(journal) == [], "unfounded journal must refuse BEFORE saving an attempt"
+        assert posts(transport) == []
+        assert journal.revision() == before
+        assert type(failure) is NonDurableExecutionError
+        assert str(failure) == "journal has no proven FULL venue-write authority."
+        assert type(failure.__cause__) is JournalSchemaError
+        assert str(failure.__cause__) == (
+            "venue POST requires a FULL-founded journal and active WAL/FULL writer."
+        )
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+
+
 def test_r03_normal_origin_cannot_post_after_connection_is_changed_to_full(tmp_path, record_property):
     from crypto_trader.tests.test_persistence_journal import decision
     transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
