@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -147,7 +148,7 @@ def _run_status(args: argparse.Namespace) -> int:
         with SQLiteEventJournal(journal_path, read_only=True) as journal:
             control = BreakGlassControl(journal=journal, state_dir=state_dir)
             record = control.status().to_record()
-    except (JournalError, EventContractError) as exc:  # never creates, migrates or repairs
+    except (JournalError, EventContractError, sqlite3.Error) as exc:  # never creates or repairs
         return _refuse(f"{type(exc).__name__}: {exc}")
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED

@@ -141,6 +141,28 @@ def test_status_refuses_an_undecodable_journal_without_a_traceback(tmp_path, cap
     assert _sha256(journal) == founded
 
 
+def test_status_refuses_a_malformed_journal_page_without_a_traceback(tmp_path, capsys, monkeypatch):
+    journal = tmp_path / "journal.db"
+    main(base_args(tmp_path, "halt-new-risk"))
+    capsys.readouterr()
+    founded = _sha256(journal)
+
+    def malformed(self, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+        yield  # pragma: no cover - makes this a generator like the real replay
+
+    monkeypatch.setattr(SQLiteEventJournal, "replay", malformed)
+    code = run_cli(tmp_path, "status", "--json")
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): DatabaseError: database disk image is malformed\n"
+    )
+    assert _sha256(journal) == founded
+
+
 def test_run_accepts_a_halt_and_engages_the_kill_switch(tmp_path, capsys):
     code = main(base_args(tmp_path, "halt-new-risk"))
     record = json.loads(capsys.readouterr().out)
