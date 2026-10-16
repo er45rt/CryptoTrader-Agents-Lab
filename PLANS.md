@@ -127,3 +127,30 @@ For each P-0x: **smallest bounded fix -> targeted red/green test -> complete off
 - **الإصدار النهائي:** NO-GO.
 
 هذا القسم يسجل قرار المالك والمهام المؤجلة فقط؛ لا يغير المهام السابقة ولا يبدأ تنفيذ أي مهمة معلقة. كل تنفيذ لاحق يحتاج نطاقًا معتمدًا وأدلته؛ لا Push/Merge/Deploy أو أوامر تداول بهذا التحديث.
+
+## F5 — رفض تكرار event_id بمحتوى مختلف داخل الدفعة الواحدة
+
+- **الحالة:** Accepted Locally بقرار المالك — 2026-10-16
+- **Commit:** `0bdc9b1c6f95a272767e9761ed13427102d353cc`
+- **Tree:** `0314d03b0ee6759b33667110183c08bb552f0f1c`
+- **الأب:** `f314959ca55f2196884ff638806d5b90751f51a3`
+- **النطاق:** `src/crypto_trader/persistence/journal.py` و`src/crypto_trader/tests/test_persistence_journal.py` فقط.
+
+**السلوك:**
+- `append_batch`: تكرار `event_id` بمحتوى مختلف داخل الدفعة يُرفض بـ`EventIdConflictError` قبل أي كتابة. التكرار المتطابق يبقى idempotent.
+- `append_batch_if_revision`: التكرار المتعارض يُرفض بـ`EventIdConflictError`، والتكرار المتطابق يبقى مرفوضًا بـ`JournalSchemaError`.
+
+**الأدلة:**
+- Red: 12 إخفاقًا متوقعًا و27 نجاحًا قبل الإصلاح، موثق من جلسة Codex بتاريخ 2026-10-15، ولم يُعَد تشغيله. وتحقق Claude من الكود أن الحالات الـ12 تفشل على الكود القديم.
+- Green: 39 passed في `test_persistence_journal.py`.
+- pytest الكامل: 3068 passed و22 skipped و1 deselected (الاستثناء المعتمد الوحيد)، على ملفات مطابقة بالبصمة لمحتوى الـCommit.
+- `git diff --check` و`git diff --cached --check`: نظيف.
+
+**المراجعات:** Claude PASS، وChatGPT PASS.
+
+**طريقة التنفيذ (للتدقيق):** الكود كتبه Codex. أما التحقق والاختبارات والـCommit فنفذها المالك بأمر PowerShell واحد يتوقف عند أول خلل، لأن جلسة Codex لم تستطع قراءة المستودع ولا طلب تصعيد.
+
+**ملاحظات مفتوحة:**
+- رسالة `EventIdConflictError` في حالة التكرار داخل الدفعة تقول "already exists"، وتحسين الصياغة لاحقًا غير مانع.
+- F5 بين كاتبين (السباق بين فحص الأحداث وبداية معاملة الكتابة) ما زال مفتوحًا ضمن مهمة Testnet رقم 2.
+- بيئة تنفيذ Codex تحتاج إصلاحًا قبل المهمة التالية: الـsandbox لا يقرأ المستودع.
