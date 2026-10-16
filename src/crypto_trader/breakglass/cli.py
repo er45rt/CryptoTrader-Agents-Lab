@@ -38,7 +38,7 @@ from crypto_trader.execution.binance_testnet import (
     WithdrawalPolicy,
     credentials_from_environment,
 )
-from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.persistence import JournalError, SQLiteEventJournal
 from crypto_trader.recovery import load_policy as load_recovery_policy
 
 from .commands import parse_operator_command
@@ -142,7 +142,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run_status(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir)
     journal_path = Path(args.journal) if args.journal else _default_journal(state_dir)
-    with SQLiteEventJournal(journal_path) as journal:
+    try:
+        journal = SQLiteEventJournal(journal_path, read_only=True)
+    except JournalError as exc:  # status never creates, migrates or repairs a journal
+        return _refuse(f"{type(exc).__name__}: {exc}")
+    with journal:
         control = BreakGlassControl(journal=journal, state_dir=state_dir)
         record = control.status().to_record()
     _emit(record, as_json=args.json)

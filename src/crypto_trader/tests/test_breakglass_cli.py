@@ -1,5 +1,6 @@
 """Phase 13: the operator CLI - explicit, LLM-free, fail-closed and secret-free."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -55,7 +56,16 @@ def base_args(tmp_path: Path, command: str, *, command_id: str | None = None, **
     return args
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_status_reports_the_read_only_posture(tmp_path, capsys):
+    journal = tmp_path / "journal.db"
+    with SQLiteEventJournal(journal):
+        pass  # founded by a writer; status itself never creates a journal
+    founded = _sha256(journal)
+
     code = run_cli(tmp_path, "status", "--json")
     record = json.loads(capsys.readouterr().out)
 
@@ -63,6 +73,46 @@ def test_status_reports_the_read_only_posture(tmp_path, capsys):
     assert record["safety"]["mode"] == "normal"
     assert record["safety"]["new_risk_permitted"] is False  # no writer has claimed the lease yet
     assert record["epoch"]["open"] is False
+    assert _sha256(journal) == founded
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("explicit_journal", [True, False])
+def test_status_refuses_a_missing_journal_and_creates_nothing(tmp_path, capsys, explicit_journal):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    journal = tmp_path / "journal.db" if explicit_journal else state_dir / "journal.db"
+    argv = ["status", "--json", "--state-dir", str(state_dir)]
+    if explicit_journal:
+        argv += ["--journal", str(journal)]
+
+    code = main(argv)
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: "
+        f"journal {journal} is not an existing file; a read-only open never creates it.\n"
+    )
+    assert sorted(p.name for p in tmp_path.rglob("*")) == ["state"]
+
+
+def test_status_refuses_an_unfounded_journal_file_without_writing_a_schema(tmp_path, capsys):
+    journal = tmp_path / "journal.db"
+    journal.write_bytes(b"")
+
+    code = run_cli(tmp_path, "status", "--json")
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: read-only journal has no "
+        "usable schema (no such table: journal_meta); refusing to create one.\n"
+    )
+    assert journal.read_bytes() == b""
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["journal.db"]
 
 
 def test_run_accepts_a_halt_and_engages_the_kill_switch(tmp_path, capsys):

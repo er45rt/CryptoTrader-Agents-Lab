@@ -192,10 +192,14 @@ class SQLiteEventJournal:
         registry: EventRegistry | None = None,
         timeout_seconds: float = 10.0,
         venue_writes: bool = False,
+        read_only: bool = False,
     ) -> None:
         self.path = str(path)
         was_new = self.path != ":memory:" and not Path(self.path).exists()
         self._registry = registry if registry is not None else get_default_registry()
+        if read_only:
+            self._open_read_only(timeout_seconds=timeout_seconds, venue_writes=venue_writes)
+            return
         self._conn = sqlite3.connect(self.path, timeout=timeout_seconds)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
@@ -206,6 +210,45 @@ class SQLiteEventJournal:
                 self._ensure_full_foundation(was_new=was_new)
             else:
                 self._ensure_schema()
+        except Exception:
+            self._conn.close()
+            raise
+
+    def _open_read_only(self, *, timeout_seconds: float, venue_writes: bool) -> None:
+        """Open an existing journal for reads only: never create, migrate or repair anything."""
+        if venue_writes:
+            raise JournalSchemaError("a read-only journal cannot be opened for venue writes.")
+        if self.path == ":memory:" or not Path(self.path).is_file():
+            raise JournalSchemaError(
+                f"journal {self.path} is not an existing file; a read-only open never creates it."
+            )
+        uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+        try:
+            self._conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds)
+        except sqlite3.Error as exc:
+            raise JournalSchemaError(
+                f"journal {self.path} could not be opened read-only: {exc}"
+            ) from exc
+        self._conn.row_factory = sqlite3.Row
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM journal_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            self._conn.execute("SELECT 1 FROM events LIMIT 1").fetchone()
+            if row is None:
+                raise JournalSchemaError(
+                    "read-only journal has no schema version; refusing to open it."
+                )
+            if row["value"] != str(JOURNAL_SCHEMA_VERSION):
+                raise JournalSchemaError(
+                    f"journal schema version {row['value']} is not supported by this build "
+                    f"(expected {JOURNAL_SCHEMA_VERSION}); refusing to open it."
+                )
+        except sqlite3.Error as exc:
+            self._conn.close()
+            raise JournalSchemaError(
+                f"read-only journal has no usable schema ({exc}); refusing to create one."
+            ) from exc
         except Exception:
             self._conn.close()
             raise

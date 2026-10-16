@@ -392,6 +392,102 @@ def test_f5_batch_refuses_to_start_inside_an_existing_transaction(journal):
     assert journal.read_by_id(event.event_id) is None
 
 
+def test_read_only_open_never_creates_a_missing_journal(tmp_path):
+    path = tmp_path / "missing.db"
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"journal {path} is not an existing file; a read-only open never creates it."
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_only_open_reads_without_changing_the_journal_file(tmp_path):
+    path = tmp_path / "journal.db"
+    event = decision(0)
+    with SQLiteEventJournal(path) as writer:
+        writer.append(event)
+    founded = path.read_bytes()
+
+    with SQLiteEventJournal(path, read_only=True) as reader:
+        assert reader.count() == 1
+        assert reader.read_by_id(event.event_id) == event
+        assert reader.schema_version() == JOURNAL_SCHEMA_VERSION
+
+    assert path.read_bytes() == founded
+
+
+@pytest.mark.parametrize("method", ["append", "batch", "conditional"])
+def test_read_only_journal_refuses_every_write(tmp_path, method):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+    founded = path.read_bytes()
+    event = decision(0)
+
+    with SQLiteEventJournal(path, read_only=True) as reader:
+        with pytest.raises(JournalSchemaError) as caught:
+            if method == "append":
+                reader.append(event)
+            elif method == "batch":
+                reader.append_batch([event])
+            else:
+                reader.append_batch_if_revision([event], expected=reader.revision())
+        assert not reader._conn.in_transaction
+        assert reader.count() == 0
+
+    prefix = {
+        "append": "journal write failed",
+        "batch": "journal batch failed",
+        "conditional": "conditional journal batch failed",
+    }[method]
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == f"{prefix}: attempt to write a readonly database"
+    assert path.read_bytes() == founded
+
+
+@pytest.mark.parametrize("stored", ["99", None])
+def test_read_only_open_refuses_a_missing_or_unsupported_schema_version(tmp_path, stored):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+    raw = sqlite3.connect(path)
+    with raw:
+        if stored is None:
+            raw.execute("DELETE FROM journal_meta WHERE key = 'schema_version'")
+        else:
+            raw.execute("UPDATE journal_meta SET value = ? WHERE key = 'schema_version'", (stored,))
+    raw.close()
+    founded = path.read_bytes()
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        "read-only journal has no schema version; refusing to open it."
+        if stored is None
+        else f"journal schema version {stored} is not supported by this build "
+        f"(expected {JOURNAL_SCHEMA_VERSION}); refusing to open it."
+    )
+    assert path.read_bytes() == founded
+
+
+def test_read_only_open_refuses_venue_writes(tmp_path):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True, venue_writes=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == "a read-only journal cannot be opened for venue writes."
+
+
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
     events = [decision(2), decision(0), decision(1)]
 
