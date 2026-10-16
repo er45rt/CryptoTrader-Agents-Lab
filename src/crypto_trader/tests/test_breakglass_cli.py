@@ -62,6 +62,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _found_full_journal(tmp_path: Path) -> Path:
+    """Found the FULL journal a venue-grade writer creates; the break-glass run never creates one."""
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path, venue_writes=True):
+        pass
+    return path
+
+
 def test_status_reports_the_read_only_posture(tmp_path, capsys):
     journal = tmp_path / "journal.db"
     with SQLiteEventJournal(journal):
@@ -118,7 +126,7 @@ def test_status_refuses_an_unfounded_journal_file_without_writing_a_schema(tmp_p
 
 
 def test_status_refuses_an_undecodable_journal_without_a_traceback(tmp_path, capsys):
-    journal = tmp_path / "journal.db"
+    journal = _found_full_journal(tmp_path)
     main(base_args(tmp_path, "halt-new-risk"))
     capsys.readouterr()
     bad = '{"event_type": "strategy.decision.recorded", "schema_version": 1}'
@@ -142,7 +150,7 @@ def test_status_refuses_an_undecodable_journal_without_a_traceback(tmp_path, cap
 
 
 def test_status_refuses_a_malformed_journal_page_without_a_traceback(tmp_path, capsys, monkeypatch):
-    journal = tmp_path / "journal.db"
+    journal = _found_full_journal(tmp_path)
     main(base_args(tmp_path, "halt-new-risk"))
     capsys.readouterr()
     founded = _sha256(journal)
@@ -164,6 +172,7 @@ def test_status_refuses_a_malformed_journal_page_without_a_traceback(tmp_path, c
 
 
 def test_run_accepts_a_halt_and_engages_the_kill_switch(tmp_path, capsys):
+    _found_full_journal(tmp_path)
     code = main(base_args(tmp_path, "halt-new-risk"))
     record = json.loads(capsys.readouterr().out)
 
@@ -175,6 +184,7 @@ def test_run_accepts_a_halt_and_engages_the_kill_switch(tmp_path, capsys):
 
 
 def test_a_second_identical_delivery_is_idempotent(tmp_path, capsys):
+    _found_full_journal(tmp_path)
     command_id = str(uuid4())
     first = main(base_args(tmp_path, "halt-new-risk", command_id=command_id))
     json.loads(capsys.readouterr().out)
@@ -187,6 +197,7 @@ def test_a_second_identical_delivery_is_idempotent(tmp_path, capsys):
 
 
 def test_restore_is_refused_until_the_gates_are_met(tmp_path, capsys):
+    _found_full_journal(tmp_path)
     main(base_args(tmp_path, "enter-degraded"))
     capsys.readouterr()
     code = main(base_args(tmp_path, "restore-normal"))
@@ -215,7 +226,65 @@ def test_malformed_arguments_fail_closed_without_touching_state(tmp_path, capsys
         assert journal.count() == 0
 
 
+@pytest.mark.parametrize("command", ["halt-new-risk", "cancel-open"])
+def test_run_refuses_a_missing_journal_and_creates_nothing(tmp_path, capsys, command):
+    journal = tmp_path / "journal.db"
+
+    code = main(base_args(tmp_path, command))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: the journal is not an existing "
+        f"file; run never creates a journal. [journal: {journal}] If orders are open, cancel them "
+        "directly at the exchange.\n"
+    )
+    assert sorted(p.name for p in tmp_path.rglob("*")) == []
+
+
+def test_run_refuses_a_journal_that_is_not_full_founded_without_touching_it(tmp_path, capsys):
+    journal = tmp_path / "journal.db"
+    with SQLiteEventJournal(journal):
+        pass  # a NORMAL journal, e.g. a wrong --journal path
+    founded = _sha256(journal)
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: refusing retrospective FULL "
+        f"founding of an existing journal. [journal: {journal}] If orders are open, cancel them "
+        "directly at the exchange.\n"
+    )
+    assert _sha256(journal) == founded
+    assert not (tmp_path / "state").exists()
+
+
+def test_run_turns_an_os_error_on_the_journal_path_into_a_clean_refusal(tmp_path, capsys, monkeypatch):
+    journal = _found_full_journal(tmp_path)
+
+    def denied(self):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: the journal could not be "
+        f"checked: [Errno 13] access denied [journal: {journal}] If orders are open, cancel them "
+        "directly at the exchange.\n"
+    )
+    assert not (tmp_path / "state").exists()
+
+
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
+    _found_full_journal(tmp_path)
     main(base_args(tmp_path, "cancel-open"))
     output = capsys.readouterr().out
 
@@ -242,7 +311,7 @@ def test_the_cli_is_usable_without_the_ai_layer(tmp_path):
 
 def test_the_cli_can_run_while_the_ai_backlog_is_saturated(tmp_path):
     """The control path is a separate process: it does not depend on the strategy queue at all."""
-    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
         control = BreakGlassControl(journal=journal, state_dir=tmp_path / "state")
         control.total = None  # the control exposes no queue/backlog surface at all
         assert not hasattr(control, "drain")
@@ -254,6 +323,7 @@ def test_the_cli_can_run_while_the_ai_backlog_is_saturated(tmp_path):
 
 
 def test_status_output_is_json_serializable_and_secret_free(tmp_path, capsys):
+    _found_full_journal(tmp_path)
     main(base_args(tmp_path, "force-recovery-required"))
     capsys.readouterr()
     main(["status", "--json", "--state-dir", str(tmp_path / "state"), "--journal", str(tmp_path / "journal.db")])

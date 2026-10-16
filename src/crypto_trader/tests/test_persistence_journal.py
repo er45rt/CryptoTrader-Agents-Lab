@@ -675,6 +675,21 @@ def test_read_only_open_through_a_symlink_shares_the_writers_wal(tmp_path):
             assert reader.read_by_id(event.event_id) == event
 
 
+def test_writer_open_turns_an_os_error_into_a_clean_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "journal.db"
+
+    def denied(self):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "exists", denied)
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == f"journal {path} could not be checked: [Errno 13] access denied"
+    assert type(caught.value.__cause__) is PermissionError
+
+
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
     events = [decision(2), decision(0), decision(1)]
 

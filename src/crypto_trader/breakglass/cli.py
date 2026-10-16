@@ -40,7 +40,7 @@ from crypto_trader.execution.binance_testnet import (
     WithdrawalPolicy,
     credentials_from_environment,
 )
-from crypto_trader.persistence import JournalError, SQLiteEventJournal
+from crypto_trader.persistence import JournalError, JournalSchemaError, SQLiteEventJournal
 from crypto_trader.recovery import load_policy as load_recovery_policy
 
 from .commands import parse_operator_command
@@ -55,6 +55,7 @@ EXIT_MALFORMED = 2
 EXIT_REFUSED = 3
 
 DEFAULT_RECOVERY_POLICY_ID = "recovery-breakglass-v1"
+EXCHANGE_FALLBACK = "If orders are open, cancel them directly at the exchange."
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -172,7 +173,11 @@ def _run_command(args: argparse.Namespace) -> int:
         },
         delivered_at=delivered_at,
     )
-    with SQLiteEventJournal(journal_path) as journal:
+    try:
+        journal = _open_emergency_journal(journal_path)
+    except (JournalError, sqlite3.Error) as exc:  # before any lease, state or venue side effect
+        return _refuse(f"{type(exc).__name__}: {exc} [journal: {journal_path}] {EXCHANGE_FALLBACK}")
+    with journal:
         venue = _build_venue(args)
         control = BreakGlassControl(
             journal=journal,
@@ -184,6 +189,17 @@ def _run_command(args: argparse.Namespace) -> int:
         record = outcome.to_record()
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED if outcome.accepted else EXIT_REFUSED
+
+
+def _open_emergency_journal(journal_path: Path) -> SQLiteEventJournal:
+    """Open the existing FULL-founded journal for durable emergency writes; never create one."""
+    try:
+        exists = journal_path.is_file()
+    except (OSError, ValueError) as exc:
+        raise JournalSchemaError(f"the journal could not be checked: {exc}") from exc
+    if not exists:
+        raise JournalSchemaError("the journal is not an existing file; run never creates a journal.")
+    return SQLiteEventJournal(journal_path, venue_writes=True)
 
 
 def _build_venue(args: argparse.Namespace):

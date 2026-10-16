@@ -196,7 +196,10 @@ class SQLiteEventJournal:
         read_only: bool = False,
     ) -> None:
         self.path = str(path)
-        was_new = self.path != ":memory:" and not Path(self.path).exists()
+        try:
+            was_new = self.path != ":memory:" and not Path(self.path).exists()
+        except (OSError, ValueError) as exc:
+            raise JournalSchemaError(f"journal {self.path} could not be checked: {exc}") from exc
         self._registry = registry if registry is not None else get_default_registry()
         if read_only:
             self._open_read_only(timeout_seconds=timeout_seconds, venue_writes=venue_writes)
