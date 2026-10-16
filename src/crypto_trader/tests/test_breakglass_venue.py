@@ -24,7 +24,13 @@ from crypto_trader.execution.binance_testnet import (
     TestnetEndpointError as EndpointError,
     TestnetOrderRuntime as OrderRuntime,
 )
+from crypto_trader.events import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    OperatorCommandRecordPayload,
+    OperatorCommandRecorded,
+)
 from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.safety import SafetyController
 from crypto_trader.tests import testnet_fixtures as txf
 
@@ -238,6 +244,136 @@ def test_break_glass_cancel_records_lifecycle_events_for_the_journal(journal, tm
     assert "order.state.changed" in event_types
     assert breakglass.status().new_risk_permitted is False
     assert breakglass.ownership_store.require_fence().owner_kind is OwnerKind.EMERGENCY
+
+
+def _operator_command(command_type):
+    return parse_operator_command(
+        {
+            "command_type": command_type,
+            "command_id": str(uuid4()),
+            "operator_label": "jamal",
+            "reason": "venue emergency",
+            "source": "operator-cli",
+        },
+        delivered_at=BASE,
+    )
+
+
+def _cancel_in_a_first_process(journal, state_dir, *later_responses):
+    """Process A: cancel ct-4 through the safety path; its venue memory dies with it."""
+    first, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-4"),
+            txf.cancel_response("ct-4", order_id=100),
+            *later_responses,
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=first,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert process.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+    return process
+
+
+def test_cancel_open_journals_the_cancelled_references_in_a_v2_record(journal, tmp_path):
+    process = _cancel_in_a_first_process(journal, tmp_path / "state")
+    records = [event for event in journal.read_range() if event.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+
+    assert [event.schema_version for event in records] == [2]
+    assert records[0].payload.model_dump().get("cancelled_order_references") == ["ct-4"]
+    ledger_record = process.load_ledger().records[0]
+    assert getattr(ledger_record, "cancelled_order_references", None) == ("ct-4",)
+
+
+def _reconcile_after_cancel(root, *, new_process):
+    root.mkdir(parents=True)
+    with SQLiteEventJournal(root / "journal.db") as journal:
+        canceled = txf.order_response("ct-4", status="CANCELED")
+        process = _cancel_in_a_first_process(journal, root / "state", canceled)
+        transport = None
+        if new_process:
+            second, client, _, transport = venue(journal, [canceled])
+            client.clock.synchronize(txf.SERVER_TIME_MS)
+            process = BreakGlassControl(
+                journal=journal,
+                state_dir=root / "state",
+                venue=second,
+                clock=lambda: BASE,
+                reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+            )
+        return process.handle(_operator_command("reconcile")), transport
+
+
+def test_reconcile_in_a_new_process_matches_the_cancelling_process(tmp_path):
+    same, _ = _reconcile_after_cancel(tmp_path / "same", new_process=False)
+    new, transport = _reconcile_after_cancel(tmp_path / "new", new_process=True)
+
+    # ct-4 has no durable submission attempt here, so the venue evidence escalates it as an
+    # unknown external order: both processes must stay pending (never "confirmed by evidence").
+    assert (new.reconciliation_status, new.reason_code, new.reconciliation_result) == (
+        "pending",
+        "UNKNOWN_PENDING_RECONCILIATION",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (same.reconciliation_status, same.reason_code, same.reconciliation_result) == (
+        "pending",
+        "UNKNOWN_PENDING_RECONCILIATION",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert [request.method for request in transport.requests] == ["GET"]
+
+
+def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):
+    legacy = _operator_command("cancel_open")
+    journal.append(
+        OperatorCommandRecorded(
+            event_id=uuid4(),
+            occurred_at=BASE,
+            correlation_id=legacy.command_id,
+            causation_id=legacy.causation_id,
+            producer="application.breakglass",
+            sequence_number=100,
+            payload=OperatorCommandRecordPayload(
+                command_id=legacy.command_id,
+                command_type="cancel_open",
+                requested_at=legacy.requested_at,
+                operator_label=legacy.operator_label,
+                operator_identity=legacy.operator_identity,
+                reason=legacy.reason,
+                source=legacy.source,
+                previous_safety_state="normal",
+                resulting_safety_state="reduce_only",
+                disposition="accepted",
+                reason_code="break_glass_engaged_cancel_open",
+                command_digest=legacy.digest,
+                mode_path=("normal", "reduce_only"),
+                venue_control="confirmed",
+                reconciliation_status="pending",
+                epoch_opened=True,
+                epoch_closed=False,
+                fence_term=2,
+            ),
+        )
+    )
+    control = BreakGlassControl(journal=journal, state_dir=tmp_path / "state", clock=lambda: BASE)
+
+    assert type(list(journal.read_range())[0]) is OperatorCommandRecorded
+    record = control.load_ledger().records[0]
+    assert getattr(record, "cancelled_order_references", None) == ()
 
 
 def test_venue_reports_expose_only_reference_backed_evidence(journal):

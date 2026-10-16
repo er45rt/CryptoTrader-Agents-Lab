@@ -72,7 +72,9 @@ def test_default_registry_registers_every_v1_contract():
     for contract in V1_CONTRACTS:
         event_type = contract.model_fields["event_type"].default
         assert registry.supported_versions(event_type) == (
-            (1, 2) if event_type == "risk.evaluation.recorded" else (1,)
+            (1, 2)
+            if event_type in ("risk.evaluation.recorded", "safety.operator_command.recorded")
+            else (1,)
         )
 
 

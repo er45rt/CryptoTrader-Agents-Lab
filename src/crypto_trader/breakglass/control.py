@@ -32,8 +32,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from crypto_trader.events import (
-    OperatorCommandRecordPayload,
-    OperatorCommandRecorded,
+    OperatorCommandRecordPayloadV2,
+    OperatorCommandRecordedV2,
     SafetyStateChangePayload,
     SafetyStateChanged,
 )
@@ -624,6 +624,9 @@ class BreakGlassControl:
             reason_code=self._action_reason_code(command, controller, venue_outcome),
             correlation_id=session_id,
             venue_control="not_requested" if venue_outcome is None else venue_outcome.disposition,
+            cancelled_order_references=(
+                () if venue_outcome is None else venue_outcome.cancelled_order_references
+            ),
             reconciliation_status="pending",
             epoch_opened=reanchor,
             epoch_closed=False,
@@ -1163,6 +1166,14 @@ class BreakGlassControl:
         venue_reports = list(
             self._venue_state_provider() if self._venue_state_provider is not None else ()
         )
+        ledger = derive_ledger(self._journal)
+        journaled_epoch = ledger.open_epoch
+        if journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id:
+            # A new process knows the cancelled orders only from the journal, never from memory.
+            references = ledger.open_epoch_order_references()
+            track = getattr(self._venue, "track_order_references", None)
+            if references and callable(track):
+                track(references)
         venue_reports.extend(self._venue.venue_reports())
         engine = ReconciliationEngine(self._reconciliation_policy)
         source = StaticVenueStateSource(entries=tuple(venue_reports), name="breakglass.venue")
@@ -1207,6 +1218,7 @@ class BreakGlassControl:
         fence_term: int,
         occurred_at: datetime,
         transitions: Sequence[SafetyTransition],
+        cancelled_order_references: Sequence[str] = (),
     ) -> list[UUID]:
         """Journal the safety transitions and the command record in ONE atomic transaction."""
         del controller
@@ -1238,15 +1250,19 @@ class BreakGlassControl:
                     ),
                 )
             )
+        # Unique, non-blank, venue order: the venue already acted, so the record must never fail.
+        references = list(
+            dict.fromkeys(ref for ref in cancelled_order_references if ref and ref.strip())
+        )
         events.append(
-            OperatorCommandRecorded(
+            OperatorCommandRecordedV2(
                 event_id=uuid4(),
                 occurred_at=occurred_at.astimezone(timezone.utc),
                 correlation_id=correlation_id,
                 causation_id=command.causation_id,
                 producer=self._producer,
                 sequence_number=sequence_base + len(transitions) + 1,
-                payload=OperatorCommandRecordPayload(
+                payload=OperatorCommandRecordPayloadV2(
                     command_id=command.command_id,
                     command_type=command.command_type.value,
                     requested_at=command.requested_at,
@@ -1265,6 +1281,7 @@ class BreakGlassControl:
                     epoch_opened=epoch_opened,
                     epoch_closed=epoch_closed,
                     fence_term=fence_term,
+                    cancelled_order_references=references,
                 ),
             )
         )

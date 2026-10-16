@@ -260,6 +260,7 @@ class RecordedOperatorCommand:
     event_id: UUID
     correlation_id: UUID
     causation_id: UUID | None
+    cancelled_order_references: tuple[str, ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -286,6 +287,7 @@ class RecordedOperatorCommand:
             "epoch_opened": self.epoch_opened,
             "epoch_closed": self.epoch_closed,
             "fence_term": self.fence_term,
+            "cancelled_order_references": list(self.cancelled_order_references),
             "correlation_id": str(self.correlation_id),
             "causation_id": None if self.causation_id is None else str(self.causation_id),
             "event_id": str(self.event_id),
@@ -310,6 +312,19 @@ class BreakGlassLedger:
     @property
     def open_epoch(self) -> BreakGlassEpoch | None:
         return self.epoch if self.epoch is not None and self.epoch.is_open else None
+
+    def open_epoch_order_references(self) -> tuple[str, ...]:
+        """Order references cancelled since the open epoch was opened, in journal order."""
+        if self.open_epoch is None:
+            return ()
+        references: list[str] = []
+        for record in self.records:
+            if record.epoch_opened:
+                references = []
+            for reference in record.cancelled_order_references:
+                if reference not in references:
+                    references.append(reference)
+        return tuple(references)
 
 
 def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
@@ -345,6 +360,11 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
                 event_id=event.event_id,
                 correlation_id=event.correlation_id,
                 causation_id=event.causation_id,
+                # V1 records carry no references; V2 records journal the venue-confirmed ones.
+                cancelled_order_references=tuple(
+                    str(reference)
+                    for reference in getattr(payload, "cancelled_order_references", ())
+                ),
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise BreakGlassStateError(

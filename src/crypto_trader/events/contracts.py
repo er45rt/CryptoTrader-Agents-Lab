@@ -101,6 +101,8 @@ __all__ = [
     "OPERATOR_COMMAND_EVENT_TYPE",
     "OperatorCommandRecordPayload",
     "OperatorCommandRecorded",
+    "OperatorCommandRecordPayloadV2",
+    "OperatorCommandRecordedV2",
     "OperatorCommandType",
     "STREAM_LIFECYCLE_EVENT_TYPE",
     "StreamLifecyclePayload",
@@ -807,6 +809,34 @@ class OperatorCommandRecorded(DomainEvent):
     payload: OperatorCommandRecordPayload
 
 
+class OperatorCommandRecordPayloadV2(OperatorCommandRecordPayload):
+    """V2 adds the order references the venue confirmed cancelled; V1 fields keep their meanings.
+
+    A new process reconciling the epoch reads these references back from the journal, so the venue
+    evidence it queries never depends on the memory of the process that cancelled.
+    """
+
+    cancelled_order_references: list[str] = Field(
+        description="Client order references the venue confirmed cancelled, in venue order."
+    )
+
+    @field_validator("cancelled_order_references")
+    @classmethod
+    def _usable_references(cls, value: list[str]) -> list[str]:
+        if any(not reference.strip() for reference in value):
+            raise ValueError("cancelled order references must not be blank.")
+        if len(set(value)) != len(value):
+            raise ValueError("cancelled order references must be unique.")
+        return value
+
+
+class OperatorCommandRecordedV2(OperatorCommandRecorded):
+    """Explicit V2 command record. V1 stays registered and is never silently upgraded."""
+
+    schema_version: Literal[2] = 2
+    payload: OperatorCommandRecordPayloadV2
+
+
 # --- 11. Market-data stream lifecycle (Phase 15, additive) ------------------
 
 #: The stream lifecycle vocabulary. ``ready`` is reachable only after a fresh synchronized
@@ -924,4 +954,4 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StreamLifecycleRecorded,
 )
 
-V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2,)
+V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2, OperatorCommandRecordedV2)
