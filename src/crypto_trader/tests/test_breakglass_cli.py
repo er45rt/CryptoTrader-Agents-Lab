@@ -19,7 +19,7 @@ from crypto_trader.breakglass.cli import (
     EXIT_REFUSED,
     main,
 )
-from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.persistence import JournalSchemaError, SQLiteEventJournal
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -352,6 +352,29 @@ def test_run_accepts_another_spelling_of_the_bound_journal(tmp_path, capsys):
     capsys.readouterr()
 
     assert code == EXIT_ACCEPTED
+
+
+def test_run_reports_incomplete_when_the_journal_fails_after_side_effects(
+    tmp_path, capsys, monkeypatch
+):
+    journal = _found_full_journal(tmp_path)
+
+    def fail(self, events):
+        raise JournalSchemaError("journal batch failed: disk I/O error")
+
+    monkeypatch.setattr(SQLiteEventJournal, "append_batch", fail)
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == 4
+    assert captured.out == ""
+    assert captured.err == (
+        "INCOMPLETE (side effects may already be in effect): JournalSchemaError: journal batch "
+        f"failed: disk I/O error [journal: {journal}]. The emergency lease and any venue cancel may "
+        "already have happened: check status and re-deliver the same --command-id. If orders are "
+        "open, cancel them directly at the exchange.\n"
+    )
 
 
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):

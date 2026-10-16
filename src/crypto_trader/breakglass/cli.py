@@ -19,7 +19,8 @@ Properties required of this control channel:
   adapter, which never exposes a value.
 
 Exit codes: ``0`` accepted (including an idempotent re-delivery), ``3`` refused by the deterministic
-safety policy, ``2`` malformed/unknown command or unusable configuration.
+safety policy, ``2`` malformed/unknown command or unusable configuration, ``4`` incomplete: the
+journal failed after the command started, so its lease or venue side effects may already be in effect.
 """
 
 from __future__ import annotations
@@ -51,11 +52,19 @@ from .control import BreakGlassControl
 from .errors import BreakGlassError, MalformedOperatorCommandError
 from .venue import BinanceSpotTestnetEmergencyControl, PolicyOnlyVenueControl
 
-__all__ = ["EXIT_ACCEPTED", "EXIT_MALFORMED", "EXIT_REFUSED", "build_parser", "main"]
+__all__ = [
+    "EXIT_ACCEPTED",
+    "EXIT_INCOMPLETE",
+    "EXIT_MALFORMED",
+    "EXIT_REFUSED",
+    "build_parser",
+    "main",
+]
 
 EXIT_ACCEPTED = 0
 EXIT_MALFORMED = 2
 EXIT_REFUSED = 3
+EXIT_INCOMPLETE = 4
 
 DEFAULT_RECOVERY_POLICY_ID = "recovery-breakglass-v1"
 EXCHANGE_FALLBACK = "If orders are open, cancel them directly at the exchange."
@@ -192,7 +201,11 @@ def _run_command(args: argparse.Namespace) -> int:
             venue=venue,
             reconciliation_policy=load_recovery_policy({"policy_id": args.recovery_policy_id}),
         )
-        outcome = control.handle(command)
+        try:
+            outcome = control.handle(command)
+        except (JournalError, EventContractError, sqlite3.Error, OSError) as exc:
+            # Never "nothing changed": the lease or the venue cancel may precede the failed append.
+            return _incomplete(f"{type(exc).__name__}: {exc} [journal: {journal_path}]")
         record = outcome.to_record()
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED if outcome.accepted else EXIT_REFUSED
@@ -262,6 +275,15 @@ def _emit(record: dict[str, Any], *, as_json: bool) -> None:
 def _render(record: dict[str, Any]) -> str:
     lines = [f"{key}: {value}" for key, value in sorted(record.items())]
     return "\n".join(lines)
+
+
+def _incomplete(message: str) -> int:
+    sys.stderr.write(
+        f"INCOMPLETE (side effects may already be in effect): {message}. The emergency lease and "
+        "any venue cancel may already have happened: check status and re-deliver the same "
+        f"--command-id. {EXCHANGE_FALLBACK}\n"
+    )
+    return EXIT_INCOMPLETE
 
 
 def _refuse(message: str) -> int:
