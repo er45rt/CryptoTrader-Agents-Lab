@@ -357,7 +357,11 @@ class SQLiteEventJournal:
         return False
 
     def append_batch(self, events: Sequence[EventEnvelope]) -> int:
-        """Append many events in ONE transaction; returns the number newly journaled."""
+        """Append many events in ONE transaction; returns the number newly journaled.
+
+        BEGIN IMMEDIATE serializes the conflict precheck with every SQLite writer, so no other
+        writer can journal a conflicting event_id between the check and the insert.
+        """
         rows = []
         digests = {}
         for event in events:
@@ -369,8 +373,16 @@ class SQLiteEventJournal:
             digests[event_id] = digest
             rows.append(self._row_for(event, payload_json, digest))
 
-        # Fail closed on conflicts BEFORE writing anything.
-        if digests:
+        if not rows:
+            return 0
+        if self._conn.in_transaction:
+            raise JournalSchemaError(
+                "append batch refuses to start inside an existing transaction."
+            )
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Fail closed on conflicts BEFORE writing anything, under the same write lock.
             placeholders = ",".join("?" for _ in digests)
             existing = self._conn.execute(
                 f"SELECT event_id, payload_sha256 FROM events WHERE event_id IN ({placeholders})",
@@ -380,25 +392,34 @@ class SQLiteEventJournal:
                 if record["payload_sha256"] != digests[record["event_id"]]:
                     raise EventIdConflictError(UUID(record["event_id"]))
 
-        inserted = 0
-        try:
-            with self._conn:
-                for row in rows:
-                    cursor = self._conn.execute(
-                        """
-                        INSERT INTO events (
-                            event_id, event_type, schema_version, occurred_at_ns, occurred_at_iso,
-                            correlation_id, causation_id, producer, strategy_id, order_id, symbol,
-                            sequence_number, payload_json, payload_sha256, ingested_at_iso
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(event_id) DO NOTHING
-                        """,
-                        row,
-                    )
-                    inserted += cursor.rowcount
-        except sqlite3.Error as exc:  # pragma: no cover - transaction rolled back above
+            inserted = 0
+            for row in rows:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, event_type, schema_version, occurred_at_ns, occurred_at_iso,
+                        correlation_id, causation_id, producer, strategy_id, order_id, symbol,
+                        sequence_number, payload_json, payload_sha256, ingested_at_iso
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO NOTHING
+                    """,
+                    row,
+                )
+                inserted += cursor.rowcount
+            self._conn.commit()
+            return inserted
+        except (EventIdConflictError, JournalSchemaError):
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if self._conn.in_transaction:
+                self._conn.rollback()
             raise JournalSchemaError(f"journal batch failed: {exc}") from exc
-        return inserted
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def append_batch_if_revision(
         self,

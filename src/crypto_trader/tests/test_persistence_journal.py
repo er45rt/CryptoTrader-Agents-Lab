@@ -281,6 +281,117 @@ def test_f5_conditional_identical_redelivery_remains_idempotent(journal):
     assert journal.read_by_id(event.event_id) == event
 
 
+class _InterleaveBeforeFirstInsert:
+    """Delegating connection: runs ``interleave`` once, just before the first event INSERT."""
+
+    def __init__(self, conn, interleave):
+        self._real = conn
+        self._interleave = interleave
+        self.fired = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def execute(self, sql, *args, **kwargs):
+        if not self.fired and sql.lstrip().startswith("INSERT INTO events"):
+            self.fired = True
+            self._interleave()
+        return self._real.execute(sql, *args, **kwargs)
+
+
+def test_f5_cross_writer_conflict_cannot_slip_between_batch_precheck_and_insert(
+    tmp_path, record_property,
+):
+    path = tmp_path / "writers.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="conflicting cross-writer content",
+        ),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        interleaved = {}
+
+        def other_writer():
+            try:
+                interleaved["result"] = b.append_batch([conflicting])
+            except Exception as exc:
+                interleaved["error"] = exc
+
+        conn = a._conn
+        proxy = _InterleaveBeforeFirstInsert(conn, other_writer)
+        a._conn = proxy
+        try:
+            inserted = a.append_batch([original])
+        finally:
+            a._conn = conn
+
+        stored = a.read_by_id(original.event_id)
+        error = interleaved.get("error")
+        observed = {
+            "interleaved": proxy.fired,
+            "a_inserted": inserted,
+            "stored_rationale": None if stored is None else stored.payload.rationale,
+            "b_result": interleaved.get("result"),
+            "b_error_type": type(error).__name__,
+            "b_error_message": str(error),
+        }
+        record_property("f5_cross_writer_observed", str(observed))
+        assert proxy.fired, observed
+        assert inserted == 1, observed
+        assert stored == original, observed
+        assert "result" not in interleaved, observed
+        assert type(error) is JournalSchemaError, observed
+        assert str(error) == "journal batch failed: database is locked"
+        assert type(error.__cause__) is sqlite3.OperationalError
+        assert not b._conn.in_transaction
+
+        with pytest.raises(EventIdConflictError) as caught:
+            b.append_batch([conflicting])
+        assert caught.value.event_id == original.event_id
+        assert str(caught.value) == (
+            f"event_id {original.event_id} already exists with different content; "
+            "refusing to overwrite an append-only journal entry."
+        )
+        assert b.count() == 1
+        assert b.read_by_id(original.event_id) == original
+
+
+def test_f5_cross_writer_identical_redelivery_remains_idempotent(tmp_path):
+    path = tmp_path / "writers.db"
+    event = decision(0)
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path) as b:
+        assert a.append_batch([event]) == 1
+        before = b.revision()
+
+        assert b.append_batch([event]) == 0
+
+        assert b.revision() == before
+        assert a.count() == b.count() == 1
+        assert b.read_by_id(event.event_id) == event
+
+
+def test_f5_batch_refuses_to_start_inside_an_existing_transaction(journal):
+    event = decision(0)
+    journal._conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(JournalSchemaError) as caught:
+            journal.append_batch([event])
+        assert type(caught.value) is JournalSchemaError
+        assert str(caught.value) == "append batch refuses to start inside an existing transaction."
+        assert journal._conn.in_transaction
+    finally:
+        journal._conn.rollback()
+    assert journal.count() == 0
+    assert journal.read_by_id(event.event_id) is None
+
+
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
     events = [decision(2), decision(0), decision(1)]
 

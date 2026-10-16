@@ -18,7 +18,9 @@ from crypto_trader.events import (
 )
 from crypto_trader.paper import FrozenMarketDataFeed, PaperStateError, SimulationOutcome
 from crypto_trader.persistence import SQLiteEventJournal
-from crypto_trader.persistence.errors import JournalRevisionMismatchError, JournalSchemaError
+from crypto_trader.persistence.errors import (
+    EventIdConflictError, JournalRevisionMismatchError, JournalSchemaError,
+)
 from crypto_trader.risk import (
     HardRiskEngine, PendingIntent, PendingIntentRegistry, RiskRequest,
     RiskStateSnapshot, Side, record_risk_decision,
@@ -159,8 +161,8 @@ def test_existing_batch_rolls_back_real_second_insert_failure(tmp_path):
         assert journal.count() == 0
 
 
-def test_existing_batch_precheck_has_an_independent_writer_window(tmp_path):
-    """Characterization: atomic insertion does not make conflict precheck atomic."""
+def test_batch_precheck_has_no_independent_writer_window(tmp_path):
+    """Closure: the conflict precheck and the insert share one BEGIN IMMEDIATE transaction."""
     _, _, _, _, decision = risk_case()
     with SQLiteEventJournal(tmp_path / "pair.db") as source:
         record_risk_decision(source, decision, occurred_at=fx.BASE)
@@ -171,27 +173,43 @@ def test_existing_batch_precheck_has_an_independent_writer_window(tmp_path):
         "payload": semantic.payload.model_copy(update={"reason": "other writer"})
     })
     path = tmp_path / "writers.db"
-    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path) as b:
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
         conn = a._conn
+        interleaved = []
 
-        class InterleaveBeforeTransaction:
+        class InterleaveBeforeFirstInsert:
             def __getattr__(self, name):
                 return getattr(conn, name)
 
             def __enter__(self):
-                b.append(conflicting)  # after A's SELECT, before its transaction
                 return conn.__enter__()
 
             def __exit__(self, *args):
                 return conn.__exit__(*args)
 
-        a._conn = InterleaveBeforeTransaction()
+            def execute(self, sql, *args, **kwargs):
+                if not interleaved and sql.lstrip().startswith("INSERT INTO events"):
+                    try:  # after A's SELECT, before its first INSERT
+                        b.append(conflicting)
+                    except JournalSchemaError as exc:
+                        interleaved.append(exc)
+                    else:
+                        interleaved.append(None)
+                return conn.execute(sql, *args, **kwargs)
+
+        a._conn = InterleaveBeforeFirstInsert()
         try:
-            assert a.append_batch((semantic, audit)) == 1
-            assert a.read_by_id(semantic.event_id).payload.reason == "other writer"
-            assert a.read_by_id(audit.event_id).payload.reason_codes == decision.reason_codes
+            inserted = a.append_batch((semantic, audit))
         finally:
             a._conn = conn
+        assert (inserted, len(interleaved)) == (2, 1), interleaved
+        assert type(interleaved[0]) is JournalSchemaError
+        assert str(interleaved[0]) == "journal write failed: database is locked"
+        assert a.read_by_id(semantic.event_id) == semantic
+        assert a.read_by_id(audit.event_id).payload.reason_codes == decision.reason_codes
+        with pytest.raises(EventIdConflictError) as caught:
+            b.append(conflicting)
+        assert caught.value.event_id == semantic.event_id
 
 
 def test_existing_conditional_batch_rejects_changed_revision_without_writing(tmp_path):
