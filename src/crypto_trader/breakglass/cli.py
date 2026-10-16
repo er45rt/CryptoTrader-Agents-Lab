@@ -1,9 +1,11 @@
 """The narrow local operator CLI for break-glass control (Phase 13).
 
-        python -m crypto_trader.breakglass.cli status --journal <journal.db> --state-dir <dir>
+        python -m crypto_trader.breakglass.cli status --state-dir <dir>
         python -m crypto_trader.breakglass.cli run --command-type halt-new-risk \
-            --command-id <uuid> --operator <name> --reason "<why>" \
-            --journal <journal.db> --state-dir <dir>
+            --command-id <uuid> --operator <name> --reason "<why>" --state-dir <dir>
+
+The journal is always ``<state-dir>/journal.db``: one system's ownership state and journal live
+together, so a mistyped path can never pair one system's journal with another system's lease.
 
 Properties required of this control channel:
 
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -71,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", help="emit the record as JSON")
 
     run = subparsers.add_parser("run", help="deliver one operator break-glass command")
-    _add_common_paths(run, journal_required=True)
+    _add_common_paths(run, journal_required=False)
     run.add_argument(
         "--command-type",
         "--command",
@@ -116,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_common_paths(parser: argparse.ArgumentParser, *, journal_required: bool) -> None:
     parser.add_argument(
-        "--journal", required=journal_required, default=None, help="path to the event journal"
+        "--journal", required=journal_required, default=None, help="the event journal; must be <state-dir>/journal.db (the default)"
     )
     parser.add_argument(
         "--state-dir",
@@ -144,7 +147,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run_status(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir)
-    journal_path = Path(args.journal) if args.journal else _default_journal(state_dir)
+    journal_path, mismatch = _journal_for(args)
+    if mismatch is not None:
+        return _refuse(mismatch)
     try:
         with SQLiteEventJournal(journal_path, read_only=True) as journal:
             control = BreakGlassControl(journal=journal, state_dir=state_dir)
@@ -156,7 +161,6 @@ def _run_status(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    journal_path = Path(args.journal)
     state_dir = Path(args.state_dir)
     delivered_at = datetime.now(timezone.utc)
     command = parse_operator_command(
@@ -173,6 +177,9 @@ def _run_command(args: argparse.Namespace) -> int:
         },
         delivered_at=delivered_at,
     )
+    journal_path, mismatch = _journal_for(args)
+    if mismatch is not None:
+        return _refuse(f"{mismatch} {EXCHANGE_FALLBACK}")
     try:
         journal = _open_emergency_journal(journal_path)
     except (JournalError, sqlite3.Error) as exc:  # before any lease, state or venue side effect
@@ -225,6 +232,20 @@ def _build_venue(args: argparse.Namespace):
 
 def _monotonic_utc() -> float:
     return datetime.now(timezone.utc).timestamp()
+
+
+def _journal_for(args: argparse.Namespace) -> tuple[Path, str | None]:
+    """The journal bound to ``--state-dir`` is always ``<state-dir>/journal.db``; refuse any other."""
+    bound = _default_journal(Path(args.state_dir))
+    if args.journal is None:
+        return bound, None
+    given = Path(args.journal)
+    if os.path.normcase(os.path.abspath(given)) == os.path.normcase(os.path.abspath(bound)):
+        return bound, None
+    return bound, (
+        f"--journal {given} is not the journal bound to --state-dir {args.state_dir} "
+        f"(expected {bound}); refusing to pair a journal with another system's ownership state."
+    )
 
 
 def _default_journal(state_dir: Path) -> Path:

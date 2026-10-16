@@ -30,7 +30,7 @@ def run_cli(tmp_path: Path, *args: str, journal_path: Path | None = None) -> int
         [
             *args,
             "--state-dir",
-            str(tmp_path / "state"),
+            str(tmp_path),
             *([] if journal is None else ["--journal", str(journal)]),
         ]
     )
@@ -50,7 +50,7 @@ def base_args(tmp_path: Path, command: str, *, command_id: str | None = None, **
         "--journal",
         str(tmp_path / "journal.db"),
         "--state-dir",
-        str(tmp_path / "state"),
+        str(tmp_path),
         "--json",
     ]
     for key, value in extra.items():
@@ -70,6 +70,11 @@ def _found_full_journal(tmp_path: Path) -> Path:
     return path
 
 
+def _assert_no_state_files(state_dir: Path) -> None:
+    """No ownership, safety or lock file was written next to the journal."""
+    assert sorted(p.name for p in state_dir.iterdir() if not p.name.startswith("journal.db")) == []
+
+
 def test_status_reports_the_read_only_posture(tmp_path, capsys):
     journal = tmp_path / "journal.db"
     with SQLiteEventJournal(journal):
@@ -84,14 +89,14 @@ def test_status_reports_the_read_only_posture(tmp_path, capsys):
     assert record["safety"]["new_risk_permitted"] is False  # no writer has claimed the lease yet
     assert record["epoch"]["open"] is False
     assert _sha256(journal) == founded
-    assert not (tmp_path / "state").exists()
+    _assert_no_state_files(tmp_path)
 
 
 @pytest.mark.parametrize("explicit_journal", [True, False])
 def test_status_refuses_a_missing_journal_and_creates_nothing(tmp_path, capsys, explicit_journal):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    journal = tmp_path / "journal.db" if explicit_journal else state_dir / "journal.db"
+    journal = state_dir / "journal.db"
     argv = ["status", "--json", "--state-dir", str(state_dir)]
     if explicit_journal:
         argv += ["--journal", str(journal)]
@@ -260,7 +265,7 @@ def test_run_refuses_a_journal_that_is_not_full_founded_without_touching_it(tmp_
         "directly at the exchange.\n"
     )
     assert _sha256(journal) == founded
-    assert not (tmp_path / "state").exists()
+    _assert_no_state_files(tmp_path)
 
 
 def test_run_turns_an_os_error_on_the_journal_path_into_a_clean_refusal(tmp_path, capsys, monkeypatch):
@@ -280,7 +285,73 @@ def test_run_turns_an_os_error_on_the_journal_path_into_a_clean_refusal(tmp_path
         f"checked: [Errno 13] access denied [journal: {journal}] If orders are open, cancel them "
         "directly at the exchange.\n"
     )
-    assert not (tmp_path / "state").exists()
+    _assert_no_state_files(tmp_path)
+
+
+def test_run_refuses_a_journal_that_is_not_bound_to_the_state_dir(tmp_path, capsys):
+    production = tmp_path / "production"
+    production.mkdir()
+    journal = _found_full_journal(production)
+    founded = _sha256(journal)
+    other_state = tmp_path / "typo-state"
+    args = base_args(tmp_path, "halt-new-risk")
+    args[args.index("--journal") + 1] = str(journal)
+    args[args.index("--state-dir") + 1] = str(other_state)
+
+    code = main(args)
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        f"REFUSED (fail closed, nothing changed): --journal {journal} is not the journal bound to "
+        f"--state-dir {other_state} (expected {other_state / 'journal.db'}); refusing to pair a "
+        "journal with another system's ownership state. If orders are open, cancel them directly "
+        "at the exchange.\n"
+    )
+    assert _sha256(journal) == founded
+    assert not other_state.exists()
+
+
+def test_status_refuses_a_journal_that_is_not_bound_to_the_state_dir(tmp_path, capsys):
+    journal = _found_full_journal(tmp_path)
+    other_state = tmp_path / "typo-state"
+
+    code = main(["status", "--json", "--state-dir", str(other_state), "--journal", str(journal)])
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        f"REFUSED (fail closed, nothing changed): --journal {journal} is not the journal bound to "
+        f"--state-dir {other_state} (expected {other_state / 'journal.db'}); refusing to pair a "
+        "journal with another system's ownership state.\n"
+    )
+    assert not other_state.exists()
+
+
+def test_run_uses_the_state_dir_journal_when_journal_is_omitted(tmp_path, capsys):
+    _found_full_journal(tmp_path)
+    args = base_args(tmp_path, "halt-new-risk")
+    at = args.index("--journal")
+    del args[at:at + 2]
+
+    code = main(args)
+    record = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_ACCEPTED
+    assert record["resulting_safety_state"] == "halt_new_risk"
+
+
+def test_run_accepts_another_spelling_of_the_bound_journal(tmp_path, capsys):
+    _found_full_journal(tmp_path)
+    args = base_args(tmp_path, "halt-new-risk")
+    args[args.index("--journal") + 1] = str(tmp_path / "sub" / ".." / "journal.db")
+
+    code = main(args)
+    capsys.readouterr()
+
+    assert code == EXIT_ACCEPTED
 
 
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
@@ -326,7 +397,7 @@ def test_status_output_is_json_serializable_and_secret_free(tmp_path, capsys):
     _found_full_journal(tmp_path)
     main(base_args(tmp_path, "force-recovery-required"))
     capsys.readouterr()
-    main(["status", "--json", "--state-dir", str(tmp_path / "state"), "--journal", str(tmp_path / "journal.db")])
+    main(["status", "--json", "--state-dir", str(tmp_path), "--journal", str(tmp_path / "journal.db")])
     record = json.loads(capsys.readouterr().out)
 
     assert record["epoch"]["open"] is True
