@@ -194,6 +194,7 @@ class SQLiteEventJournal:
         timeout_seconds: float = 10.0,
         venue_writes: bool = False,
         read_only: bool = False,
+        must_exist: bool = False,
     ) -> None:
         self.path = str(path)
         try:
@@ -204,7 +205,10 @@ class SQLiteEventJournal:
         if read_only:
             self._open_read_only(timeout_seconds=timeout_seconds, venue_writes=venue_writes)
             return
-        self._conn = sqlite3.connect(self.path, timeout=timeout_seconds)
+        if must_exist:
+            self._connect_existing(timeout_seconds=timeout_seconds, was_new=was_new)
+        else:
+            self._conn = sqlite3.connect(self.path, timeout=timeout_seconds)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=FULL;" if venue_writes else "PRAGMA synchronous=NORMAL;")
@@ -217,6 +221,21 @@ class SQLiteEventJournal:
         except Exception:
             self._conn.close()
             raise
+
+    def _connect_existing(self, *, timeout_seconds: float, was_new: bool) -> None:
+        """Open an existing journal for writing; SQLite itself refuses to create a vanished file."""
+        if was_new or self.path == ":memory:":
+            raise JournalSchemaError(
+                f"journal {self.path} is not an existing file; this writer never creates one."
+            )
+        try:
+            # abspath, not resolve(): the same path every other writer uses, so one -wal/-shm.
+            uri = Path(os.path.abspath(self.path)).as_uri() + "?mode=rw"
+            self._conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            raise JournalSchemaError(
+                f"journal {self.path} could not be opened without creating it: {exc}"
+            ) from exc
 
     def _open_read_only(self, *, timeout_seconds: float, venue_writes: bool) -> None:
         """Open an existing journal for reads only: never create, migrate or repair anything."""

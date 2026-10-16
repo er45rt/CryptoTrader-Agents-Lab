@@ -377,6 +377,55 @@ def test_run_reports_incomplete_when_the_journal_fails_after_side_effects(
     )
 
 
+def _pretend_present(monkeypatch, path: Path, *names: str) -> None:
+    """Make ``path`` look present to the named Path checks: it vanished after they ran."""
+    for name in names:
+        real = getattr(Path, name)
+        monkeypatch.setattr(
+            Path, name, lambda self, *a, _real=real, **k: self == path or _real(self, *a, **k)
+        )
+
+
+def test_run_never_founds_a_journal_that_vanished_after_the_existence_check(
+    tmp_path, capsys, monkeypatch
+):
+    journal = tmp_path / "journal.db"
+    _pretend_present(monkeypatch, journal, "is_file")
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        f"REFUSED (fail closed, nothing changed): JournalSchemaError: journal {journal} is not an "
+        f"existing file; this writer never creates one. [journal: {journal}] If orders are open, "
+        "cancel them directly at the exchange.\n"
+    )
+    assert not os.path.exists(journal)
+    _assert_no_state_files(tmp_path)
+
+
+def test_run_never_creates_a_journal_that_vanished_before_the_writer_connected(
+    tmp_path, capsys, monkeypatch
+):
+    journal = tmp_path / "journal.db"
+    _pretend_present(monkeypatch, journal, "is_file", "exists")
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        f"REFUSED (fail closed, nothing changed): JournalSchemaError: journal {journal} could not "
+        "be opened without creating it: unable to open database file "
+        f"[journal: {journal}] If orders are open, cancel them directly at the exchange.\n"
+    )
+    assert not os.path.exists(journal)
+    _assert_no_state_files(tmp_path)
+
+
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
     _found_full_journal(tmp_path)
     main(base_args(tmp_path, "cancel-open"))

@@ -219,7 +219,8 @@ def _open_emergency_journal(journal_path: Path) -> SQLiteEventJournal:
         raise JournalSchemaError(f"the journal could not be checked: {exc}") from exc
     if not exists:
         raise JournalSchemaError("the journal is not an existing file; run never creates a journal.")
-    return SQLiteEventJournal(journal_path, venue_writes=True)
+    # must_exist closes the window between the check above and the connect: never found anew.
+    return SQLiteEventJournal(journal_path, venue_writes=True, must_exist=True)
 
 
 def _build_venue(args: argparse.Namespace):
