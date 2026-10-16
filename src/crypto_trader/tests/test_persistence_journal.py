@@ -179,6 +179,108 @@ def test_batch_with_conflict_writes_nothing(journal):
     assert journal.read_by_id(fresh_one.event_id) is None
 
 
+@pytest.mark.parametrize("method", ["batch", "conditional", "conditional_all_new"])
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("reverse_conflict", [False, True])
+def test_f5_intra_batch_conflicting_event_id_writes_nothing(
+    journal, method, seeded, reverse_conflict, record_property,
+):
+    prior = decision(-1)
+    if seeded:
+        journal.append(prior)
+    before = journal.revision()
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="conflicting intra-batch content",
+        ),
+    })
+    pair = [original, conflicting]
+    if reverse_conflict:
+        pair.reverse()
+    fresh_one, fresh_two = decision(1), decision(2)
+    events = [fresh_one, *pair, fresh_two]
+
+    error = None
+    try:
+        if method == "batch":
+            journal.append_batch(events)
+        else:
+            journal.append_batch_if_revision(
+                events, expected=before, require_all_new=method == "conditional_all_new",
+            )
+    except Exception as exc:
+        error = exc
+
+    after = journal.revision()
+    newly_persisted = [
+        str(event.event_id) for event in (fresh_one, original, fresh_two)
+        if journal.read_by_id(event.event_id) is not None
+    ]
+    observed = {
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "new_events": len(newly_persisted),
+        "revision_unchanged": after == before,
+    }
+    record_property("f5_observed", str(observed))
+    assert type(error) is EventIdConflictError, observed
+    assert error.event_id == original.event_id
+    assert str(error) == (
+        f"event_id {original.event_id} already exists with different content; refusing to overwrite "
+        "an append-only journal entry."
+    )
+    assert after == before
+    assert journal.count() == int(seeded)
+    assert newly_persisted == []
+    assert journal.read_by_id(prior.event_id) == (prior if seeded else None)
+
+
+def test_f5_intra_batch_identical_duplicates_remain_idempotent(journal):
+    first, second = decision(0), decision(1)
+    events = [first, first, second, second]
+
+    assert journal.append_batch(events) == 2
+    before = journal.revision()
+    assert journal.append_batch(events) == 0
+    assert journal.revision() == before
+    assert journal.count() == 2
+    assert journal.read_by_id(first.event_id) == first
+    assert journal.read_by_id(second.event_id) == second
+
+
+@pytest.mark.parametrize("require_all_new", [False, True])
+def test_f5_conditional_identical_intra_batch_duplicates_keep_schema_rejection(
+    journal, require_all_new,
+):
+    event = decision(0)
+    before = journal.revision()
+
+    with pytest.raises(JournalSchemaError) as caught:
+        journal.append_batch_if_revision(
+            [event, event], expected=before, require_all_new=require_all_new,
+        )
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"conditional append batch contains duplicate event_id {event.event_id}."
+    )
+    assert journal.revision() == before
+    assert journal.count() == 0
+
+
+def test_f5_conditional_identical_redelivery_remains_idempotent(journal):
+    event = decision(0)
+    journal.append(event)
+    before = journal.revision()
+
+    result = journal.append_batch_if_revision([event], expected=before)
+
+    assert result.inserted == 0
+    assert result.before == result.after == journal.revision() == before
+    assert journal.read_by_id(event.event_id) == event
+
+
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
     events = [decision(2), decision(0), decision(1)]
 

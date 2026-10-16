@@ -363,7 +363,10 @@ class SQLiteEventJournal:
         for event in events:
             payload_json = event.to_json()
             digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-            digests[str(event.event_id)] = digest
+            event_id = str(event.event_id)
+            if event_id in digests and digests[event_id] != digest:
+                raise EventIdConflictError(event.event_id)
+            digests[event_id] = digest
             rows.append(self._row_for(event, payload_json, digest))
 
         # Fail closed on conflicts BEFORE writing anything.
@@ -421,6 +424,8 @@ class SQLiteEventJournal:
             digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
             event_id = str(event.event_id)
             if event_id in digests:
+                if digests[event_id] != digest:
+                    raise EventIdConflictError(event.event_id)
                 raise JournalSchemaError(
                     f"conditional append batch contains duplicate event_id {event_id}."
                 )
