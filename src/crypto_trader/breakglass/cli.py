@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from crypto_trader.events.errors import EventContractError
 from crypto_trader.execution import InstrumentSpec
 from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient,
@@ -143,12 +144,11 @@ def _run_status(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir)
     journal_path = Path(args.journal) if args.journal else _default_journal(state_dir)
     try:
-        journal = SQLiteEventJournal(journal_path, read_only=True)
-    except JournalError as exc:  # status never creates, migrates or repairs a journal
+        with SQLiteEventJournal(journal_path, read_only=True) as journal:
+            control = BreakGlassControl(journal=journal, state_dir=state_dir)
+            record = control.status().to_record()
+    except (JournalError, EventContractError) as exc:  # never creates, migrates or repairs
         return _refuse(f"{type(exc).__name__}: {exc}")
-    with journal:
-        control = BreakGlassControl(journal=journal, state_dir=state_dir)
-        record = control.status().to_record()
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED
 

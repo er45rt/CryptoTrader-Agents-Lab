@@ -488,6 +488,193 @@ def test_read_only_open_refuses_venue_writes(tmp_path):
     assert str(caught.value) == "a read-only journal cannot be opened for venue writes."
 
 
+class _InterleaveAfterPrecheck(_InterleaveBeforeFirstInsert):
+    """Runs ``interleave`` once, right after the batch conflict precheck SELECT has executed."""
+
+    def execute(self, sql, *args, **kwargs):
+        result = self._real.execute(sql, *args, **kwargs)
+        if not self.fired and sql.lstrip().startswith("SELECT event_id, payload_sha256 FROM events"):
+            self.fired = True
+            self._interleave()
+        return result
+
+
+def test_f5_cross_writer_is_locked_out_right_after_the_precheck(tmp_path):
+    path = tmp_path / "writers.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="written right after the precheck",
+        ),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        interleaved = {}
+
+        def other_writer():
+            try:
+                interleaved["result"] = b.append_batch([conflicting])
+            except JournalSchemaError as exc:
+                interleaved["error"] = exc
+
+        conn = a._conn
+        proxy = _InterleaveAfterPrecheck(conn, other_writer)
+        a._conn = proxy
+        try:
+            inserted = a.append_batch([original])
+        finally:
+            a._conn = conn
+
+        assert proxy.fired
+        assert (inserted, "result" in interleaved) == (1, False), interleaved
+        assert str(interleaved["error"]) == "journal batch failed: database is locked"
+        assert a.read_by_id(original.event_id) == original
+
+
+def test_f5_conflict_refusal_releases_the_write_lock(tmp_path):
+    path = tmp_path / "journal.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(action="sell", confidence="low", rationale="conflict"),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        a.append(original)
+        with pytest.raises(EventIdConflictError) as caught:
+            a.append_batch([conflicting])
+        assert caught.value.event_id == original.event_id
+        assert not a._conn.in_transaction
+        assert b.append(decision(1)) is True
+
+
+def test_empty_batch_is_a_no_op_without_a_transaction(journal):
+    assert journal.append_batch([]) == 0
+    assert not journal._conn.in_transaction
+    assert journal.count() == 0
+
+
+class _RaiseOnNthInsert:
+    """Delegating connection that raises ``exc`` just before its ``nth`` event INSERT."""
+
+    def __init__(self, conn, nth, exc):
+        self._real, self._nth, self._exc, self._seen = conn, nth, exc, 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.lstrip().startswith("INSERT INTO events"):
+            self._seen += 1
+            if self._seen == self._nth:
+                raise self._exc
+        return self._real.execute(sql, *args, **kwargs)
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("method", ["batch", "conditional"])
+def test_interrupt_mid_batch_rolls_back_and_releases_the_write_lock(tmp_path, method, interrupt):
+    path = tmp_path / "journal.db"
+    first, second, later = decision(0), decision(1), decision(2)
+    with SQLiteEventJournal(path) as journal, SQLiteEventJournal(path, timeout_seconds=0.1) as other:
+        conn = journal._conn
+        journal._conn = _RaiseOnNthInsert(conn, 2, interrupt())
+        try:
+            with pytest.raises(interrupt):
+                if method == "batch":
+                    journal.append_batch([first, second])
+                else:
+                    journal.append_batch_if_revision([first, second], expected=journal.revision())
+        finally:
+            journal._conn = conn
+
+        assert not conn.in_transaction
+        assert other.append(later) is True
+        assert journal.append(decision(3)) is True
+        assert journal.count() == 2
+        assert journal.read_by_id(first.event_id) is None
+        assert journal.read_by_id(second.event_id) is None
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_r03_interrupted_full_foundation_rolls_back_and_releases_the_lock(
+    tmp_path, monkeypatch, interrupt,
+):
+    path = tmp_path / "interrupted-genesis.db"
+    connect = sqlite3.connect
+
+    class InterruptedFoundation(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("PRAGMA application_id="):
+                raise interrupt()
+            return result
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(
+            *args, **kwargs, factory=InterruptedFoundation,
+        ))
+        with pytest.raises(interrupt) as caught:  # keeps the interrupted writer alive
+            SQLiteEventJournal(path, venue_writes=True)
+    with pytest.raises(JournalSchemaError, match="retrospective"):
+        SQLiteEventJournal(path, venue_writes=True, timeout_seconds=0.1)
+    with connect(path) as reader:
+        assert reader.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert reader.execute("SELECT name FROM sqlite_schema").fetchall() == []
+    assert caught.type is interrupt
+
+
+def test_read_only_open_turns_an_os_error_into_a_clean_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+
+    def denied(self):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"journal {path} could not be checked read-only: [Errno 13] access denied"
+    )
+    assert type(caught.value.__cause__) is PermissionError
+
+
+def test_read_only_open_sees_a_live_writers_uncheckpointed_events(tmp_path):
+    path = tmp_path / "journal.db"
+    first, second = decision(0), decision(1)
+    with SQLiteEventJournal(path) as writer:
+        writer.append(first)
+        assert Path(f"{path}-wal").stat().st_size > 0
+        with SQLiteEventJournal(path, read_only=True) as reader:
+            assert reader.read_by_id(first.event_id) == first
+            writer.append(second)
+            assert reader.count() == 2
+
+
+def test_read_only_open_through_a_symlink_shares_the_writers_wal(tmp_path):
+    target = tmp_path / "real" / "journal.db"
+    target.parent.mkdir()
+    with SQLiteEventJournal(target):
+        pass
+    link = tmp_path / "link.db"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are not available here: {exc}")
+    event = decision(0)
+    with SQLiteEventJournal(link) as writer:
+        writer.append(event)
+        with SQLiteEventJournal(link, read_only=True) as reader:
+            assert reader.read_by_id(event.event_id) == event
+
+
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
     events = [decision(2), decision(0), decision(1)]
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -218,11 +219,17 @@ class SQLiteEventJournal:
         """Open an existing journal for reads only: never create, migrate or repair anything."""
         if venue_writes:
             raise JournalSchemaError("a read-only journal cannot be opened for venue writes.")
-        if self.path == ":memory:" or not Path(self.path).is_file():
+        try:
+            if self.path == ":memory:" or not Path(self.path).is_file():
+                raise JournalSchemaError(
+                    f"journal {self.path} is not an existing file; a read-only open never creates it."
+                )
+            # abspath, not resolve(): read the path the writer uses so both share one -wal/-shm.
+            uri = Path(os.path.abspath(self.path)).as_uri() + "?mode=ro"
+        except (OSError, ValueError) as exc:
             raise JournalSchemaError(
-                f"journal {self.path} is not an existing file; a read-only open never creates it."
-            )
-        uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+                f"journal {self.path} could not be checked read-only: {exc}"
+            ) from exc
         try:
             self._conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds)
         except sqlite3.Error as exc:
@@ -247,9 +254,9 @@ class SQLiteEventJournal:
         except sqlite3.Error as exc:
             self._conn.close()
             raise JournalSchemaError(
-                f"read-only journal has no usable schema ({exc}); refusing to create one."
+                f"read-only journal could not be validated ({exc}); nothing was created or repaired."
             ) from exc
-        except Exception:
+        except BaseException:
             self._conn.close()
             raise
 
@@ -299,7 +306,7 @@ class SQLiteEventJournal:
                 self._conn.execute(f"PRAGMA application_id={FULL_GENESIS_APPLICATION_ID}")
             self.require_venue_write_ready()
             self._conn.commit()
-        except Exception:
+        except BaseException:  # includes KeyboardInterrupt/SystemExit: never leave it open
             if self._conn.in_transaction:
                 self._conn.rollback()
             raise
@@ -459,7 +466,7 @@ class SQLiteEventJournal:
             if self._conn.in_transaction:
                 self._conn.rollback()
             raise JournalSchemaError(f"journal batch failed: {exc}") from exc
-        except Exception:
+        except BaseException:  # includes KeyboardInterrupt/SystemExit: never leave it open
             if self._conn.in_transaction:
                 self._conn.rollback()
             raise
@@ -550,7 +557,7 @@ class SQLiteEventJournal:
             if self._conn.in_transaction:
                 self._conn.rollback()
             raise JournalSchemaError(f"conditional journal batch failed: {exc}") from exc
-        except Exception:
+        except BaseException:  # includes KeyboardInterrupt/SystemExit: never leave it open
             if self._conn.in_transaction:
                 self._conn.rollback()
             raise

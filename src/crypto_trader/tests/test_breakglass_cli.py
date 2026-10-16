@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from uuid import uuid4
 import pytest
 
 from crypto_trader.breakglass import BreakGlassControl
+from crypto_trader.events import EventValidationError, decode_event
 from crypto_trader.breakglass.cli import (
     EXIT_ACCEPTED,
     EXIT_MALFORMED,
@@ -108,11 +110,35 @@ def test_status_refuses_an_unfounded_journal_file_without_writing_a_schema(tmp_p
     assert code == EXIT_MALFORMED
     assert captured.out == ""
     assert captured.err == (
-        "REFUSED (fail closed, nothing changed): JournalSchemaError: read-only journal has no "
-        "usable schema (no such table: journal_meta); refusing to create one.\n"
+        "REFUSED (fail closed, nothing changed): JournalSchemaError: read-only journal could not "
+        "be validated (no such table: journal_meta); nothing was created or repaired.\n"
     )
     assert journal.read_bytes() == b""
     assert sorted(p.name for p in tmp_path.iterdir()) == ["journal.db"]
+
+
+def test_status_refuses_an_undecodable_journal_without_a_traceback(tmp_path, capsys):
+    journal = tmp_path / "journal.db"
+    main(base_args(tmp_path, "halt-new-risk"))
+    capsys.readouterr()
+    bad = '{"event_type": "strategy.decision.recorded", "schema_version": 1}'
+    raw = sqlite3.connect(journal)
+    with raw:
+        raw.execute("UPDATE events SET payload_json = ?", (bad,))
+    raw.close()
+    founded = _sha256(journal)
+    with pytest.raises(EventValidationError) as expected:
+        decode_event(bad)
+
+    code = run_cli(tmp_path, "status", "--json")
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        f"REFUSED (fail closed, nothing changed): EventValidationError: {expected.value}\n"
+    )
+    assert _sha256(journal) == founded
 
 
 def test_run_accepts_a_halt_and_engages_the_kill_switch(tmp_path, capsys):
