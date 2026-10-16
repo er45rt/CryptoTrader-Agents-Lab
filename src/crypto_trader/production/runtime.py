@@ -720,7 +720,13 @@ class ProductionRuntime:
                 engine=ReconciliationEngine(self._reconciliation_policy), journal=self._journal,
                 venue_sources=sources, producer=self._producer,
             )
-            run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
+            if writing:
+                # Journal recovery only as the still-fenced owner: no takeover window before it.
+                with self._control.ownership_store.exclusive(purpose="startup_fence"):
+                    authorize_startup_fence_locked(fence)
+                    run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
+            else:
+                run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
             if not run.report.is_fully_resolved or run.requires_halt_new_risk or not run.may_resume_trading:
                 self._last_refusal = "recovery_required"
                 raise ProductionRecoveryRequiredError(
