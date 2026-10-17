@@ -823,6 +823,126 @@ def test_a_cancel_never_reaches_the_venue_through_another_journal_at_the_bound_p
     assert _sha256(bound) == founded
 
 
+def _bind_without_a_journal_id(state_dir: Path, journal: Path) -> str:
+    """A lease bound by path alone, as builds before journal identities wrote it."""
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import OwnerKind, OwnershipStore
+
+    store = OwnershipStore(state_dir / "ownership.json")
+    store.takeover(
+        owner_id="normal:legacy",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=datetime.now(timezone.utc),
+        reason_code="runtime_started",
+        journal_path=str(journal),
+    )
+    return store.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("subcommand", ["run", "status"])
+def test_a_lease_bound_without_a_journal_id_refuses_a_journal_that_has_one(
+    tmp_path, capsys, subcommand
+):
+    # Review F02-R1: identities are minted only at founding and never backfilled, so a journal that
+    # has one is not the id-less journal a path-only lease was bound to; it must not be adopted.
+    system_a, system_b = tmp_path / "system-a", tmp_path / "system-b"
+    system_a.mkdir()
+    system_b.mkdir()
+    journal_a = _found_full_journal(system_a)
+    journal_b = _found_full_journal(system_b)
+    lease = _bind_without_a_journal_id(system_b, journal_b)
+    os.replace(journal_a, journal_b)
+    moved = _sha256(journal_b)
+    if subcommand == "run":
+        args, prefix = base_args(system_b, "halt-new-risk"), "OwnershipStateError: "
+    else:
+        args, prefix = ["status", "--json", "--state-dir", str(system_b)], ""
+
+    code = main(args)
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED, captured.out
+    assert captured.out == ""
+    assert re.fullmatch(
+        re.escape(
+            f"REFUSED (fail closed, nothing changed): {prefix}the trading-state lease is bound to "
+            f"journal {journal_b} without a journal_id, but the journal open at {journal_b} has "
+            "journal_id "
+        )
+        + _UUID
+        + re.escape("; refusing to pair a journal with another system's ownership state.\n"),
+        captured.err,
+    ), captured.err
+    assert _sha256(journal_b) == moved
+    assert (system_b / "ownership.json").read_text(encoding="utf-8") == lease
+
+
+def test_a_lease_bound_without_a_journal_id_never_adopts_a_journal_founded_anew(tmp_path):
+    # Review F02-R1: neither a runtime claim nor a cancel may take a journal founded again at the
+    # bound path as the bound one and record its identity; the venue is never called.
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import parse_operator_command
+
+    state_dir = tmp_path / "state"
+    bound = _found_full_journal(tmp_path)
+    lease = _bind_without_a_journal_id(state_dir, bound)
+    bound.unlink()
+    _found_full_journal(tmp_path)
+    founded = _sha256(bound)
+    venue = _CountingVenue()
+    refusal = (
+        re.escape(f"the trading-state lease is bound to journal {bound} without a journal_id, but ")
+        + re.escape(f"the journal open at {bound} has journal_id ")
+        + _UUID
+        + re.escape("; refusing to pair a journal with another system's ownership state.")
+    )
+
+    with SQLiteEventJournal(bound, venue_writes=True, must_exist=True) as journal:
+        control = BreakGlassControl(journal=journal, state_dir=state_dir, venue=venue)
+        with pytest.raises(OwnershipStateError, match=refusal):
+            control.claim_normal_writer(owner_id="normal:other")
+        with pytest.raises(OwnershipStateError, match=refusal):
+            control.handle(
+                parse_operator_command(
+                    {
+                        "command_type": "cancel_open",
+                        "command_id": str(uuid4()),
+                        "operator_label": "jamal",
+                        "reason": "journal identity",
+                        "source": "operator-cli",
+                    },
+                    delivered_at=datetime.now(timezone.utc),
+                )
+            )
+    assert venue.cancels == 0
+    assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease
+    assert _sha256(bound) == founded
+
+
+def test_a_lease_bound_without_a_journal_id_keeps_its_id_less_journal_by_path(tmp_path):
+    # Review F02-R1 (residual, by design): a journal founded before identities has none, so its
+    # path-only lease is judged by path as before, and a takeover never records an identity.
+    state_dir = tmp_path / "state"
+    bound = _found_full_journal(tmp_path)
+    with sqlite3.connect(bound) as raw:
+        raw.execute("DELETE FROM journal_meta WHERE key = 'journal_id'")
+    raw.close()
+    _bind_without_a_journal_id(state_dir, bound)
+
+    with SQLiteEventJournal(bound, venue_writes=True, must_exist=True) as journal:
+        assert journal.journal_id() is None
+        control = BreakGlassControl(journal=journal, state_dir=state_dir)
+        control.claim_normal_writer(owner_id="normal:runtime")
+        record = control.ownership_store.read()
+
+    assert record.owner_id == "normal:runtime"
+    assert record.journal_path == str(bound)
+    assert record.journal_id is None
+    assert "journal_id" not in json.loads((state_dir / "ownership.json").read_text(encoding="utf-8"))
+
+
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
     _found_full_journal(tmp_path)
     main(base_args(tmp_path, "cancel-open"))

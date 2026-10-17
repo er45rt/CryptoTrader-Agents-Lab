@@ -213,11 +213,12 @@ def test_a_takeover_cannot_switch_the_lease_to_another_spelling_of_its_journal(
 def test_a_takeover_keeps_the_recorded_journal_id_and_never_drops_or_switches_it(
     store: OwnershipStore, tmp_path: Path
 ):
-    # Review F-02: once a lease records its journal's identity, a takeover through the bound path
-    # must present that identity; a lease recorded without one takes the first one presented.
+    # Review F-02/F02-R1: a new binding records its journal's identity; a takeover through the bound
+    # path must present that identity, and a lease bound without one is never given one.
     bound = str(tmp_path / "journal.db")
     first, other = uuid4(), uuid4()
-    legacy = store.takeover(
+    legacy_store = OwnershipStore(tmp_path / "legacy" / "ownership.json")
+    legacy = legacy_store.takeover(
         owner_id="normal:runtime",
         owner_kind=OwnerKind.NORMAL,
         acquired_at=BASE,
@@ -225,7 +226,22 @@ def test_a_takeover_keeps_the_recorded_journal_id_and_never_drops_or_switches_it
         journal_path=bound,
     )
     assert legacy.journal_id is None
-    assert "journal_id" not in json.loads(store.path.read_text(encoding="utf-8"))
+    legacy_raw = legacy_store.path.read_text(encoding="utf-8")
+    assert "journal_id" not in json.loads(legacy_raw)
+    with pytest.raises(OwnershipStateError, match=re.escape(
+        f"the trading-state lease is bound to journal {bound} without a journal_id, but the "
+        f"journal open at {bound} has journal_id {first}; refusing to pair a journal with another "
+        "system's ownership state."
+    )):
+        legacy_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+            journal_path=bound,
+            journal_id=first,
+        )
+    assert legacy_store.path.read_text(encoding="utf-8") == legacy_raw
 
     upgraded = store.takeover(
         owner_id="normal:runtime",

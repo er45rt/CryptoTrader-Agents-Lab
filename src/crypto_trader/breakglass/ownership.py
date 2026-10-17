@@ -113,10 +113,19 @@ def journal_identity_mismatch(
 
     A real path names whatever file is there now (another journal moved onto it, or one founded
     anew there), so a lease that recorded its journal's identity requires the open connection to
-    report that same identity. A lease recorded without one is judged by its path alone.
+    report that same identity. Identities are minted only at founding and never backfilled, so a
+    lease bound without one accepts only a journal without one (judged by its path alone).
     """
-    if record is None or record.journal_id is None or journal_path is None:
+    if record is None or record.journal_realpath is None or journal_path is None:
         return None
+    if record.journal_id is None:
+        if journal_id is None:
+            return None
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path} without a "
+            f"journal_id, but the journal open at {journal_path} has journal_id {journal_id}; "
+            "refusing to pair a journal with another system's ownership state."
+        )
     if journal_id != record.journal_id:
         found = "no journal_id" if journal_id is None else f"journal_id {journal_id}"
         return (
@@ -421,7 +430,8 @@ class OwnershipStore:
                 bound_path = bound_real = bound_id = None
             else:
                 bound_path, bound_real = os.path.abspath(journal_path), journal_realpath(journal_path)
-                # Equal to a recorded identity (checked above), or the first one this lease records.
+                # Checked above: the recorded identity, none for a lease bound without one, or the
+                # identity a new binding records first. A takeover never upgrades a bound lease.
                 bound_id = journal_id
             term = 1 if previous is None else previous.term + 1
             record = OwnershipRecord(
