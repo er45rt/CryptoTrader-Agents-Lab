@@ -146,6 +146,11 @@ class OwnershipRecord:
             raise OwnershipStateError("an ownership record requires a reason code.")
         if self.acquired_at.tzinfo is None or self.acquired_at.utcoffset() is None:
             raise OwnershipStateError("acquired_at must be timezone-aware.")
+        if (self.journal_path is None) != (self.journal_realpath is None):
+            raise OwnershipStateError(
+                "the ownership record is partially bound to a journal (journal_path and "
+                "journal_realpath must be recorded together); refusing to guess its binding."
+            )
 
     @property
     def fence(self) -> WriterFence:

@@ -1,5 +1,6 @@
 """Phase 13: single-writer ownership, fencing tokens and explicit takeover semantics."""
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -128,6 +129,39 @@ def test_a_corrupt_ownership_record_fails_closed(store: OwnershipStore):
         store.read()
     with pytest.raises(OwnershipStateError):
         store.require_fence()
+
+
+@pytest.mark.parametrize("present", ["journal_path", "journal_realpath"])
+def test_a_partially_bound_ownership_record_fails_closed_before_any_change(
+    store: OwnershipStore, tmp_path: Path, present: str
+):
+    # Review N-03: one binding field without the other must never read as an unbound lease,
+    # or a takeover could re-bind the state dir to another system's journal.
+    payload = {
+        "schema_version": OWNERSHIP_SCHEMA_VERSION,
+        "term": 1,
+        "owner_id": "normal:runtime",
+        "owner_kind": "normal",
+        "acquired_at": "2026-01-01T12:00:00+00:00",
+        "previous_owner_id": None,
+        "reason_code": "runtime_started",
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        present: str(tmp_path / "system-a" / "journal.db"),
+    }
+    raw = json.dumps(payload)
+    store.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(OwnershipStateError, match="partially bound to a journal"):
+        store.read()
+    with pytest.raises(OwnershipStateError, match="partially bound to a journal"):
+        store.takeover(
+            owner_id="normal:other",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+            journal_path=str(tmp_path / "system-b" / "journal.db"),
+        )
+    assert store.path.read_text(encoding="utf-8") == raw
 
 
 def test_an_unknown_ownership_schema_is_refused(store: OwnershipStore):
