@@ -104,6 +104,7 @@ class VenueControlOutcome:
     reason_code: str
     detail: str
     cancelled_order_references: tuple[str, ...] = ()
+    unconfirmed_order_references: tuple[str, ...] = ()
     preflight: EmergencyPreflight | None = None
 
     @property
@@ -121,6 +122,7 @@ class VenueControlOutcome:
             "reason_code": self.reason_code,
             "detail": self.detail,
             "cancelled_order_references": list(self.cancelled_order_references),
+            "unconfirmed_order_references": list(self.unconfirmed_order_references),
             "preflight": None if self.preflight is None else self.preflight.to_record(),
         }
 
@@ -257,6 +259,14 @@ class BinanceSpotTestnetEmergencyControl:
         )
         return confirmed
 
+    @staticmethod
+    def _unconfirmed_of(exc: BaseException) -> tuple[str, ...]:
+        """The order whose cancel failed: journaled as unconfirmed, never as cancelled."""
+        unconfirmed = getattr(exc, "unconfirmed_order_reference", None)
+        if isinstance(unconfirmed, str) and unconfirmed.strip():
+            return (unconfirmed,)
+        return ()
+
     def cancel_open_orders(
         self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
@@ -281,6 +291,7 @@ class BinanceSpotTestnetEmergencyControl:
                 detail="the cancel outcome is unknown; it was NOT retried and the epoch requires "
                 "reconciliation",
                 cancelled_order_references=self._remember_failed_cancel(exc),
+                unconfirmed_order_references=self._unconfirmed_of(exc),
                 preflight=preflight,
             )
         except BinanceTestnetError as exc:
@@ -290,6 +301,7 @@ class BinanceSpotTestnetEmergencyControl:
                 detail=f"the venue rejected the cancel deterministically ({type(exc).__name__}); "
                 "reconciliation is still required to confirm the resulting order state",
                 cancelled_order_references=self._remember_failed_cancel(exc),
+                unconfirmed_order_references=self._unconfirmed_of(exc),
                 preflight=preflight,
             )
         references = tuple(order.client_order_id for order in orders)

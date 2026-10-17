@@ -71,11 +71,12 @@ def test_default_registry_registers_every_v1_contract():
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:
         event_type = contract.model_fields["event_type"].default
-        assert registry.supported_versions(event_type) == (
-            (1, 2)
-            if event_type in ("risk.evaluation.recorded", "safety.operator_command.recorded")
-            else (1,)
-        )
+        expected = (1,)
+        if event_type == "risk.evaluation.recorded":
+            expected = (1, 2)
+        elif event_type == "safety.operator_command.recorded":
+            expected = (1, 2, 3)  # V3 adds unconfirmed cancel references (review N-05)
+        assert registry.supported_versions(event_type) == expected
 
 
 def test_valid_registration_and_explicit_lookup():

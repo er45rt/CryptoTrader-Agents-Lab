@@ -462,6 +462,49 @@ def test_a_part_way_cancel_failure_never_journals_the_failed_cancel(journal, tmp
 
     assert outcome.venue_control == "ambiguous"
     assert process.load_ledger().records[0].cancelled_order_references == ("ct-1",)
+    assert process.load_ledger().records[0].unconfirmed_order_references == ("ct-2",)
+    records = [e for e in journal.read_range() if e.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+    assert [event.schema_version for event in records] == [3]
+
+
+def test_reconcile_in_a_new_process_still_asks_about_an_unconfirmed_cancel(journal, tmp_path):
+    # Review N-05: ct-1's cancel was confirmed and ct-2's was rejected. A new process knows both
+    # only from the journal; it must ask the venue about ct-2 too and stay pending without it.
+    state_dir = tmp_path / "state"
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            txf.rejected(-2011, "Unknown order sent."),
+        ],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+    silent = _SilentVenue()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, silent)
+
+    assert silent.tracked == ["ct-1", "ct-2"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
 
 
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):

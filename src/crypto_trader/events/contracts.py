@@ -91,6 +91,7 @@ __all__ = [
     "RiskEvaluationRecordedV2",
     "RiskRuleResultPayloadV2",
     "V2_CONTRACTS",
+    "V3_CONTRACTS",
     "RiskRuleResultPayload",
     "RiskRuleUnit",
     "SAFETY_EVENT_TYPE",
@@ -103,6 +104,8 @@ __all__ = [
     "OperatorCommandRecorded",
     "OperatorCommandRecordPayloadV2",
     "OperatorCommandRecordedV2",
+    "OperatorCommandRecordPayloadV3",
+    "OperatorCommandRecordedV3",
     "OperatorCommandType",
     "STREAM_LIFECYCLE_EVENT_TYPE",
     "StreamLifecyclePayload",
@@ -837,6 +840,34 @@ class OperatorCommandRecordedV2(OperatorCommandRecorded):
     payload: OperatorCommandRecordPayloadV2
 
 
+class OperatorCommandRecordPayloadV3(OperatorCommandRecordPayloadV2):
+    """V3 adds the references whose cancel was attempted but never confirmed (review N-05).
+
+    V2 fields keep their meanings: cancelled_order_references stays venue-confirmed only. A new
+    process reconciling the epoch must still demand venue evidence for every unconfirmed one.
+    """
+
+    unconfirmed_order_references: list[str] = Field(
+        description="Client order references whose cancel was attempted but not confirmed."
+    )
+
+    @field_validator("unconfirmed_order_references")
+    @classmethod
+    def _usable_unconfirmed(cls, value: list[str]) -> list[str]:
+        if any(not reference.strip() for reference in value):
+            raise ValueError("unconfirmed order references must not be blank.")
+        if len(set(value)) != len(value):
+            raise ValueError("unconfirmed order references must be unique.")
+        return value
+
+
+class OperatorCommandRecordedV3(OperatorCommandRecorded):
+    """Explicit V3 command record, written only when a cancel stayed unconfirmed."""
+
+    schema_version: Literal[3] = 3
+    payload: OperatorCommandRecordPayloadV3
+
+
 # --- 11. Market-data stream lifecycle (Phase 15, additive) ------------------
 
 #: The stream lifecycle vocabulary. ``ready`` is reachable only after a fresh synchronized
@@ -955,3 +986,4 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
 )
 
 V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2, OperatorCommandRecordedV2)
+V3_CONTRACTS: tuple[type[DomainEvent], ...] = (OperatorCommandRecordedV3,)

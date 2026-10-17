@@ -261,6 +261,7 @@ class RecordedOperatorCommand:
     correlation_id: UUID
     causation_id: UUID | None
     cancelled_order_references: tuple[str, ...] = ()
+    unconfirmed_order_references: tuple[str, ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -326,6 +327,19 @@ class BreakGlassLedger:
                     references.append(reference)
         return tuple(references)
 
+    def open_epoch_unconfirmed_references(self) -> tuple[str, ...]:
+        """Order references whose cancel stayed unconfirmed since the open epoch was opened."""
+        if self.open_epoch is None:
+            return ()
+        references: list[str] = []
+        for record in self.records:
+            if record.epoch_opened:
+                references = []
+            for reference in record.unconfirmed_order_references:
+                if reference not in references:
+                    references.append(reference)
+        return tuple(references)
+
 
 def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     """Rebuild the ledger from the authoritative journal (no cache, no guessing)."""
@@ -364,6 +378,11 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
                 cancelled_order_references=tuple(
                     str(reference)
                     for reference in getattr(payload, "cancelled_order_references", ())
+                ),
+                # V3 records also journal the cancels the venue never confirmed (review N-05).
+                unconfirmed_order_references=tuple(
+                    str(reference)
+                    for reference in getattr(payload, "unconfirmed_order_references", ())
                 ),
             )
         except (AttributeError, TypeError, ValueError) as exc:
