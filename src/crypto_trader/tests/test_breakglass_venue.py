@@ -157,11 +157,11 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
         ("rejected", txf.rejected(-2011, "Unknown order sent.")),
     ],
 )
-def test_a_cancel_all_failing_part_way_keeps_every_reference_it_touched(
+def test_a_cancel_all_failing_part_way_journals_only_confirmed_cancels(
     journal, disposition, second_cancel
 ):
-    # Review F-03: ct-1 was already cancelled and ct-2's cancel failed; both must stay on the
-    # record so reconciliation demands venue evidence for them instead of resolving by silence.
+    # Review F-03/N-04: ct-1's cancel was confirmed, ct-2's failed. ct-1 stays on the record;
+    # ct-2 is tracked for venue evidence but never recorded as cancelled.
     control, _, _, transport = venue(
         journal,
         [
@@ -180,7 +180,8 @@ def test_a_cancel_all_failing_part_way_keeps_every_reference_it_touched(
     deletes = [request for request in transport.requests if request.method == "DELETE"]
 
     assert outcome.disposition == disposition
-    assert outcome.cancelled_order_references == ("ct-1", "ct-2")
+    assert outcome.cancelled_order_references == ("ct-1",)
+    assert "ct-2" in control._order_references
     assert len(deletes) == 2
 
 
@@ -429,9 +430,9 @@ def test_reconcile_stays_pending_when_the_venue_has_no_evidence_for_journaled_ca
     )
 
 
-def test_a_part_way_cancel_failure_journals_every_touched_reference(journal, tmp_path):
-    # Review F-03: the journal is the only memory a new process has, so the references a
-    # failed cancel-all touched must reach it, or reconcile would have nothing to ask about.
+def test_a_part_way_cancel_failure_never_journals_the_failed_cancel(journal, tmp_path):
+    # Review F-03/N-04: the journal is a new process's only memory: the confirmed cancel (ct-1)
+    # must reach it, and the cancel that timed out (ct-2) must never be recorded as cancelled.
     control, _, _, _ = venue(
         journal,
         [
@@ -460,7 +461,7 @@ def test_a_part_way_cancel_failure_journals_every_touched_reference(journal, tmp
     outcome = process.handle(_operator_command("cancel_open"))
 
     assert outcome.venue_control == "ambiguous"
-    assert process.load_ledger().records[0].cancelled_order_references == ("ct-1", "ct-2")
+    assert process.load_ledger().records[0].cancelled_order_references == ("ct-1",)
 
 
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):

@@ -1206,18 +1206,21 @@ class BinanceSpotTestnetClient:
     def cancel_all_open_orders(self, symbol: str) -> tuple[TestnetOrder, ...]:
         """Cancel every open order for ``symbol`` (the Safety Lane cancel-all action).
 
-        A failure part-way never forgets what was already touched: the raised error carries
-        ``attempted_order_references`` (every order cancelled so far plus the one whose cancel
-        failed), so the caller can still require venue evidence for each of them.
+        A failure part-way never forgets what was already done. The raised error carries
+        ``cancelled_order_references`` (the cancels the venue confirmed before the failure) and
+        ``unconfirmed_order_reference`` (the order whose cancel failed, or None when listing the
+        open orders failed). Only the former are venue-confirmed cancels.
         """
         results: list[TestnetOrder] = []
-        attempted: list[str] = []
+        pending: str | None = None
         try:
             for order in self.open_orders(symbol):
-                attempted.append(order.client_order_id)
-                results.append(self.cancel_order(symbol, order.client_order_id))
+                pending = order.client_order_id
+                results.append(self.cancel_order(symbol, pending))
+                pending = None
         except BinanceTestnetError as exc:
-            exc.attempted_order_references = tuple(attempted)
+            exc.cancelled_order_references = tuple(done.client_order_id for done in results)
+            exc.unconfirmed_order_reference = pending
             raise
         return tuple(results)
 

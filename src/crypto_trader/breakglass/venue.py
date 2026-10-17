@@ -233,20 +233,29 @@ class BinanceSpotTestnetEmergencyControl:
 
     # --- control ----------------------------------------------------------
 
-    def _remember_touched(self, exc: BaseException) -> tuple[str, ...]:
-        """References a failed cancel-all already touched (cancelled, or cancel outcome unknown).
+    def _remember_failed_cancel(self, exc: BaseException) -> tuple[str, ...]:
+        """The venue-confirmed cancels a failed cancel-all completed before it failed.
 
-        Each needs venue evidence before reconciliation may resolve, so it is tracked and
-        journaled like a confirmed cancel instead of being forgotten with the exception.
+        Only those are returned, so only those are journaled as cancelled. The order whose cancel
+        failed is tracked with them so the venue is asked about it as evidence, but it is never
+        recorded as cancelled: its cancel was not confirmed.
         """
-        touched = getattr(exc, "attempted_order_references", ())
-        references = tuple(
-            dict.fromkeys(ref for ref in touched if isinstance(ref, str) and ref.strip())
+        confirmed = tuple(
+            dict.fromkeys(
+                ref
+                for ref in getattr(exc, "cancelled_order_references", ())
+                if isinstance(ref, str) and ref.strip()
+            )
         )
+        unconfirmed = getattr(exc, "unconfirmed_order_reference", None)
+        if isinstance(unconfirmed, str) and unconfirmed.strip():
+            tracked = (*confirmed, unconfirmed)
+        else:
+            tracked = confirmed
         self._order_references.extend(
-            reference for reference in references if reference not in self._order_references
+            reference for reference in tracked if reference not in self._order_references
         )
-        return references
+        return confirmed
 
     def cancel_open_orders(
         self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
@@ -271,7 +280,7 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="UNKNOWN_PENDING_RECONCILIATION",
                 detail="the cancel outcome is unknown; it was NOT retried and the epoch requires "
                 "reconciliation",
-                cancelled_order_references=self._remember_touched(exc),
+                cancelled_order_references=self._remember_failed_cancel(exc),
                 preflight=preflight,
             )
         except BinanceTestnetError as exc:
@@ -280,7 +289,7 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="venue_cancel_rejected",
                 detail=f"the venue rejected the cancel deterministically ({type(exc).__name__}); "
                 "reconciliation is still required to confirm the resulting order state",
-                cancelled_order_references=self._remember_touched(exc),
+                cancelled_order_references=self._remember_failed_cancel(exc),
                 preflight=preflight,
             )
         references = tuple(order.client_order_id for order in orders)
