@@ -608,6 +608,73 @@ def test_run_refuses_when_the_bound_journal_became_a_link_to_another_system(tmp_
     assert _sha256(journal_a) == founded_a
 
 
+@pytest.mark.parametrize("alias_kind", ["junction", "symlink"])
+def test_the_status_reader_shares_the_writer_spelling_while_the_wal_is_live(
+    tmp_path, capsys, alias_kind
+):
+    # Review F-05: a writer on an alias of the journal (junction or link) and a reader on the
+    # real path may not share -wal/-shm. The only production reader (status) opens the spelling
+    # the lease recorded, refuses any other, and sees the writer's uncheckpointed WAL there.
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import parse_operator_command
+
+    real_dir, alias_dir, state = tmp_path / "real", tmp_path / "alias", tmp_path / "state"
+    real_dir.mkdir()
+    real = _found_full_journal(real_dir)
+    if alias_kind == "junction":
+        if os.name != "nt":
+            pytest.skip("directory junctions exist only on Windows")
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias_dir), str(real_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if made.returncode != 0:
+            pytest.skip(f"a junction could not be created here: {made.stdout}{made.stderr}")
+    else:
+        alias_dir.mkdir()
+        try:
+            os.symlink(real, alias_dir / "journal.db")
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"file symlinks are unavailable here: {exc}")
+    alias = alias_dir / "journal.db"
+
+    with SQLiteEventJournal(alias, venue_writes=True) as writer:
+        control = BreakGlassControl(journal=writer, state_dir=state)
+        control.claim_normal_writer(owner_id="normal:alias")
+        control.handle(
+            parse_operator_command(
+                {
+                    "command_type": "halt_new_risk",
+                    "command_id": str(uuid4()),
+                    "operator_label": "jamal",
+                    "reason": "live wal",
+                    "source": "operator-cli",
+                },
+                delivered_at=datetime.now(timezone.utc),
+            )
+        )
+        written = len(list(writer.replay()))
+        bound = control.ownership_store.read().journal_path
+
+        assert written > 0
+        assert os.path.getsize(f"{alias}-wal") > 0
+        assert os.path.normcase(bound) == os.path.normcase(os.path.abspath(alias))
+
+        code = main(["status", "--json", "--state-dir", str(state), "--journal", str(real)])
+        captured = capsys.readouterr()
+
+        assert code == EXIT_MALFORMED
+        assert captured.err == (
+            f"REFUSED (fail closed, nothing changed): --journal {real} is not the journal bound "
+            f"to --state-dir {state} (expected {Path(bound)}); refusing to pair a journal with "
+            "another system's ownership state.\n"
+        )
+        with SQLiteEventJournal(bound, read_only=True) as reader:
+            assert len(list(reader.replay())) == written
+
+
 def test_a_writer_cannot_claim_a_state_dir_bound_to_another_journal(tmp_path):
     state_dir = tmp_path / "state"
     first, second = tmp_path / "a.db", tmp_path / "b.db"
