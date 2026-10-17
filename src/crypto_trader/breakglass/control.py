@@ -1214,6 +1214,7 @@ class BreakGlassControl:
         ledger = derive_ledger(self._journal)
         journaled_epoch = ledger.open_epoch
         references: tuple[str, ...] = ()
+        listing_missing = False
         if journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id:
             # A new process knows the cancelled orders only from the journal, never from memory.
             references = ledger.open_epoch_order_references()
@@ -1224,6 +1225,11 @@ class BreakGlassControl:
             track = getattr(self._venue, "track_order_references", None)
             if references and callable(track):
                 track(references)
+            if ledger.open_epoch_open_orders_unknown():
+                # A cancel that never learned the open orders is settled only by a complete venue
+                # listing taken now (review F-03); without one the epoch stays pending.
+                list_open = getattr(self._venue, "track_open_orders", None)
+                listing_missing = (list_open() if callable(list_open) else None) is None
         venue_reports.extend(self._venue.venue_reports())
         reported = {report.order_reference for report in venue_reports}
         # A journaled cancel is never resolved by silence: every reference needs venue evidence.
@@ -1243,11 +1249,13 @@ class BreakGlassControl:
         )
         if unverified:
             note = "reconciliation_missing_venue_evidence_for_cancelled_orders"
+        elif listing_missing:
+            note = "reconciliation_missing_open_orders_listing"
         elif run.report.is_fully_resolved:
             note = "reconciliation_confirmed_by_evidence"
         else:
             note = "reconciliation_left_orders_unresolved"
-        return run.report, note, not unverified
+        return run.report, note, not unverified and not listing_missing
 
     def _local_states(self) -> tuple[LocalOrderState, ...]:
         if self._local_state_provider is not None:

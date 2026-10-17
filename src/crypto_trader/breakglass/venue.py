@@ -330,6 +330,19 @@ class BinanceSpotTestnetEmergencyControl:
             if reference and reference not in self._order_references:
                 self._order_references.append(reference)
 
+    def track_open_orders(self) -> tuple[str, ...] | None:
+        """List the venue's open orders now and track them, so venue_reports() covers every one.
+
+        None when the venue cannot list them: the open orders stay unknown, never assumed empty.
+        """
+        try:
+            orders = self.client.open_orders(self.symbol)
+        except BinanceTestnetError:
+            return None
+        references = tuple(order.client_order_id for order in orders)
+        self.track_order_references(references)
+        return references
+
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""
     if not reason_code or not detail:

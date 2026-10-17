@@ -509,6 +509,95 @@ def test_reconcile_in_a_new_process_still_asks_about_an_unconfirmed_cancel(journ
     )
 
 
+_NEVER_LEARNED_THE_OPEN_ORDERS = {
+    # Listing the open orders failed, so not a single order reference was ever known.
+    "listing timed out": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+        "rejected",
+    ),
+    "listing rejected": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.rejected(-1003, "Too many requests."),
+        ],
+        "rejected",
+    ),
+    # The venue could not even be verified, so the cancel was never attempted.
+    "venue unreachable": ([TransportError("down")], "unavailable"),
+}
+
+
+def _cancel_that_never_learned_the_open_orders(journal, state_dir, case):
+    responses, disposition = _NEVER_LEARNED_THE_OPEN_ORDERS[case]
+    control, _, _, transport = venue(journal, responses)
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control == disposition
+    record = first.load_ledger().records[0]
+    assert (record.cancelled_order_references, record.unconfirmed_order_references) == ((), ())
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+
+
+@pytest.mark.parametrize("case", sorted(_NEVER_LEARNED_THE_OPEN_ORDERS))
+def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
+    journal, tmp_path, case
+):
+    # Review F-03 (remainder): with no order reference journaled there was nothing to verify, so a
+    # new process resolved the epoch "confirmed by evidence" while orders could still be open.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, case)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, _SilentVenue())
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_open_orders_listing",
+    )
+
+
+@pytest.mark.parametrize(
+    ("listing", "status", "result"),
+    [
+        ([txf.open_orders_response()], "resolved", "reconciliation_confirmed_by_evidence"),
+        (
+            [txf.open_orders_response("ct-9"), txf.order_response("ct-9")],
+            "pending",
+            "reconciliation_left_orders_unresolved",
+        ),
+        ([TransportTimeout("lost")], "pending", "reconciliation_missing_open_orders_listing"),
+    ],
+    ids=["nothing open", "an order still open", "listing fails again"],
+)
+def test_reconcile_lists_the_open_orders_a_failed_cancel_never_learned(
+    journal, tmp_path, listing, status, result
+):
+    # Review F-03 (remainder): only a complete listing taken now can settle what is open. An empty
+    # listing is evidence; every listed order is reconciled like any other; a failed one is not.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    second, client, _, transport = venue(journal, listing)
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, second)
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (status, result)
+    assert transport.requests and "openOrders" in transport.requests[0].url, transport.requests
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+
+
 def _journal_a_v3_cancel(journal, tmp_path):
     # ct-1's cancel is confirmed and ct-2's times out, so the command is journaled as V3.
     control, _, _, _ = venue(

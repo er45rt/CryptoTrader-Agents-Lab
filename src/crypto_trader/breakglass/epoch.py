@@ -341,6 +341,28 @@ class BreakGlassLedger:
                     references.append(reference)
         return tuple(references)
 
+    def open_epoch_open_orders_unknown(self) -> bool:
+        """Whether a cancel since the open epoch was opened never learned the venue's open orders.
+
+        A cancel_open the venue did not confirm that recorded no reference at all (listing the
+        open orders failed, or the cancel could not be attempted) leaves them unknown: only a
+        complete venue listing can settle what is open (review F-03).
+        """
+        if self.open_epoch is None:
+            return False
+        unknown = False
+        for record in self.records:
+            if record.epoch_opened:
+                unknown = False
+            if (
+                record.command_type == "cancel_open"
+                and record.venue_control in ("rejected", "ambiguous", "unavailable")
+                and not record.cancelled_order_references
+                and not record.unconfirmed_order_references
+            ):
+                unknown = True
+        return unknown
+
 
 def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     """Rebuild the ledger from the authoritative journal (no cache, no guessing)."""
