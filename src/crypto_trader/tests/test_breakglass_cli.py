@@ -552,6 +552,37 @@ def test_run_refuses_a_bound_journal_whose_real_path_changed(tmp_path, capsys):
     assert _sha256(journal) == founded
 
 
+@pytest.mark.parametrize("subcommand", ["run", "status"])
+def test_an_unreadable_lease_refuses_before_any_journal_is_chosen(tmp_path, capsys, subcommand):
+    # Review N-01: an unreadable lease must not fall back to <state-dir>/journal.db - that file
+    # may belong to another system while the bound journal lives outside the state dir.
+    journal = _found_full_journal(tmp_path)
+    founded = _sha256(journal)
+    (tmp_path / "ownership.json").write_text("{not-json", encoding="utf-8")
+    if subcommand == "run":
+        args = base_args(tmp_path, "halt-new-risk")
+        at = args.index("--journal")
+        del args[at:at + 2]
+        tail = "be read. If orders are open, cancel them directly at the exchange.\n"
+    else:
+        args = ["status", "--json", "--state-dir", str(tmp_path)]
+        tail = "be read.\n"
+
+    code = main(args)
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err.startswith(
+        "REFUSED (fail closed, nothing changed): the trading-state ownership record under "
+        f"--state-dir {tmp_path} is unusable (the ownership record could not be read: "
+    )
+    assert captured.err.endswith(
+        "); refusing to choose a journal while the lease it must be bound to cannot " + tail
+    )
+    assert _sha256(journal) == founded
+
+
 def test_run_refuses_when_the_bound_journal_became_a_link_to_another_system(tmp_path, capsys):
     system_a, system_b = tmp_path / "system-a", tmp_path / "system-b"
     system_a.mkdir()

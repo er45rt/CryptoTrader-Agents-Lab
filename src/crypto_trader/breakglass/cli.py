@@ -258,12 +258,20 @@ def _monotonic_utc() -> float:
 
 
 def _journal_for(args: argparse.Namespace) -> tuple[Path, str | None]:
-    """The journal bound to ``--state-dir``: the lease owner's recorded journal, else the default."""
+    """The journal bound to ``--state-dir``: the lease owner's recorded journal, else the default.
+
+    An unreadable lease is a refusal, never the default: the default may be another system's
+    journal while the bound one lives outside the state dir.
+    """
     state_dir = Path(args.state_dir)
     try:
         lease = OwnershipStore(break_glass_state_path(state_dir, "ownership.json")).read()
-    except OwnershipStateError:
-        lease = None  # an unreadable lease fails closed in the command itself
+    except OwnershipStateError as exc:
+        return _default_journal(state_dir), (
+            f"the trading-state ownership record under --state-dir {args.state_dir} is unusable "
+            f"({exc}); refusing to choose a journal while the lease it must be bound to cannot "
+            "be read."
+        )
     if lease is not None and lease.journal_path is not None:
         bound = Path(lease.journal_path)
     else:
