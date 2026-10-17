@@ -280,6 +280,86 @@ def test_a_takeover_keeps_the_recorded_journal_id_and_never_drops_or_switches_it
     assert store.path.read_text(encoding="utf-8") == raw
 
 
+def test_a_lease_bound_to_a_journal_identity_is_schema_2_which_older_builds_refuse(
+    store: OwnershipStore, tmp_path: Path
+):
+    # Review F02-R2: a build before journal identities reads schema 1, ignores journal_id and
+    # rewrites the lease without it on its next takeover; it refuses any other schema, so an
+    # identity-bound lease is written as schema 2. A lease without an identity stays schema 1.
+    bound = str(tmp_path / "journal.db")
+    id_less = OwnershipStore(tmp_path / "id-less" / "ownership.json")
+    id_less.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=bound,
+    )
+    assert json.loads(id_less.path.read_text(encoding="utf-8"))["schema_version"] == 1
+
+    journal_id = uuid4()
+    store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=bound,
+        journal_id=journal_id,
+    )
+    assert json.loads(store.path.read_text(encoding="utf-8"))["schema_version"] == 2
+    carried = store.takeover(
+        owner_id="emergency:jamal",
+        owner_kind=OwnerKind.EMERGENCY,
+        acquired_at=BASE,
+        reason_code="break_glass:halt_new_risk",
+    )
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    assert (payload["schema_version"], payload["journal_id"]) == (2, str(journal_id))
+    assert store.read() == carried
+    assert carried.schema_version == 2
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "journal_id", "reason"),
+    [
+        (1, "00000000-0000-4000-8000-0000000000aa", "ownership schema 1 never carries a journal_id"),
+        (2, None, "ownership schema 2 requires a journal_id"),
+    ],
+)
+def test_an_ownership_schema_that_disagrees_with_its_journal_id_fails_closed(
+    store: OwnershipStore, tmp_path: Path, schema_version: int, journal_id: str | None, reason: str
+):
+    # Review F02-R2: schema 1 with a journal_id (as 2aae436 wrote it) is readable by older builds
+    # that would drop it; schema 2 without one is not an identity-bound lease. Neither is repaired.
+    journal = str(tmp_path / "journal.db")
+    payload = {
+        "schema_version": schema_version,
+        "term": 1,
+        "owner_id": "normal:runtime",
+        "owner_kind": "normal",
+        "acquired_at": "2026-01-01T12:00:00+00:00",
+        "previous_owner_id": None,
+        "reason_code": "runtime_started",
+        "session_id": "00000000-0000-4000-8000-000000000000",
+        "journal_path": journal,
+        "journal_realpath": journal,
+        **({} if journal_id is None else {"journal_id": journal_id}),
+    }
+    raw = json.dumps(payload)
+    store.path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(OwnershipStateError, match=reason):
+        store.read()
+    with pytest.raises(OwnershipStateError, match=reason):
+        store.takeover(
+            owner_id="emergency:jamal",
+            owner_kind=OwnerKind.EMERGENCY,
+            acquired_at=BASE,
+            reason_code="break_glass:halt_new_risk",
+        )
+    assert store.path.read_text(encoding="utf-8") == raw
+
+
 def test_a_malformed_persisted_journal_id_fails_closed(store: OwnershipStore, tmp_path: Path):
     store.takeover(
         owner_id="normal:runtime",

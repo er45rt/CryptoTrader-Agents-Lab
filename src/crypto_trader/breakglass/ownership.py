@@ -36,6 +36,7 @@ from uuid import UUID, uuid4
 from .errors import BreakGlassConfigError, OwnershipStateError, StaleWriterFenceError
 
 __all__ = [
+    "OWNERSHIP_IDENTITY_SCHEMA_VERSION",
     "OWNERSHIP_SCHEMA_VERSION",
     "OwnerKind",
     "OwnershipRecord",
@@ -49,6 +50,9 @@ __all__ = [
 
 #: Schema version of the persisted ownership record (not of any event).
 OWNERSHIP_SCHEMA_VERSION = 1
+#: Schema of a record bound to a journal identity (journal_id). Builds before identities refuse it,
+#: so they can never read such a lease and rewrite it without its journal_id.
+OWNERSHIP_IDENTITY_SCHEMA_VERSION = 2
 
 # One local lock per canonical store path, plus a SQLite writer lock for other processes.
 # The lock database contains no trading data. It must stay beside the ownership record.
@@ -185,7 +189,7 @@ class OwnershipRecord:
     journal_id: UUID | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != OWNERSHIP_SCHEMA_VERSION:
+        if self.schema_version not in (OWNERSHIP_SCHEMA_VERSION, OWNERSHIP_IDENTITY_SCHEMA_VERSION):
             raise OwnershipStateError(
                 f"unsupported ownership schema {self.schema_version}; refusing to guess."
             )
@@ -210,6 +214,17 @@ class OwnershipRecord:
             raise OwnershipStateError(
                 "the ownership record is partially bound to a journal (a journal_id needs its "
                 "journal_path and journal_realpath); refusing to guess its binding."
+            )
+        if self.journal_id is not None and self.schema_version != OWNERSHIP_IDENTITY_SCHEMA_VERSION:
+            raise OwnershipStateError(
+                f"ownership schema {self.schema_version} never carries a journal_id (a lease bound "
+                f"to a journal identity is schema {OWNERSHIP_IDENTITY_SCHEMA_VERSION}); refusing to "
+                "guess its binding."
+            )
+        if self.journal_id is None and self.schema_version == OWNERSHIP_IDENTITY_SCHEMA_VERSION:
+            raise OwnershipStateError(
+                f"ownership schema {OWNERSHIP_IDENTITY_SCHEMA_VERSION} requires a journal_id; "
+                "refusing to guess its binding."
             )
 
     @property
@@ -435,6 +450,9 @@ class OwnershipStore:
                 bound_id = journal_id
             term = 1 if previous is None else previous.term + 1
             record = OwnershipRecord(
+                schema_version=(
+                    OWNERSHIP_SCHEMA_VERSION if bound_id is None else OWNERSHIP_IDENTITY_SCHEMA_VERSION
+                ),
                 term=term,
                 owner_id=owner_id,
                 owner_kind=owner_kind,
