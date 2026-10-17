@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from crypto_trader.events import EventEnvelope, EventRegistry, decode_event, get_default_registry
 
@@ -325,6 +325,9 @@ class SQLiteEventJournal:
                         self._conn.execute(statement)
                 self._conn.execute("INSERT INTO journal_meta(key,value) VALUES('schema_version',?)",
                                    (str(JOURNAL_SCHEMA_VERSION),))
+                # The journal's identity, minted once in the founding transaction (see journal_id()).
+                self._conn.execute("INSERT INTO journal_meta(key,value) VALUES('journal_id',?)",
+                                   (str(uuid4()),))
                 self._conn.execute(f"PRAGMA application_id={FULL_GENESIS_APPLICATION_ID}")
             self.require_venue_write_ready()
             self._conn.commit()
@@ -357,6 +360,22 @@ class SQLiteEventJournal:
             "SELECT value FROM journal_meta WHERE key = 'schema_version'"
         ).fetchone()
         return int(row["value"]) if row is not None else JOURNAL_SCHEMA_VERSION
+
+    def journal_id(self) -> UUID | None:
+        """The identity minted when this journal was FULL-founded, read on this connection.
+
+        A path names whatever file is there now; this names the journal itself. None when the
+        journal records none (not FULL-founded, or founded before identities were minted).
+        """
+        row = self._conn.execute("SELECT value FROM journal_meta WHERE key = 'journal_id'").fetchone()
+        if row is None:
+            return None
+        try:
+            if not isinstance(row[0], str):
+                raise ValueError("not text")
+            return UUID(row[0])
+        except ValueError as exc:
+            raise JournalSchemaError("the journal identity is malformed; refusing to guess it.") from exc
 
     def journal_mode(self) -> str:
         return str(self._conn.execute("PRAGMA journal_mode;").fetchone()[0])

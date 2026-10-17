@@ -692,6 +692,137 @@ def test_a_writer_cannot_claim_a_state_dir_bound_to_another_journal(tmp_path):
             control.claim_normal_writer(owner_id="normal:b")
 
 
+_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+@pytest.mark.parametrize("subcommand", ["run", "status"])
+def test_the_cli_refuses_another_journal_moved_onto_the_bound_path(tmp_path, capsys, subcommand):
+    # Review F-02: a real path names whatever file is there now. Another system's FULL journal
+    # moved onto the bound path has the same real path and spelling, but not the same identity.
+    system_a, system_b = tmp_path / "system-a", tmp_path / "system-b"
+    system_a.mkdir()
+    system_b.mkdir()
+    journal_a = _found_full_journal(system_a)
+    journal_b = _found_full_journal(system_b)
+    with SQLiteEventJournal(journal_b, venue_writes=True) as journal:
+        BreakGlassControl(journal=journal, state_dir=system_b).claim_normal_writer(
+            owner_id="normal:system-b"
+        )
+    lease = (system_b / "ownership.json").read_text(encoding="utf-8")
+    os.replace(journal_a, journal_b)
+    moved = _sha256(journal_b)
+    if subcommand == "run":
+        args, prefix = base_args(system_b, "halt-new-risk"), "OwnershipStateError: "
+    else:
+        args, prefix = ["status", "--json", "--state-dir", str(system_b)], ""
+
+    code = main(args)
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED, captured.out
+    assert captured.out == ""
+    refusal = re.fullmatch(
+        re.escape(
+            f"REFUSED (fail closed, nothing changed): {prefix}the trading-state lease is bound to "
+            f"journal {journal_b} (journal_id "
+        )
+        + f"({_UUID})"
+        + re.escape(f"), but the journal open at {journal_b} has journal_id ")
+        + f"({_UUID})"
+        + re.escape("; refusing to pair a journal with another system's ownership state.\n"),
+        captured.err,
+    )
+    assert refusal is not None, captured.err
+    assert refusal.group(1) != refusal.group(2)
+    assert _sha256(journal_b) == moved
+    assert (system_b / "ownership.json").read_text(encoding="utf-8") == lease
+
+
+def test_a_writer_cannot_claim_a_state_dir_whose_journal_was_founded_anew_at_its_path(tmp_path):
+    # Review F-02: a journal founded again at the bound path (the bound one lost or deleted) has
+    # the bound real path and spelling, but it is not the journal the lease is bound to.
+    state_dir = tmp_path / "state"
+    bound = _found_full_journal(tmp_path)
+    with SQLiteEventJournal(bound, venue_writes=True) as journal:
+        BreakGlassControl(journal=journal, state_dir=state_dir).claim_normal_writer(
+            owner_id="normal:a"
+        )
+    lease = (state_dir / "ownership.json").read_text(encoding="utf-8")
+    bound.unlink()
+    _found_full_journal(tmp_path)
+
+    with SQLiteEventJournal(bound, venue_writes=True) as journal:
+        control = BreakGlassControl(journal=journal, state_dir=state_dir)
+        with pytest.raises(OwnershipStateError, match=(
+            re.escape(f"the trading-state lease is bound to journal {bound} (journal_id ")
+            + _UUID
+            + re.escape(f"), but the journal open at {bound} has journal_id ")
+            + _UUID
+            + re.escape("; refusing to pair a journal with another system's ownership state.")
+        )):
+            control.claim_normal_writer(owner_id="normal:b")
+    assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease
+
+
+class _CountingVenue:
+    """A venue that records every cancel it is asked to send."""
+
+    def __init__(self) -> None:
+        self.cancels = 0
+
+    def cancel_open_orders(self, *, correlation_id, occurred_at, safety):
+        self.cancels += 1
+        return VenueControlOutcome(
+            disposition="confirmed",
+            reason_code="cancel_confirmed",
+            detail="0 open order(s) were cancelled through the safety path",
+        )
+
+    def venue_reports(self):
+        return ()
+
+
+def test_a_cancel_never_reaches_the_venue_through_another_journal_at_the_bound_path(tmp_path):
+    # Review F-02: the venue cancel precedes the emergency takeover, so the journal's identity is
+    # judged before any side effect; otherwise the venue acts for a journal it does not belong to.
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import parse_operator_command
+
+    state_dir = tmp_path / "state"
+    bound = _found_full_journal(tmp_path)
+    with SQLiteEventJournal(bound, venue_writes=True) as journal:
+        BreakGlassControl(journal=journal, state_dir=state_dir).claim_normal_writer(
+            owner_id="normal:a"
+        )
+    lease = (state_dir / "ownership.json").read_text(encoding="utf-8")
+    bound.unlink()
+    _found_full_journal(tmp_path)
+    founded = _sha256(bound)
+    venue = _CountingVenue()
+
+    with SQLiteEventJournal(bound, venue_writes=True, must_exist=True) as journal:
+        control = BreakGlassControl(journal=journal, state_dir=state_dir, venue=venue)
+        with pytest.raises(OwnershipStateError, match=re.escape(
+            "; refusing to pair a journal with another system's ownership state."
+        )):
+            control.handle(
+                parse_operator_command(
+                    {
+                        "command_type": "cancel_open",
+                        "command_id": str(uuid4()),
+                        "operator_label": "jamal",
+                        "reason": "journal identity",
+                        "source": "operator-cli",
+                    },
+                    delivered_at=datetime.now(timezone.utc),
+                )
+            )
+    assert venue.cancels == 0
+    assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease
+    assert _sha256(bound) == founded
+
+
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
     _found_full_journal(tmp_path)
     main(base_args(tmp_path, "cancel-open"))

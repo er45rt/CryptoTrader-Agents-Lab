@@ -133,7 +133,7 @@ def test_a_corrupt_ownership_record_fails_closed(store: OwnershipStore):
         store.require_fence()
 
 
-@pytest.mark.parametrize("present", ["journal_path", "journal_realpath"])
+@pytest.mark.parametrize("present", ["journal_path", "journal_realpath", "journal_id"])
 def test_a_partially_bound_ownership_record_fails_closed_before_any_change(
     store: OwnershipStore, tmp_path: Path, present: str
 ):
@@ -148,7 +148,10 @@ def test_a_partially_bound_ownership_record_fails_closed_before_any_change(
         "previous_owner_id": None,
         "reason_code": "runtime_started",
         "session_id": "00000000-0000-4000-8000-000000000000",
-        present: str(tmp_path / "system-a" / "journal.db"),
+        present: (
+            "00000000-0000-4000-8000-0000000000aa" if present == "journal_id"
+            else str(tmp_path / "system-a" / "journal.db")
+        ),
     }
     raw = json.dumps(payload)
     store.path.write_text(raw, encoding="utf-8")
@@ -205,6 +208,77 @@ def test_a_takeover_cannot_switch_the_lease_to_another_spelling_of_its_journal(
             journal_path=str(alias),
         )
     assert store.path.read_text(encoding="utf-8") == raw
+
+
+def test_a_takeover_keeps_the_recorded_journal_id_and_never_drops_or_switches_it(
+    store: OwnershipStore, tmp_path: Path
+):
+    # Review F-02: once a lease records its journal's identity, a takeover through the bound path
+    # must present that identity; a lease recorded without one takes the first one presented.
+    bound = str(tmp_path / "journal.db")
+    first, other = uuid4(), uuid4()
+    legacy = store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=bound,
+    )
+    assert legacy.journal_id is None
+    assert "journal_id" not in json.loads(store.path.read_text(encoding="utf-8"))
+
+    upgraded = store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=bound,
+        journal_id=first,
+    )
+    assert upgraded.journal_id == first
+    carried = store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert carried.journal_id == first
+    assert store.read() == carried
+    raw = store.path.read_text(encoding="utf-8")
+
+    for presented in (None, other):
+        found = "no journal_id" if presented is None else f"journal_id {presented}"
+        with pytest.raises(OwnershipStateError, match=re.escape(
+            f"the trading-state lease is bound to journal {bound} (journal_id {first}), but the "
+            f"journal open at {bound} has {found}; refusing to pair a journal with another "
+            "system's ownership state."
+        )):
+            store.takeover(
+                owner_id="emergency:jamal",
+                owner_kind=OwnerKind.EMERGENCY,
+                acquired_at=BASE,
+                reason_code="break_glass:halt_new_risk",
+                journal_path=bound,
+                journal_id=presented,
+            )
+    assert store.path.read_text(encoding="utf-8") == raw
+
+
+def test_a_malformed_persisted_journal_id_fails_closed(store: OwnershipStore, tmp_path: Path):
+    store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=str(tmp_path / "journal.db"),
+        journal_id=uuid4(),
+    )
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    for malformed in ("not-a-uuid", 7):
+        payload["journal_id"] = malformed
+        store.path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(OwnershipStateError, match="the ownership record is not usable"):
+            store.read()
 
 
 def test_an_unknown_ownership_schema_is_refused(store: OwnershipStore):

@@ -169,6 +169,12 @@ def _run_status(args: argparse.Namespace) -> int:
     try:
         with SQLiteEventJournal(journal_path, read_only=True) as journal:
             control = BreakGlassControl(journal=journal, state_dir=state_dir)
+            # The file at the bound path must still be the bound journal, judged on this connection.
+            mismatch = control.ownership_store.journal_binding_error(
+                str(journal_path), journal.journal_id()
+            )
+            if mismatch is not None:
+                return _refuse(mismatch)
             record = control.status().to_record()
     except (JournalError, EventContractError, sqlite3.Error) as exc:  # never creates or repairs
         return _refuse(f"{type(exc).__name__}: {exc}")

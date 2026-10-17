@@ -351,6 +351,7 @@ class BreakGlassControl:
                 acquired_at=self._now(),
                 reason_code=reason_code,
                 journal_path=self._journal_path(),
+                journal_id=self._journal_id(),
             )
             return WriterGuard(self._ownership_store, record.fence)
 
@@ -443,7 +444,7 @@ class BreakGlassControl:
         if not isinstance(command, OperatorCommand):
             raise BreakGlassConfigError("handle() expects a validated OperatorCommand.")
         # Before any side effect: this journal must be the one the state dir's lease is bound to.
-        binding = self._ownership_store.journal_binding_error(self._journal_path())
+        binding = self._ownership_store.journal_binding_error(self._journal_path(), self._journal_id())
         if binding is not None:
             raise OwnershipStateError(binding)
         delivered_at = self._now()
@@ -638,6 +639,7 @@ class BreakGlassControl:
             reason_code=f"break_glass:{command.command_type.value}",
             session_id=session_id,
             journal_path=self._journal_path(),
+            journal_id=self._journal_id(),
         )
         recorded = self._append_records(
             command,
@@ -999,6 +1001,7 @@ class BreakGlassControl:
             reason_code="operator_restore_normal",
             session_id=epoch.session_id,
             journal_path=self._journal_path(),
+            journal_id=self._journal_id(),
         )
         event_ids = self._append_records(
             command,
@@ -1170,6 +1173,13 @@ class BreakGlassControl:
         if not isinstance(path, str) or not path or path == ":memory:":
             return None
         return os.path.abspath(path)
+
+    def _journal_id(self) -> UUID | None:
+        """The identity this control's open journal connection reports (None when it has none)."""
+        if self._journal_path() is None:
+            return None
+        read = getattr(self._journal, "journal_id", None)
+        return None if read is None else read()
 
     def _current_term(self) -> int:
         return self._ownership_observation()[1]

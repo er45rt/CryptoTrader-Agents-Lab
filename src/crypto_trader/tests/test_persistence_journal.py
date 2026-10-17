@@ -108,6 +108,28 @@ def test_r03_full_foundation_active_connection_and_header(tmp_path, record_prope
         journal.append(decision())
 
 
+def test_full_founding_mints_one_journal_id_that_every_open_reads_back(tmp_path):
+    # Review F-02: the identity is minted in the founding transaction, never on a later open.
+    path = tmp_path / "full.db"
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        minted = journal.journal_id()
+    assert isinstance(minted, UUID)
+    with SQLiteEventJournal(path, venue_writes=True, must_exist=True) as journal:
+        assert journal.journal_id() == minted
+    with SQLiteEventJournal(path, read_only=True) as journal:
+        assert journal.journal_id() == minted
+    with SQLiteEventJournal(tmp_path / "other.db", venue_writes=True) as journal:
+        assert journal.journal_id() != minted
+    with SQLiteEventJournal(tmp_path / "plain.db") as journal:
+        assert journal.journal_id() is None
+    with sqlite3.connect(path) as raw:
+        raw.execute("UPDATE journal_meta SET value = 'not-a-uuid' WHERE key = 'journal_id'")
+    raw.close()
+    with SQLiteEventJournal(path, read_only=True) as journal:
+        with pytest.raises(JournalSchemaError, match="journal identity is malformed"):
+            journal.journal_id()
+
+
 def test_r03_refuse_full_stamp_on_populated_legacy_journal(tmp_path):
     from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
     path = tmp_path / "legacy.db"
