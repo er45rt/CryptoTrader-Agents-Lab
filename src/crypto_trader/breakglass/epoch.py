@@ -289,6 +289,7 @@ class RecordedOperatorCommand:
             "epoch_closed": self.epoch_closed,
             "fence_term": self.fence_term,
             "cancelled_order_references": list(self.cancelled_order_references),
+            "unconfirmed_order_references": list(self.unconfirmed_order_references),
             "correlation_id": str(self.correlation_id),
             "causation_id": None if self.causation_id is None else str(self.causation_id),
             "event_id": str(self.event_id),

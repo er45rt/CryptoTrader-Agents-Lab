@@ -507,6 +507,47 @@ def test_reconcile_in_a_new_process_still_asks_about_an_unconfirmed_cancel(journ
     )
 
 
+def _journal_a_v3_cancel(journal, tmp_path):
+    # ct-1's cancel is confirmed and ct-2's times out, so the command is journaled as V3.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            TransportTimeout("lost"),
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert process.handle(_operator_command("cancel_open")).venue_control == "ambiguous"
+    return process
+
+
+def test_the_audit_record_of_a_v3_command_shows_both_reference_lists(journal, tmp_path):
+    # Review N-06: the audit record rebuilt from the journal shows the cancel the venue never
+    # confirmed (ct-2) apart from the confirmed one (ct-1).
+    process = _journal_a_v3_cancel(journal, tmp_path)
+
+    record = process.load_ledger().records[0].to_record()
+
+    assert record["cancelled_order_references"] == ["ct-1"]
+    assert record["unconfirmed_order_references"] == ["ct-2"]
+
+
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):
     legacy = _operator_command("cancel_open")
     journal.append(
