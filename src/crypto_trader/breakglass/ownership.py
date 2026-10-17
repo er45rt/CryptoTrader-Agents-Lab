@@ -344,12 +344,10 @@ class OwnershipStore:
     def journal_binding_error(self, journal_path: str | None, journal_id: UUID | None) -> str | None:
         """Why the journal open at ``journal_path`` (reporting ``journal_id``) is not this lease's.
 
-        An unreadable lease is judged elsewhere.
+        An unreadable lease raises OwnershipStateError: its binding cannot be judged, so the caller
+        refuses before any side effect instead of proceeding as if the lease were unbound.
         """
-        try:
-            record = self._load()
-        except OwnershipStateError:
-            return None
+        record = self._load()
         return journal_binding_mismatch(record, journal_path) or journal_identity_mismatch(
             record, journal_path, journal_id
         )

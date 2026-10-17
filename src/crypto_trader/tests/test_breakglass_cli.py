@@ -12,7 +12,12 @@ from uuid import uuid4
 
 import pytest
 
-from crypto_trader.breakglass import BreakGlassControl, BreakGlassStateError, OwnershipStateError
+from crypto_trader.breakglass import (
+    BreakGlassControl,
+    BreakGlassStateError,
+    OperatorCommandType,
+    OwnershipStateError,
+)
 from crypto_trader.breakglass.state import SafetyStateStore
 from crypto_trader.breakglass.venue import VenueControlOutcome
 from crypto_trader.events import EventValidationError, decode_event
@@ -821,6 +826,99 @@ def test_a_cancel_never_reaches_the_venue_through_another_journal_at_the_bound_p
     assert venue.cancels == 0
     assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease
     assert _sha256(bound) == founded
+
+
+@pytest.mark.parametrize("command_type", [kind.value for kind in OperatorCommandType])
+@pytest.mark.parametrize(
+    ("lease_text", "reason"),
+    [
+        ("{not-json", "the ownership record could not be read"),
+        (
+            json.dumps({
+                "schema_version": 99, "term": 1, "owner_id": "normal:newer-build",
+                "owner_kind": "normal", "acquired_at": "2026-01-01T12:00:00+00:00",
+                "previous_owner_id": None, "reason_code": "runtime_started",
+                "session_id": "00000000-0000-4000-8000-000000000000",
+            }),
+            "unsupported ownership schema 99",
+        ),
+    ],
+)
+def test_handle_refuses_an_unreadable_lease_before_any_side_effect(
+    tmp_path, command_type, lease_text, reason
+):
+    # Review N-01: a lease that cannot be read cannot vouch for its journal binding. handle()
+    # used to treat it as unbound: a cancel reached the venue before the takeover refused, and
+    # other commands journaled (reduce-only even changed the posture) beside an unusable lease.
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import parse_operator_command
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    journal_path = _found_full_journal(tmp_path)
+    (state_dir / "ownership.json").write_text(lease_text, encoding="utf-8")
+    founded = _sha256(journal_path)
+    venue = _CountingVenue()
+
+    with SQLiteEventJournal(journal_path, venue_writes=True, must_exist=True) as journal:
+        control = BreakGlassControl(journal=journal, state_dir=state_dir, venue=venue)
+        with pytest.raises(OwnershipStateError, match=reason):
+            control.handle(
+                parse_operator_command(
+                    {
+                        "command_type": command_type,
+                        "command_id": str(uuid4()),
+                        "operator_label": "jamal",
+                        "reason": "unreadable lease",
+                        "source": "operator-cli",
+                    },
+                    delivered_at=datetime.now(timezone.utc),
+                )
+            )
+        assert journal.count() == 0
+    assert venue.cancels == 0
+    assert _sha256(journal_path) == founded
+    assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease_text
+    assert sorted(p.name for p in state_dir.iterdir() if not p.name.endswith(".lock.db")) == [
+        "ownership.json"
+    ]
+
+
+@pytest.mark.parametrize("command", ["cancel-open", "reduce-only"])
+def test_run_reports_a_lease_unusable_by_handle_time_as_refused_never_accepted(
+    tmp_path, capsys, monkeypatch, command
+):
+    # Review N-01: run refuses an unreadable lease before choosing a journal; a lease that becomes
+    # unreadable after that is refused by handle() before any side effect, so the operator sees a
+    # refusal - never an accepted outcome or a partial (INCOMPLETE) change.
+    from crypto_trader.breakglass import cli
+
+    journal = _found_full_journal(tmp_path)
+    with SQLiteEventJournal(journal, venue_writes=True) as writer:
+        BreakGlassControl(journal=writer, state_dir=tmp_path).claim_normal_writer(
+            owner_id="normal:runtime"
+        )
+    founded = _sha256(journal)
+    choose = cli._journal_for
+
+    def choose_then_corrupt(args):
+        chosen = choose(args)
+        (tmp_path / "ownership.json").write_text("{not-json", encoding="utf-8")
+        return chosen
+
+    monkeypatch.setattr(cli, "_journal_for", choose_then_corrupt)
+
+    code = main(base_args(tmp_path, command))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED, captured.out
+    assert captured.out == ""
+    assert captured.err.startswith(
+        "REFUSED (fail closed, nothing changed): OwnershipStateError: the ownership record could "
+        "not be read: "
+    ), captured.err
+    assert _sha256(journal) == founded
 
 
 def _bind_without_a_journal_id(state_dir: Path, journal: Path) -> str:

@@ -134,18 +134,24 @@ def test_restore_normal_from_reduce_only_is_operator_audited_without_takeover(co
 
 
 def test_restore_normal_from_reduce_only_fails_closed_when_ownership_is_unreadable(
-    control, tmp_path
+    control, journal, tmp_path
 ):
+    # Review N-01: an unreadable lease cannot vouch for this journal, so the restore is refused
+    # before anything is written (it used to journal a rejection beside the unusable lease).
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
     control.claim_normal_writer(owner_id="normal:runtime")
     assert control.handle(command("reduce_only", seed="reduce-corrupt-owner")).accepted
     ownership_path = tmp_path / "state" / "ownership.json"
     ownership_path.write_text("{not-json", encoding="utf-8")
+    before = journal.revision()
 
-    restored = control.handle(command("restore_normal", seed="restore-corrupt-owner"))
+    with pytest.raises(OwnershipStateError, match="the ownership record could not be read"):
+        control.handle(command("restore_normal", seed="restore-corrupt-owner"))
 
-    assert restored.disposition == "rejected"
-    assert restored.reason_code == "restore_denied_ownership_unreadable"
-    assert restored.resulting_safety_state == "reduce_only"
+    assert journal.revision() == before
+    assert ownership_path.read_text(encoding="utf-8") == "{not-json"
+    assert control.load_safety_state().controller.mode.value == "reduce_only"
 
 
 def test_reduce_only_then_halt_escalates_to_emergency_takeover(control):

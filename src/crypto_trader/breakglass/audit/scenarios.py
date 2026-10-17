@@ -1078,6 +1078,7 @@ def scenario_corrupted_breakglass_request(workspace: Path) -> BreakGlassScenario
     state_file = root / "state" / "safety_state.json"
     state_file.write_text("{not json at all", encoding="utf-8")
     ownership_file = root / "state" / "ownership.json"
+    bound_lease = ownership_file.read_bytes()
     ownership_file.write_text('{"schema_version": 99}', encoding="utf-8")
     with SQLiteEventJournal(root / "journal.db") as journal:
         control = _open_control(root, journal=journal)
@@ -1087,6 +1088,20 @@ def scenario_corrupted_breakglass_request(workspace: Path) -> BreakGlassScenario
             control.ownership_store.require_fence()
         except OwnershipStateError:
             ownership_refused = True
+        # N-01: a corrupted lease cannot vouch for this journal, so the request is refused before
+        # it writes anything - journal, safety state or lease - instead of recording a rejection.
+        before = (journal.revision(), state_file.read_bytes(), ownership_file.read_bytes())
+        request_refused = False
+        try:
+            control.handle(
+                _command(OperatorCommandType.REDUCE_ONLY, seed="corrupt-2", requested_at=LATER)
+            )
+        except OwnershipStateError:
+            request_refused = True
+        untouched = before == (journal.revision(), state_file.read_bytes(), ownership_file.read_bytes())
+        # Once the lease is readable again, the corrupted safety state still refuses the downgrade;
+        # the same command id is not a duplicate, because the refused delivery recorded nothing.
+        ownership_file.write_bytes(bound_lease)
         downgrade = control.handle(
             _command(OperatorCommandType.REDUCE_ONLY, seed="corrupt-2", requested_at=LATER)
         )
@@ -1095,6 +1110,9 @@ def scenario_corrupted_breakglass_request(workspace: Path) -> BreakGlassScenario
         and status.safety_mode == "recovery_required"
         and status.kill_switch_engaged
         and ownership_refused
+        and request_refused
+        and untouched
+        and not downgrade.duplicate
         and downgrade.disposition == "rejected"
         and downgrade.reason_code == "downgrade_refused_monotonic_escalation"
     ):
@@ -1102,7 +1120,8 @@ def scenario_corrupted_breakglass_request(workspace: Path) -> BreakGlassScenario
             "corrupted_breakglass_request",
             "Corrupted break-glass state/request",
             "a corrupted safety-state file restored fail-closed into recovery_required, a corrupted "
-            "ownership record refused to name any writer, and a downgrade attempt was refused",
+            "ownership record refused to name any writer and refused the request before anything "
+            "was written, and with the lease readable again a downgrade attempt was refused",
             source=status.safety_state_source,
         )
     return _fail(
