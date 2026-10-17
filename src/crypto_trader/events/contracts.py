@@ -860,6 +860,19 @@ class OperatorCommandRecordPayloadV3(OperatorCommandRecordPayloadV2):
             raise ValueError("unconfirmed order references must be unique.")
         return value
 
+    @model_validator(mode="after")
+    def _one_outcome_per_reference(self) -> "OperatorCommandRecordPayloadV3":
+        # Review N-07: a reference is venue-confirmed cancelled or unconfirmed, never both. The
+        # writer already keeps them apart; the contract enforces it for any payload it validates.
+        both = sorted(
+            set(self.cancelled_order_references) & set(self.unconfirmed_order_references)
+        )
+        if both:
+            raise ValueError(
+                f"order references cannot be both cancelled and unconfirmed: {both}"
+            )
+        return self
+
 
 class OperatorCommandRecordedV3(OperatorCommandRecorded):
     """Explicit V3 command record, written only when a cancel stayed unconfirmed."""

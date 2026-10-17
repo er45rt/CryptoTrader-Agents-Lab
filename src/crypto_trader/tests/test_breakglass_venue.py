@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from crypto_trader.breakglass import BreakGlassControl, OwnerKind, parse_operator_command
 from crypto_trader.breakglass.venue import (
@@ -32,6 +33,7 @@ from crypto_trader.events import (
     OperatorCommandRecordPayload,
     OperatorCommandRecorded,
 )
+from crypto_trader.events.contracts import OperatorCommandRecordPayloadV3
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.safety import SafetyController
@@ -546,6 +548,23 @@ def test_the_audit_record_of_a_v3_command_shows_both_reference_lists(journal, tm
 
     assert record["cancelled_order_references"] == ["ct-1"]
     assert record["unconfirmed_order_references"] == ["ct-2"]
+
+
+def test_the_v3_contract_refuses_a_reference_both_cancelled_and_unconfirmed(journal, tmp_path):
+    # Review N-07: the writer keeps the two lists apart; the contract must refuse an overlap too,
+    # for any V3 payload it validates on read or replay.
+    _journal_a_v3_cancel(journal, tmp_path)
+    (event,) = [e for e in journal.read_range() if e.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+    data = event.payload.model_dump()
+    valid = OperatorCommandRecordPayloadV3.model_validate(data)
+    assert (valid.cancelled_order_references, valid.unconfirmed_order_references) == (
+        ["ct-1"],
+        ["ct-2"],
+    )
+    overlap = {**data, "cancelled_order_references": ["ct-1", "ct-2"]}
+
+    with pytest.raises(ValidationError, match="both cancelled and unconfirmed"):
+        OperatorCommandRecordPayloadV3.model_validate(overlap)
 
 
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):
