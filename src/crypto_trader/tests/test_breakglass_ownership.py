@@ -1,6 +1,8 @@
 """Phase 13: single-writer ownership, fencing tokens and explicit takeover semantics."""
 
 import json
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -160,6 +162,47 @@ def test_a_partially_bound_ownership_record_fails_closed_before_any_change(
             acquired_at=BASE,
             reason_code="runtime_started",
             journal_path=str(tmp_path / "system-b" / "journal.db"),
+        )
+    assert store.path.read_text(encoding="utf-8") == raw
+
+
+def test_a_takeover_cannot_switch_the_lease_to_another_spelling_of_its_journal(
+    store: OwnershipStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Review N-02: a link or junction and its target share one real path, but a writer and its
+    # readers share -wal/-shm through one spelling, so a takeover may not switch the bound one.
+    from crypto_trader.breakglass import ownership
+
+    bound = tmp_path / "journal.db"
+    alias = tmp_path / "alias" / "journal.db"
+    resolve = ownership.journal_realpath
+
+    def same_file(path: str) -> str:
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(str(alias)):
+            return resolve(str(bound))
+        return resolve(path)
+
+    monkeypatch.setattr(ownership, "journal_realpath", same_file)
+    store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+        journal_path=str(bound),
+    )
+    raw = store.path.read_text(encoding="utf-8")
+
+    with pytest.raises(OwnershipStateError, match=re.escape(
+        f"the trading-state lease is bound to journal {bound}, but {alias} is another spelling of "
+        "that file; refusing to switch the journal path a writer and its readers share (-wal/-shm) "
+        "while the lease is bound to it."
+    )):
+        store.takeover(
+            owner_id="emergency:jamal",
+            owner_kind=OwnerKind.EMERGENCY,
+            acquired_at=BASE,
+            reason_code="break_glass:halt_new_risk",
+            journal_path=str(alias),
         )
     assert store.path.read_text(encoding="utf-8") == raw
 

@@ -72,17 +72,28 @@ def journal_realpath(path: str) -> str:
 
 
 def journal_binding_mismatch(record: "OwnershipRecord | None", journal_path: str | None) -> str | None:
-    """Why ``journal_path`` is not the journal this lease is bound to; None when it is or unbound."""
+    """Why ``journal_path`` is not the journal this lease is bound to; None when it is or unbound.
+
+    The bound journal is the same file (real path) under the same spelling (abspath): a writer and
+    its readers share -wal/-shm through that spelling, so another alias of the file is refused too.
+    """
     if record is None or record.journal_realpath is None or journal_path is None:
         return None
     actual = journal_realpath(journal_path)
-    if os.path.normcase(actual) == os.path.normcase(record.journal_realpath):
-        return None
-    return (
-        f"the trading-state lease is bound to journal {record.journal_path} (real path "
-        f"{record.journal_realpath}), but {journal_path} resolves to {actual}; refusing to pair a "
-        "journal with another system's ownership state."
-    )
+    if os.path.normcase(actual) != os.path.normcase(record.journal_realpath):
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path} (real path "
+            f"{record.journal_realpath}), but {journal_path} resolves to {actual}; refusing to "
+            "pair a journal with another system's ownership state."
+        )
+    spelled = os.path.normcase(os.path.abspath(journal_path))
+    if record.journal_path is not None and spelled != os.path.normcase(record.journal_path):
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path}, but "
+            f"{journal_path} is another spelling of that file; refusing to switch the journal "
+            "path a writer and its readers share (-wal/-shm) while the lease is bound to it."
+        )
+    return None
 
 
 class OwnerKind(str, Enum):
