@@ -578,8 +578,25 @@ def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
             "reconciliation_left_orders_unresolved",
         ),
         ([TransportTimeout("lost")], "pending", "reconciliation_missing_open_orders_listing"),
+        # Review F03-R1: a listed order the status read reports nothing for is not settled.
+        (
+            [txf.open_orders_response("ct-9"), txf.rejected(-2013, "Order does not exist.")],
+            "pending",
+            "reconciliation_missing_venue_evidence_for_listed_orders",
+        ),
+        (
+            [txf.open_orders_response("ct-9"), txf.rejected(-1003, "Too many requests.")],
+            "pending",
+            "reconciliation_missing_venue_evidence_for_listed_orders",
+        ),
     ],
-    ids=["nothing open", "an order still open", "listing fails again"],
+    ids=[
+        "nothing open",
+        "an order still open",
+        "listing fails again",
+        "listed order status -2013",
+        "listed order status -1003",
+    ],
 )
 def test_reconcile_lists_the_open_orders_a_failed_cancel_never_learned(
     journal, tmp_path, listing, status, result
@@ -596,6 +613,30 @@ def test_reconcile_lists_the_open_orders_a_failed_cancel_never_learned(
     assert (outcome.reconciliation_status, outcome.reconciliation_result) == (status, result)
     assert transport.requests and "openOrders" in transport.requests[0].url, transport.requests
     assert not [request for request in transport.requests if request.method == "DELETE"]
+
+
+class _ListsButNeverReports(_SilentVenue):
+    """Lists one open order but never returns venue evidence for it."""
+
+    def track_open_orders(self):
+        self.tracked.append("ct-9")
+        return ("ct-9",)
+
+
+def test_reconcile_never_resolves_a_listed_order_without_venue_evidence(journal, tmp_path):
+    # Review F03-R1: a successful listing only names the open orders; each listed order still
+    # needs its own venue report before the epoch may resolve, like every journaled reference.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    venue_control = _ListsButNeverReports()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, venue_control)
+
+    assert venue_control.tracked == ["ct-9"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_listed_orders",
+    )
 
 
 def _journal_a_v3_cancel(journal, tmp_path):
