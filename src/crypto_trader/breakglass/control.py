@@ -699,8 +699,8 @@ class BreakGlassControl:
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to reconcile.",
             )
-        report, reconciliation_note = self._run_reconciliation(epoch)
-        status = "resolved" if report.is_fully_resolved else "pending"
+        report, reconciliation_note, evidenced = self._run_reconciliation(epoch)
+        status = "resolved" if report.is_fully_resolved and evidenced else "pending"
         reason_code = (
             "reconciliation_resolved" if status == "resolved" else "UNKNOWN_PENDING_RECONCILIATION"
         )
@@ -1183,6 +1183,7 @@ class BreakGlassControl:
         )
         ledger = derive_ledger(self._journal)
         journaled_epoch = ledger.open_epoch
+        references: tuple[str, ...] = ()
         if journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id:
             # A new process knows the cancelled orders only from the journal, never from memory.
             references = ledger.open_epoch_order_references()
@@ -1190,6 +1191,9 @@ class BreakGlassControl:
             if references and callable(track):
                 track(references)
         venue_reports.extend(self._venue.venue_reports())
+        reported = {report.order_reference for report in venue_reports}
+        # A journaled cancel is never resolved by silence: every reference needs venue evidence.
+        unverified = tuple(reference for reference in references if reference not in reported)
         engine = ReconciliationEngine(self._reconciliation_policy)
         source = StaticVenueStateSource(entries=tuple(venue_reports), name="breakglass.venue")
         recovery = RestartRecovery(
@@ -1203,12 +1207,13 @@ class BreakGlassControl:
             local_states=local_states,
             correlation_id=epoch.session_id,
         )
-        note = (
-            "reconciliation_confirmed_by_evidence"
-            if run.report.is_fully_resolved
-            else "reconciliation_left_orders_unresolved"
-        )
-        return run.report, note
+        if unverified:
+            note = "reconciliation_missing_venue_evidence_for_cancelled_orders"
+        elif run.report.is_fully_resolved:
+            note = "reconciliation_confirmed_by_evidence"
+        else:
+            note = "reconciliation_left_orders_unresolved"
+        return run.report, note, not unverified
 
     def _local_states(self) -> tuple[LocalOrderState, ...]:
         if self._local_state_provider is not None:

@@ -8,7 +8,10 @@ from uuid import uuid4
 import pytest
 
 from crypto_trader.breakglass import BreakGlassControl, OwnerKind, parse_operator_command
-from crypto_trader.breakglass.venue import BinanceSpotTestnetEmergencyControl
+from crypto_trader.breakglass.venue import (
+    BinanceSpotTestnetEmergencyControl,
+    PolicyOnlyVenueControl,
+)
 from crypto_trader.execution import InstrumentSpec
 from crypto_trader.execution.binance_testnet import (
     MAINNET_HOST_MARKERS,
@@ -335,6 +338,61 @@ def test_reconcile_in_a_new_process_matches_the_cancelling_process(tmp_path):
         "reconciliation_left_orders_unresolved",
     )
     assert [request.method for request in transport.requests] == ["GET"]
+
+
+class _SilentVenue:
+    """Tracks the journaled references but never returns venue evidence for them."""
+
+    def __init__(self):
+        self.tracked = []
+
+    def cancel_open_orders(self, *, correlation_id, occurred_at, safety):
+        raise AssertionError("reconcile must never cancel")
+
+    def venue_reports(self):
+        return ()
+
+    def track_order_references(self, references):
+        self.tracked.extend(references)
+
+
+def _reconcile_in_a_new_process_with(journal, state_dir, venue_control):
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    return process.handle(_operator_command("reconcile"))
+
+
+def test_reconcile_stays_pending_when_the_venue_cannot_query_journaled_cancels(journal, tmp_path):
+    state_dir = tmp_path / "state"
+    _cancel_in_a_first_process(journal, state_dir)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, PolicyOnlyVenueControl())
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
+
+
+def test_reconcile_stays_pending_when_the_venue_has_no_evidence_for_journaled_cancels(
+    journal, tmp_path
+):
+    state_dir = tmp_path / "state"
+    _cancel_in_a_first_process(journal, state_dir)
+    silent = _SilentVenue()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, silent)
+
+    assert silent.tracked == ["ct-4"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
 
 
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):
