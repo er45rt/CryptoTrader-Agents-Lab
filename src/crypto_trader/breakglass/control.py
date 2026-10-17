@@ -421,8 +421,8 @@ class BreakGlassControl:
     def handle(self, command: OperatorCommand) -> OperatorCommandOutcome:
         """Serialize the complete operator transaction against normal submission.
 
-        A break-glass failure after the first side effect (venue cancel or journal record, which
-        follows the lease takeover) is raised as BreakGlassIncompleteError, never as a refusal.
+        Any failure after the first side effect (venue cancel or journal record, which follows the
+        lease takeover) is raised as BreakGlassIncompleteError, never as a refusal or a traceback.
         """
         with self._ownership_store.exclusive():
             self._side_effect_started = False
@@ -430,7 +430,7 @@ class BreakGlassControl:
                 return self._handle_locked(command)
             except BreakGlassIncompleteError:
                 raise
-            except BreakGlassError as exc:
+            except Exception as exc:  # BaseException (an interrupt) is never masked
                 if not self._side_effect_started:
                     raise
                 raise BreakGlassIncompleteError(f"{type(exc).__name__}: {exc}") from exc

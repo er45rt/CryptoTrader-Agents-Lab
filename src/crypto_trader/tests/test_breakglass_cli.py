@@ -13,6 +13,7 @@ import pytest
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassStateError
 from crypto_trader.breakglass.state import SafetyStateStore
+from crypto_trader.breakglass.venue import VenueControlOutcome
 from crypto_trader.events import EventValidationError, decode_event
 from crypto_trader.breakglass.cli import (
     EXIT_ACCEPTED,
@@ -451,6 +452,43 @@ def test_run_reports_incomplete_when_a_step_fails_after_the_command_was_journale
     with SQLiteEventJournal(journal, read_only=True) as reader:
         recorded = [event.event_type for event in reader.read_range()]
     assert recorded[-1] == "safety.operator_command.recorded"
+
+
+class _ConfirmedWithAnUnusableReference:
+    """The venue confirms the cancel but hands back a reference the record cannot use."""
+
+    def cancel_open_orders(self, *, correlation_id, occurred_at, safety):
+        return VenueControlOutcome(
+            disposition="confirmed",
+            reason_code="cancel_confirmed",
+            detail="1 open order(s) were cancelled through the safety path",
+            cancelled_order_references=(42,),
+        )
+
+    def venue_reports(self):
+        return ()
+
+
+def test_run_reports_incomplete_for_any_error_after_a_confirmed_venue_cancel(
+    tmp_path, capsys, monkeypatch
+):
+    journal = _found_full_journal(tmp_path)
+    monkeypatch.setattr(
+        "crypto_trader.breakglass.cli._build_venue",
+        lambda args: _ConfirmedWithAnUnusableReference(),
+    )
+
+    code = main(base_args(tmp_path, "cancel-open"))
+    captured = capsys.readouterr()
+
+    assert code == 4
+    assert captured.out == ""
+    assert captured.err == (
+        "INCOMPLETE (side effects may already be in effect): AttributeError: 'int' object has no "
+        f"attribute 'strip' [journal: {journal}]. The emergency lease and any venue cancel may "
+        "already have happened: check status and re-deliver the same --command-id. If orders are "
+        "open, cancel them directly at the exchange.\n"
+    )
 
 
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
