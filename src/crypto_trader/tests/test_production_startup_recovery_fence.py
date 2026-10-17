@@ -7,8 +7,15 @@ from crypto_trader.breakglass.errors import StaleWriterFenceError
 from crypto_trader.breakglass.ownership import OwnerKind, OwnershipStore
 from crypto_trader.execution.binance_testnet.startup import BinanceStartupCollector
 from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.recovery import RestartRecovery
 from crypto_trader.tests import testnet_fixtures as fx
-from crypto_trader.tests.production_fixtures import BASE, startup_responses
+from crypto_trader.tests.production_fixtures import (
+    BASE,
+    INSTRUMENT,
+    RecordingExecutionPort,
+    build_runtime,
+    startup_responses,
+)
 from crypto_trader.tests.test_production_testnet_integration import _wired
 
 RECOVERY_EVENT_TYPE = "recovery.state.changed"
@@ -44,3 +51,22 @@ def test_takeover_before_startup_recovery_writes_no_recovery_events(tmp_path, mo
         assert taken, "the takeover must land inside the startup window"
         assert runtime.status()["last_refusal"] == "recovery:StaleWriterFenceError"
         assert [event.event_type for event in written if event.event_type == RECOVERY_EVENT_TYPE] == []
+
+
+def test_non_writing_startup_journals_recovery_only_as_the_lease_owner(tmp_path, monkeypatch):
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        runtime = build_runtime(
+            journal=journal, state_dir=tmp_path / "state", execution=RecordingExecutionPort(INSTRUMENT)
+        )
+        owners = []
+        run = RestartRecovery.run
+
+        def run_recording_the_owner(self, *args, **kwargs):
+            record = runtime.control.ownership_store.read()
+            owners.append(None if record is None else record.owner_id)
+            return run(self, *args, **kwargs)
+
+        monkeypatch.setattr(RestartRecovery, "run", run_recording_the_owner)
+        report = runtime.start()
+
+    assert owners == [report.owner_id]

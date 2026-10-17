@@ -709,7 +709,15 @@ class ProductionRuntime:
                 sources = [source]
                 local_states = None  # Preserve conflicts and immutable durable attempt anchors.
             else:
-                # Explicit NON_WRITING ports retain their offline behavior.
+                # Explicit NON_WRITING ports keep their offline evidence, but like every writer they
+                # journal recovery only after claiming the lease, under its fence.
+                phase = "writer_claim"
+                guard = claim()
+                fence = ProductionFence(
+                    control=self._control, guard=guard, owner_id=self._owner_id,
+                    environment=decision.environment,
+                )
+                phase = "execution_context"
                 reconstructed, _ = reconstruct_order_states(self._journal)
                 local_states = reconstructed.states()
                 sources = list(self._venue_sources) or [
@@ -720,12 +728,9 @@ class ProductionRuntime:
                 engine=ReconciliationEngine(self._reconciliation_policy), journal=self._journal,
                 venue_sources=sources, producer=self._producer,
             )
-            if writing:
-                # Journal recovery only as the still-fenced owner: no takeover window before it.
-                with self._control.ownership_store.exclusive(purpose="startup_fence"):
-                    authorize_startup_fence_locked(fence)
-                    run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
-            else:
+            # Journal recovery only as the still-fenced owner: no takeover window before it.
+            with self._control.ownership_store.exclusive(purpose="startup_fence"):
+                authorize_startup_fence_locked(fence)
                 run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
             if not run.report.is_fully_resolved or run.requires_halt_new_risk or not run.may_resume_trading:
                 self._last_refusal = "recovery_required"
@@ -733,13 +738,6 @@ class ProductionRuntime:
                     "startup refused: unresolved order state requires recovery: "
                     f"{sorted(run.report.unresolved_orders)}"
                 )
-            if not writing:
-                guard = claim()
-                fence = ProductionFence(
-                    control=self._control, guard=guard, owner_id=self._owner_id,
-                    environment=decision.environment,
-                )
-
             def verify_evidence():
                 if writing:
                     if (self._execution is not collector.execution or self._venue_sources
