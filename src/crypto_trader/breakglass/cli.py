@@ -49,7 +49,7 @@ from crypto_trader.recovery import load_policy as load_recovery_policy
 
 from .commands import parse_operator_command
 from .control import BreakGlassControl
-from .errors import BreakGlassError, MalformedOperatorCommandError
+from .errors import BreakGlassError, BreakGlassIncompleteError, MalformedOperatorCommandError
 from .venue import BinanceSpotTestnetEmergencyControl, PolicyOnlyVenueControl
 
 __all__ = [
@@ -206,6 +206,8 @@ def _run_command(args: argparse.Namespace) -> int:
         except (JournalError, EventContractError, sqlite3.Error, OSError) as exc:
             # Never "nothing changed": the lease or the venue cancel may precede the failed append.
             return _incomplete(f"{type(exc).__name__}: {exc} [journal: {journal_path}]")
+        except BreakGlassIncompleteError as exc:
+            return _incomplete(f"{exc} [journal: {journal_path}]")
         record = outcome.to_record()
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED if outcome.accepted else EXIT_REFUSED

@@ -11,7 +11,8 @@ from uuid import uuid4
 
 import pytest
 
-from crypto_trader.breakglass import BreakGlassControl
+from crypto_trader.breakglass import BreakGlassControl, BreakGlassStateError
+from crypto_trader.breakglass.state import SafetyStateStore
 from crypto_trader.events import EventValidationError, decode_event
 from crypto_trader.breakglass.cli import (
     EXIT_ACCEPTED,
@@ -424,6 +425,32 @@ def test_run_never_creates_a_journal_that_vanished_before_the_writer_connected(
     )
     assert not os.path.exists(journal)
     _assert_no_state_files(tmp_path)
+
+
+def test_run_reports_incomplete_when_a_step_fails_after_the_command_was_journaled(
+    tmp_path, capsys, monkeypatch
+):
+    journal = _found_full_journal(tmp_path)
+
+    def fail(self, controller):
+        raise BreakGlassStateError("the safety state could not be written: disk full")
+
+    monkeypatch.setattr(SafetyStateStore, "save", fail)
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == 4
+    assert captured.out == ""
+    assert captured.err == (
+        "INCOMPLETE (side effects may already be in effect): BreakGlassStateError: the safety "
+        f"state could not be written: disk full [journal: {journal}]. The emergency lease and any "
+        "venue cancel may already have happened: check status and re-deliver the same "
+        "--command-id. If orders are open, cancel them directly at the exchange.\n"
+    )
+    with SQLiteEventJournal(journal, read_only=True) as reader:
+        recorded = [event.event_type for event in reader.read_range()]
+    assert recorded[-1] == "safety.operator_command.recorded"
 
 
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):

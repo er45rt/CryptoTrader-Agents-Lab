@@ -11,6 +11,7 @@ __all__ = [
     "BreakGlassCommandError",
     "BreakGlassConfigError",
     "BreakGlassError",
+    "BreakGlassIncompleteError",
     "BreakGlassRefusedError",
     "BreakGlassStateError",
     "MalformedOperatorCommandError",
@@ -34,6 +35,11 @@ class BreakGlassCommandError(BreakGlassError):
 
 class MalformedOperatorCommandError(BreakGlassCommandError):
     """The command payload is malformed, unknown or carries credential-shaped text."""
+
+
+class BreakGlassIncompleteError(BreakGlassError):
+    """A command failed after its first side effect: the venue cancel, the lease takeover or the
+    journal record may already be in effect, so the failure must never read as "nothing changed"."""
 
 
 class BreakGlassRefusedError(BreakGlassError):

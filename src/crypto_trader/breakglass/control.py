@@ -71,6 +71,8 @@ from .epoch import (
 from .errors import (
     BreakGlassActiveError,
     BreakGlassConfigError,
+    BreakGlassError,
+    BreakGlassIncompleteError,
     OwnershipStateError,
 )
 from .ownership import OwnerKind, OwnershipRecord, OwnershipStore, WriterGuard
@@ -417,9 +419,21 @@ class BreakGlassControl:
     # --- the single ingress ---------------------------------------------------
 
     def handle(self, command: OperatorCommand) -> OperatorCommandOutcome:
-        """Serialize the complete operator transaction against normal submission."""
+        """Serialize the complete operator transaction against normal submission.
+
+        A break-glass failure after the first side effect (venue cancel or journal record, which
+        follows the lease takeover) is raised as BreakGlassIncompleteError, never as a refusal.
+        """
         with self._ownership_store.exclusive():
-            return self._handle_locked(command)
+            self._side_effect_started = False
+            try:
+                return self._handle_locked(command)
+            except BreakGlassIncompleteError:
+                raise
+            except BreakGlassError as exc:
+                if not self._side_effect_started:
+                    raise
+                raise BreakGlassIncompleteError(f"{type(exc).__name__}: {exc}") from exc
 
     def _handle_locked(self, command: OperatorCommand) -> OperatorCommandOutcome:
         if not isinstance(command, OperatorCommand):
@@ -569,6 +583,7 @@ class BreakGlassControl:
         venue_outcome: VenueControlOutcome | None = None
         notes: list[str] = []
         if command.command_type is OperatorCommandType.CANCEL_OPEN:
+            self._side_effect_started = True  # the venue may act even if the call then fails
             venue_outcome = self._venue.cancel_open_orders(
                 correlation_id=session_id,
                 occurred_at=delivered_at,
@@ -1221,6 +1236,7 @@ class BreakGlassControl:
         cancelled_order_references: Sequence[str] = (),
     ) -> list[UUID]:
         """Journal the safety transitions and the command record in ONE atomic transaction."""
+        self._side_effect_started = True  # any lease takeover precedes this append
         del controller
         # Deterministic intra-command ordering: several operator commands may legitimately share one
         # request timestamp (and therefore one journal `occurred_at`), so every event in this batch
