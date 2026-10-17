@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 
-from crypto_trader.breakglass import BreakGlassControl, BreakGlassStateError
+from crypto_trader.breakglass import BreakGlassControl, BreakGlassStateError, OwnershipStateError
 from crypto_trader.breakglass.state import SafetyStateStore
 from crypto_trader.breakglass.venue import VenueControlOutcome
 from crypto_trader.events import EventValidationError, decode_event
@@ -22,6 +23,7 @@ from crypto_trader.breakglass.cli import (
     main,
 )
 from crypto_trader.persistence import JournalSchemaError, SQLiteEventJournal
+from crypto_trader.tests.production_fixtures import INSTRUMENT, RecordingExecutionPort, build_runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -489,6 +491,107 @@ def test_run_reports_incomplete_for_any_error_after_a_confirmed_venue_cancel(
         "already have happened: check status and re-deliver the same --command-id. If orders are "
         "open, cancel them directly at the exchange.\n"
     )
+
+
+def test_run_uses_the_journal_recorded_by_the_runtime_that_owns_the_state_dir(tmp_path, capsys):
+    journal_path = tmp_path / "journal.db"  # beside the state dir: the layout the runtime uses
+    state_dir = tmp_path / "state"
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        runtime = build_runtime(
+            journal=journal, state_dir=state_dir, execution=RecordingExecutionPort(INSTRUMENT)
+        )
+        runtime.start()
+        args = base_args(state_dir, "halt-new-risk")
+        at = args.index("--journal")
+        del args[at:at + 2]
+
+        code = main(args)
+        captured = capsys.readouterr()
+
+    assert code == EXIT_ACCEPTED, captured.err
+    assert json.loads(captured.out)["resulting_safety_state"] == "halt_new_risk"
+    with SQLiteEventJournal(journal_path, read_only=True) as reader:
+        recorded = [event.event_type for event in reader.read_range()]
+    assert recorded[-1] == "safety.operator_command.recorded"
+    assert not (state_dir / "journal.db").exists()
+
+
+def test_run_refuses_a_bound_journal_whose_real_path_changed(tmp_path, capsys):
+    journal = _found_full_journal(tmp_path)
+    founded = _sha256(journal)
+    other_real = tmp_path / "system-a" / "journal.db"
+    (tmp_path / "ownership.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "term": 1,
+                "owner_id": "normal:production-runtime",
+                "owner_kind": "normal",
+                "acquired_at": "2026-01-01T12:00:00+00:00",
+                "previous_owner_id": None,
+                "reason_code": "production_runtime_started",
+                "session_id": str(uuid4()),
+                "journal_path": str(journal),
+                "journal_realpath": str(other_real),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(base_args(tmp_path, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert captured.out == ""
+    assert captured.err == (
+        "REFUSED (fail closed, nothing changed): the trading-state lease is bound to journal "
+        f"{journal} (real path {other_real}), but {journal} resolves to "
+        f"{os.path.realpath(journal)}; refusing to pair a journal with another system's ownership "
+        "state. If orders are open, cancel them directly at the exchange.\n"
+    )
+    assert _sha256(journal) == founded
+
+
+def test_run_refuses_when_the_bound_journal_became_a_link_to_another_system(tmp_path, capsys):
+    system_a, system_b = tmp_path / "system-a", tmp_path / "system-b"
+    system_a.mkdir()
+    system_b.mkdir()
+    journal_a = _found_full_journal(system_a)
+    journal_b = _found_full_journal(system_b)
+    with SQLiteEventJournal(journal_b, venue_writes=True) as journal:
+        BreakGlassControl(journal=journal, state_dir=system_b).claim_normal_writer(
+            owner_id="normal:system-b"
+        )
+    journal_b.unlink()
+    try:
+        os.symlink(journal_a, journal_b)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"file symlinks are unavailable here: {exc}")
+    founded_a = _sha256(journal_a)
+
+    code = main(base_args(system_b, "halt-new-risk"))
+    captured = capsys.readouterr()
+
+    assert code == EXIT_MALFORMED
+    assert "refusing to pair a journal with another system's ownership state." in captured.err
+    assert _sha256(journal_a) == founded_a
+
+
+def test_a_writer_cannot_claim_a_state_dir_bound_to_another_journal(tmp_path):
+    state_dir = tmp_path / "state"
+    first, second = tmp_path / "a.db", tmp_path / "b.db"
+    with SQLiteEventJournal(first) as journal:
+        BreakGlassControl(journal=journal, state_dir=state_dir).claim_normal_writer(
+            owner_id="normal:a"
+        )
+    with SQLiteEventJournal(second) as journal:
+        control = BreakGlassControl(journal=journal, state_dir=state_dir)
+        with pytest.raises(OwnershipStateError, match=re.escape(
+            f"the trading-state lease is bound to journal {first} (real path "
+            f"{os.path.realpath(first)}), but {second} resolves to {os.path.realpath(second)}; "
+            "refusing to pair a journal with another system's ownership state."
+        )):
+            control.claim_normal_writer(owner_id="normal:b")
 
 
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):

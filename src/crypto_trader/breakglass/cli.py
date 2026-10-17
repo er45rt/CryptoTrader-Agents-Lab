@@ -4,8 +4,9 @@
         python -m crypto_trader.breakglass.cli run --command-type halt-new-risk \
             --command-id <uuid> --operator <name> --reason "<why>" --state-dir <dir>
 
-The journal is always ``<state-dir>/journal.db``: one system's ownership state and journal live
-together, so a mistyped path can never pair one system's journal with another system's lease.
+The journal is the one the state dir's lease owner recorded when it took the lease (its exact path,
+checked against its real path), or ``<state-dir>/journal.db`` when none is recorded, so a mistyped
+path or a swapped link can never pair one system's journal with another system's lease.
 
 Properties required of this control channel:
 
@@ -48,8 +49,14 @@ from crypto_trader.persistence import JournalError, JournalSchemaError, SQLiteEv
 from crypto_trader.recovery import load_policy as load_recovery_policy
 
 from .commands import parse_operator_command
-from .control import BreakGlassControl
-from .errors import BreakGlassError, BreakGlassIncompleteError, MalformedOperatorCommandError
+from .control import BreakGlassControl, break_glass_state_path
+from .errors import (
+    BreakGlassError,
+    BreakGlassIncompleteError,
+    MalformedOperatorCommandError,
+    OwnershipStateError,
+)
+from .ownership import OwnershipStore, journal_binding_mismatch
 from .venue import BinanceSpotTestnetEmergencyControl, PolicyOnlyVenueControl
 
 __all__ = [
@@ -128,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_common_paths(parser: argparse.ArgumentParser, *, journal_required: bool) -> None:
     parser.add_argument(
-        "--journal", required=journal_required, default=None, help="the event journal; must be <state-dir>/journal.db (the default)"
+        "--journal", required=journal_required, default=None, help="the event journal; must be the journal bound to --state-dir (the default)"
     )
     parser.add_argument(
         "--state-dir",
@@ -251,17 +258,25 @@ def _monotonic_utc() -> float:
 
 
 def _journal_for(args: argparse.Namespace) -> tuple[Path, str | None]:
-    """The journal bound to ``--state-dir`` is always ``<state-dir>/journal.db``; refuse any other."""
-    bound = _default_journal(Path(args.state_dir))
-    if args.journal is None:
-        return bound, None
-    given = Path(args.journal)
-    if os.path.normcase(os.path.abspath(given)) == os.path.normcase(os.path.abspath(bound)):
-        return bound, None
-    return bound, (
-        f"--journal {given} is not the journal bound to --state-dir {args.state_dir} "
-        f"(expected {bound}); refusing to pair a journal with another system's ownership state."
-    )
+    """The journal bound to ``--state-dir``: the lease owner's recorded journal, else the default."""
+    state_dir = Path(args.state_dir)
+    try:
+        lease = OwnershipStore(break_glass_state_path(state_dir, "ownership.json")).read()
+    except OwnershipStateError:
+        lease = None  # an unreadable lease fails closed in the command itself
+    if lease is not None and lease.journal_path is not None:
+        bound = Path(lease.journal_path)
+    else:
+        bound = _default_journal(state_dir)
+    if args.journal is not None:
+        given = Path(args.journal)
+        if os.path.normcase(os.path.abspath(given)) != os.path.normcase(os.path.abspath(bound)):
+            return bound, (
+                f"--journal {given} is not the journal bound to --state-dir {args.state_dir} "
+                f"(expected {bound}); refusing to pair a journal with another system's ownership "
+                "state."
+            )
+    return bound, journal_binding_mismatch(lease, str(bound))
 
 
 def _default_journal(state_dir: Path) -> Path:

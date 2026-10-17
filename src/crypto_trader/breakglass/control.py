@@ -24,6 +24,7 @@ Guarantees:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -347,6 +348,7 @@ class BreakGlassControl:
                 owner_kind=OwnerKind.NORMAL,
                 acquired_at=self._now(),
                 reason_code=reason_code,
+                journal_path=self._journal_path(),
             )
             return WriterGuard(self._ownership_store, record.fence)
 
@@ -438,6 +440,10 @@ class BreakGlassControl:
     def _handle_locked(self, command: OperatorCommand) -> OperatorCommandOutcome:
         if not isinstance(command, OperatorCommand):
             raise BreakGlassConfigError("handle() expects a validated OperatorCommand.")
+        # Before any side effect: this journal must be the one the state dir's lease is bound to.
+        binding = self._ownership_store.journal_binding_error(self._journal_path())
+        if binding is not None:
+            raise OwnershipStateError(binding)
         delivered_at = self._now()
         ledger = derive_ledger(self._journal)
         load = self._safety_store.load(self._journal)
@@ -629,6 +635,7 @@ class BreakGlassControl:
             acquired_at=delivered_at,
             reason_code=f"break_glass:{command.command_type.value}",
             session_id=session_id,
+            journal_path=self._journal_path(),
         )
         recorded = self._append_records(
             command,
@@ -986,6 +993,7 @@ class BreakGlassControl:
             acquired_at=delivered_at,
             reason_code="operator_restore_normal",
             session_id=epoch.session_id,
+            journal_path=self._journal_path(),
         )
         event_ids = self._append_records(
             command,
@@ -1150,6 +1158,13 @@ class BreakGlassControl:
         if ownership is None:
             return None, 0, "ownership absent"
         return ownership, ownership.term, None
+
+    def _journal_path(self) -> str | None:
+        """The exact path this control's journal is written at (None for an in-memory journal)."""
+        path = getattr(self._journal, "path", None)
+        if not isinstance(path, str) or not path or path == ":memory:":
+            return None
+        return os.path.abspath(path)
 
     def _current_term(self) -> int:
         return self._ownership_observation()[1]

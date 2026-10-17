@@ -42,6 +42,8 @@ __all__ = [
     "OwnershipStore",
     "WriterFence",
     "WriterGuard",
+    "journal_binding_mismatch",
+    "journal_realpath",
 ]
 
 #: Schema version of the persisted ownership record (not of any event).
@@ -53,6 +55,34 @@ _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
 _HELD_LOCKS = threading.local()
 _LOCK_TIMEOUT_SECONDS = 10.0
+
+
+def _optional_path(value: Any) -> str | None:
+    """A persisted journal binding is absent or a non-empty string; anything else fails closed."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("a journal binding must be a non-empty string")
+    return value
+
+
+def journal_realpath(path: str) -> str:
+    """The resolved real path that identifies one journal file (links and junctions followed)."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def journal_binding_mismatch(record: "OwnershipRecord | None", journal_path: str | None) -> str | None:
+    """Why ``journal_path`` is not the journal this lease is bound to; None when it is or unbound."""
+    if record is None or record.journal_realpath is None or journal_path is None:
+        return None
+    actual = journal_realpath(journal_path)
+    if os.path.normcase(actual) == os.path.normcase(record.journal_realpath):
+        return None
+    return (
+        f"the trading-state lease is bound to journal {record.journal_path} (real path "
+        f"{record.journal_realpath}), but {journal_path} resolves to {actual}; refusing to pair a "
+        "journal with another system's ownership state."
+    )
 
 
 class OwnerKind(str, Enum):
@@ -96,6 +126,10 @@ class OwnershipRecord:
     reason_code: str
     session_id: UUID
     schema_version: int = OWNERSHIP_SCHEMA_VERSION
+    #: The exact path the lease owner writes its journal at (readers open the same path, so they
+    #: share its -wal/-shm), and that file's real path when the lease was taken (its identity).
+    journal_path: str | None = None
+    journal_realpath: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != OWNERSHIP_SCHEMA_VERSION:
@@ -128,6 +162,8 @@ class OwnershipRecord:
             "previous_owner_id": self.previous_owner_id,
             "reason_code": self.reason_code,
             "session_id": str(self.session_id),
+            **({} if self.journal_path is None else {"journal_path": self.journal_path}),
+            **({} if self.journal_realpath is None else {"journal_realpath": self.journal_realpath}),
         }
 
     @classmethod
@@ -148,6 +184,8 @@ class OwnershipRecord:
                 ),
                 reason_code=str(payload["reason_code"]),
                 session_id=UUID(str(payload["session_id"])),
+                journal_path=_optional_path(payload.get("journal_path")),
+                journal_realpath=_optional_path(payload.get("journal_realpath")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise OwnershipStateError(f"the ownership record is not usable: {exc}") from exc
@@ -219,6 +257,17 @@ class OwnershipStore:
 
     def read(self) -> OwnershipRecord | None:
         """Return the current record, ``None`` when absent, or fail closed when unusable."""
+        return self._load()
+
+    def journal_binding_error(self, journal_path: str | None) -> str | None:
+        """Why ``journal_path`` is not this lease's journal (an unreadable lease is judged elsewhere)."""
+        try:
+            record = self._load()
+        except OwnershipStateError:
+            return None
+        return journal_binding_mismatch(record, journal_path)
+
+    def _load(self) -> OwnershipRecord | None:
         if not self._path.exists():
             return None
         try:
@@ -278,6 +327,7 @@ class OwnershipStore:
         acquired_at: datetime,
         reason_code: str,
         session_id: UUID | None = None,
+        journal_path: str | None = None,
     ) -> OwnershipRecord:
         """Explicitly take the lease over and mint a NEW, higher fencing term.
 
@@ -292,7 +342,17 @@ class OwnershipStore:
             if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
                 raise OwnershipStateError("acquired_at must be timezone-aware.")
             previous = self.read()
+            mismatch = journal_binding_mismatch(previous, journal_path)
+            if mismatch is not None:
+                raise OwnershipStateError(mismatch)
             previous_owner = None if previous is None else previous.owner_id
+            if journal_path is None and previous is not None:
+                # Carry the binding forward: a takeover never silently unbinds the state dir.
+                bound_path, bound_real = previous.journal_path, previous.journal_realpath
+            elif journal_path is None:
+                bound_path = bound_real = None
+            else:
+                bound_path, bound_real = os.path.abspath(journal_path), journal_realpath(journal_path)
             term = 1 if previous is None else previous.term + 1
             record = OwnershipRecord(
                 term=term,
@@ -302,6 +362,8 @@ class OwnershipStore:
                 previous_owner_id=previous_owner,
                 reason_code=reason_code,
                 session_id=uuid4() if session_id is None else session_id,
+                journal_path=bound_path,
+                journal_realpath=bound_real,
             )
             self._write(record)
             return record
