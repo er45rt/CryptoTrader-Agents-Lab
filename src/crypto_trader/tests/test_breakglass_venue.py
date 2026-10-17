@@ -150,6 +150,40 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
     assert len(deletes) == 1
 
 
+@pytest.mark.parametrize(
+    ("disposition", "second_cancel"),
+    [
+        ("ambiguous", TransportTimeout("lost")),
+        ("rejected", txf.rejected(-2011, "Unknown order sent.")),
+    ],
+)
+def test_a_cancel_all_failing_part_way_keeps_every_reference_it_touched(
+    journal, disposition, second_cancel
+):
+    # Review F-03: ct-1 was already cancelled and ct-2's cancel failed; both must stay on the
+    # record so reconciliation demands venue evidence for them instead of resolving by silence.
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            second_cancel,
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
+    deletes = [request for request in transport.requests if request.method == "DELETE"]
+
+    assert outcome.disposition == disposition
+    assert outcome.cancelled_order_references == ("ct-1", "ct-2")
+    assert len(deletes) == 2
+
+
 def test_an_unreachable_venue_is_reported_as_unavailable(journal):
     control, _, _, _ = venue(journal, [TransportError("down")])
 
@@ -393,6 +427,40 @@ def test_reconcile_stays_pending_when_the_venue_has_no_evidence_for_journaled_ca
         "pending",
         "reconciliation_missing_venue_evidence_for_cancelled_orders",
     )
+
+
+def test_a_part_way_cancel_failure_journals_every_touched_reference(journal, tmp_path):
+    # Review F-03: the journal is the only memory a new process has, so the references a
+    # failed cancel-all touched must reach it, or reconcile would have nothing to ask about.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            TransportTimeout("lost"),
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+
+    outcome = process.handle(_operator_command("cancel_open"))
+
+    assert outcome.venue_control == "ambiguous"
+    assert process.load_ledger().records[0].cancelled_order_references == ("ct-1", "ct-2")
 
 
 def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):

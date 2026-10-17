@@ -233,6 +233,21 @@ class BinanceSpotTestnetEmergencyControl:
 
     # --- control ----------------------------------------------------------
 
+    def _remember_touched(self, exc: BaseException) -> tuple[str, ...]:
+        """References a failed cancel-all already touched (cancelled, or cancel outcome unknown).
+
+        Each needs venue evidence before reconciliation may resolve, so it is tracked and
+        journaled like a confirmed cancel instead of being forgotten with the exception.
+        """
+        touched = getattr(exc, "attempted_order_references", ())
+        references = tuple(
+            dict.fromkeys(ref for ref in touched if isinstance(ref, str) and ref.strip())
+        )
+        self._order_references.extend(
+            reference for reference in references if reference not in self._order_references
+        )
+        return references
+
     def cancel_open_orders(
         self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
@@ -251,12 +266,12 @@ class BinanceSpotTestnetEmergencyControl:
         try:
             orders = self.runtime.cancel_all()
         except AmbiguousOrderError as exc:
-            del exc
             return VenueControlOutcome(
                 disposition="ambiguous",
                 reason_code="UNKNOWN_PENDING_RECONCILIATION",
                 detail="the cancel outcome is unknown; it was NOT retried and the epoch requires "
                 "reconciliation",
+                cancelled_order_references=self._remember_touched(exc),
                 preflight=preflight,
             )
         except BinanceTestnetError as exc:
@@ -265,6 +280,7 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="venue_cancel_rejected",
                 detail=f"the venue rejected the cancel deterministically ({type(exc).__name__}); "
                 "reconciliation is still required to confirm the resulting order state",
+                cancelled_order_references=self._remember_touched(exc),
                 preflight=preflight,
             )
         references = tuple(order.client_order_id for order in orders)
