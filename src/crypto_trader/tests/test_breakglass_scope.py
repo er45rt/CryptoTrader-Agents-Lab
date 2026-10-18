@@ -184,6 +184,7 @@ def test_phase13_adds_exactly_one_additive_event_contract():
         # Review F-03 additive contracts (existing schemas unchanged).
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
+        "breakglass.reconciliation.settled",
     }
 
 

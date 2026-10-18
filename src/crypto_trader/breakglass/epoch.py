@@ -29,6 +29,7 @@ from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
     RECONCILIATION_INTAKE_EVENT_TYPE,
     RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
 )
 from crypto_trader.persistence import EventJournal
 from crypto_trader.safety import SafetyMode
@@ -48,7 +49,11 @@ __all__ = [
 EPOCH_SCHEMA_VERSION = 1
 
 #: The journaled events of one break-glass reconcile run (review F-03).
-_RUN_EVENT_TYPES = (RECONCILIATION_INTAKE_EVENT_TYPE, RECONCILIATION_OBSERVED_EVENT_TYPE)
+_RUN_EVENT_TYPES = (
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
+)
 
 #: Reconciliation states an epoch can be in.
 ReconciliationStatus = Literal["not_required", "pending", "resolved", "failed"]
@@ -308,14 +313,15 @@ class RecordedOperatorCommand:
 class EpochObservations:
     """What the journaled reconcile runs recorded (review F-03); a closed epoch leaves none behind.
 
-    ``external_orders`` are the open venue orders any run listed that the journal does not know;
-    nothing settles them yet, so they stay outstanding for the life of the epoch.
+    ``external_orders`` are the (client order id, venue order id) of every open venue order a run
+    listed that the journal does not know; one leaves only when a run settles that exact venue
+    order as terminal without any execution, otherwise it stays outstanding for the epoch.
     ``unobserved_intakes`` are runs that started but never journaled what they saw: they may have
     seen orders nobody recorded. ``run_incomplete`` means the latest run started after the last
     completed one, so no recorded reconciliation result covers the latest venue reads.
     """
 
-    external_orders: tuple[str, ...] = ()
+    external_orders: tuple[tuple[str, str | None], ...] = ()
     unobserved_intakes: tuple[UUID, ...] = ()
     run_incomplete: bool = False
 
@@ -399,7 +405,7 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     # epoch is restored while any of them blocks it, so a closed epoch leaves none behind.
     intakes: list[UUID] = []
     observed: set[UUID] = set()
-    external: list[str] = []
+    external: list[tuple[str, str | None]] = []
     last_intake = last_completed = -1
     latest_occurred_at: datetime | None = None
     for index, event in enumerate(journal.replay()):
@@ -413,11 +419,18 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
                 last_intake = index
                 # An acknowledgement covers the evidence it saw; a new run reads new evidence.
                 epoch = epoch.with_updates(acknowledgement=None)
-            else:
+            elif event.event_type == RECONCILIATION_OBSERVED_EVENT_TYPE:
                 observed.add(event.payload.intake_id)
                 for order in event.payload.external_orders:
-                    if order.client_order_id not in external:
-                        external.append(order.client_order_id)
+                    identity = (order.client_order_id, order.venue_order_id)
+                    if identity not in external:
+                        external.append(identity)
+            else:
+                # Only the exact venue order first observed leaves; any other stays outstanding.
+                for order in event.payload.settled_orders:
+                    identity = (order.client_order_id, order.venue_order_id)
+                    if identity in external:
+                        external.remove(identity)
             continue
         if event.event_type != OPERATOR_COMMAND_EVENT_TYPE:
             continue

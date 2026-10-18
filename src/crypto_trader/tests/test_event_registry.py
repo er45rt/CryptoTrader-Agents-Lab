@@ -70,6 +70,7 @@ def test_default_registry_registers_every_v1_contract():
         # Review F-03 additive contracts (existing schemas unchanged).
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
+        "breakglass.reconciliation.settled",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:

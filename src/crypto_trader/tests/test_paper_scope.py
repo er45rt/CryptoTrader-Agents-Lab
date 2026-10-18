@@ -170,4 +170,5 @@ def test_paper_adds_no_new_event_contract():
         # Review F-03 additive contracts (existing schemas unchanged).
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
+        "breakglass.reconciliation.settled",
     }

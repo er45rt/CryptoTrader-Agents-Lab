@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -352,6 +353,19 @@ class BinanceSpotTestnetEmergencyControl:
     def listed_venue_order_ids(self) -> Mapping[str, str | None]:
         """The venue order id of each order the last strict listing named (review F-03)."""
         return dict(self._listed_venue_order_ids)
+
+    def order_settlement_evidence(
+        self, client_order_id: str
+    ) -> tuple[str | None, str, Decimal] | None:
+        """Strict status evidence for one order: (venue order id, status, executed quantity).
+
+        None when the strict read fails or the venue has no such order: nothing is settled then.
+        """
+        try:
+            order = self.client.startup_order_status(self.symbol, client_order_id)
+        except BinanceTestnetError:
+            return None
+        return order.venue_order_id, order.status, order.executed_quantity
 
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""

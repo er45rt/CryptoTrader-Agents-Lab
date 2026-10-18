@@ -32,6 +32,7 @@ from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
     RECONCILIATION_INTAKE_EVENT_TYPE,
     RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
     OperatorCommandRecordPayload,
     OperatorCommandRecorded,
 )
@@ -936,6 +937,148 @@ def test_a_run_for_a_synthesised_epoch_keeps_the_ledger_derivable(journal, tmp_p
     assert first.accepted and second.accepted
     assert process.status().epoch_provenance == "provenance_missing"
     assert process.load_ledger().epoch is None
+
+
+# --- Review F-03 settlement: an external order the venue proves never executed ---------------
+
+
+def _an_outstanding_external_order(journal, state_dir):
+    """The listing found ct-9 (venue order 100), which the journal does not know: outstanding."""
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    seen, client, _, _ = venue(
+        journal, [txf.open_orders_response("ct-9"), txf.order_response("ct-9", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    first = _reconcile_in_a_new_process_with(journal, state_dir, seen)
+    assert first.reconciliation_status == "pending"
+
+
+def _settled_events(journal):
+    return [e for e in journal.read_range() if e.event_type == RECONCILIATION_SETTLED_EVENT_TYPE]
+
+
+def test_an_external_order_the_venue_shows_cancelled_unexecuted_is_settled(journal, tmp_path):
+    # Review F-03 settlement: the strict status read shows the venue order first observed, a
+    # terminal status and no execution, so the order is journaled as settled and the epoch can
+    # resolve, be acknowledged and return to normal.
+    state_dir = tmp_path / "state"
+    _an_outstanding_external_order(journal, state_dir)
+    later, client, _, transport = venue(
+        journal,
+        [txf.open_orders_response(), txf.order_response("ct-9", status="CANCELED", order_id=100)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+    settled = _settled_events(journal)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "resolved",
+        "reconciliation_confirmed_by_evidence",
+    )
+    assert [
+        (order.client_order_id, order.venue_order_id, order.status, order.executed_quantity)
+        for order in settled[0].payload.settled_orders
+    ] == [("ct-9", "100", "CANCELED", Decimal("0"))]
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+
+
+def _without(response, field):
+    body = dict(response.body)
+    del body[field]
+    return txf.response(200, body)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        txf.order_response("ct-9", status="NEW", order_id=100),
+        txf.order_response("ct-9", status="FILLED", order_id=100, executed_qty="0.00100000"),
+        txf.order_response("ct-9", status="CANCELED", order_id=100, executed_qty="0.00050000"),
+        txf.order_response("ct-9", status="EXPIRED_IN_MATCH", order_id=100),
+        txf.order_response("ct-9", status="CANCELED", order_id=101),
+        txf.rejected(-2013, "Order does not exist."),
+        TransportTimeout("lost"),
+        # A lenient read would assume no execution, or accept another order's answer.
+        _without(txf.order_response("ct-9", status="CANCELED", order_id=100), "executedQty"),
+        txf.order_response("ct-8", status="CANCELED", order_id=100),
+    ],
+    ids=[
+        "still open",
+        "filled",
+        "partly executed then cancelled",
+        "outside the approved terminal statuses",
+        "another venue order",
+        "unknown to the venue",
+        "status read timed out",
+        "no executed quantity reported",
+        "answer for another client order id",
+    ],
+)
+def test_an_external_order_stays_outstanding_without_proof_it_never_executed(
+    journal, tmp_path, evidence
+):
+    # Review F-03 settlement: anything short of the exact venue order, an approved terminal status
+    # and zero execution leaves the order outstanding; executed orders need trade history.
+    state_dir = tmp_path / "state"
+    _an_outstanding_external_order(journal, state_dir)
+    later, client, _, _ = venue(journal, [txf.open_orders_response(), evidence])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+    assert _settled_events(journal) == []
+
+
+class _ListsWithIdentities(_SilentVenue):
+    """Lists the given orders with their venue order ids and answers the given status evidence."""
+
+    def __init__(self, listed=(), evidence=()):
+        super().__init__()
+        self.listed = dict(listed)
+        self.evidence = dict(evidence)
+
+    def track_open_orders(self):
+        return tuple(self.listed)
+
+    def listed_venue_order_ids(self):
+        return dict(self.listed)
+
+    def order_settlement_evidence(self, reference):
+        return self.evidence.get(reference)
+
+
+def test_settling_a_reused_client_order_id_settles_only_that_venue_order(journal, tmp_path):
+    # Review F-03 settlement: the venue may reuse a client order id once an order ends. ct-9 was
+    # listed as venue order 100 and later as 205; settling 205 must leave 100 outstanding.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    for listed in ({"ct-9": "100"}, {"ct-9": "205"}):
+        _reconcile_in_a_new_process_with(journal, state_dir, _ListsWithIdentities(listed=listed))
+    settles = _ListsWithIdentities(evidence={"ct-9": ("205", "CANCELED", Decimal("0"))})
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, settles)
+    settled = _settled_events(journal)[0].payload.settled_orders
+    ledger = BreakGlassControl(journal=journal, state_dir=state_dir).load_ledger()
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+    assert [order.venue_order_id for order in settled] == ["205"]
+    assert ledger.observations.external_orders == (("ct-9", "100"),)
 
 
 def _journal_a_v3_cancel(journal, tmp_path):

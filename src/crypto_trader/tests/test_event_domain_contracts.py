@@ -26,6 +26,7 @@ from crypto_trader.events import (
     OrderStateChangePayload,
     OrderSubmissionAttempted,
     ReconciliationObservedRecorded,
+    ReconciliationSettledRecorded,
     RecoveryStateChanged,
     RecoveryStateChangePayload,
     RiskDecisionPayload,
@@ -530,6 +531,7 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         # Review F-03 additive contracts (existing schemas unchanged).
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
+        "breakglass.reconciliation.settled",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)
 
@@ -583,6 +585,65 @@ def test_a_reconciliation_observation_is_caused_by_its_intake():
 def test_a_reconciliation_observation_refuses_an_unproven_order_identity(overrides):
     with pytest.raises(ValidationError):
         ReconciliationObservedRecorded(**_observation(**overrides))
+
+
+def _settlement(*, causation_id=None, orders=(("ct-9", "101", "CANCELED", "0"),)):
+    intake_id = uuid.uuid4()
+    return base_fields(
+        causation_id=intake_id if causation_id is None else causation_id,
+        payload={
+            "intake_id": intake_id,
+            "settled_orders": [
+                {
+                    "client_order_id": client,
+                    "venue_order_id": venue,
+                    "status": status,
+                    "executed_quantity": executed,
+                }
+                for client, venue, status, executed in orders
+            ],
+        },
+    )
+
+
+def test_a_reconciliation_settlement_is_caused_by_its_intake():
+    event = ReconciliationSettledRecorded(**_settlement())
+
+    assert event.causation_id == event.payload.intake_id
+    assert [
+        (order.client_order_id, order.venue_order_id, order.status, order.executed_quantity)
+        for order in event.payload.settled_orders
+    ] == [("ct-9", "101", "CANCELED", Decimal("0"))]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"causation_id": uuid.uuid4()},
+        {"orders": ()},
+        {"orders": (("ct-9", "101", "CANCELED", "0"), ("ct-9", "102", "EXPIRED", "0"))},
+        {"orders": ((" ", "101", "CANCELED", "0"),)},
+        {"orders": (("ct-9", None, "CANCELED", "0"),)},
+        {"orders": (("ct-9", "0101", "CANCELED", "0"),)},
+        {"orders": (("ct-9", "\u0661\u0660\u0661", "CANCELED", "0"),)},
+        {"orders": (("ct-9", "101", "FILLED", "0"),)},
+        {"orders": (("ct-9", "101", "CANCELED", "0.001"),)},
+    ],
+    ids=[
+        "caused by another event",
+        "nothing settled",
+        "one client order id twice",
+        "blank client order id",
+        "no venue order id",
+        "venue id with a leading zero",
+        "non-ASCII venue id digits",
+        "not an approved terminal status",
+        "executed",
+    ],
+)
+def test_a_reconciliation_settlement_refuses_anything_but_a_proven_unexecuted_order(overrides):
+    with pytest.raises(ValidationError):
+        ReconciliationSettledRecorded(**_settlement(**overrides))
 
 
 def test_decimal_precision_is_exact_for_string_inputs():

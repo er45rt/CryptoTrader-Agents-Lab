@@ -34,6 +34,7 @@ from uuid import UUID, uuid4
 
 from crypto_trader.events import (
     ExternalOrderObservation,
+    ExternalOrderSettlement,
     OperatorCommandRecordPayloadV2,
     OperatorCommandRecordPayloadV3,
     OperatorCommandRecordedV2,
@@ -42,6 +43,8 @@ from crypto_trader.events import (
     ReconciliationIntakeRecorded,
     ReconciliationObservedPayload,
     ReconciliationObservedRecorded,
+    ReconciliationSettledPayload,
+    ReconciliationSettledRecorded,
     SafetyStateChangePayload,
     SafetyStateChanged,
 )
@@ -129,6 +132,8 @@ _IDENTITY_WARNING = (
 #: Review F-03: a reconcile run that journaled its intake but never what it observed may have seen
 #: venue orders nobody recorded; nothing settles that yet, so the epoch never resolves after it.
 OBSERVATION_POSSIBLY_LOST = "observation_possibly_lost"
+#: The terminal venue statuses that settle an external order the venue shows never executed.
+SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
 
 def break_glass_state_path(state_dir: str | Path, name: str) -> Path:
@@ -1318,6 +1323,7 @@ class BreakGlassControl:
         journaled = journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id
         references: tuple[str, ...] = ()
         listing_needed = False
+        outstanding = ledger.observations.external_orders
         if journaled:
             # A new process knows the cancelled orders only from the journal, never from memory.
             references = ledger.open_epoch_order_references()
@@ -1340,6 +1346,7 @@ class BreakGlassControl:
         venue_reports: list[VenueOrderReport] = []
         listed: tuple[str, ...] = ()
         listing = "missing" if listing_needed else "not_required"
+        settlements: list[ExternalOrderSettlement] = []
         evidence_complete = True
         try:
             if self._venue_state_provider is not None:
@@ -1353,6 +1360,28 @@ class BreakGlassControl:
                 if found is not None:
                     listing, listed = "complete", tuple(found)
             venue_reports.extend(self._venue.venue_reports())
+            # An outstanding external order settles only on strict evidence that the exact venue
+            # order first observed ended without any execution.
+            read_evidence = getattr(self._venue, "order_settlement_evidence", None)
+            if callable(read_evidence):
+                for reference in dict.fromkeys(ref for ref, _ in outstanding):
+                    evidence = read_evidence(reference)
+                    if evidence is None:
+                        continue
+                    venue_order_id, status, executed = evidence
+                    if (
+                        (reference, venue_order_id) in outstanding
+                        and status in SETTLED_WITHOUT_EXECUTION_STATUSES
+                        and executed == 0
+                    ):
+                        settlements.append(
+                            ExternalOrderSettlement(
+                                client_order_id=reference,
+                                venue_order_id=venue_order_id,
+                                status=status,
+                                executed_quantity=executed,
+                            )
+                        )
         except Exception:  # an interrupt is never masked: its intake then stays unobserved
             evidence_complete = False
         local_references = {state.order_reference for state in local_states}
@@ -1381,6 +1410,15 @@ class BreakGlassControl:
             occurred_at=delivered_at,
             sequence_number=sequence_base - 1,
         )
+        if settlements:
+            self._append_run_event(
+                ReconciliationSettledRecorded,
+                ReconciliationSettledPayload(intake_id=intake_id, settled_orders=settlements),
+                correlation_id=epoch.session_id,
+                causation_id=intake_id,
+                occurred_at=delivered_at,
+                sequence_number=sequence_base,
+            )
         observations = derive_ledger(self._journal).observations
         observation_lost = bool(observations.unobserved_intakes)
         if not evidence_complete:
@@ -1423,8 +1461,12 @@ class BreakGlassControl:
 
     def _append_run_event(
         self,
-        event_type: type[ReconciliationIntakeRecorded] | type[ReconciliationObservedRecorded],
-        payload: ReconciliationIntakePayload | ReconciliationObservedPayload,
+        event_type: type[ReconciliationIntakeRecorded]
+        | type[ReconciliationObservedRecorded]
+        | type[ReconciliationSettledRecorded],
+        payload: ReconciliationIntakePayload
+        | ReconciliationObservedPayload
+        | ReconciliationSettledPayload,
         *,
         correlation_id: UUID,
         causation_id: UUID | None,

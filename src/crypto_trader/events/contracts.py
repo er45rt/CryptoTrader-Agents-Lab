@@ -39,6 +39,8 @@ Additive contracts added by later phases (existing schemas unchanged):
     before its first venue read
 16. ``breakglass.reconciliation.observed`` (review F-03) - what that run read, including every
     venue order it listed that the journal does not know
+17. ``breakglass.reconciliation.settled``  (review F-03) - the external orders that run proved
+    terminal at the venue without any execution
 """
 
 from __future__ import annotations
@@ -113,11 +115,15 @@ __all__ = [
     "OperatorCommandType",
     "RECONCILIATION_INTAKE_EVENT_TYPE",
     "RECONCILIATION_OBSERVED_EVENT_TYPE",
+    "RECONCILIATION_SETTLED_EVENT_TYPE",
     "ExternalOrderObservation",
+    "ExternalOrderSettlement",
     "ReconciliationIntakePayload",
     "ReconciliationIntakeRecorded",
     "ReconciliationObservedPayload",
     "ReconciliationObservedRecorded",
+    "ReconciliationSettledPayload",
+    "ReconciliationSettledRecorded",
     "STREAM_LIFECYCLE_EVENT_TYPE",
     "StreamLifecyclePayload",
     "StreamLifecycleRecorded",
@@ -151,6 +157,7 @@ STREAM_LIFECYCLE_EVENT_TYPE = "stream.lifecycle.recorded"
 #: Review F-03 additive contracts: a break-glass reconcile run's start and what it observed.
 RECONCILIATION_INTAKE_EVENT_TYPE = "breakglass.reconciliation.intake"
 RECONCILIATION_OBSERVED_EVENT_TYPE = "breakglass.reconciliation.observed"
+RECONCILIATION_SETTLED_EVENT_TYPE = "breakglass.reconciliation.settled"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -985,6 +992,73 @@ class ReconciliationObservedRecorded(DomainEvent):
         return self
 
 
+class ExternalOrderSettlement(EventPayload):
+    """One external order the venue showed terminal without any execution."""
+
+    client_order_id: str = Field(min_length=1, description="The venue's client order id.")
+    venue_order_id: str = Field(description="The venue order id the strict status read reported.")
+    status: Literal["CANCELED", "EXPIRED", "REJECTED"] = Field(
+        description="The terminal venue status the strict status read reported."
+    )
+    executed_quantity: Decimal = Field(description="The executed quantity the venue reported.")
+
+    @field_validator("client_order_id")
+    @classmethod
+    def _non_blank_reference(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a settled order needs a non-blank client order id.")
+        return value
+
+    @field_validator("venue_order_id")
+    @classmethod
+    def _canonical_venue_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isdigit() or value.startswith("0"):
+            raise ValueError("a settled venue order id must be a canonical positive integer.")
+        return value
+
+    @field_validator("executed_quantity")
+    @classmethod
+    def _never_executed(cls, value: Decimal) -> Decimal:
+        if value != 0:
+            raise ValueError("only an order that never executed is settled here.")
+        return value
+
+
+class ReconciliationSettledPayload(EventPayload):
+    """The external orders one reconcile run settled, journaled before it decides anything.
+
+    Only an order whose strict status read shows the venue order id first observed, a terminal
+    status and no execution is settled; every other external order stays outstanding.
+    """
+
+    intake_id: UUID = Field(description="The intake event of the run that read the evidence.")
+    settled_orders: list[ExternalOrderSettlement] = Field(
+        min_length=1, description="The external orders the run settled."
+    )
+
+    @field_validator("settled_orders")
+    @classmethod
+    def _unique_orders(cls, value: list[ExternalOrderSettlement]) -> list[ExternalOrderSettlement]:
+        references = [order.client_order_id for order in value]
+        if len(set(references)) != len(references):
+            raise ValueError("a settlement lists each client order id once.")
+        return value
+
+
+class ReconciliationSettledRecorded(DomainEvent):
+    """The external orders a break-glass reconcile run settled (review F-03)."""
+
+    event_type: Literal["breakglass.reconciliation.settled"] = RECONCILIATION_SETTLED_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: ReconciliationSettledPayload
+
+    @model_validator(mode="after")
+    def _caused_by_its_intake(self) -> "ReconciliationSettledRecorded":
+        if self.causation_id != self.payload.intake_id:
+            raise ValueError("a settlement is caused by the intake it names.")
+        return self
+
+
 # --- 11. Market-data stream lifecycle (Phase 15, additive) ------------------
 
 #: The stream lifecycle vocabulary. ``ready`` is reachable only after a fresh synchronized
@@ -1102,6 +1176,7 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     StreamLifecycleRecorded,
     ReconciliationIntakeRecorded,
     ReconciliationObservedRecorded,
+    ReconciliationSettledRecorded,
 )
 
 V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2, OperatorCommandRecordedV2)
