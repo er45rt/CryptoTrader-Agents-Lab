@@ -134,6 +134,9 @@ _IDENTITY_WARNING = (
 OBSERVATION_POSSIBLY_LOST = "observation_possibly_lost"
 #: The latest reconcile run started after the last completed one, so no result covers its reads.
 RECONCILIATION_RUN_INCOMPLETE = "reconciliation_run_incomplete"
+#: Review ADV-04: a reconcile run journaled before intakes existed listed the open orders and
+#: journaled nothing it saw; only re-establishing on a newly founded journal clears it.
+LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE = "legacy_external_evidence_unverifiable"
 #: The terminal venue statuses that settle an external order the venue shows never executed.
 SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
@@ -397,6 +400,11 @@ class BreakGlassControl:
         # The reconcile-run gates refuse restore before the epoch's own blockers (review F-03).
         run_gates = (
             *((OBSERVATION_POSSIBLY_LOST,) if ledger.observations.unobserved_intakes else ()),
+            *(
+                (LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE,)
+                if ledger.open_epoch_legacy_listing_run()
+                else ()
+            ),
             *((RECONCILIATION_RUN_INCOMPLETE,) if ledger.observations.run_incomplete else ()),
         )
         return BreakGlassStatus(
@@ -761,7 +769,7 @@ class BreakGlassControl:
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to reconcile.",
             )
-        settled, reconciliation_note, observation_lost = self._run_reconciliation(
+        settled, reconciliation_note, run_blocker = self._run_reconciliation(
             command, epoch, delivered_at
         )
         resolved = settled and not self._identity_unverified
@@ -769,8 +777,8 @@ class BreakGlassControl:
         if self._identity_unverified:
             # Evidence can never vouch for a journal whose identity is unproven (review F-02).
             reason_code = JOURNAL_IDENTITY_UNVERIFIED
-        elif observation_lost:
-            reason_code = OBSERVATION_POSSIBLY_LOST
+        elif run_blocker is not None:
+            reason_code = run_blocker
         elif resolved:
             reason_code = "reconciliation_resolved"
         else:
@@ -1312,13 +1320,13 @@ class BreakGlassControl:
 
     def _run_reconciliation(
         self, command: OperatorCommand, epoch: BreakGlassEpoch, delivered_at: datetime
-    ) -> tuple[bool, str, bool]:
+    ) -> tuple[bool, str, str | None]:
         """Run the Phase 8 reconciliation through the injected evidence providers.
 
         Review F-03: the run journals its intake before its first venue read and what it observed
         before it decides anything, so no later run can forget an order this one saw. Returns
-        whether the epoch is settled, the result note, and whether an earlier run's observation
-        may be lost.
+        whether the epoch is settled, the result note, and the sticky gate (an earlier run's
+        observation may be lost, or an older run listed unrecorded orders) if one holds.
         """
         if self._reconciliation_policy is None:
             raise BreakGlassConfigError(
@@ -1427,10 +1435,14 @@ class BreakGlassControl:
                 sequence_number=sequence_base,
             )
         observations = derive_ledger(self._journal).observations
-        observation_lost = bool(observations.unobserved_intakes)
+        run_blocker = None
+        if observations.unobserved_intakes:
+            run_blocker = OBSERVATION_POSSIBLY_LOST
+        elif ledger.open_epoch_legacy_listing_run():
+            run_blocker = LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE
         if not evidence_complete:
             # Absence of evidence is not evidence of absence: Phase 8 never runs on a failed read.
-            return False, "reconciliation_venue_evidence_unavailable", observation_lost
+            return False, "reconciliation_venue_evidence_unavailable", run_blocker
         reported = {report.order_reference for report in venue_reports}
         # A journaled cancel is never resolved by silence: every reference needs venue evidence.
         unverified = tuple(reference for reference in references if reference not in reported)
@@ -1457,14 +1469,14 @@ class BreakGlassControl:
             note = "reconciliation_missing_venue_evidence_for_listed_orders"
         elif not run.report.is_fully_resolved:
             note = "reconciliation_left_orders_unresolved"
-        elif observation_lost:
-            note = OBSERVATION_POSSIBLY_LOST
+        elif run_blocker is not None:
+            note = run_blocker
         elif observations.external_orders:
             # Nothing settles an order the journal does not know yet: it stays outstanding.
             note = "reconciliation_external_orders_outstanding"
         else:
             note = "reconciliation_confirmed_by_evidence"
-        return note == "reconciliation_confirmed_by_evidence", note, observation_lost
+        return note == "reconciliation_confirmed_by_evidence", note, run_blocker
 
     def _append_run_event(
         self,
@@ -1496,12 +1508,20 @@ class BreakGlassControl:
 
     def _reconcile_run_blocker(self) -> tuple[str, str] | None:
         """The open epoch's reconcile-run gate (review F-03): its code suffix and note, if any."""
-        observations = derive_ledger(self._journal).observations
+        ledger = derive_ledger(self._journal)
+        observations = ledger.observations
         if observations.unobserved_intakes:
             return (
                 OBSERVATION_POSSIBLY_LOST,
                 "a reconcile run started but never journaled what it observed, so it may have seen "
                 "venue orders nobody recorded; nothing settles that yet.",
+            )
+        if ledger.open_epoch_legacy_listing_run():
+            return (
+                LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE,
+                "a reconcile run journaled by older code listed the open orders and journaled "
+                "nothing it saw; cancel open orders directly at the exchange and re-establish on a "
+                "newly founded journal.",
             )
         if observations.run_incomplete:
             return (

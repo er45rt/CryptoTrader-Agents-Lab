@@ -1105,6 +1105,124 @@ def test_settling_a_reused_client_order_id_settles_only_that_venue_order(journal
     assert ledger.observations.external_orders == (("ct-9", "100"),)
 
 
+# --- Review ADV-04: a listing run journaled before reconcile runs recorded anything ------------
+
+
+def _as_code_before_run_events(patch):
+    """Behave as the code before review F-03: no intake, observation or settlement, no run gate."""
+    from crypto_trader.breakglass import control as control_module
+
+    patch.setattr(
+        control_module.BreakGlassControl, "_append_run_event", lambda self, *a, **k: uuid4()
+    )
+    patch.setattr(control_module.BreakGlassControl, "_reconcile_run_blocker", lambda self: None)
+
+
+def test_a_listing_run_by_older_code_keeps_the_epoch_unsettled(journal, tmp_path, monkeypatch):
+    # Review ADV-04: older code listed the open orders a failed cancel never learned, found ct-9,
+    # failed to read its status and journaled nothing about it. ct-9 then left the listing, and the
+    # new code resolved the epoch on an empty listing: the only evidence of ct-9 was gone.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    older, client, _, _ = venue(
+        journal, [txf.open_orders_response("ct-9"), txf.rejected(-1003, "Too many requests.")]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        legacy = _reconcile_in_a_new_process_with(journal, state_dir, older)
+    gone, client, _, _ = venue(journal, [txf.open_orders_response()])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    later = _reconcile_in_a_new_process_with(journal, state_dir, gone)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert legacy.reconciliation_result == "reconciliation_missing_venue_evidence_for_listed_orders"
+    assert (later.reconciliation_status, later.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_legacy_external_evidence_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_legacy_external_evidence_unverifiable",
+    )
+    assert process.status().restore_blockers[0] == "legacy_external_evidence_unverifiable"
+
+
+def test_a_run_by_older_code_before_the_open_orders_were_unknown_never_listed(
+    journal, tmp_path, monkeypatch
+):
+    # Review ADV-04: the older run came before any cancel left the open orders unknown, so it never
+    # listed them and hid nothing; the epoch settles as usual.
+    state_dir = tmp_path / "state"
+    control, _, _, _ = venue(
+        journal,
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("halt_new_risk")).accepted
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        assert first.handle(_operator_command("reconcile")).accepted
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+    listing, client, _, _ = venue(journal, [txf.open_orders_response()])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    later = _reconcile_in_a_new_process_with(journal, state_dir, listing)
+
+    assert (later.reconciliation_status, later.reconciliation_result) == (
+        "resolved",
+        "reconciliation_confirmed_by_evidence",
+    )
+
+
+def test_a_listing_run_by_older_code_in_a_closed_epoch_never_blocks_a_later_one(
+    journal, tmp_path, monkeypatch
+):
+    # Review ADV-04: an epoch the older code already closed keeps its history; only the open
+    # epoch is judged, so a new epoch settles as usual.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_ListsWithIdentities(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+        assert process.handle(_operator_command("acknowledge")).accepted
+        assert process.handle(_operator_command("restore_normal")).accepted
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+
+
 def _journal_a_v3_cancel(journal, tmp_path):
     # ct-1's cancel is confirmed and ct-2's times out, so the command is journaled as V3.
     control, _, _, _ = venue(
