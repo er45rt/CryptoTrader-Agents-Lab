@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -104,6 +104,20 @@ KILL_SWITCH_ACTIONS = frozenset(
         OperatorCommandType.ENTER_DEGRADED,
         OperatorCommandType.FORCE_RECOVERY_REQUIRED,
     }
+)
+
+#: Review F-02 (legacy): a FULL journal founded before identities records no journal_id, so the
+#: id-less journal at a path-only lease's path cannot be told apart from another id-less journal
+#: moved onto that path. Emergency actions stay available on it; these two would extend trust in the
+#: unproven pairing (reduce-only keeps the bound writer sending orders) and are refused unwritten.
+JOURNAL_IDENTITY_UNVERIFIED = "journal_identity_unverified"
+IDENTITY_TRUST_COMMANDS = frozenset(
+    {OperatorCommandType.REDUCE_ONLY, OperatorCommandType.RESTORE_NORMAL}
+)
+_IDENTITY_WARNING = (
+    f"{JOURNAL_IDENTITY_UNVERIFIED}: the journal records no journal_id, so it cannot be proven to "
+    "be the journal this state dir's lease was bound to; reconciliation stays pending and "
+    "restore_normal is refused until the system is re-established on a newly founded journal."
 )
 
 
@@ -431,8 +445,12 @@ class BreakGlassControl:
         """
         with self._ownership_store.exclusive():
             self._side_effect_started = False
+            self._identity_unverified = False
             try:
-                return self._handle_locked(command)
+                outcome = self._handle_locked(command)
+                if self._identity_unverified:
+                    outcome = replace(outcome, notes=(*outcome.notes, _IDENTITY_WARNING))
+                return outcome
             except BreakGlassIncompleteError:
                 raise
             except Exception as exc:  # BaseException (an interrupt) is never masked
@@ -447,6 +465,9 @@ class BreakGlassControl:
         binding = self._ownership_store.journal_binding_error(self._journal_path(), self._journal_id())
         if binding is not None:
             raise OwnershipStateError(binding)
+        self._identity_unverified = self._journal_identity_unverified()
+        if self._identity_unverified and command.command_type in IDENTITY_TRUST_COMMANDS:
+            raise OwnershipStateError(self._identity_refusal(command.command_type))
         delivered_at = self._now()
         ledger = derive_ledger(self._journal)
         load = self._safety_store.load(self._journal)
@@ -714,10 +735,15 @@ class BreakGlassControl:
                 note="there is no open break-glass epoch to reconcile.",
             )
         report, reconciliation_note, evidenced = self._run_reconciliation(epoch)
-        status = "resolved" if report.is_fully_resolved and evidenced else "pending"
-        reason_code = (
-            "reconciliation_resolved" if status == "resolved" else "UNKNOWN_PENDING_RECONCILIATION"
-        )
+        resolved = report.is_fully_resolved and evidenced and not self._identity_unverified
+        status = "resolved" if resolved else "pending"
+        if self._identity_unverified:
+            # Evidence can never vouch for a journal whose identity is unproven (review F-02).
+            reason_code = JOURNAL_IDENTITY_UNVERIFIED
+        elif resolved:
+            reason_code = "reconciliation_resolved"
+        else:
+            reason_code = "UNKNOWN_PENDING_RECONCILIATION"
         ownership, fence_term, ownership_diagnostic = self._ownership_observation()
         event_ids = self._append_records(
             command,
@@ -1180,6 +1206,38 @@ class BreakGlassControl:
             return None
         read = getattr(self._journal, "journal_id", None)
         return None if read is None else read()
+
+    def _journal_identity_unverified(self) -> bool:
+        """Whether the open journal is FULL-founded yet records no journal_id (review F-02).
+
+        Only a FULL-founded journal can back venue writes or be opened by the emergency CLI, so
+        that is where an unproven pairing matters; a journal that was never FULL-founded never
+        carries an identity and can never send a venue write.
+        """
+        if self._journal_path() is None:
+            return False
+        founded = getattr(self._journal, "has_full_foundation", None)
+        if founded is None or not founded():
+            return False
+        return self._journal_id() is None
+
+    def _identity_refusal(self, command_type: OperatorCommandType) -> str:
+        """The operator-facing refusal of a command that would extend trust in an id-less journal."""
+        if command_type is OperatorCommandType.REDUCE_ONLY:
+            refused = (
+                "reduce_only is refused because it would let the bound writer keep sending orders on "
+                "that unproven pairing; use halt_new_risk or cancel_open instead."
+            )
+        else:
+            refused = (
+                "restore_normal is refused: normal is never resumed on an unproven pairing; "
+                "re-establish on a new state dir with a newly founded journal."
+            )
+        return (
+            f"{JOURNAL_IDENTITY_UNVERIFIED}: the journal open at {self._journal_path()} records no "
+            "journal_id, so it cannot be proven to be the journal this state dir's lease was bound "
+            f"to; {refused} If orders are open, cancel them directly at the exchange."
+        )
 
     def _current_term(self) -> int:
         return self._ownership_observation()[1]

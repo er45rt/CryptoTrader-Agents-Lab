@@ -1041,6 +1041,115 @@ def test_a_lease_bound_without_a_journal_id_keeps_its_id_less_journal_by_path(tm
     assert "journal_id" not in json.loads((state_dir / "ownership.json").read_text(encoding="utf-8"))
 
 
+def _found_journal_without_an_identity(tmp_path: Path) -> Path:
+    """A FULL journal as builds before journal identities founded it (no journal_id)."""
+    path = _found_full_journal(tmp_path)
+    with sqlite3.connect(path) as raw:
+        raw.execute("DELETE FROM journal_meta WHERE key = 'journal_id'")
+    raw.close()
+    return path
+
+
+def _journal_event_count(path: Path) -> int:
+    with SQLiteEventJournal(path, read_only=True) as journal:
+        return journal.count()
+
+
+@pytest.mark.parametrize("command", ["reduce-only", "restore-normal"])
+def test_an_id_less_journal_refuses_reduce_only_and_restore_without_any_write(
+    tmp_path, capsys, command
+):
+    # F-02 legacy gate: a path-only lease cannot prove that the id-less journal at its path is still
+    # the one it was bound to. reduce-only would let the bound writer keep sending orders and restore
+    # would resume normal on that unproven pairing, so both are refused before any journal, lease,
+    # safety or venue effect, and a redelivery of the same command is refused the same way.
+    journal = _found_journal_without_an_identity(tmp_path)
+    lease = _bind_without_a_journal_id(tmp_path, journal)
+    founded, events = _sha256(journal), _journal_event_count(journal)
+    command_id = str(uuid4())
+
+    for _delivery in range(2):
+        code = main(base_args(tmp_path, command, command_id=command_id))
+        captured = capsys.readouterr()
+
+        assert code == EXIT_MALFORMED, captured.out
+        assert captured.out == ""
+        assert captured.err.startswith(
+            "REFUSED (fail closed, nothing changed): OwnershipStateError: "
+            "journal_identity_unverified: "
+        ), captured.err
+        assert "cancel them directly at the exchange" in captured.err
+    assert _sha256(journal) == founded
+    assert _journal_event_count(journal) == events
+    assert (tmp_path / "ownership.json").read_text(encoding="utf-8") == lease
+    assert not (tmp_path / "safety_state.json").exists()
+
+
+@pytest.mark.parametrize("identity", ["absent", "present"])
+def test_an_id_less_journal_keeps_emergency_actions_but_never_reconciles_or_restores(
+    tmp_path, identity
+):
+    # F-02 legacy gate: emergency actions stay available on an id-less journal and say why they
+    # cannot be trusted further; reconcile is journaled pending for that reason, so the
+    # acknowledgement stays refused, and restore is refused before any write. A journal with an
+    # identity keeps the existing behavior end to end.
+    from datetime import datetime, timezone
+
+    from crypto_trader.breakglass import parse_operator_command
+    from crypto_trader.breakglass.cli import DEFAULT_RECOVERY_POLICY_ID
+    from crypto_trader.recovery import load_policy
+
+    if identity == "absent":
+        journal_path = _found_journal_without_an_identity(tmp_path)
+        _bind_without_a_journal_id(tmp_path, journal_path)
+    else:
+        journal_path = _found_full_journal(tmp_path)
+
+    def command(kind: str):
+        return parse_operator_command(
+            {
+                "command_type": kind,
+                "command_id": str(uuid4()),
+                "operator_label": "jamal",
+                "reason": "journal identity",
+                "source": "operator-cli",
+            },
+            delivered_at=datetime.now(timezone.utc),
+        )
+
+    with SQLiteEventJournal(journal_path, venue_writes=True, must_exist=True) as journal:
+        control = BreakGlassControl(
+            journal=journal,
+            state_dir=tmp_path,
+            reconciliation_policy=load_policy({"policy_id": DEFAULT_RECOVERY_POLICY_ID}),
+        )
+        halt = control.handle(command("halt_new_risk"))
+        reconcile = control.handle(command("reconcile"))
+        acknowledge = control.handle(command("acknowledge"))
+        warned = [
+            any(note.startswith("journal_identity_unverified: ") for note in outcome.notes)
+            for outcome in (halt, reconcile, acknowledge)
+        ]
+
+        assert halt.accepted
+        assert reconcile.accepted
+        if identity == "absent":
+            assert warned == [True, True, True]
+            assert reconcile.reconciliation_status == "pending"
+            assert reconcile.reason_code == "journal_identity_unverified"
+            assert not acknowledge.accepted
+            assert acknowledge.reason_code == "acknowledgement_denied_reconciliation_pending"
+            events = journal.count()
+            with pytest.raises(OwnershipStateError, match="^journal_identity_unverified: "):
+                control.handle(command("restore_normal"))
+            assert journal.count() == events
+        else:
+            assert warned == [False, False, False]
+            assert reconcile.reconciliation_status == "resolved"
+            assert acknowledge.accepted
+            assert control.handle(command("restore_normal")).accepted
+
+
 def test_the_cli_never_prints_credential_material(tmp_path, capsys):
     _found_full_journal(tmp_path)
     main(base_args(tmp_path, "cancel-open"))

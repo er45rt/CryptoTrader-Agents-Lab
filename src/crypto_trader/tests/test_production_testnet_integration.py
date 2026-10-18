@@ -195,6 +195,36 @@ def test_venue_writing_runtime_refuses_start_without_admission_binding(
     assert transport.requests == []
 
 
+def test_venue_writing_runtime_refuses_start_on_a_journal_without_an_identity(
+    tmp_path, state_dir
+):
+    # F-02 legacy gate: a journal founded before identities cannot prove it is the one its
+    # path-only lease was bound to, so a venue-writing start is refused before the writer claim and
+    # before any venue request; the operator re-establishes on a newly founded journal instead.
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    with SQLiteEventJournal(path, venue_writes=True):
+        pass
+    with sqlite3.connect(path) as raw:
+        raw.execute("DELETE FROM journal_meta WHERE key = 'journal_id'")
+    raw.close()
+    with SQLiteEventJournal(path, venue_writes=True, must_exist=True) as legacy:
+        transport = fx.ScriptedTransport(startup_responses())
+        runtime, port, _client = _wired(legacy, state_dir, transport)
+        lease = (state_dir / "ownership.json").read_text(encoding="utf-8")
+
+        with pytest.raises(ProductionStateError, match="journal_identity_unverified"):
+            runtime.start()
+
+        status = runtime.status()
+        assert status["runtime_state"] == "stopped"
+        assert status["last_refusal"] == "journal_identity_unverified"
+        assert port.state().value == "stopped"
+        assert transport.requests == []
+        assert (state_dir / "ownership.json").read_text(encoding="utf-8") == lease
+
+
 def test_unbound_writing_runtime_refuses_direct_decision_paths_before_io(
     journal, state_dir
 ):

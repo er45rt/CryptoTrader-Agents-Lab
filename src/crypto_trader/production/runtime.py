@@ -641,6 +641,14 @@ class ProductionRuntime:
             writing = capability.writes_to_venue
             collector = None
             if writing:
+                if self._journal_identity_unverified():
+                    # Review F-02 (legacy): before the writer claim and before any venue request.
+                    self._last_refusal = "journal_identity_unverified"
+                    raise ProductionStateError(
+                        "startup refused: journal_identity_unverified: the journal records no "
+                        "journal_id, so it cannot be proven to be the journal its lease was bound "
+                        "to; re-establish on a new state dir with a newly founded journal."
+                    )
                 if self._execution.durable_attempt_journal() is not self._journal:
                     raise NonDurableExecutionError("execution startup journal wiring changed.")
                 if self._venue_sources:
@@ -1298,6 +1306,21 @@ class ProductionRuntime:
             safety_mode=controller.mode.value,
             prepared_at=now,
         )
+
+    def _journal_identity_unverified(self) -> bool:
+        """Whether this FULL-founded journal records no journal_id (founded before identities, F-02).
+
+        Venue writes require a FULL-founded journal, so that is the only kind a writer could trade
+        on with an unproven pairing; a journal that was never FULL-founded never carries one.
+        """
+        path = getattr(self._journal, "path", None)
+        if not isinstance(path, str) or not path or path == ":memory:":
+            return False
+        founded = getattr(self._journal, "has_full_foundation", None)
+        if founded is None or not founded():
+            return False
+        read = getattr(self._journal, "journal_id", None)
+        return read is None or read() is None
 
     def _require_startup_posture(self, controller: SafetyController) -> None:
         if controller.kill_switch_engaged:
