@@ -35,6 +35,10 @@ Additive contracts added by later phases (existing schemas unchanged):
     venue trade metadata linked to one existing execution.fill.recorded event
 14. ``account.equity.recorded``        (G5b canonical risk-state prerequisite) - durable account
     equity baseline/rebaseline roots and observed high-water-mark updates
+15. ``breakglass.reconciliation.intake``   (review F-03) - a reconcile run started, journaled
+    before its first venue read
+16. ``breakglass.reconciliation.observed`` (review F-03) - what that run read, including every
+    venue order it listed that the journal does not know
 """
 
 from __future__ import annotations
@@ -107,6 +111,13 @@ __all__ = [
     "OperatorCommandRecordPayloadV3",
     "OperatorCommandRecordedV3",
     "OperatorCommandType",
+    "RECONCILIATION_INTAKE_EVENT_TYPE",
+    "RECONCILIATION_OBSERVED_EVENT_TYPE",
+    "ExternalOrderObservation",
+    "ReconciliationIntakePayload",
+    "ReconciliationIntakeRecorded",
+    "ReconciliationObservedPayload",
+    "ReconciliationObservedRecorded",
     "STREAM_LIFECYCLE_EVENT_TYPE",
     "StreamLifecyclePayload",
     "StreamLifecycleRecorded",
@@ -137,6 +148,9 @@ SAFETY_EVENT_TYPE = "safety.state.changed"
 OPERATOR_COMMAND_EVENT_TYPE = "safety.operator_command.recorded"
 #: Phase 15 additive contract: one deterministic market-data stream lifecycle transition.
 STREAM_LIFECYCLE_EVENT_TYPE = "stream.lifecycle.recorded"
+#: Review F-03 additive contracts: a break-glass reconcile run's start and what it observed.
+RECONCILIATION_INTAKE_EVENT_TYPE = "breakglass.reconciliation.intake"
+RECONCILIATION_OBSERVED_EVENT_TYPE = "breakglass.reconciliation.observed"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -881,6 +895,96 @@ class OperatorCommandRecordedV3(OperatorCommandRecorded):
     payload: OperatorCommandRecordPayloadV3
 
 
+# --- 10b. Break-glass reconciliation evidence (review F-03, additive) -------
+
+
+class ReconciliationIntakePayload(EventPayload):
+    """A break-glass reconcile run started; journaled before its first venue read.
+
+    The envelope ``correlation_id`` is the epoch session. The run's operator command record carries
+    the same ``command_id`` once the run completes, so an intake without one names a run that never
+    completed, and an intake without an observation names a run that may have seen venue orders it
+    never recorded.
+    """
+
+    command_id: UUID = Field(description="The reconcile command this run serves.")
+
+
+class ReconciliationIntakeRecorded(DomainEvent):
+    """A break-glass reconcile run started (review F-03)."""
+
+    event_type: Literal["breakglass.reconciliation.intake"] = RECONCILIATION_INTAKE_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: ReconciliationIntakePayload
+
+
+class ExternalOrderObservation(EventPayload):
+    """One open venue order a reconcile run listed that the journal does not know."""
+
+    client_order_id: str = Field(min_length=1, description="The venue's client order id.")
+    venue_order_id: str | None = Field(
+        default=None, description="The venue order id the strict listing reported, when known."
+    )
+    source: Literal["listing"] = Field(description="The venue read that found the order.")
+
+    @field_validator("client_order_id")
+    @classmethod
+    def _non_blank_reference(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("an observed order needs a non-blank client order id.")
+        return value
+
+    @field_validator("venue_order_id")
+    @classmethod
+    def _canonical_venue_id(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.isascii() or not value.isdigit() or value.startswith("0")
+        ):
+            raise ValueError("an observed venue order id must be a canonical positive integer.")
+        return value
+
+
+class ReconciliationObservedPayload(EventPayload):
+    """What one break-glass reconcile run read, journaled before it decides anything.
+
+    Every venue order the run listed that the journal does not know is recorded here, so a later
+    run that no longer lists it can never treat the epoch as settled while it stays unexplained.
+    """
+
+    intake_id: UUID = Field(description="The intake event of the run that observed this.")
+    listing: Literal["not_required", "complete", "missing"] = Field(
+        description="Whether the run took a complete open-orders listing, needed none, or had none."
+    )
+    venue_evidence_complete: bool = Field(
+        description="False when a venue evidence read failed during the run."
+    )
+    external_orders: list[ExternalOrderObservation] = Field(
+        description="Open venue orders the run listed that the journal does not know."
+    )
+
+    @field_validator("external_orders")
+    @classmethod
+    def _unique_orders(cls, value: list[ExternalOrderObservation]) -> list[ExternalOrderObservation]:
+        references = [order.client_order_id for order in value]
+        if len(set(references)) != len(references):
+            raise ValueError("an observation lists each client order id once.")
+        return value
+
+
+class ReconciliationObservedRecorded(DomainEvent):
+    """What a break-glass reconcile run observed (review F-03)."""
+
+    event_type: Literal["breakglass.reconciliation.observed"] = RECONCILIATION_OBSERVED_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: ReconciliationObservedPayload
+
+    @model_validator(mode="after")
+    def _caused_by_its_intake(self) -> "ReconciliationObservedRecorded":
+        if self.causation_id != self.payload.intake_id:
+            raise ValueError("an observation is caused by the intake it names.")
+        return self
+
+
 # --- 11. Market-data stream lifecycle (Phase 15, additive) ------------------
 
 #: The stream lifecycle vocabulary. ``ready`` is reachable only after a fresh synchronized
@@ -996,6 +1100,8 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     SafetyStateChanged,
     OperatorCommandRecorded,
     StreamLifecycleRecorded,
+    ReconciliationIntakeRecorded,
+    ReconciliationObservedRecorded,
 )
 
 V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2, OperatorCommandRecordedV2)

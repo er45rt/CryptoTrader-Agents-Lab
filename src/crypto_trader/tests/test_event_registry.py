@@ -67,6 +67,9 @@ def test_default_registry_registers_every_v1_contract():
         # Phase 15 additive contract (existing schemas unchanged).
         "order.submission.attempted",
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:

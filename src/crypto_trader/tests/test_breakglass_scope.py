@@ -181,6 +181,9 @@ def test_phase13_adds_exactly_one_additive_event_contract():
         "safety.state.changed",
         "safety.operator_command.recorded",
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
     }
 
 

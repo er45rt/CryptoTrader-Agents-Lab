@@ -25,6 +25,7 @@ from crypto_trader.events import (
     OrderStateChanged,
     OrderStateChangePayload,
     OrderSubmissionAttempted,
+    ReconciliationObservedRecorded,
     RecoveryStateChanged,
     RecoveryStateChangePayload,
     RiskDecisionPayload,
@@ -526,8 +527,62 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         # Phase 15 additive contract (existing schemas unchanged).
         "order.submission.attempted",
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)
+
+
+# --- Review F-03: what a break-glass reconcile run observed ------------------
+
+def _observation(*, causation_id=None, orders=(("ct-9", "101"),)):
+    intake_id = uuid.uuid4()
+    return base_fields(
+        causation_id=intake_id if causation_id is None else causation_id,
+        payload={
+            "intake_id": intake_id,
+            "listing": "complete",
+            "venue_evidence_complete": True,
+            "external_orders": [
+                {"client_order_id": client, "venue_order_id": venue, "source": "listing"}
+                for client, venue in orders
+            ],
+        },
+    )
+
+
+def test_a_reconciliation_observation_is_caused_by_its_intake():
+    event = ReconciliationObservedRecorded(**_observation())
+
+    assert event.causation_id == event.payload.intake_id
+    assert [(order.client_order_id, order.venue_order_id) for order in event.payload.external_orders] == [
+        ("ct-9", "101")
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"causation_id": uuid.uuid4()},
+        {"orders": (("ct-9", "101"), ("ct-9", "102"))},
+        {"orders": ((" ", None),)},
+        {"orders": (("ct-9", "0101"),)},
+        {"orders": (("ct-9", "-1"),)},
+        {"orders": (("ct-9", "\u0661\u0660\u0661"),)},
+    ],
+    ids=[
+        "caused by another event",
+        "one client order id twice",
+        "blank client order id",
+        "venue id with a leading zero",
+        "negative venue id",
+        "non-ASCII venue id digits",
+    ],
+)
+def test_a_reconciliation_observation_refuses_an_unproven_order_identity(overrides):
+    with pytest.raises(ValidationError):
+        ReconciliationObservedRecorded(**_observation(**overrides))
 
 
 def test_decimal_precision_is_exact_for_string_inputs():

@@ -107,6 +107,9 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
         "safety.state.changed",
         "safety.operator_command.recorded",
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
     }
     source = "\n".join(file.read_text(encoding="utf-8") for file in _files())
     assert "from crypto_trader.events import" in source

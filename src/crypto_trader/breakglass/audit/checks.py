@@ -19,6 +19,8 @@ from typing import Any
 from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
     ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
     STREAM_LIFECYCLE_EVENT_TYPE,
     VENUE_TRADE_EVENT_TYPE,
     ACCOUNT_EQUITY_EVENT_TYPE,
@@ -419,6 +421,8 @@ def _contract_checks() -> list[BreakGlassItem]:
             (ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE, 1),
             (VENUE_TRADE_EVENT_TYPE, 1),
             (ACCOUNT_EQUITY_EVENT_TYPE, 1),
+            (RECONCILIATION_INTAKE_EVENT_TYPE, 1),
+            (RECONCILIATION_OBSERVED_EVENT_TYPE, 1),
         ]
     )
     items.append(
@@ -430,7 +434,7 @@ def _contract_checks() -> list[BreakGlassItem]:
             "every Phase 1-12 tagged contract keeps its exact payload fields and version; later "
             "phases add only the reviewed additive v1 contracts (Phase 13 operator command, "
             "Phase 15 stream lifecycle, Phase 15 durable submission attempt, G4 venue trade metadata, "
-            "G5b account equity chain)",
+            "G5b account equity chain, F-03 reconcile run intake and observation)",
             {
                 "modified": unchanged,
                 "additive": [f"{name} v{version}" for name, version in new_contracts],

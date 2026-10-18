@@ -33,10 +33,15 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from crypto_trader.events import (
+    ExternalOrderObservation,
     OperatorCommandRecordPayloadV2,
     OperatorCommandRecordPayloadV3,
     OperatorCommandRecordedV2,
     OperatorCommandRecordedV3,
+    ReconciliationIntakePayload,
+    ReconciliationIntakeRecorded,
+    ReconciliationObservedPayload,
+    ReconciliationObservedRecorded,
     SafetyStateChangePayload,
     SafetyStateChanged,
 )
@@ -119,6 +124,11 @@ _IDENTITY_WARNING = (
     "be the journal this state dir's lease was bound to; reconciliation stays pending and "
     "restore_normal is refused until the system is re-established on a newly founded journal."
 )
+
+
+#: Review F-03: a reconcile run that journaled its intake but never what it observed may have seen
+#: venue orders nobody recorded; nothing settles that yet, so the epoch never resolves after it.
+OBSERVATION_POSSIBLY_LOST = "observation_possibly_lost"
 
 
 def break_glass_state_path(state_dir: str | Path, name: str) -> Path:
@@ -734,12 +744,16 @@ class BreakGlassControl:
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to reconcile.",
             )
-        report, reconciliation_note, evidenced = self._run_reconciliation(epoch)
-        resolved = report.is_fully_resolved and evidenced and not self._identity_unverified
+        settled, reconciliation_note, observation_lost = self._run_reconciliation(
+            command, epoch, delivered_at
+        )
+        resolved = settled and not self._identity_unverified
         status = "resolved" if resolved else "pending"
         if self._identity_unverified:
             # Evidence can never vouch for a journal whose identity is unproven (review F-02).
             reason_code = JOURNAL_IDENTITY_UNVERIFIED
+        elif observation_lost:
+            reason_code = OBSERVATION_POSSIBLY_LOST
         elif resolved:
             reason_code = "reconciliation_resolved"
         else:
@@ -806,6 +820,16 @@ class BreakGlassControl:
                 delivered_at,
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to acknowledge.",
+            )
+        run_blocker = self._reconcile_run_blocker()
+        if run_blocker is not None:
+            return self._reject(
+                command,
+                controller,
+                load,
+                delivered_at,
+                reason_code=f"acknowledgement_denied_{run_blocker[0]}",
+                note=f"an operator acknowledgement is refused: {run_blocker[1]}",
             )
         if not epoch.reconciliation_satisfied:
             return self._reject(
@@ -974,6 +998,16 @@ class BreakGlassControl:
                 delivered_at,
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch; normal is never restored by fiat.",
+            )
+        run_blocker = self._reconcile_run_blocker()
+        if run_blocker is not None:
+            return self._reject(
+                command,
+                controller,
+                load,
+                delivered_at,
+                reason_code=f"restore_denied_{run_blocker[0]}",
+                note=f"restoring normal is refused: {run_blocker[1]}",
             )
         blockers = epoch.restore_blockers
         if "reconciliation_pending" in blockers:
@@ -1259,39 +1293,94 @@ class BreakGlassControl:
             return False
         return True
 
-    def _run_reconciliation(self, epoch: BreakGlassEpoch):
-        """Run the Phase 8 reconciliation through the injected evidence providers."""
+    def _run_reconciliation(
+        self, command: OperatorCommand, epoch: BreakGlassEpoch, delivered_at: datetime
+    ) -> tuple[bool, str, bool]:
+        """Run the Phase 8 reconciliation through the injected evidence providers.
+
+        Review F-03: the run journals its intake before its first venue read and what it observed
+        before it decides anything, so no later run can forget an order this one saw. Returns
+        whether the epoch is settled, the result note, and whether an earlier run's observation
+        may be lost.
+        """
         if self._reconciliation_policy is None:
             raise BreakGlassConfigError(
                 "no reconciliation policy is configured; reconciliation cannot be invented."
             )
         local_states = self._local_states()
-        venue_reports = list(
-            self._venue_state_provider() if self._venue_state_provider is not None else ()
-        )
         ledger = derive_ledger(self._journal)
         journaled_epoch = ledger.open_epoch
+        journaled = journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id
         references: tuple[str, ...] = ()
-        listed: tuple[str, ...] = ()
-        listing_missing = False
-        if journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id:
+        listing_needed = False
+        if journaled:
             # A new process knows the cancelled orders only from the journal, never from memory.
             references = ledger.open_epoch_order_references()
             # An unconfirmed cancel needs venue evidence just the same (review N-05).
             references += tuple(
                 ref for ref in ledger.open_epoch_unconfirmed_references() if ref not in references
             )
+            # A cancel that never learned the open orders is settled only by a complete venue
+            # listing taken now (review F-03); without one the epoch stays pending.
+            listing_needed = ledger.open_epoch_open_orders_unknown()
+        sequence_base = (len(ledger.commands) + 1) * 100
+        intake_id = self._append_run_event(
+            ReconciliationIntakeRecorded,
+            ReconciliationIntakePayload(command_id=command.command_id),
+            correlation_id=epoch.session_id,
+            causation_id=command.causation_id,
+            occurred_at=delivered_at,
+            sequence_number=sequence_base - 2,
+        )
+        venue_reports: list[VenueOrderReport] = []
+        listed: tuple[str, ...] = ()
+        listing = "missing" if listing_needed else "not_required"
+        evidence_complete = True
+        try:
+            if self._venue_state_provider is not None:
+                venue_reports.extend(self._venue_state_provider())
             track = getattr(self._venue, "track_order_references", None)
             if references and callable(track):
                 track(references)
-            if ledger.open_epoch_open_orders_unknown():
-                # A cancel that never learned the open orders is settled only by a complete venue
-                # listing taken now (review F-03); without one the epoch stays pending.
+            if listing_needed:
                 list_open = getattr(self._venue, "track_open_orders", None)
                 found = list_open() if callable(list_open) else None
-                listing_missing = found is None
-                listed = () if found is None else tuple(found)
-        venue_reports.extend(self._venue.venue_reports())
+                if found is not None:
+                    listing, listed = "complete", tuple(found)
+            venue_reports.extend(self._venue.venue_reports())
+        except Exception:  # an interrupt is never masked: its intake then stays unobserved
+            evidence_complete = False
+        local_references = {state.order_reference for state in local_states}
+        listed_ids = getattr(self._venue, "listed_venue_order_ids", None)
+        venue_order_ids = {}
+        if listing == "complete" and callable(listed_ids):
+            venue_order_ids = dict(listed_ids())
+        self._append_run_event(
+            ReconciliationObservedRecorded,
+            ReconciliationObservedPayload(
+                intake_id=intake_id,
+                listing=listing,
+                venue_evidence_complete=evidence_complete,
+                external_orders=[
+                    ExternalOrderObservation(
+                        client_order_id=reference,
+                        venue_order_id=venue_order_ids.get(reference),
+                        source="listing",
+                    )
+                    for reference in dict.fromkeys(listed)
+                    if reference not in local_references
+                ],
+            ),
+            correlation_id=epoch.session_id,
+            causation_id=intake_id,
+            occurred_at=delivered_at,
+            sequence_number=sequence_base - 1,
+        )
+        observations = derive_ledger(self._journal).observations
+        observation_lost = bool(observations.unobserved_intakes)
+        if not evidence_complete:
+            # Absence of evidence is not evidence of absence: Phase 8 never runs on a failed read.
+            return False, "reconciliation_venue_evidence_unavailable", observation_lost
         reported = {report.order_reference for report in venue_reports}
         # A journaled cancel is never resolved by silence: every reference needs venue evidence.
         unverified = tuple(reference for reference in references if reference not in reported)
@@ -1312,15 +1401,60 @@ class BreakGlassControl:
         )
         if unverified:
             note = "reconciliation_missing_venue_evidence_for_cancelled_orders"
-        elif listing_missing:
+        elif listing == "missing":
             note = "reconciliation_missing_open_orders_listing"
         elif unverified_listed:
             note = "reconciliation_missing_venue_evidence_for_listed_orders"
-        elif run.report.is_fully_resolved:
-            note = "reconciliation_confirmed_by_evidence"
-        else:
+        elif not run.report.is_fully_resolved:
             note = "reconciliation_left_orders_unresolved"
-        return run.report, note, not unverified and not listing_missing and not unverified_listed
+        elif observation_lost:
+            note = OBSERVATION_POSSIBLY_LOST
+        elif observations.external_orders:
+            # Nothing settles an order the journal does not know yet: it stays outstanding.
+            note = "reconciliation_external_orders_outstanding"
+        else:
+            note = "reconciliation_confirmed_by_evidence"
+        return note == "reconciliation_confirmed_by_evidence", note, observation_lost
+
+    def _append_run_event(
+        self,
+        event_type: type[ReconciliationIntakeRecorded] | type[ReconciliationObservedRecorded],
+        payload: ReconciliationIntakePayload | ReconciliationObservedPayload,
+        *,
+        correlation_id: UUID,
+        causation_id: UUID | None,
+        occurred_at: datetime,
+        sequence_number: int,
+    ) -> UUID:
+        """Journal one event of a reconcile run, ordered before the run's command record."""
+        self._side_effect_started = True
+        event = event_type(
+            event_id=uuid4(),
+            occurred_at=occurred_at.astimezone(timezone.utc),
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            producer=self._producer,
+            sequence_number=sequence_number,
+            payload=payload,
+        )
+        self._journal.append_batch([event])
+        return event.event_id
+
+    def _reconcile_run_blocker(self) -> tuple[str, str] | None:
+        """The open epoch's reconcile-run gate (review F-03): its code suffix and note, if any."""
+        observations = derive_ledger(self._journal).observations
+        if observations.unobserved_intakes:
+            return (
+                OBSERVATION_POSSIBLY_LOST,
+                "a reconcile run started but never journaled what it observed, so it may have seen "
+                "venue orders nobody recorded; nothing settles that yet.",
+            )
+        if observations.run_incomplete:
+            return (
+                "reconciliation_run_incomplete",
+                "the latest reconcile run never completed; reconcile again first.",
+            )
+        return None
 
     def _local_states(self) -> tuple[LocalOrderState, ...]:
         if self._local_state_provider is not None:

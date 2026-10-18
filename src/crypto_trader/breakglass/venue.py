@@ -17,7 +17,7 @@ An unconfirmed write is NEVER retried and never silently treated as success: it 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
@@ -172,6 +172,7 @@ class BinanceSpotTestnetEmergencyControl:
     symbol: str | None = None
     _preflight: EmergencyPreflight | None = field(default=None, init=False)
     _order_references: list[str] = field(default_factory=list, init=False)
+    _listed_venue_order_ids: dict[str, str | None] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.client is None or self.runtime is None:
@@ -335,6 +336,7 @@ class BinanceSpotTestnetEmergencyControl:
 
         None when the venue cannot list them: the open orders stay unknown, never assumed empty.
         """
+        self._listed_venue_order_ids = {}
         try:
             # Review FZ-10: strict, so a 200 that is empty, not JSON or not a list is no listing.
             orders = self.client.startup_open_orders(self.symbol)
@@ -342,7 +344,14 @@ class BinanceSpotTestnetEmergencyControl:
             return None
         references = tuple(order.client_order_id for order in orders)
         self.track_order_references(references)
+        self._listed_venue_order_ids = {
+            order.client_order_id: order.venue_order_id for order in orders
+        }
         return references
+
+    def listed_venue_order_ids(self) -> Mapping[str, str | None]:
+        """The venue order id of each order the last strict listing named (review F-03)."""
+        return dict(self._listed_venue_order_ids)
 
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""

@@ -167,4 +167,7 @@ def test_paper_adds_no_new_event_contract():
         "safety.operator_command.recorded",
         # Phase 15 additive contract (existing schemas unchanged).
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
     }

@@ -25,7 +25,11 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from crypto_trader.events import OPERATOR_COMMAND_EVENT_TYPE
+from crypto_trader.events import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+)
 from crypto_trader.persistence import EventJournal
 from crypto_trader.safety import SafetyMode
 
@@ -35,12 +39,16 @@ __all__ = [
     "EPOCH_SCHEMA_VERSION",
     "BreakGlassEpoch",
     "BreakGlassLedger",
+    "EpochObservations",
     "OperatorAcknowledgement",
     "RecordedOperatorCommand",
     "derive_ledger",
 ]
 
 EPOCH_SCHEMA_VERSION = 1
+
+#: The journaled events of one break-glass reconcile run (review F-03).
+_RUN_EVENT_TYPES = (RECONCILIATION_INTAKE_EVENT_TYPE, RECONCILIATION_OBSERVED_EVENT_TYPE)
 
 #: Reconciliation states an epoch can be in.
 ReconciliationStatus = Literal["not_required", "pending", "resolved", "failed"]
@@ -297,11 +305,28 @@ class RecordedOperatorCommand:
 
 
 @dataclass(frozen=True)
+class EpochObservations:
+    """What the journaled reconcile runs recorded (review F-03); a closed epoch leaves none behind.
+
+    ``external_orders`` are the open venue orders any run listed that the journal does not know;
+    nothing settles them yet, so they stay outstanding for the life of the epoch.
+    ``unobserved_intakes`` are runs that started but never journaled what they saw: they may have
+    seen orders nobody recorded. ``run_incomplete`` means the latest run started after the last
+    completed one, so no recorded reconciliation result covers the latest venue reads.
+    """
+
+    external_orders: tuple[str, ...] = ()
+    unobserved_intakes: tuple[UUID, ...] = ()
+    run_incomplete: bool = False
+
+
+@dataclass(frozen=True)
 class BreakGlassLedger:
     """The journal-derived break-glass ledger: the open epoch plus every recorded command."""
 
     epoch: BreakGlassEpoch | None = None
     commands: dict[UUID, RecordedOperatorCommand] = field(default_factory=dict)
+    observations: EpochObservations = field(default_factory=EpochObservations)
 
     def command(self, command_id: UUID) -> RecordedOperatorCommand | None:
         return self.commands.get(command_id)
@@ -368,7 +393,29 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     """Rebuild the ledger from the authoritative journal (no cache, no guessing)."""
     commands: dict[UUID, RecordedOperatorCommand] = {}
     epoch: BreakGlassEpoch | None = None
-    for event in journal.replay():
+    # Every reconcile run, in replay order (review F-03): their intakes, the intakes observed, every
+    # external order observed, and the replay index of the latest intake and completed run. No
+    # epoch is restored while any of them blocks it, so a closed epoch leaves none behind.
+    intakes: list[UUID] = []
+    observed: set[UUID] = set()
+    external: list[str] = []
+    last_intake = last_completed = -1
+    for index, event in enumerate(journal.replay()):
+        if event.event_type in _RUN_EVENT_TYPES:
+            # A run for a synthesised epoch (no journaled one) settles nothing.
+            if epoch is None:
+                continue
+            if event.event_type == RECONCILIATION_INTAKE_EVENT_TYPE:
+                intakes.append(event.event_id)
+                last_intake = index
+                # An acknowledgement covers the evidence it saw; a new run reads new evidence.
+                epoch = epoch.with_updates(acknowledgement=None)
+            else:
+                observed.add(event.payload.intake_id)
+                for order in event.payload.external_orders:
+                    if order.client_order_id not in external:
+                        external.append(order.client_order_id)
+            continue
         if event.event_type != OPERATOR_COMMAND_EVENT_TYPE:
             continue
         payload = event.payload
@@ -420,7 +467,14 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
             )
         commands.setdefault(record.command_id, record)
         epoch = _reduce_epoch(epoch, record)
-    return BreakGlassLedger(epoch=epoch, commands=commands)
+        if record.accepted and record.command_type == "reconcile":
+            last_completed = index
+    observations = EpochObservations(
+        external_orders=tuple(external),
+        unobserved_intakes=tuple(intake for intake in intakes if intake not in observed),
+        run_incomplete=last_intake > last_completed,
+    )
+    return BreakGlassLedger(epoch=epoch, commands=commands, observations=observations)
 
 
 def _reduce_epoch(
