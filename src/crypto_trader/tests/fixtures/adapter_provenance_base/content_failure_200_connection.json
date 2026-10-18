@@ -1,0 +1,35 @@
+{
+  "expected": {
+    "analysis": {
+      "observations": [
+        {
+          "availability_provenance": "live_fetch",
+          "available_at": 1791080000000,
+          "confidence_adjustment": "none",
+          "event_time": 1791079999000,
+          "fetched_at": 1791080000000,
+          "max_age_seconds": 120.0,
+          "may_support_primary_trade_thesis": false,
+          "metric": "current_open_interest",
+          "period": null,
+          "provider": "binance_usdm_public",
+          "quality_reason": null,
+          "replay_eligible": true,
+          "schema_version": 1,
+          "status": "available",
+          "strict_ab_adoption_status": "NOT YET ELIGIBLE",
+          "symbol": "ETHUSDT",
+          "usage": "advisory_only",
+          "value": {
+            "amount": "1234",
+            "quote_value": null
+          }
+        }
+      ]
+    },
+    "sleeps": [],
+    "transport_calls": 1
+  },
+  "generated_from_commit": "b3ce6364db48cd50a8c04e6098e2d0426ce18dec",
+  "scenario": "content_failure_200_connection"
+}

@@ -5,10 +5,9 @@ implementation lives under ``crypto_trader.execution.nautilus`` (infrastructure)
 contains only engine-independent types, so no engine name, type or import leaks into the
 paper/shadow domain path.
 
-Design note (documented limitation): the decision pass produces the approved execution requests
-for the session and the simulated pass then replays them against the frozen market data. Simulated
-fills are therefore applied to the position ledger *after* the decision pass, so intra-session
-risk feedback (risk re-evaluating against its own simulated fills) is not yet modelled.
+The original scripted simulator is a legacy deterministic test double with batch-only semantics.
+The separate TemporalExecutionSimulator protocol supports incremental, causal Paper replay
+against a persistent execution engine; synthetic test-double fills are not performance evidence.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from .errors import SimulationError
 
 __all__ = [
     "ExecutionSimulator",
+    "TemporalExecutionSimulator",
     "SCRIPTED_SIM_NAMESPACE",
     "ScriptedSimulationRunner",
     "SimulationOutcome",
@@ -70,11 +70,46 @@ class SimulationOutcome:
         return tuple(seen)
 
 
+@dataclass(frozen=True)
+class CashEndEvidence:
+    """Transient native final accounting, not a recoverable engine checkpoint."""
+
+    initial_quote: Decimal
+    base_total: Decimal
+    base_free: Decimal
+    base_locked: Decimal
+    quote_total: Decimal
+    quote_free: Decimal
+    quote_locked: Decimal
+    fees_quote: Decimal
+    position_quantity: Decimal
+    unsettled: bool
+    account_type: str = "CASH"
+    allow_borrowing: bool = False
+
+
+@runtime_checkable
+class HistoricalCashSimulator(Protocol):
+    def configure_frozen(self, bundle: Any) -> None: ...
+    def cash_end_evidence(self) -> CashEndEvidence: ...
+
+
 @runtime_checkable
 class ExecutionSimulator(Protocol):
     """The only simulated-execution surface the paper session may depend on."""
 
     def simulate(self, requests: Sequence[ExecutionRequest]) -> SimulationOutcome: ...
+
+
+@runtime_checkable
+class TemporalExecutionSimulator(ExecutionSimulator, Protocol):
+    """Paper-only streaming surface, not a venue-writing execution port."""
+
+    def start_temporal(self) -> None: ...
+    def advance_until(self, timestamp_ns: int) -> SimulationOutcome: ...
+    def submit_temporal(self, request: ExecutionRequest, *, decided_ns: int) -> None: ...
+    def finish_temporal(self) -> SimulationOutcome: ...
+    def abort_temporal(self) -> None: ...
 
 
 @dataclass(frozen=True)

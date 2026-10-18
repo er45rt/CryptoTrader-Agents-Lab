@@ -27,6 +27,7 @@ from crypto_trader.tests.agent_expectations import (
     MIGRATED_AGENT_NAMES,
 )
 from crypto_trader.tools.binance_public_tool import BinancePublicTool
+from crypto_trader.tools.binance_futures_public_tool import BinanceFuturesPublicTool
 
 PACKAGE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PACKAGE_DIR / "config"
@@ -134,7 +135,10 @@ def test_market_agent_keeps_the_same_binance_public_tool(crew_with_fake_factory)
 
     tool_names = [tool.name for tool in crew.binance_data_analyst().tools]
 
-    assert tool_names == [MARKET_TOOL_NAME]
+    assert tool_names == [MARKET_TOOL_NAME, "Binance Futures Public Advisory Data"]
+    assert [type(tool) for tool in crew.binance_data_analyst().tools] == [
+        BinancePublicTool, BinanceFuturesPublicTool,
+    ]
 
 
 def test_binance_tool_still_public_and_read_only():

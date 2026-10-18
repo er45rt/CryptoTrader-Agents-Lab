@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from decimal import ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 
 import pytest
@@ -98,7 +98,9 @@ def _resting_limit_request(client, *, side: str = "BUY") -> SpotOrderRequest:
     tick = rules.price_tick.normalize()
     step = rules.quantity_step.normalize()
 
-    raw_price = (market / 2) if side == "BUY" else (market * 2)
+    # Keep resting prices inside the venue's percent-price band, as in the other live tests.
+    offset = Decimal("0.9") if side == "BUY" else Decimal("1.1")
+    raw_price = market * offset
     price = ((raw_price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick).quantize(tick)
 
     minimum_quantity = max(rules.min_notional / price, rules.min_quantity)
@@ -200,9 +202,9 @@ def test_live_order_place_and_cancel_lifecycle(tmp_path: Path, live_client):
 
 def test_live_duplicate_client_order_id_is_idempotent(live_client):
     request = _resting_limit_request(live_client)
-    first = live_client.place_order(request)
+    first = fx.place_order(live_client, request)
     try:
-        second = live_client.place_order(request)
+        second = fx.place_order(live_client, request)
     finally:
         live_client.cancel_order(request.symbol, request.client_order_id)
 
@@ -226,25 +228,27 @@ class _InterruptAfterSend:
         return response
 
 
-def test_live_ambiguous_submission_is_reconciled_not_retried(live_client):
+def test_live_ambiguous_submission_is_reconciled_not_retried(tmp_path: Path, live_client):
     intent_id = uuid.uuid4()
     correlation_id = uuid.uuid4()
-    runtime = OrderRuntime(client=live_client, instrument=INSTRUMENT)
-    runtime.start()
-    request = _execution_request(live_client, intent_id, correlation_id)
+    with SQLiteEventJournal(tmp_path / "live-ambiguity.db") as journal:
+        # Stage 2: a venue write requires a durable attempt journal before the POST.
+        runtime = OrderRuntime(client=live_client, instrument=INSTRUMENT, journal=journal)
+        runtime.start()
+        request = _execution_request(live_client, intent_id, correlation_id)
 
-    original = runtime.client.transport
-    runtime.client.transport = _InterruptAfterSend(original)
-    try:
-        with pytest.raises(AmbiguousOrderError):
-            runtime.submit(request)
-    finally:
-        runtime.client.transport = original
+        original = runtime.client.transport
+        runtime.client.transport = _InterruptAfterSend(original)
+        try:
+            with pytest.raises(AmbiguousOrderError):
+                runtime.submit(request)
+        finally:
+            runtime.client.transport = original
 
-    # The restart path adopts the order that really exists instead of re-sending it.
-    restarted = OrderRuntime(client=live_client, instrument=INSTRUMENT)
-    restarted.start()
-    adopted = restarted.recover_order(intent_id, correlation_id=correlation_id)
+        # The restart path adopts the order that really exists instead of re-sending it.
+        restarted = OrderRuntime(client=live_client, instrument=INSTRUMENT, journal=journal)
+        restarted.start()
+        adopted = restarted.recover_order(intent_id, correlation_id=correlation_id)
     assert adopted is not None
     assert adopted.client_order_id == restarted.client_order_id_for(intent_id)
 
@@ -261,7 +265,7 @@ def test_live_ambiguous_submission_is_reconciled_not_retried(live_client):
 
 def test_live_safety_cancel_all_stops_every_open_order(live_client):
     placed = [
-        live_client.place_order(_resting_limit_request(live_client)) for _ in range(2)
+        fx.place_order(live_client, _resting_limit_request(live_client)) for _ in range(2)
     ]
     assert len(placed) == 2
     safety = SafetyController()

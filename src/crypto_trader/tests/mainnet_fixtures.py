@@ -329,6 +329,7 @@ def pipeline(
     control: BreakGlassControl | None = None,
     soak_instance: SoakRecorder | None = None,
     when: datetime = BASE,
+    runtime_clock=None,
 ) -> MainnetDryRunPipeline:
     # A client-backed pipeline reads its filters/top-of-book from the client unless overridden.
     if filters_provider is None and client_instance is None:
@@ -352,7 +353,7 @@ def pipeline(
         quote_provider=quote_provider,
         soak=soak_instance or soak(tmp_path, when=when),
         control=control,
-        clock=lambda: when,
+        clock=runtime_clock or (lambda: when),
     )
 
 

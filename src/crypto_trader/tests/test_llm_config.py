@@ -133,10 +133,11 @@ def test_api_key_value_is_never_logged(caplog):
         assert SENTINEL_KEY not in record.getMessage()
 
 
-def test_api_key_env_var_name_can_be_overridden_without_embedding_secret():
-    profile = load_profile(
-        CANARY_PROFILE_NAME, env={"DEEPSEEK_CANARY_API_KEY_ENV": "MY_CUSTOM_DEEPSEEK_KEY"}
-    )
+def test_api_key_env_override_rejects_arbitrary_secret_name():
+    with pytest.raises(LLMConfigError, match="allowlist"):
+        load_profile(
+            CANARY_PROFILE_NAME, env={"DEEPSEEK_CANARY_API_KEY_ENV": "MY_CUSTOM_DEEPSEEK_KEY"}
+        )
 
-    assert profile.api_key_env == "MY_CUSTOM_DEEPSEEK_KEY"
-    assert profile.resolve_api_key(env={"MY_CUSTOM_DEEPSEEK_KEY": SENTINEL_KEY}) == SENTINEL_KEY
+    profile = load_profile(CANARY_PROFILE_NAME, env={"DEEPSEEK_CANARY_API_KEY_ENV": "DEEPSEEK_API_KEY"})
+    assert profile.resolve_api_key(env={"DEEPSEEK_API_KEY": SENTINEL_KEY}) == SENTINEL_KEY

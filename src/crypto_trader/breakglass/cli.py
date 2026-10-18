@@ -1,9 +1,12 @@
 """The narrow local operator CLI for break-glass control (Phase 13).
 
-        python -m crypto_trader.breakglass.cli status --journal <journal.db> --state-dir <dir>
+        python -m crypto_trader.breakglass.cli status --state-dir <dir>
         python -m crypto_trader.breakglass.cli run --command-type halt-new-risk \
-            --command-id <uuid> --operator <name> --reason "<why>" \
-            --journal <journal.db> --state-dir <dir>
+            --command-id <uuid> --operator <name> --reason "<why>" --state-dir <dir>
+
+The journal is the one the state dir's lease owner recorded when it took the lease (its exact path,
+checked against its real path), or ``<state-dir>/journal.db`` when none is recorded, so a mistyped
+path or a swapped link can never pair one system's journal with another system's lease.
 
 Properties required of this control channel:
 
@@ -17,18 +20,22 @@ Properties required of this control channel:
   adapter, which never exposes a value.
 
 Exit codes: ``0`` accepted (including an idempotent re-delivery), ``3`` refused by the deterministic
-safety policy, ``2`` malformed/unknown command or unusable configuration.
+safety policy, ``2`` malformed/unknown command or unusable configuration, ``4`` incomplete: the
+journal failed after the command started, so its lease or venue side effects may already be in effect.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from crypto_trader.events.errors import EventContractError
 from crypto_trader.execution import InstrumentSpec
 from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient,
@@ -38,21 +45,36 @@ from crypto_trader.execution.binance_testnet import (
     WithdrawalPolicy,
     credentials_from_environment,
 )
-from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.persistence import JournalError, JournalSchemaError, SQLiteEventJournal
 from crypto_trader.recovery import load_policy as load_recovery_policy
 
 from .commands import parse_operator_command
-from .control import BreakGlassControl
-from .errors import BreakGlassError, MalformedOperatorCommandError
+from .control import BreakGlassControl, break_glass_state_path
+from .errors import (
+    BreakGlassError,
+    BreakGlassIncompleteError,
+    MalformedOperatorCommandError,
+    OwnershipStateError,
+)
+from .ownership import OwnershipStore, journal_binding_mismatch
 from .venue import BinanceSpotTestnetEmergencyControl, PolicyOnlyVenueControl
 
-__all__ = ["EXIT_ACCEPTED", "EXIT_MALFORMED", "EXIT_REFUSED", "build_parser", "main"]
+__all__ = [
+    "EXIT_ACCEPTED",
+    "EXIT_INCOMPLETE",
+    "EXIT_MALFORMED",
+    "EXIT_REFUSED",
+    "build_parser",
+    "main",
+]
 
 EXIT_ACCEPTED = 0
 EXIT_MALFORMED = 2
 EXIT_REFUSED = 3
+EXIT_INCOMPLETE = 4
 
 DEFAULT_RECOVERY_POLICY_ID = "recovery-breakglass-v1"
+EXCHANGE_FALLBACK = "If orders are open, cancel them directly at the exchange."
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", help="emit the record as JSON")
 
     run = subparsers.add_parser("run", help="deliver one operator break-glass command")
-    _add_common_paths(run, journal_required=True)
+    _add_common_paths(run, journal_required=False)
     run.add_argument(
         "--command-type",
         "--command",
@@ -113,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_common_paths(parser: argparse.ArgumentParser, *, journal_required: bool) -> None:
     parser.add_argument(
-        "--journal", required=journal_required, default=None, help="path to the event journal"
+        "--journal", required=journal_required, default=None, help="the event journal; must be the journal bound to --state-dir (the default)"
     )
     parser.add_argument(
         "--state-dir",
@@ -141,16 +163,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run_status(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir)
-    journal_path = Path(args.journal) if args.journal else _default_journal(state_dir)
-    with SQLiteEventJournal(journal_path) as journal:
-        control = BreakGlassControl(journal=journal, state_dir=state_dir)
-        record = control.status().to_record()
+    journal_path, mismatch = _journal_for(args)
+    if mismatch is not None:
+        return _refuse(mismatch)
+    try:
+        with SQLiteEventJournal(journal_path, read_only=True) as journal:
+            control = BreakGlassControl(journal=journal, state_dir=state_dir)
+            # The file at the bound path must still be the bound journal, judged on this connection.
+            mismatch = control.ownership_store.journal_binding_error(
+                str(journal_path), journal.journal_id()
+            )
+            if mismatch is not None:
+                return _refuse(mismatch)
+            record = control.status().to_record()
+    except (JournalError, EventContractError, sqlite3.Error) as exc:  # never creates or repairs
+        return _refuse(f"{type(exc).__name__}: {exc}")
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    journal_path = Path(args.journal)
     state_dir = Path(args.state_dir)
     delivered_at = datetime.now(timezone.utc)
     command = parse_operator_command(
@@ -167,7 +199,14 @@ def _run_command(args: argparse.Namespace) -> int:
         },
         delivered_at=delivered_at,
     )
-    with SQLiteEventJournal(journal_path) as journal:
+    journal_path, mismatch = _journal_for(args)
+    if mismatch is not None:
+        return _refuse(f"{mismatch} {EXCHANGE_FALLBACK}")
+    try:
+        journal = _open_emergency_journal(journal_path)
+    except (JournalError, sqlite3.Error) as exc:  # before any lease, state or venue side effect
+        return _refuse(f"{type(exc).__name__}: {exc} [journal: {journal_path}] {EXCHANGE_FALLBACK}")
+    with journal:
         venue = _build_venue(args)
         control = BreakGlassControl(
             journal=journal,
@@ -175,10 +214,28 @@ def _run_command(args: argparse.Namespace) -> int:
             venue=venue,
             reconciliation_policy=load_recovery_policy({"policy_id": args.recovery_policy_id}),
         )
-        outcome = control.handle(command)
+        try:
+            outcome = control.handle(command)
+        except (JournalError, EventContractError, sqlite3.Error, OSError) as exc:
+            # Never "nothing changed": the lease or the venue cancel may precede the failed append.
+            return _incomplete(f"{type(exc).__name__}: {exc} [journal: {journal_path}]")
+        except BreakGlassIncompleteError as exc:
+            return _incomplete(f"{exc} [journal: {journal_path}]")
         record = outcome.to_record()
     _emit(record, as_json=args.json)
     return EXIT_ACCEPTED if outcome.accepted else EXIT_REFUSED
+
+
+def _open_emergency_journal(journal_path: Path) -> SQLiteEventJournal:
+    """Open the existing FULL-founded journal for durable emergency writes; never create one."""
+    try:
+        exists = journal_path.is_file()
+    except (OSError, ValueError) as exc:
+        raise JournalSchemaError(f"the journal could not be checked: {exc}") from exc
+    if not exists:
+        raise JournalSchemaError("the journal is not an existing file; run never creates a journal.")
+    # must_exist closes the window between the check above and the connect: never found anew.
+    return SQLiteEventJournal(journal_path, venue_writes=True, must_exist=True)
 
 
 def _build_venue(args: argparse.Namespace):
@@ -206,6 +263,36 @@ def _monotonic_utc() -> float:
     return datetime.now(timezone.utc).timestamp()
 
 
+def _journal_for(args: argparse.Namespace) -> tuple[Path, str | None]:
+    """The journal bound to ``--state-dir``: the lease owner's recorded journal, else the default.
+
+    An unreadable lease is a refusal, never the default: the default may be another system's
+    journal while the bound one lives outside the state dir.
+    """
+    state_dir = Path(args.state_dir)
+    try:
+        lease = OwnershipStore(break_glass_state_path(state_dir, "ownership.json")).read()
+    except OwnershipStateError as exc:
+        return _default_journal(state_dir), (
+            f"the trading-state ownership record under --state-dir {args.state_dir} is unusable "
+            f"({exc}); refusing to choose a journal while the lease it must be bound to cannot "
+            "be read."
+        )
+    if lease is not None and lease.journal_path is not None:
+        bound = Path(lease.journal_path)
+    else:
+        bound = _default_journal(state_dir)
+    if args.journal is not None:
+        given = Path(args.journal)
+        if os.path.normcase(os.path.abspath(given)) != os.path.normcase(os.path.abspath(bound)):
+            return bound, (
+                f"--journal {given} is not the journal bound to --state-dir {args.state_dir} "
+                f"(expected {bound}); refusing to pair a journal with another system's ownership "
+                "state."
+            )
+    return bound, journal_binding_mismatch(lease, str(bound))
+
+
 def _default_journal(state_dir: Path) -> Path:
     return state_dir / "journal.db"
 
@@ -220,6 +307,15 @@ def _emit(record: dict[str, Any], *, as_json: bool) -> None:
 def _render(record: dict[str, Any]) -> str:
     lines = [f"{key}: {value}" for key, value in sorted(record.items())]
     return "\n".join(lines)
+
+
+def _incomplete(message: str) -> int:
+    sys.stderr.write(
+        f"INCOMPLETE (side effects may already be in effect): {message}. The emergency lease and "
+        "any venue cancel may already have happened: check status and re-deliver the same "
+        f"--command-id. {EXCHANGE_FALLBACK}\n"
+    )
+    return EXIT_INCOMPLETE
 
 
 def _refuse(message: str) -> int:

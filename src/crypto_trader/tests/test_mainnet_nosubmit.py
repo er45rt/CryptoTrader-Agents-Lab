@@ -177,3 +177,103 @@ def test_a_mutation_attempt_on_the_client_surface_is_refused_before_transport():
     with pytest.raises(MainnetMutationForbiddenError):
         client._get("/api/v3/order/../../anything", {}, signed=True)
     assert transport.requests == []
+
+
+def test_mainnet_transport_retry_uses_injected_backoff_sleep():
+    from crypto_trader.execution.binance_testnet import TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[
+            TransportTimeout("transient read timeout"),
+            fx.response(200, fx.restrictions_body()),
+        ]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    client.api_restrictions()
+
+    assert sleeps == [client.retry.delay_for_attempt(1)]
+    assert [request.method for request in transport.requests] == ["GET", "GET"]
+
+
+def test_mainnet_final_transport_failure_does_not_sleep_after_exhaustion():
+    from crypto_trader.execution.binance_testnet import TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[TransportTimeout("timeout")] * 3
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(TransportTimeout):
+        client.api_restrictions()
+
+    assert sleeps == [
+        client.retry.delay_for_attempt(1),
+        client.retry.delay_for_attempt(2),
+    ]
+    assert len(transport.requests) == 3
+
+
+def test_mainnet_non_200_response_neither_retries_nor_sleeps():
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[fx.response(429, {"code": -1003, "msg": "Too many requests"})]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(MainnetEndpointError):
+        client.api_restrictions()
+
+    assert sleeps == []
+    assert len(transport.requests) == 1
+
+
+def test_mainnet_signed_retry_rebuilds_timestamp_each_attempt():
+    from urllib.parse import parse_qs
+    from crypto_trader.execution.binance_testnet import TestnetClock, TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    ticks = iter([fx.SERVER_TIME_MS / 1000, (fx.SERVER_TIME_MS + 1000) / 1000])
+    clock = TestnetClock(time_source=lambda: next(ticks), recv_window_ms=5_000)
+    clock.synchronize(fx.SERVER_TIME_MS, local_time_ms=fx.SERVER_TIME_MS)
+    transport = ScriptedTransport(
+        responses=[
+            TransportTimeout("first signed read timed out"),
+            fx.response(200, fx.restrictions_body()),
+        ]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=clock,
+        sleep=lambda _seconds: None,
+    )
+
+    client.api_restrictions()
+
+    timestamps = [
+        int(parse_qs(request.query)["timestamp"][0])
+        for request in transport.requests
+    ]
+    assert timestamps == [fx.SERVER_TIME_MS, fx.SERVER_TIME_MS + 1000]

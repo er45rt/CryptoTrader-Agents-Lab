@@ -17,9 +17,10 @@ An unconfirmed write is NEVER retried and never silently treated as success: it 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -104,6 +105,7 @@ class VenueControlOutcome:
     reason_code: str
     detail: str
     cancelled_order_references: tuple[str, ...] = ()
+    unconfirmed_order_references: tuple[str, ...] = ()
     preflight: EmergencyPreflight | None = None
 
     @property
@@ -121,6 +123,7 @@ class VenueControlOutcome:
             "reason_code": self.reason_code,
             "detail": self.detail,
             "cancelled_order_references": list(self.cancelled_order_references),
+            "unconfirmed_order_references": list(self.unconfirmed_order_references),
             "preflight": None if self.preflight is None else self.preflight.to_record(),
         }
 
@@ -130,7 +133,7 @@ class EmergencyVenuePort(Protocol):
     """The only venue surface the break-glass control may use."""
 
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome: ...
 
     def venue_reports(self) -> Sequence[VenueOrderReport]: ...
@@ -141,9 +144,9 @@ class PolicyOnlyVenueControl:
     """The default control when no venue is attached: policy-only, deterministic, no I/O."""
 
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
-        del correlation_id, occurred_at
+        del correlation_id, occurred_at, safety
         return VenueControlOutcome(
             disposition="not_requested",
             reason_code="venue_control_not_attached",
@@ -166,16 +169,30 @@ class BinanceSpotTestnetEmergencyControl:
 
     client: BinanceSpotTestnetClient
     runtime: TestnetOrderRuntime
-    withdrawal_policy: WithdrawalPolicy = WithdrawalPolicy.REQUIRE_DISABLED
+    withdrawal_policy: WithdrawalPolicy | None = None
     symbol: str | None = None
     _preflight: EmergencyPreflight | None = field(default=None, init=False)
     _order_references: list[str] = field(default_factory=list, init=False)
+    _listed_venue_order_ids: dict[str, str | None] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.client is None or self.runtime is None:
             raise BreakGlassConfigError("a testnet client and runtime are required.")
+        if self.runtime.client is not self.client:
+            raise BreakGlassConfigError("the emergency runtime and control must share the same client.")
+        runtime_symbol = self.runtime.instrument.symbol
         if self.symbol is None:
-            self.symbol = self.runtime.instrument.symbol
+            self.symbol = runtime_symbol
+        if self.symbol != runtime_symbol or self.client.symbol != runtime_symbol:
+            raise BreakGlassConfigError(
+                "the emergency client, runtime and control must target the same symbol."
+            )
+        if self.withdrawal_policy is None:
+            self.withdrawal_policy = self.client.withdrawal_policy
+        elif self.withdrawal_policy is not self.client.withdrawal_policy:
+            raise BreakGlassConfigError(
+                "the emergency control withdrawal policy must match the client policy."
+            )
 
     # --- pre-flight -------------------------------------------------------
 
@@ -190,38 +207,25 @@ class BinanceSpotTestnetEmergencyControl:
             mainnet_hosts_blocked = True
         except BinanceTestnetError:
             mainnet_hosts_blocked = False
-        self.client.synchronize_clock()
-        offset = self.client.clock.offset_ms
-        clock_synchronized = self.client.clock.is_synchronized
+
+        # Preserve the production environment proof rather than reimplementing a weaker subset:
+        # this forces a fresh symbol-rule read, verifies canTrade, withdrawal policy and clock drift.
+        environment = self.client.verify_environment(symbol=self.symbol)
         self.client.clock.require_acceptable_drift()
-        account = self.client.account_snapshot(asset=self.client.symbol_rules().quote_asset)
+        account = environment.account
         withdrawals_available = account.withdrawals_available
-        policy_ok = not withdrawals_available or self.withdrawal_policy is WithdrawalPolicy.RECORD_ONLY
-        if withdrawals_available and self.withdrawal_policy is WithdrawalPolicy.REQUIRE_DISABLED:
-            raise UnsafeTestnetAccountError(
-                "the account reports withdrawals enabled; the break-glass venue control refuses to "
-                "use a key with withdrawal capability."
-            )
-        notes: list[str] = [
-            "endpoint verified as Binance Spot Testnet",
-            "no mainnet endpoint is reachable from this control",
-            "no withdrawal endpoint exists anywhere in this adapter",
-        ]
-        if withdrawals_available:
-            notes.append(
-                "the venue reports withdrawals enabled on this TESTNET key "
-                f"(policy={self.withdrawal_policy.value}); no withdrawal capability is implemented "
-                "or used, and a future live key MUST be withdrawal-disabled"
-            )
-        else:
-            notes.append("withdrawals unavailable on this key (verified)")
+        policy_ok = (
+            not withdrawals_available
+            or self.withdrawal_policy is WithdrawalPolicy.RECORD_ONLY
+        )
+        notes = list(environment.notes)
         notes.append("cancelling open orders is permitted in every safety mode: it cannot increase risk")
         preflight = EmergencyPreflight(
-            venue_label=self.client.venue_label,
+            venue_label=environment.venue_label,
             endpoint_is_testnet=endpoint_is_testnet,
             mainnet_hosts_blocked=mainnet_hosts_blocked,
-            clock_synchronized=clock_synchronized,
-            clock_offset_ms=offset,
+            clock_synchronized=self.client.clock.is_synchronized,
+            clock_offset_ms=environment.clock_offset_ms,
             withdrawals_available=withdrawals_available,
             withdrawal_policy_ok=policy_ok,
             safety_mode=safety.mode.value,
@@ -233,13 +237,46 @@ class BinanceSpotTestnetEmergencyControl:
 
     # --- control ----------------------------------------------------------
 
+    def _remember_failed_cancel(self, exc: BaseException) -> tuple[str, ...]:
+        """The venue-confirmed cancels a failed cancel-all completed before it failed.
+
+        Only those are returned, so only those are journaled as cancelled. The order whose cancel
+        failed is tracked with them so the venue is asked about it as evidence, but it is never
+        recorded as cancelled: its cancel was not confirmed.
+        """
+        confirmed = tuple(
+            dict.fromkeys(
+                ref
+                for ref in getattr(exc, "cancelled_order_references", ())
+                if isinstance(ref, str) and ref.strip()
+            )
+        )
+        unconfirmed = getattr(exc, "unconfirmed_order_reference", None)
+        if isinstance(unconfirmed, str) and unconfirmed.strip():
+            tracked = (*confirmed, unconfirmed)
+        else:
+            tracked = confirmed
+        self._order_references.extend(
+            reference for reference in tracked if reference not in self._order_references
+        )
+        return confirmed
+
+    @staticmethod
+    def _unconfirmed_of(exc: BaseException) -> tuple[str, ...]:
+        """The order whose cancel failed: journaled as unconfirmed, never as cancelled."""
+        unconfirmed = getattr(exc, "unconfirmed_order_reference", None)
+        if isinstance(unconfirmed, str) and unconfirmed.strip():
+            return (unconfirmed,)
+        return ()
+
     def cancel_open_orders(
-        self, *, correlation_id: UUID, occurred_at: datetime
+        self, *, correlation_id: UUID, occurred_at: datetime, safety: SafetyController
     ) -> VenueControlOutcome:
         """Cancel every open order for the instrument. Never retried, never assumed successful."""
         del occurred_at
+        self._preflight = None
         try:
-            self.runtime.client.verify_environment(symbol=self.client.symbol)
+            preflight = self.preflight(safety=safety)
         except BinanceTestnetError as exc:
             return VenueControlOutcome(
                 disposition="unavailable",
@@ -250,12 +287,14 @@ class BinanceSpotTestnetEmergencyControl:
         try:
             orders = self.runtime.cancel_all()
         except AmbiguousOrderError as exc:
-            del exc
             return VenueControlOutcome(
                 disposition="ambiguous",
                 reason_code="UNKNOWN_PENDING_RECONCILIATION",
                 detail="the cancel outcome is unknown; it was NOT retried and the epoch requires "
                 "reconciliation",
+                cancelled_order_references=self._remember_failed_cancel(exc),
+                unconfirmed_order_references=self._unconfirmed_of(exc),
+                preflight=preflight,
             )
         except BinanceTestnetError as exc:
             return VenueControlOutcome(
@@ -263,6 +302,9 @@ class BinanceSpotTestnetEmergencyControl:
                 reason_code="venue_cancel_rejected",
                 detail=f"the venue rejected the cancel deterministically ({type(exc).__name__}); "
                 "reconciliation is still required to confirm the resulting order state",
+                cancelled_order_references=self._remember_failed_cancel(exc),
+                unconfirmed_order_references=self._unconfirmed_of(exc),
+                preflight=preflight,
             )
         references = tuple(order.client_order_id for order in orders)
         self._order_references.extend(
@@ -274,7 +316,7 @@ class BinanceSpotTestnetEmergencyControl:
             reason_code="cancel_confirmed",
             detail=f"{len(references)} open order(s) were cancelled through the safety path",
             cancelled_order_references=references,
-            preflight=self._preflight,
+            preflight=preflight,
         )
 
     def venue_reports(self) -> Sequence[VenueOrderReport]:
@@ -289,6 +331,41 @@ class BinanceSpotTestnetEmergencyControl:
         for reference in references:
             if reference and reference not in self._order_references:
                 self._order_references.append(reference)
+
+    def track_open_orders(self) -> tuple[str, ...] | None:
+        """List the venue's open orders now and track them, so venue_reports() covers every one.
+
+        None when the venue cannot list them: the open orders stay unknown, never assumed empty.
+        """
+        self._listed_venue_order_ids = {}
+        try:
+            # Review FZ-10: strict, so a 200 that is empty, not JSON or not a list is no listing.
+            orders = self.client.startup_open_orders(self.symbol)
+        except BinanceTestnetError:
+            return None
+        references = tuple(order.client_order_id for order in orders)
+        self.track_order_references(references)
+        self._listed_venue_order_ids = {
+            order.client_order_id: order.venue_order_id for order in orders
+        }
+        return references
+
+    def listed_venue_order_ids(self) -> Mapping[str, str | None]:
+        """The venue order id of each order the last strict listing named (review F-03)."""
+        return dict(self._listed_venue_order_ids)
+
+    def order_settlement_evidence(
+        self, client_order_id: str
+    ) -> tuple[str | None, str, Decimal] | None:
+        """Strict status evidence for one order: (venue order id, status, executed quantity).
+
+        None when the strict read fails or the venue has no such order: nothing is settled then.
+        """
+        try:
+            order = self.client.startup_order_status(self.symbol, client_order_id)
+        except BinanceTestnetError:
+            return None
+        return order.venue_order_id, order.status, order.executed_quantity
 
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""

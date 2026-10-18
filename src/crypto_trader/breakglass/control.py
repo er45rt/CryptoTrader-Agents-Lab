@@ -14,24 +14,37 @@ Guarantees:
 * fail-closed: a refused command changes nothing, an unconfirmed venue-side control escalates
   through ``degraded`` into ``recovery_required`` with ``UNKNOWN_PENDING_RECONCILIATION``, and a
   corrupt persisted state fails closed into ``recovery_required``;
-* single-writer: every accepted break-glass action takes the writer lease as the emergency owner
-  and mints a new fencing term, so the normal writer cannot keep trading concurrently;
-* no automatic return to ``normal``: restore requires a resolved reconciliation AND an explicit
-  operator acknowledgement, and is the only path that releases the kill switch.
+* single-writer: emergency break-glass actions take the writer lease as the emergency owner
+  and mint a new fencing term; ``reduce_only`` is an audited policy restriction that preserves
+  the current normal lease while Hard Risk proves each reduction;
+* no automatic return to ``normal``: emergency epochs require resolved reconciliation plus
+  operator acknowledgement; a policy-only ``reduce_only`` posture still requires an explicit
+  audited operator restore.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from crypto_trader.events import (
-    OperatorCommandRecordPayload,
-    OperatorCommandRecorded,
+    ExternalOrderObservation,
+    ExternalOrderSettlement,
+    OperatorCommandRecordPayloadV2,
+    OperatorCommandRecordPayloadV3,
+    OperatorCommandRecordedV2,
+    OperatorCommandRecordedV3,
+    ReconciliationIntakePayload,
+    ReconciliationIntakeRecorded,
+    ReconciliationObservedPayload,
+    ReconciliationObservedRecorded,
+    ReconciliationSettledPayload,
+    ReconciliationSettledRecorded,
     SafetyStateChangePayload,
     SafetyStateChanged,
 )
@@ -69,6 +82,8 @@ from .epoch import (
 from .errors import (
     BreakGlassActiveError,
     BreakGlassConfigError,
+    BreakGlassError,
+    BreakGlassIncompleteError,
     OwnershipStateError,
 )
 from .ownership import OwnerKind, OwnershipRecord, OwnershipStore, WriterGuard
@@ -98,6 +113,32 @@ KILL_SWITCH_ACTIONS = frozenset(
         OperatorCommandType.FORCE_RECOVERY_REQUIRED,
     }
 )
+
+#: Review F-02 (legacy): a FULL journal founded before identities records no journal_id, so the
+#: id-less journal at a path-only lease's path cannot be told apart from another id-less journal
+#: moved onto that path. Emergency actions stay available on it; these two would extend trust in the
+#: unproven pairing (reduce-only keeps the bound writer sending orders) and are refused unwritten.
+JOURNAL_IDENTITY_UNVERIFIED = "journal_identity_unverified"
+IDENTITY_TRUST_COMMANDS = frozenset(
+    {OperatorCommandType.REDUCE_ONLY, OperatorCommandType.RESTORE_NORMAL}
+)
+_IDENTITY_WARNING = (
+    f"{JOURNAL_IDENTITY_UNVERIFIED}: the journal records no journal_id, so it cannot be proven to "
+    "be the journal this state dir's lease was bound to; reconciliation stays pending and "
+    "restore_normal is refused until the system is re-established on a newly founded journal."
+)
+
+
+#: Review F-03: a reconcile run that journaled its intake but never what it observed may have seen
+#: venue orders nobody recorded; nothing settles that yet, so the epoch never resolves after it.
+OBSERVATION_POSSIBLY_LOST = "observation_possibly_lost"
+#: The latest reconcile run started after the last completed one, so no result covers its reads.
+RECONCILIATION_RUN_INCOMPLETE = "reconciliation_run_incomplete"
+#: Review ADV-04: a reconcile run journaled before intakes existed listed the open orders and
+#: journaled nothing it saw; only re-establishing on a newly founded journal clears it.
+LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE = "legacy_external_evidence_unverifiable"
+#: The terminal venue statuses that settle an external order the venue shows never executed.
+SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
 
 def break_glass_state_path(state_dir: str | Path, name: str) -> Path:
@@ -331,19 +372,22 @@ class BreakGlassControl:
         Refused while a break-glass epoch is open: after an emergency takeover the normal runtime may
         not simply help itself to the lease again.
         """
-        epoch = self.load_epoch()
-        if epoch is not None and epoch.is_open:
-            raise BreakGlassActiveError(
-                f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
-                "the trading-state lease until an operator restore completes."
+        with self._ownership_store.exclusive():
+            epoch = self.load_epoch()
+            if epoch is not None and epoch.is_open:
+                raise BreakGlassActiveError(
+                    f"a break-glass epoch is open ({epoch.session_id}); the normal writer may not claim "
+                    "the trading-state lease until an operator restore completes."
+                )
+            record = self._ownership_store.takeover(
+                owner_id=owner_id,
+                owner_kind=OwnerKind.NORMAL,
+                acquired_at=self._now(),
+                reason_code=reason_code,
+                journal_path=self._journal_path(),
+                journal_id=self._journal_id(),
             )
-        record = self._ownership_store.takeover(
-            owner_id=owner_id,
-            owner_kind=OwnerKind.NORMAL,
-            acquired_at=self._now(),
-            reason_code=reason_code,
-        )
-        return WriterGuard(self._ownership_store, record.fence)
+            return WriterGuard(self._ownership_store, record.fence)
 
     def status(self) -> BreakGlassStatus:
         """Read-only posture. Never writes, never mutates, never silently repairs anything."""
@@ -353,6 +397,16 @@ class BreakGlassControl:
         epoch = self._effective_epoch(controller, ledger)
         ownership = self._read_ownership()
         acknowledgement = None if epoch is None else epoch.acknowledgement
+        # The reconcile-run gates refuse restore before the epoch's own blockers (review F-03).
+        run_gates = (
+            *((OBSERVATION_POSSIBLY_LOST,) if ledger.observations.unobserved_intakes else ()),
+            *(
+                (LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE,)
+                if ledger.open_epoch_legacy_listing_run()
+                else ()
+            ),
+            *((RECONCILIATION_RUN_INCOMPLETE,) if ledger.observations.run_incomplete else ()),
+        )
         return BreakGlassStatus(
             safety_mode=controller.mode.value,
             kill_switch_engaged=controller.kill_switch_engaged,
@@ -371,11 +425,11 @@ class BreakGlassControl:
             epoch_actions=() if epoch is None else epoch.actions,
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             reconciliation_reason_code=None if epoch is None else epoch.reconciliation_reason_code,
-            operator_acknowledgement_pending=acknowledgement is None,
+            operator_acknowledgement_pending=bool(epoch is not None and acknowledgement is None),
             operator_acknowledged_by=(
                 None if acknowledgement is None else acknowledgement.operator_label
             ),
-            restore_blockers=() if epoch is None else epoch.restore_blockers,
+            restore_blockers=() if epoch is None else (*run_gates, *epoch.restore_blockers),
             recorded_commands=len(ledger.commands),
             last_command_id=(None if not ledger.records else ledger.records[-1].command_id),
         )
@@ -414,11 +468,43 @@ class BreakGlassControl:
     # --- the single ingress ---------------------------------------------------
 
     def handle(self, command: OperatorCommand) -> OperatorCommandOutcome:
-        """Apply one validated operator command deterministically (or refuse it, fail-closed)."""
+        """Serialize the complete operator transaction against normal submission.
+
+        Any failure after the first side effect (venue cancel or journal record, which follows the
+        lease takeover) is raised as BreakGlassIncompleteError, never as a refusal or a traceback.
+        """
+        with self._ownership_store.exclusive():
+            self._side_effect_started = False
+            self._identity_unverified = False
+            try:
+                outcome = self._handle_locked(command)
+                if self._identity_unverified:
+                    outcome = replace(outcome, notes=(*outcome.notes, _IDENTITY_WARNING))
+                return outcome
+            except BreakGlassIncompleteError:
+                raise
+            except Exception as exc:  # BaseException (an interrupt) is never masked
+                if not self._side_effect_started:
+                    raise
+                raise BreakGlassIncompleteError(f"{type(exc).__name__}: {exc}") from exc
+
+    def _handle_locked(self, command: OperatorCommand) -> OperatorCommandOutcome:
         if not isinstance(command, OperatorCommand):
             raise BreakGlassConfigError("handle() expects a validated OperatorCommand.")
-        delivered_at = self._now()
+        # Before any side effect: this journal must be the one the state dir's lease is bound to.
+        binding = self._ownership_store.journal_binding_error(self._journal_path(), self._journal_id())
+        if binding is not None:
+            raise OwnershipStateError(binding)
+        self._identity_unverified = self._journal_identity_unverified()
+        if self._identity_unverified and command.command_type in IDENTITY_TRUST_COMMANDS:
+            raise OwnershipStateError(self._identity_refusal(command.command_type))
         ledger = derive_ledger(self._journal)
+        # Replay orders by occurred_at first: a command journaled with a wall clock stepped back
+        # behind the journal would replay before what already happened. The delivery time never
+        # goes below the latest journaled event; the batch sequence numbers then order the tie.
+        delivered_at = self._now()
+        if ledger.latest_occurred_at is not None:
+            delivered_at = max(delivered_at, ledger.latest_occurred_at)
         load = self._safety_store.load(self._journal)
         controller = load.controller
 
@@ -467,6 +553,86 @@ class BreakGlassControl:
                 ),
             )
 
+        if command.command_type is OperatorCommandType.REDUCE_ONLY:
+            if open_epoch is not None:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="reduce_only_refused_break_glass_epoch_open",
+                    note=(
+                        "reduce-only cannot replace or weaken an active emergency epoch; "
+                        "reconciliation, acknowledgement and explicit restore remain mandatory."
+                    ),
+                )
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
+            if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="reduce_only_refused_emergency_owner",
+                    note=(
+                        "reduce-only cannot restore trading authority while the emergency owner "
+                        "holds the writer lease."
+                    ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
+                )
+            correlation_id = command.correlation_id or command.command_id
+            transitions = self._apply_posture(
+                controller,
+                target,
+                command=command,
+                engage_kill_switch=False,
+            )
+            recorded = self._append_records(
+                command,
+                controller,
+                previous_mode=previous_mode,
+                resulting_mode=controller.mode,
+                disposition="accepted",
+                reason_code=self._action_reason_code(command, controller, None),
+                correlation_id=correlation_id,
+                venue_control="not_requested",
+                reconciliation_status="not_required",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=fence_term,
+                occurred_at=delivered_at,
+                transitions=transitions,
+            )
+            self._persist_state_cache(controller)
+            return OperatorCommandOutcome(
+                command_id=command.command_id,
+                command_type=command.command_type.value,
+                disposition="accepted",
+                reason_code=self._action_reason_code(command, controller, None),
+                previous_safety_state=previous_mode.value,
+                resulting_safety_state=controller.mode.value,
+                correlation_id=correlation_id,
+                causation_id=command.causation_id,
+                delivered_at=delivered_at,
+                reconciliation_required=False,
+                reconciliation_status="not_required",
+                operator_acknowledgement_pending=False,
+                new_risk_permitted=False,
+                venue_control="not_requested",
+                fence_term=fence_term,
+                safety_transitions=tuple(
+                    f"{item.previous_mode.value}->{item.mode.value}" for item in transitions
+                ),
+                journaled_event_ids=tuple(recorded),
+                notes=(
+                    "reduce-only is an operator-audited policy restriction; it preserves the "
+                    "current normal writer lease and delegates reduction proof to Hard Risk.",
+                    load.detail,
+                    *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
+                ),
+                safety_state_source=load.source,
+            )
+
         reanchor = open_epoch is None or open_epoch.provenance == "provenance_missing"
         if reanchor:
             session_id = command.correlation_id or command.command_id
@@ -482,8 +648,11 @@ class BreakGlassControl:
         venue_outcome: VenueControlOutcome | None = None
         notes: list[str] = []
         if command.command_type is OperatorCommandType.CANCEL_OPEN:
+            self._side_effect_started = True  # the venue may act even if the call then fails
             venue_outcome = self._venue.cancel_open_orders(
-                correlation_id=session_id, occurred_at=delivered_at
+                correlation_id=session_id,
+                occurred_at=delivered_at,
+                safety=controller,
             )
             if venue_outcome.disposition == "ambiguous":
                 notes.append(
@@ -525,6 +694,8 @@ class BreakGlassControl:
             acquired_at=delivered_at,
             reason_code=f"break_glass:{command.command_type.value}",
             session_id=session_id,
+            journal_path=self._journal_path(),
+            journal_id=self._journal_id(),
         )
         recorded = self._append_records(
             command,
@@ -535,6 +706,12 @@ class BreakGlassControl:
             reason_code=self._action_reason_code(command, controller, venue_outcome),
             correlation_id=session_id,
             venue_control="not_requested" if venue_outcome is None else venue_outcome.disposition,
+            unconfirmed_order_references=(
+                () if venue_outcome is None else venue_outcome.unconfirmed_order_references
+            ),
+            cancelled_order_references=(
+                () if venue_outcome is None else venue_outcome.cancelled_order_references
+            ),
             reconciliation_status="pending",
             epoch_opened=reanchor,
             epoch_closed=False,
@@ -592,11 +769,21 @@ class BreakGlassControl:
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to reconcile.",
             )
-        report, reconciliation_note = self._run_reconciliation(epoch)
-        status = "resolved" if report.is_fully_resolved else "pending"
-        reason_code = (
-            "reconciliation_resolved" if status == "resolved" else "UNKNOWN_PENDING_RECONCILIATION"
+        settled, reconciliation_note, run_blocker = self._run_reconciliation(
+            command, epoch, delivered_at
         )
+        resolved = settled and not self._identity_unverified
+        status = "resolved" if resolved else "pending"
+        if self._identity_unverified:
+            # Evidence can never vouch for a journal whose identity is unproven (review F-02).
+            reason_code = JOURNAL_IDENTITY_UNVERIFIED
+        elif run_blocker is not None:
+            reason_code = run_blocker
+        elif resolved:
+            reason_code = "reconciliation_resolved"
+        else:
+            reason_code = "UNKNOWN_PENDING_RECONCILIATION"
+        ownership, fence_term, ownership_diagnostic = self._ownership_observation()
         event_ids = self._append_records(
             command,
             controller,
@@ -609,7 +796,7 @@ class BreakGlassControl:
             reconciliation_status=status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
@@ -632,11 +819,12 @@ class BreakGlassControl:
                 resulting_epoch is None or not resulting_epoch.acknowledgement_satisfied
             ),
             new_risk_permitted=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
             notes=(
                 f"reconciliation ran through Phase 8 evidence: {reconciliation_note}",
                 "unresolved orders stay UNKNOWN_PENDING_RECONCILIATION and are never retried",
+                *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
             ),
             safety_state_source=load.source,
         )
@@ -658,6 +846,16 @@ class BreakGlassControl:
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch to acknowledge.",
             )
+        run_blocker = self._reconcile_run_blocker()
+        if run_blocker is not None:
+            return self._reject(
+                command,
+                controller,
+                load,
+                delivered_at,
+                reason_code=f"acknowledgement_denied_{run_blocker[0]}",
+                note=f"an operator acknowledgement is refused: {run_blocker[1]}",
+            )
         if not epoch.reconciliation_satisfied:
             return self._reject(
                 command,
@@ -675,6 +873,7 @@ class BreakGlassControl:
             if epoch.acknowledgement_satisfied
             else "operator_acknowledgement_recorded"
         )
+        ownership, fence_term, ownership_diagnostic = self._ownership_observation()
         event_ids = self._append_records(
             command,
             controller,
@@ -687,7 +886,7 @@ class BreakGlassControl:
             reconciliation_status=epoch.reconciliation_status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
@@ -707,10 +906,11 @@ class BreakGlassControl:
             reconciliation_result=epoch.reconciliation_reason_code,
             operator_acknowledgement_pending=False,
             new_risk_permitted=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
             notes=(
                 "the acknowledgement is attributed to the operator label in the command record",
+                *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
             ),
             safety_state_source=load.source,
         )
@@ -723,6 +923,98 @@ class BreakGlassControl:
         load: SafetyStateLoad,
         delivered_at: datetime,
     ) -> OperatorCommandOutcome:
+        if (
+            (epoch is None or not epoch.is_open)
+            and controller.mode is SafetyMode.REDUCE_ONLY
+            and not controller.kill_switch_engaged
+        ):
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
+            if ownership_diagnostic == "ownership unreadable":
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="restore_denied_ownership_unreadable",
+                    note=(
+                        "normal cannot be restored from reduce-only while writer ownership "
+                        "cannot be read authoritatively."
+                    ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
+                )
+            if ownership is not None and ownership.owner_kind is OwnerKind.EMERGENCY:
+                return self._reject(
+                    command,
+                    controller,
+                    load,
+                    delivered_at,
+                    reason_code="restore_denied_emergency_owner",
+                    note=(
+                        "normal cannot be restored from reduce-only while the emergency owner "
+                        "holds the writer lease."
+                    ),
+                    ownership_observation=(ownership, fence_term, ownership_diagnostic),
+                )
+            correlation_id = command.correlation_id or command.command_id
+            transitions = [
+                controller.set_mode(
+                    SafetyMode.NORMAL,
+                    reason_code="operator_restore_normal",
+                    reason=(
+                        f"operator {command.operator_label} restored normal from the "
+                        "reduce-only policy posture"
+                    ),
+                    trigger="operator",
+                )
+            ]
+            event_ids = self._append_records(
+                command,
+                controller,
+                previous_mode=SafetyMode.REDUCE_ONLY,
+                resulting_mode=controller.mode,
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                correlation_id=correlation_id,
+                venue_control="not_requested",
+                reconciliation_status="not_required",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=fence_term,
+                occurred_at=delivered_at,
+                transitions=tuple(transitions),
+            )
+            self._persist_state_cache(controller)
+            return OperatorCommandOutcome(
+                command_id=command.command_id,
+                command_type=command.command_type.value,
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                previous_safety_state=SafetyMode.REDUCE_ONLY.value,
+                resulting_safety_state=controller.mode.value,
+                correlation_id=correlation_id,
+                causation_id=command.causation_id,
+                delivered_at=delivered_at,
+                reconciliation_required=False,
+                reconciliation_status="not_required",
+                operator_acknowledgement_pending=False,
+                new_risk_permitted=self._new_risk_permitted(
+                    controller, None, ownership
+                ),
+                fence_term=fence_term,
+                safety_transitions=tuple(
+                    f"{item.previous_mode.value}->{item.mode.value}"
+                    for item in transitions
+                ),
+                journaled_event_ids=tuple(event_ids),
+                notes=(
+                    "normal was restored by an explicit operator command from reduce-only; "
+                    "no emergency epoch or ownership takeover was involved.",
+                    load.detail,
+                    *((ownership_diagnostic,) if ownership_diagnostic is not None else ()),
+                ),
+                safety_state_source=load.source,
+            )
+
         if epoch is None or not epoch.is_open:
             return self._reject(
                 command,
@@ -731,6 +1023,16 @@ class BreakGlassControl:
                 delivered_at,
                 reason_code="no_break_glass_epoch_open",
                 note="there is no open break-glass epoch; normal is never restored by fiat.",
+            )
+        run_blocker = self._reconcile_run_blocker()
+        if run_blocker is not None:
+            return self._reject(
+                command,
+                controller,
+                load,
+                delivered_at,
+                reason_code=f"restore_denied_{run_blocker[0]}",
+                note=f"restoring normal is refused: {run_blocker[1]}",
             )
         blockers = epoch.restore_blockers
         if "reconciliation_pending" in blockers:
@@ -783,6 +1085,8 @@ class BreakGlassControl:
             acquired_at=delivered_at,
             reason_code="operator_restore_normal",
             session_id=epoch.session_id,
+            journal_path=self._journal_path(),
+            journal_id=self._journal_id(),
         )
         event_ids = self._append_records(
             command,
@@ -938,17 +1242,67 @@ class BreakGlassControl:
             return "break_glass_engaged_recovery_required"
         return f"break_glass_engaged_{command.command_type.value}"
 
-    def _current_term(self) -> int:
+    def _ownership_observation(self) -> tuple[OwnershipRecord | None, int, str | None]:
+        """Read ownership once and preserve why no usable fence record was available."""
         try:
-            return self._ownership_store.require_fence().term
+            ownership = self._ownership_store.read()
         except OwnershipStateError:
-            return 0
+            return None, 0, "ownership unreadable"
+        if ownership is None:
+            return None, 0, "ownership absent"
+        return ownership, ownership.term, None
+
+    def _journal_path(self) -> str | None:
+        """The exact path this control's journal is written at (None for an in-memory journal)."""
+        path = getattr(self._journal, "path", None)
+        if not isinstance(path, str) or not path or path == ":memory:":
+            return None
+        return os.path.abspath(path)
+
+    def _journal_id(self) -> UUID | None:
+        """The identity this control's open journal connection reports (None when it has none)."""
+        if self._journal_path() is None:
+            return None
+        read = getattr(self._journal, "journal_id", None)
+        return None if read is None else read()
+
+    def _journal_identity_unverified(self) -> bool:
+        """Whether the open journal is FULL-founded yet records no journal_id (review F-02).
+
+        Only a FULL-founded journal can back venue writes or be opened by the emergency CLI, so
+        that is where an unproven pairing matters; a journal that was never FULL-founded never
+        carries an identity and can never send a venue write.
+        """
+        if self._journal_path() is None:
+            return False
+        founded = getattr(self._journal, "has_full_foundation", None)
+        if founded is None or not founded():
+            return False
+        return self._journal_id() is None
+
+    def _identity_refusal(self, command_type: OperatorCommandType) -> str:
+        """The operator-facing refusal of a command that would extend trust in an id-less journal."""
+        if command_type is OperatorCommandType.REDUCE_ONLY:
+            refused = (
+                "reduce_only is refused because it would let the bound writer keep sending orders on "
+                "that unproven pairing; use halt_new_risk or cancel_open instead."
+            )
+        else:
+            refused = (
+                "restore_normal is refused: normal is never resumed on an unproven pairing; "
+                "re-establish on a new state dir with a newly founded journal."
+            )
+        return (
+            f"{JOURNAL_IDENTITY_UNVERIFIED}: the journal open at {self._journal_path()} records no "
+            "journal_id, so it cannot be proven to be the journal this state dir's lease was bound "
+            f"to; {refused} If orders are open, cancel them directly at the exchange."
+        )
+
+    def _current_term(self) -> int:
+        return self._ownership_observation()[1]
 
     def _read_ownership(self) -> OwnershipRecord | None:
-        try:
-            return self._ownership_store.read()
-        except OwnershipStateError:
-            return None
+        return self._ownership_observation()[0]
 
     def _new_risk_permitted(
         self,
@@ -964,17 +1318,136 @@ class BreakGlassControl:
             return False
         return True
 
-    def _run_reconciliation(self, epoch: BreakGlassEpoch):
-        """Run the Phase 8 reconciliation through the injected evidence providers."""
+    def _run_reconciliation(
+        self, command: OperatorCommand, epoch: BreakGlassEpoch, delivered_at: datetime
+    ) -> tuple[bool, str, str | None]:
+        """Run the Phase 8 reconciliation through the injected evidence providers.
+
+        Review F-03: the run journals its intake before its first venue read and what it observed
+        before it decides anything, so no later run can forget an order this one saw. Returns
+        whether the epoch is settled, the result note, and the sticky gate (an earlier run's
+        observation may be lost, or an older run listed unrecorded orders) if one holds.
+        """
         if self._reconciliation_policy is None:
             raise BreakGlassConfigError(
                 "no reconciliation policy is configured; reconciliation cannot be invented."
             )
         local_states = self._local_states()
-        venue_reports = list(
-            self._venue_state_provider() if self._venue_state_provider is not None else ()
+        ledger = derive_ledger(self._journal)
+        journaled_epoch = ledger.open_epoch
+        journaled = journaled_epoch is not None and journaled_epoch.session_id == epoch.session_id
+        references: tuple[str, ...] = ()
+        listing_needed = False
+        outstanding = ledger.observations.external_orders
+        if journaled:
+            # A new process knows the cancelled orders only from the journal, never from memory.
+            references = ledger.open_epoch_order_references()
+            # An unconfirmed cancel needs venue evidence just the same (review N-05).
+            references += tuple(
+                ref for ref in ledger.open_epoch_unconfirmed_references() if ref not in references
+            )
+            # A cancel that never learned the open orders is settled only by a complete venue
+            # listing taken now (review F-03); without one the epoch stays pending.
+            listing_needed = ledger.open_epoch_open_orders_unknown()
+        sequence_base = (len(ledger.commands) + 1) * 100
+        intake_id = self._append_run_event(
+            ReconciliationIntakeRecorded,
+            ReconciliationIntakePayload(command_id=command.command_id),
+            correlation_id=epoch.session_id,
+            causation_id=command.causation_id,
+            occurred_at=delivered_at,
+            sequence_number=sequence_base - 2,
         )
-        venue_reports.extend(self._venue.venue_reports())
+        venue_reports: list[VenueOrderReport] = []
+        listed: tuple[str, ...] = ()
+        listing = "missing" if listing_needed else "not_required"
+        settlements: list[ExternalOrderSettlement] = []
+        evidence_complete = True
+        try:
+            if self._venue_state_provider is not None:
+                venue_reports.extend(self._venue_state_provider())
+            track = getattr(self._venue, "track_order_references", None)
+            if references and callable(track):
+                track(references)
+            if listing_needed:
+                list_open = getattr(self._venue, "track_open_orders", None)
+                found = list_open() if callable(list_open) else None
+                if found is not None:
+                    listing, listed = "complete", tuple(found)
+            venue_reports.extend(self._venue.venue_reports())
+            # An outstanding external order settles only on strict evidence that the exact venue
+            # order first observed ended without any execution.
+            read_evidence = getattr(self._venue, "order_settlement_evidence", None)
+            if callable(read_evidence):
+                for reference in dict.fromkeys(ref for ref, _ in outstanding):
+                    evidence = read_evidence(reference)
+                    if evidence is None:
+                        continue
+                    venue_order_id, status, executed = evidence
+                    if (
+                        (reference, venue_order_id) in outstanding
+                        and status in SETTLED_WITHOUT_EXECUTION_STATUSES
+                        and executed == 0
+                    ):
+                        settlements.append(
+                            ExternalOrderSettlement(
+                                client_order_id=reference,
+                                venue_order_id=venue_order_id,
+                                status=status,
+                                executed_quantity=executed,
+                            )
+                        )
+        except Exception:  # an interrupt is never masked: its intake then stays unobserved
+            evidence_complete = False
+        local_references = {state.order_reference for state in local_states}
+        listed_ids = getattr(self._venue, "listed_venue_order_ids", None)
+        venue_order_ids = {}
+        if listing == "complete" and callable(listed_ids):
+            venue_order_ids = dict(listed_ids())
+        self._append_run_event(
+            ReconciliationObservedRecorded,
+            ReconciliationObservedPayload(
+                intake_id=intake_id,
+                listing=listing,
+                venue_evidence_complete=evidence_complete,
+                external_orders=[
+                    ExternalOrderObservation(
+                        client_order_id=reference,
+                        venue_order_id=venue_order_ids.get(reference),
+                        source="listing",
+                    )
+                    for reference in dict.fromkeys(listed)
+                    if reference not in local_references
+                ],
+            ),
+            correlation_id=epoch.session_id,
+            causation_id=intake_id,
+            occurred_at=delivered_at,
+            sequence_number=sequence_base - 1,
+        )
+        if settlements:
+            self._append_run_event(
+                ReconciliationSettledRecorded,
+                ReconciliationSettledPayload(intake_id=intake_id, settled_orders=settlements),
+                correlation_id=epoch.session_id,
+                causation_id=intake_id,
+                occurred_at=delivered_at,
+                sequence_number=sequence_base,
+            )
+        observations = derive_ledger(self._journal).observations
+        run_blocker = None
+        if observations.unobserved_intakes:
+            run_blocker = OBSERVATION_POSSIBLY_LOST
+        elif ledger.open_epoch_legacy_listing_run():
+            run_blocker = LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE
+        if not evidence_complete:
+            # Absence of evidence is not evidence of absence: Phase 8 never runs on a failed read.
+            return False, "reconciliation_venue_evidence_unavailable", run_blocker
+        reported = {report.order_reference for report in venue_reports}
+        # A journaled cancel is never resolved by silence: every reference needs venue evidence.
+        unverified = tuple(reference for reference in references if reference not in reported)
+        # A listing only names the open orders: each listed one needs its own venue report too.
+        unverified_listed = tuple(reference for reference in listed if reference not in reported)
         engine = ReconciliationEngine(self._reconciliation_policy)
         source = StaticVenueStateSource(entries=tuple(venue_reports), name="breakglass.venue")
         recovery = RestartRecovery(
@@ -988,12 +1461,74 @@ class BreakGlassControl:
             local_states=local_states,
             correlation_id=epoch.session_id,
         )
-        note = (
-            "reconciliation_confirmed_by_evidence"
-            if run.report.is_fully_resolved
-            else "reconciliation_left_orders_unresolved"
+        if unverified:
+            note = "reconciliation_missing_venue_evidence_for_cancelled_orders"
+        elif listing == "missing":
+            note = "reconciliation_missing_open_orders_listing"
+        elif unverified_listed:
+            note = "reconciliation_missing_venue_evidence_for_listed_orders"
+        elif not run.report.is_fully_resolved:
+            note = "reconciliation_left_orders_unresolved"
+        elif run_blocker is not None:
+            note = run_blocker
+        elif observations.external_orders:
+            # Nothing settles an order the journal does not know yet: it stays outstanding.
+            note = "reconciliation_external_orders_outstanding"
+        else:
+            note = "reconciliation_confirmed_by_evidence"
+        return note == "reconciliation_confirmed_by_evidence", note, run_blocker
+
+    def _append_run_event(
+        self,
+        event_type: type[ReconciliationIntakeRecorded]
+        | type[ReconciliationObservedRecorded]
+        | type[ReconciliationSettledRecorded],
+        payload: ReconciliationIntakePayload
+        | ReconciliationObservedPayload
+        | ReconciliationSettledPayload,
+        *,
+        correlation_id: UUID,
+        causation_id: UUID | None,
+        occurred_at: datetime,
+        sequence_number: int,
+    ) -> UUID:
+        """Journal one event of a reconcile run, ordered before the run's command record."""
+        self._side_effect_started = True
+        event = event_type(
+            event_id=uuid4(),
+            occurred_at=occurred_at.astimezone(timezone.utc),
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            producer=self._producer,
+            sequence_number=sequence_number,
+            payload=payload,
         )
-        return run.report, note
+        self._journal.append_batch([event])
+        return event.event_id
+
+    def _reconcile_run_blocker(self) -> tuple[str, str] | None:
+        """The open epoch's reconcile-run gate (review F-03): its code suffix and note, if any."""
+        ledger = derive_ledger(self._journal)
+        observations = ledger.observations
+        if observations.unobserved_intakes:
+            return (
+                OBSERVATION_POSSIBLY_LOST,
+                "a reconcile run started but never journaled what it observed, so it may have seen "
+                "venue orders nobody recorded; nothing settles that yet.",
+            )
+        if ledger.open_epoch_legacy_listing_run():
+            return (
+                LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE,
+                "a reconcile run journaled by older code listed the open orders and journaled "
+                "nothing it saw; cancel open orders directly at the exchange and re-establish on a "
+                "newly founded journal.",
+            )
+        if observations.run_incomplete:
+            return (
+                RECONCILIATION_RUN_INCOMPLETE,
+                "the latest reconcile run never completed; reconcile again first.",
+            )
+        return None
 
     def _local_states(self) -> tuple[LocalOrderState, ...]:
         if self._local_state_provider is not None:
@@ -1018,8 +1553,11 @@ class BreakGlassControl:
         fence_term: int,
         occurred_at: datetime,
         transitions: Sequence[SafetyTransition],
+        cancelled_order_references: Sequence[str] = (),
+        unconfirmed_order_references: Sequence[str] = (),
     ) -> list[UUID]:
         """Journal the safety transitions and the command record in ONE atomic transaction."""
+        self._side_effect_started = True  # any lease takeover precedes this append
         del controller
         # Deterministic intra-command ordering: several operator commands may legitimately share one
         # request timestamp (and therefore one journal `occurred_at`), so every event in this batch
@@ -1049,36 +1587,58 @@ class BreakGlassControl:
                     ),
                 )
             )
-        events.append(
-            OperatorCommandRecorded(
-                event_id=uuid4(),
-                occurred_at=occurred_at.astimezone(timezone.utc),
-                correlation_id=correlation_id,
-                causation_id=command.causation_id,
-                producer=self._producer,
-                sequence_number=sequence_base + len(transitions) + 1,
-                payload=OperatorCommandRecordPayload(
-                    command_id=command.command_id,
-                    command_type=command.command_type.value,
-                    requested_at=command.requested_at,
-                    operator_label=command.operator_label,
-                    operator_identity=command.operator_identity,
-                    reason=command.reason,
-                    source=command.source,
-                    previous_safety_state=previous_mode.value,
-                    resulting_safety_state=resulting_mode.value,
-                    disposition=disposition,
-                    reason_code=reason_code,
-                    command_digest=command.digest,
-                    mode_path=_mode_path(previous_mode, transitions),
-                    venue_control=venue_control,
-                    reconciliation_status=reconciliation_status,
-                    epoch_opened=epoch_opened,
-                    epoch_closed=epoch_closed,
-                    fence_term=fence_term,
+        # Unique, non-blank, venue order: the venue already acted, so the record must never fail.
+        references = list(
+            dict.fromkeys(ref for ref in cancelled_order_references if ref and ref.strip())
+        )
+        # Review N-05: a cancel the venue never confirmed is journaled apart from the confirmed
+        # ones (V3, written only then), so a new process still demands venue evidence for it.
+        unconfirmed = [
+            ref
+            for ref in dict.fromkeys(unconfirmed_order_references)
+            if isinstance(ref, str) and ref.strip() and ref not in references
+        ]
+        envelope = dict(
+            event_id=uuid4(),
+            occurred_at=occurred_at.astimezone(timezone.utc),
+            correlation_id=correlation_id,
+            causation_id=command.causation_id,
+            producer=self._producer,
+            sequence_number=sequence_base + len(transitions) + 1,
+        )
+        fields = dict(
+            command_id=command.command_id,
+            command_type=command.command_type.value,
+            requested_at=command.requested_at,
+            operator_label=command.operator_label,
+            operator_identity=command.operator_identity,
+            reason=command.reason,
+            source=command.source,
+            previous_safety_state=previous_mode.value,
+            resulting_safety_state=resulting_mode.value,
+            disposition=disposition,
+            reason_code=reason_code,
+            command_digest=command.digest,
+            mode_path=_mode_path(previous_mode, transitions),
+            venue_control=venue_control,
+            reconciliation_status=reconciliation_status,
+            epoch_opened=epoch_opened,
+            epoch_closed=epoch_closed,
+            fence_term=fence_term,
+            cancelled_order_references=references,
+        )
+        if unconfirmed:
+            record: Any = OperatorCommandRecordedV3(
+                **envelope,
+                payload=OperatorCommandRecordPayloadV3(
+                    **fields, unconfirmed_order_references=unconfirmed
                 ),
             )
-        )
+        else:
+            record = OperatorCommandRecordedV2(
+                **envelope, payload=OperatorCommandRecordPayloadV2(**fields)
+            )
+        events.append(record)
         self._journal.append_batch(events)
         return [event.event_id for event in events]
 
@@ -1102,12 +1662,17 @@ class BreakGlassControl:
         *,
         reason_code: str,
         note: str,
+        ownership_observation: tuple[OwnershipRecord | None, int, str | None] | None = None,
     ) -> OperatorCommandOutcome:
         """Record a refused command. A refusal never touches the safety state."""
         epoch = self._effective_epoch(controller, derive_ledger(self._journal))
         correlation_id = command.correlation_id or (
             command.command_id if epoch is None else epoch.session_id
         )
+        if ownership_observation is None:
+            ownership, fence_term, ownership_diagnostic = self._ownership_observation()
+        else:
+            ownership, fence_term, ownership_diagnostic = ownership_observation
         event_ids = self._append_records(
             command,
             controller,
@@ -1120,10 +1685,14 @@ class BreakGlassControl:
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             epoch_opened=False,
             epoch_closed=False,
-            fence_term=self._current_term(),
+            fence_term=fence_term,
             occurred_at=delivered_at,
             transitions=(),
         )
+        notes = [note]
+        if ownership_diagnostic is not None:
+            notes.append(ownership_diagnostic)
+        notes.append("a refused command changes no safety state (fail closed)")
         return OperatorCommandOutcome(
             command_id=command.command_id,
             command_type=command.command_type.value,
@@ -1139,12 +1708,12 @@ class BreakGlassControl:
             reconciliation_status="not_required" if epoch is None else epoch.reconciliation_status,
             reconciliation_result=None if epoch is None else epoch.reconciliation_reason_code,
             operator_acknowledgement_pending=bool(
-                epoch is None or not epoch.acknowledgement_satisfied
+                epoch is not None and not epoch.acknowledgement_satisfied
             ),
-            new_risk_permitted=self._new_risk_permitted(controller, epoch, self._read_ownership()),
-            fence_term=self._current_term(),
+            new_risk_permitted=self._new_risk_permitted(controller, epoch, ownership),
+            fence_term=fence_term,
             journaled_event_ids=tuple(event_ids),
-            notes=(note, "a refused command changes no safety state (fail closed)"),
+            notes=tuple(notes),
             safety_state_source=load.source,
         )
 
@@ -1197,8 +1766,8 @@ class BreakGlassControl:
             reconciliation_required=bool(epoch is not None and epoch.is_open),
             reconciliation_status=prior.reconciliation_status,
             reconciliation_result=None if epoch is None else epoch.reconciliation_reason_code,
-            operator_acknowledgement_pending=(
-                epoch is None or not epoch.acknowledgement_satisfied
+            operator_acknowledgement_pending=bool(
+                epoch is not None and not epoch.acknowledgement_satisfied
             ),
             new_risk_permitted=self._new_risk_permitted(controller, epoch, self._read_ownership()),
             venue_control=prior.venue_control,

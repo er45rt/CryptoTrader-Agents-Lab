@@ -16,9 +16,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from crypto_trader.paper.simulation import ExecutionSimulator, SimulationOutcome
+from crypto_trader.paper.errors import PaperStateError
 
 from ..ports import ExecutionRequest, InstrumentSpec, MarketBookUpdate, MarketTrade
-from .guard import QueueAwareSettings, tested_queue_aware_settings
+from ..errors import QueueAwareConfigurationError
+from .guard import (
+    QueueAwareSettings, require_queue_aware_settings, tested_queue_aware_settings,
+)
 from .runtime import NautilusExecutionRuntime
 
 __all__ = ["NautilusSimulationRunner"]
@@ -33,6 +37,54 @@ class NautilusSimulationRunner:
     trades: Sequence[MarketTrade] = ()
     queue_aware: bool = True
     queue_settings: QueueAwareSettings = field(default_factory=tested_queue_aware_settings)
+    _cash_settings: object | None = field(default=None, init=False, repr=False)
+    _cash_end: object | None = field(default=None, init=False, repr=False)
+
+    def configure_frozen(self, bundle):
+        from decimal import Decimal
+        from crypto_trader.execution import BookLevel
+        from crypto_trader.paper.config import SpotCashSettings
+        from crypto_trader.paper.decisions import FrozenRunInputs
+        if type(bundle) is not FrozenRunInputs or getattr(self, "_temporal_runtime", None) is not None:
+            raise PaperStateError("invalid frozen simulator configuration.")
+        doc = bundle.document()
+        self.instrument = InstrumentSpec(**doc["instrument"])
+        self.book_updates = tuple(MarketBookUpdate(
+            levels=tuple(BookLevel(**{k: Decimal(v) if k in {"price", "size"} else v for k, v in level.items()})
+                         for level in row["levels"]), ts_ns=row["ts_ns"],
+            sequence=row["sequence"], action=row["action"]) for row in doc["book_updates"])
+        self.trades = tuple(MarketTrade(**{k: Decimal(v) if k in {"price", "size"} else v for k, v in row.items()}) for row in doc["trades"])
+        self._cash_settings = SpotCashSettings(**{k: Decimal(v) if k != "random_seed" else v for k, v in doc["cash"].items()})
+        self.queue_aware, self.queue_settings = True, tested_queue_aware_settings()
+        self._cash_end = None
+
+    def cash_end_evidence(self):
+        if self._cash_end is None or getattr(self, "_temporal_runtime", None) is not None:
+            raise PaperStateError("native cash completion evidence is unavailable.")
+        return self._cash_end
+
+    def current_cash_reading(self, *, boundary_ns):
+        from uuid import uuid4
+        from crypto_trader.paper.accounting import CurrentCashReading
+        runtime = getattr(self, "_temporal_runtime", None)
+        if (runtime is None or self._cash_settings is None or type(boundary_ns) is not int
+                or boundary_ns <= 0 or boundary_ns != self._temporal_boundary
+                or runtime.engine_version() != "1.231.0"):
+            raise PaperStateError("current native cash boundary/version is unavailable or stale.")
+        observations = tuple(runtime.observations())
+        native = runtime.cash_end_evidence()  # reads this LIVE runtime, not _cash_end
+        if observations != tuple(runtime.observations()):
+            raise PaperStateError("native cash changed during the current read.")
+        latest = {item.intent_id: item.state for item in observations}
+        reflected = frozenset(identity for identity, state in latest.items()
+                              if state is not None and state.value in {"accepted", "partially_filled"})
+        if not hasattr(self, "_cash_runtime_id"):
+            self._cash_runtime_id = uuid4()
+        self._cash_read_sequence = getattr(self, "_cash_read_sequence", 0) + 1
+        reading = CurrentCashReading(boundary_ns, self._cash_runtime_id, self._cash_read_sequence,
+                                     native, reflected)
+        self._last_cash_reading, self._cash_observations = reading, observations
+        return reading
 
     def __post_init__(self) -> None:
         if isinstance(self, ExecutionSimulator):  # structural conformance, checked eagerly
@@ -63,3 +115,125 @@ class NautilusSimulationRunner:
             book_type=self.queue_settings.book_type if self.queue_aware else None,
             queue_aware=self.queue_aware,
         )
+
+
+    # Temporal mode is private to the offline Paper/Nautilus bridge. The existing
+    # simulate() batch entry point remains intact for Phase-4 callers.
+    def start_temporal(self) -> None:
+        if getattr(self, "_temporal_runtime", None) is not None:
+            raise RuntimeError("temporal simulation is already started.")
+        if self.queue_aware is not True:
+            raise QueueAwareConfigurationError("temporal Paper requires queue-aware simulation.")
+        require_queue_aware_settings(self.queue_settings)
+        runtime = NautilusExecutionRuntime(
+            self.instrument,
+            queue_aware=self.queue_aware,
+            queue_settings=self.queue_settings,
+            cash_settings=self._cash_settings,
+        )
+        runtime.start()
+        try:
+            runtime.enable_temporal()
+            if self.book_updates or self.trades:
+                runtime.feed_market_data(book_updates=self.book_updates, trades=self.trades)
+        except Exception:
+            runtime.stop()
+            raise
+        self._temporal_runtime = runtime
+        self._temporal_timeline = sorted(
+            {item.ts_ns for item in self.book_updates}
+            | {item.ts_ns for item in self.trades}
+        )
+        self._temporal_cursor = 0
+        self._temporal_boundary = 0
+        from uuid import uuid4
+        self._cash_runtime_id, self._cash_read_sequence = uuid4(), 0
+        self._last_cash_reading = None
+
+    def _temporal_snapshot(self) -> SimulationOutcome:
+        runtime = getattr(self, "_temporal_runtime", None)
+        if runtime is None:
+            raise RuntimeError("temporal simulation has not started.")
+        return SimulationOutcome(
+            observations=tuple(runtime.observations()),
+            phase3_events=tuple(runtime.phase3_events()),
+            engine_version=runtime.engine_version(),
+            book_type=self.queue_settings.book_type if self.queue_aware else None,
+            queue_aware=self.queue_aware,
+        )
+
+    def advance_until(self, timestamp_ns: int) -> SimulationOutcome:
+        if type(timestamp_ns) is not int or timestamp_ns <= 0:
+            raise ValueError("temporal boundary must be positive integer nanoseconds.")
+        runtime = getattr(self, "_temporal_runtime", None)
+        if runtime is None or timestamp_ns < self._temporal_boundary:
+            raise RuntimeError("temporal replay cannot move backwards or start implicitly.")
+        # Commit the requested logical time only after successful advancement.
+        next_cursor = self._temporal_cursor
+        while (
+            next_cursor < len(self._temporal_timeline)
+            and self._temporal_timeline[next_cursor] <= timestamp_ns
+        ):
+            next_cursor += 1
+        if next_cursor > self._temporal_cursor:
+            # All tied market events were loaded into the SAME engine ahead of time.
+            # Integer nanosecond 'end' is exclusive; use the last whole tie group +1.
+            runtime.run_until(end_ns=self._temporal_timeline[next_cursor - 1] + 1)
+            self._temporal_cursor = next_cursor
+        # Streaming cannot certify delayed timer processing past the last market tick.
+        covered = next_cursor > 0 and self._temporal_timeline[next_cursor - 1] == timestamp_ns
+        if not covered and runtime.has_unsettled_orders():
+            raise RuntimeError(
+                "unverified latency/timer state: no market event covers the decision boundary."
+            )
+        self._temporal_boundary = timestamp_ns
+        return self._temporal_snapshot()
+
+    def submit_temporal(self, request: ExecutionRequest, *, decided_ns: int, cash_reading=None) -> None:
+        runtime = getattr(self, "_temporal_runtime", None)
+        if runtime is None or type(decided_ns) is not int or decided_ns != self._temporal_boundary:
+            raise RuntimeError("timed submission must follow an advance to decision completion.")
+        if self._cash_settings is not None:
+            if (cash_reading is None or self._last_cash_reading is not cash_reading
+                    or cash_reading.boundary_ns != decided_ns
+                    or self._cash_runtime_id != cash_reading.runtime_id
+                    or tuple(runtime.observations()) != self._cash_observations
+                    or runtime.cash_end_evidence() != cash_reading.native):
+                raise PaperStateError("current native cash proof changed before submission.")
+            self._last_cash_reading = None  # consumed even if submission result is uncertain
+        runtime.submit_timed(request, decided_ns=decided_ns)
+
+    def market_horizon_ns(self) -> int:
+        """Last timestamp supported by the immutable simulated market-data tape."""
+        return max(self._temporal_timeline, default=0)
+
+    def finish_temporal(self) -> SimulationOutcome:
+        runtime = getattr(self, "_temporal_runtime", None)
+        if runtime is None:
+            raise RuntimeError("temporal replay already completed or not started.")
+        try:
+            if self._temporal_cursor < len(self._temporal_timeline):
+                runtime.run_until(end_ns=self._temporal_timeline[-1] + 1)
+                self._temporal_cursor = len(self._temporal_timeline)
+            if runtime.has_queued_orders():
+                raise PaperStateError(
+                    "temporal simulation ended with unsubmitted queued intents: "
+                    "no later market event can certify submission."
+                )
+            if self._temporal_timeline:
+                runtime.end_temporal()
+            if self._cash_settings is not None:
+                self._cash_end = runtime.cash_end_evidence()
+            return self._temporal_snapshot()
+        finally:
+            runtime.stop()
+            self._temporal_runtime = None
+
+    def abort_temporal(self) -> None:
+        """Dispose an aborted offline replay without processing pending market events."""
+        runtime = getattr(self, "_temporal_runtime", None)
+        if runtime is not None:
+            try:
+                runtime.stop()
+            finally:
+                self._temporal_runtime = None

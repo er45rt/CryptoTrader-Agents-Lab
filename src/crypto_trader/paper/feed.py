@@ -43,11 +43,15 @@ class MarketObservation:
     def __post_init__(self) -> None:
         if not self.market_reference:
             raise PaperConfigError("a market observation requires a market reference.")
-        if not isinstance(self.price, Decimal) or self.price <= 0:
+        if not isinstance(self.price, Decimal) or not self.price.is_finite() or self.price <= 0:
             raise PaperConfigError("a market observation requires a positive Decimal price.")
         if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
             raise PaperConfigError("a market observation requires a timezone-aware timestamp.")
-        if self.volume is not None and (not isinstance(self.volume, Decimal) or self.volume < 0):
+        if self.volume is not None and (
+            not isinstance(self.volume, Decimal)
+            or not self.volume.is_finite()
+            or self.volume < 0
+        ):
             raise PaperConfigError("volume must be a non-negative Decimal when present.")
 
     def normalized_at(self) -> datetime:
@@ -74,10 +78,14 @@ class FrozenMarketDataFeed:
         if not self.feed_id:
             raise PaperConfigError("a frozen feed requires a feed_id.")
         previous: datetime | None = None
+        references: set[str] = set()
         for entry in self.entries:
             current = entry.normalized_at()
             if previous is not None and current < previous:
                 raise PaperConfigError("frozen feed observations must be in timestamp order.")
+            if entry.market_reference in references:
+                raise PaperConfigError("frozen feed has a duplicate market reference.")
+            references.add(entry.market_reference)
             previous = current
 
     def observations(self) -> Sequence[MarketObservation]:
@@ -120,12 +128,23 @@ class PublicMarketDataFeed:
 
     def pull(self, *, after: datetime | None = None) -> int:
         """Pull the next public batch and return how many observations were appended."""
-        batch = self.fetch_batch(self.symbol, after)
+        batch = tuple(self.fetch_batch(self.symbol, after))
+        # Validate the entire batch before advancing the cursor. A rejected
+        # overlap may never partially mutate the replay tape.
+        previous = self._buffer[-1].normalized_at() if self._buffer else None
+        references = {item.market_reference for item in self._buffer}
         for entry in batch:
             if entry.symbol != self.symbol:
                 raise PaperConfigError(
                     f"public feed returned {entry.symbol!r} while tracking {self.symbol!r}."
                 )
+            current = entry.normalized_at()
+            if previous is not None and current <= previous:
+                raise PaperConfigError("public feed contains overlapping or out-of-order timestamps.")
+            if entry.market_reference in references:
+                raise PaperConfigError("public feed contains a duplicate market reference.")
+            references.add(entry.market_reference)
+            previous = current
         self._buffer.extend(batch)
         self._cursor += len(batch)
         return len(batch)

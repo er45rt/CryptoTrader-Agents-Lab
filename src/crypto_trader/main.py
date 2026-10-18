@@ -1,4 +1,5 @@
 # src/crypto_trader/main.py
+import sys
 import os
 import logging
 import argparse
@@ -6,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 from crypto_trader.crew import CryptoTraderCrew
+from crypto_trader.input_security import require_https_base_url, valid_market_symbol
 from datetime import datetime
 
 # Configure logging
@@ -48,13 +50,12 @@ def setup_environment() -> bool:
     # The market-data layer uses the official Binance public REST API and needs
     # no API key. We only sanity-check an operator-supplied base URL override.
     binance_base_url = (os.getenv("BINANCE_API_BASE_URL") or "").strip()
-    if binance_base_url and not binance_base_url.startswith(("https://", "http://")):
-        logger.error(
-            "BINANCE_API_BASE_URL must start with http:// or https:// (got %r). "
-            "Unset it to use the default official endpoint.",
-            binance_base_url,
-        )
-        return False
+    if binance_base_url:
+        try:
+            require_https_base_url(binance_base_url)
+        except ValueError:
+            logger.error("BINANCE_API_BASE_URL must be a valid HTTPS endpoint (no credentials).")
+            return False
 
     if not os.getenv("SERPER_API_KEY"):
         logger.warning("SERPER_API_KEY not found. The NewsAndSentimentResearcherAgent might not function correctly.")
@@ -71,9 +72,9 @@ def validate_inputs(config: Dict[str, Any]) -> bool:
     Returns:
         bool: True if inputs are valid, False otherwise
     """
-    # Validate symbol format (basic check)
-    if not isinstance(config['target_symbol'], str) or len(config['target_symbol']) < 5:
-        logger.error(f"Invalid cryptocurrency symbol: {config['target_symbol']}")
+    # Exact uppercase ASCII symbol; reject control chars, path characters and Unicode lookalikes.
+    if not valid_market_symbol(config.get('target_symbol')):
+        logger.error("Invalid cryptocurrency symbol: must match ^[A-Z0-9]{5,20}$")
         return False
     
     # Validate kline interval format
@@ -218,11 +219,11 @@ def run():
     
     # Setup environment
     if not setup_environment():
-        return
+        sys.exit(1)
     
     # Validate inputs
     if not validate_inputs(config):
-        return
+        sys.exit(1)
     
     # Prepare output directory
     output_dir = prepare_output_directory(config)
@@ -234,11 +235,12 @@ def run():
     result = run_crew(inputs, output_dir)
     
     # Display summary of results
-    if result:
-        logger.info("Trading plan generation completed successfully.")
-        # Optional: Add a summary of the trading plan here if needed
-    else:
+    if result is None:
         logger.error("Failed to generate trading plan.")
+        sys.exit(1)
+
+    logger.info("Trading plan generation completed successfully.")
+    # Optional: Add a summary of the trading plan here if needed
 
 if __name__ == "__main__":
     run()

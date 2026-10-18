@@ -8,7 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from crypto_trader.mainnet import (
+from crypto_trader.mainnet.faults import (
     IMMEDIATE_REJECTION_FAULTS,
     POST_SEND_AMBIGUITY_FAULTS,
     DryRunError,

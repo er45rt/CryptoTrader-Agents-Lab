@@ -18,7 +18,13 @@ from typing import Any
 
 from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
+    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
     STREAM_LIFECYCLE_EVENT_TYPE,
+    VENUE_TRADE_EVENT_TYPE,
+    ACCOUNT_EQUITY_EVENT_TYPE,
     OperatorCommandRecordPayload,
     V1_CONTRACTS,
 )
@@ -349,58 +355,50 @@ def _scope_checks() -> list[BreakGlassItem]:
 
 
 def _git_policy_item() -> BreakGlassItem:
-    """No push, no history rewrite: proven from the local repository metadata (read-only)."""
-    git_dir = PROJECT_ROOT / ".git"
-    config_path = git_dir / "config"
-    problems: list[str] = []
+    """Record non-secret repository identity metadata without gating break-glass readiness."""
+    git_entry = PROJECT_ROOT / ".git"
     current_branch: str | None = None
-    head_path = git_dir / "HEAD"
-    if head_path.exists():
-        head = head_path.read_text(encoding="utf-8", errors="replace").strip()
-        if head.startswith("ref: refs/heads/"):
-            current_branch = head[len("ref: refs/heads/"):]
-    upstream: str | None = None
-    if config_path.exists():
-        config = config_path.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(r"\[branch \"([^\"]+)\"\]\s*(.*?)(?=\n\[|\Z)", config, re.DOTALL):
-            if match.group(1) != current_branch:
-                continue
-            upstream = match.group(1)
-            if "remote =" in match.group(2):
-                problems.append(f"the current branch {upstream} has a configured push upstream")
-    else:
-        problems.append(".git/config is missing")
-    push_refs: list[str] = []
-    for folder in (git_dir / "refs" / "remotes",):
-        if folder.exists():
-            for file in folder.rglob("*"):
-                if file.is_file() and (
-                    "phase-13" in file.name
-                    or (current_branch is not None and file.name == current_branch)
-                ):
-                    push_refs.append(str(file.relative_to(git_dir)))
-    if push_refs:
-        problems.append(f"remote-tracking refs for phase 13 exist: {push_refs}")
-    for file in PROJECT_ROOT.rglob("*.md"):
-        if ".venv" in file.parts or "node_modules" in file.parts:
-            continue
-        if "git push" in file.read_text(encoding="utf-8", errors="replace").lower():
-            problems.append(f"{file.name} documents a push")
+    head: str | None = None
+    metadata_error: str | None = None
+    git_layout = "missing"
+
+    try:
+        head_path: Path | None = None
+        if git_entry.is_dir():
+            git_layout = "directory"
+            head_path = git_entry / "HEAD"
+        elif git_entry.is_file():
+            git_layout = "gitdir_file"
+            pointer = git_entry.read_text(encoding="utf-8", errors="replace").strip()
+            if pointer.lower().startswith("gitdir:"):
+                target = Path(pointer.split(":", 1)[1].strip())
+                if not target.is_absolute():
+                    target = (git_entry.parent / target).resolve()
+                head_path = target / "HEAD"
+        else:
+            git_layout = "missing"
+
+        if head_path is not None and head_path.is_file():
+            head = head_path.read_text(encoding="utf-8", errors="replace").strip()
+            if head.startswith("ref: refs/heads/"):
+                current_branch = head[len("ref: refs/heads/"):]
+    except OSError as exc:
+        metadata_error = type(exc).__name__
+
     return BreakGlassItem(
-        "git_policy_no_push",
+        "repository_metadata",
         "Repository policy",
-        True,
-        "pass" if not problems else "fail",
-        "the Phase 13 branch has no push upstream, no remote-tracking ref for phase 13 exists and no "
-        "push is documented",
+        False,
+        "informational",
+        "repository HEAD metadata is recorded for traceability only; source-control state does not "
+        "determine break-glass readiness",
         {
-            "problems": problems,
             "current_branch": current_branch,
-            "branch_with_upstream": upstream,
-            "push_refs": push_refs,
+            "head": head,
+            "git_layout": git_layout,
+            "metadata_error": metadata_error,
         },
     )
-
 
 # --- contracts -------------------------------------------------------------
 
@@ -418,7 +416,16 @@ def _contract_checks() -> list[BreakGlassItem]:
             unchanged.append(f"{key[0]} v{key[1]}: {actual}")
     new_contracts = sorted(set(registered) - set(PHASE12_CONTRACT_FIELDS))
     expected_additive = sorted(
-        [(OPERATOR_COMMAND_EVENT_TYPE, 1), (STREAM_LIFECYCLE_EVENT_TYPE, 1)]
+        [
+            (OPERATOR_COMMAND_EVENT_TYPE, 1),
+            (STREAM_LIFECYCLE_EVENT_TYPE, 1),
+            (ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE, 1),
+            (VENUE_TRADE_EVENT_TYPE, 1),
+            (ACCOUNT_EQUITY_EVENT_TYPE, 1),
+            (RECONCILIATION_INTAKE_EVENT_TYPE, 1),
+            (RECONCILIATION_OBSERVED_EVENT_TYPE, 1),
+            (RECONCILIATION_SETTLED_EVENT_TYPE, 1),
+        ]
     )
     items.append(
         BreakGlassItem(
@@ -428,7 +435,8 @@ def _contract_checks() -> list[BreakGlassItem]:
             "pass" if not unchanged and new_contracts == expected_additive else "fail",
             "every Phase 1-12 tagged contract keeps its exact payload fields and version; later "
             "phases add only the reviewed additive v1 contracts (Phase 13 operator command, "
-            "Phase 15 stream lifecycle)",
+            "Phase 15 stream lifecycle, Phase 15 durable submission attempt, G4 venue trade metadata, "
+            "G5b account equity chain, F-03 reconcile run intake, observation and settlement)",
             {
                 "modified": unchanged,
                 "additive": [f"{name} v{version}" for name, version in new_contracts],

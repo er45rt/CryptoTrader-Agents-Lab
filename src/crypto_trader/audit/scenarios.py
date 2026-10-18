@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from crypto_trader.events import (
     EventRegistry,
+    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
     StrategyDecisionPayload,
     StrategyDecisionRecorded,
     UnsupportedSchemaVersionError,
@@ -31,6 +32,8 @@ from crypto_trader.execution import (
     ExecutionOrderType,
     ExecutionRequest,
     ExecutionSide,
+    ExecutionTimeInForce,
+    InstrumentSpec,
 )
 from crypto_trader.execution.binance_testnet import (
     AmbiguousOrderError,
@@ -386,21 +389,45 @@ def scenario_unknown_order_result(workspace: Path) -> ScenarioResult:
 
 # --- 8. cancel failure -----------------------------------------------------
 
+def _audit_runtime_instrument() -> InstrumentSpec:
+    """The execution instrument the audit scenarios drive through the production runtime."""
+    return InstrumentSpec(
+        symbol=txf.SYMBOL, base_currency="BTC", starting_balance="100000 USDT"
+    )
+
+
+def _audit_execution_request(intent_id) -> ExecutionRequest:
+    """The order the audit scenarios submit, identical to the previous fixture request."""
+    return ExecutionRequest.create(
+        correlation_id=uuid4(),
+        symbol=txf.SYMBOL,
+        side=ExecutionSide.BUY,
+        order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal("0.00100000"),
+        limit_price=Decimal("27000.00"),
+        time_in_force=ExecutionTimeInForce.GTC,
+        intent_id=intent_id,
+    )
+
+
 def scenario_cancel_failure(workspace: Path) -> ScenarioResult:
     """A cancel that cannot be confirmed must stay ambiguous, never be retried blindly."""
-    del workspace
     from crypto_trader.execution.binance_testnet import (
         BinanceSpotTestnetClient,
         TestnetClock,
+        TestnetOrderRuntime,
         WithdrawalPolicy,
     )
 
+    workspace.mkdir(parents=True, exist_ok=True)
+    intent_id = uuid4()
+    client_order_id = f"ct-{intent_id.hex[:20]}"
     transport = ScriptedTransport(
         responses=[
             txf.time_response(),
             txf.exchange_info_response(),
             txf.account_response(),
-            txf.order_response("ct-cancel", status="NEW"),
+            txf.order_response(client_order_id, status="NEW"),
             TransportTimeout("cancel response lost"),
         ]
     )
@@ -411,25 +438,45 @@ def scenario_cancel_failure(workspace: Path) -> ScenarioResult:
         symbol=txf.SYMBOL,
         withdrawal_policy=WithdrawalPolicy.RECORD_ONLY,
     )
-    client.verify_environment()
-    client.place_order(txf.limit_order_request("ct-cancel"))
+    # Stage 2: the fresh order is created through the production runtime path (prepare -> durable
+    # attempt marker -> one send) with a temporary journal inside the scenario workspace. The
+    # audit never authorizes a prepared order or calls the client's write boundary directly.
+    with SQLiteEventJournal(workspace / "cancel_failure_journal.db", venue_writes=True) as journal:
+        runtime = TestnetOrderRuntime(
+            client=client, instrument=_audit_runtime_instrument(), journal=journal
+        )
+        runtime.start()
+        runtime.submit(_audit_execution_request(intent_id))
+        markers = [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+        ]
+        attempt_marker_present = (
+            len(markers) == 1 and markers[0].payload.venue_reference == client_order_id
+        )
     ambiguous = False
     try:
-        client.cancel_order(txf.SYMBOL, "ct-cancel")
+        client.cancel_order(txf.SYMBOL, client_order_id)
     except AmbiguousOrderError:
         ambiguous = True
     deletes = [item for item in transport.requests if item.method == "DELETE"]
-    if ambiguous and len(deletes) == 1:
+    posts = [item for item in transport.requests if item.method == "POST"]
+    if ambiguous and len(deletes) == 1 and attempt_marker_present and len(posts) == 1:
         return _ok(
             "cancel_failure",
             "Cancel failure",
-            "an unconfirmable cancel raised AmbiguousOrderError and was sent exactly once",
+            "the order was created through the runtime (durable attempt marker, one POST) and the "
+            "unconfirmable cancel raised AmbiguousOrderError and was sent exactly once",
             delete_requests=len(deletes),
+            posts=len(posts),
+            attempt_marker=attempt_marker_present,
         )
     return _fail(
         "cancel_failure",
         "Cancel failure",
-        f"unexpected cancel behaviour: ambiguous={ambiguous} deletes={len(deletes)}",
+        f"unexpected cancel behaviour: ambiguous={ambiguous} deletes={len(deletes)} "
+        f"posts={len(posts)} attempt_marker={attempt_marker_present}",
     )
 
 
@@ -437,16 +484,23 @@ def scenario_cancel_failure(workspace: Path) -> ScenarioResult:
 
 def scenario_network_interruption(workspace: Path) -> ScenarioResult:
     """A network interruption on a WRITE must never be retried; on a READ it may retry."""
-    del workspace
     from crypto_trader.execution.binance_testnet import (
         BinanceSpotTestnetClient,
         TestnetClock,
+        TestnetOrderRuntime,
         TransportError,
         WithdrawalPolicy,
     )
 
+    workspace.mkdir(parents=True, exist_ok=True)
+    intent_id = uuid4()
     write_transport = ScriptedTransport(
-        responses=[txf.exchange_info_response(), TransportTimeout("link down")]
+        responses=[
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            TransportTimeout("link down"),
+        ]
     )
     write_client = BinanceSpotTestnetClient(
         credentials=txf.credentials(),
@@ -455,12 +509,21 @@ def scenario_network_interruption(workspace: Path) -> ScenarioResult:
         symbol=txf.SYMBOL,
         withdrawal_policy=WithdrawalPolicy.RECORD_ONLY,
     )
-    write_client.clock.synchronize(txf.SERVER_TIME_MS)
     write_ambiguous = False
-    try:
-        write_client.place_order(txf.limit_order_request("ct-net"))
-    except AmbiguousOrderError:
-        write_ambiguous = True
+    # Stage 2: the interrupted write traverses the SAME runtime -> client -> transport.send path.
+    with SQLiteEventJournal(workspace / "network_interruption_journal.db", venue_writes=True) as journal:
+        write_runtime = TestnetOrderRuntime(
+            client=write_client, instrument=_audit_runtime_instrument(), journal=journal
+        )
+        write_runtime.start()
+        try:
+            write_runtime.submit(_audit_execution_request(intent_id))
+        except AmbiguousOrderError:
+            write_ambiguous = True
+        attempt_marker_present = any(
+            event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+            for event in journal.read_range()
+        )
     write_posts = [item for item in write_transport.requests if item.method == "POST"]
 
     read_transport = ScriptedTransport(
@@ -474,13 +537,20 @@ def scenario_network_interruption(workspace: Path) -> ScenarioResult:
         withdrawal_policy=WithdrawalPolicy.RECORD_ONLY,
     )
     price = read_client.price()
-    if write_ambiguous and len(write_posts) == 1 and price == Decimal("27000.00"):
+    if (
+        write_ambiguous
+        and len(write_posts) == 1
+        and attempt_marker_present
+        and price == Decimal("27000.00")
+    ):
         return _ok(
             "network_interruption",
             "Network interruption simulation",
-            "write interruption was ambiguous and sent once; read interruption retried and recovered",
+            "write interruption was ambiguous, sent once and left a durable attempt marker; read "
+            "interruption retried and recovered",
             write_posts=len(write_posts),
             read_attempts=len(read_transport.requests),
+            attempt_marker=attempt_marker_present,
         )
     return _fail(
         "network_interruption",

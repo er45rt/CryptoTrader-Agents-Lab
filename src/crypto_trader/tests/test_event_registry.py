@@ -19,6 +19,8 @@ from crypto_trader.events import (
     RiskDecisionRecorded,
     StrategyDecisionRecorded,
     TradeIntentCreated,
+    VenueTradeRecorded,
+    AccountEquityRecorded,
     UnknownEventTypeError,
     UnsupportedSchemaVersionError,
     V1_CONTRACTS,
@@ -51,6 +53,8 @@ def test_default_registry_registers_every_v1_contract():
         "risk.decision.recorded",
         "order.state.changed",
         "execution.fill.recorded",
+        "venue.trade.recorded",
+        "account.equity.recorded",
         "recovery.state.changed",
         # Phase 6 additive contract (existing schemas unchanged).
         "validity.disposition.recorded",
@@ -61,11 +65,22 @@ def test_default_registry_registers_every_v1_contract():
         # Phase 13 additive contract (existing schemas unchanged).
         "safety.operator_command.recorded",
         # Phase 15 additive contract (existing schemas unchanged).
+        "order.submission.attempted",
         "stream.lifecycle.recorded",
+        # Review F-03 additive contracts (existing schemas unchanged).
+        "breakglass.reconciliation.intake",
+        "breakglass.reconciliation.observed",
+        "breakglass.reconciliation.settled",
     }
     assert registry.registered_pairs() == tuple(sorted(registry.registered_pairs()))
     for contract in V1_CONTRACTS:
-        assert registry.supported_versions(contract.model_fields["event_type"].default) == (1,)
+        event_type = contract.model_fields["event_type"].default
+        expected = (1,)
+        if event_type == "risk.evaluation.recorded":
+            expected = (1, 2)
+        elif event_type == "safety.operator_command.recorded":
+            expected = (1, 2, 3)  # V3 adds unconfirmed cancel references (review N-05)
+        assert registry.supported_versions(event_type) == expected
 
 
 def test_valid_registration_and_explicit_lookup():
@@ -126,6 +141,8 @@ def test_register_model_requires_declared_defaults():
         ("risk_decision", RiskDecisionRecorded),
         ("order_state_changed", OrderStateChanged),
         ("partial_fill", ExecutionFillRecorded),
+        ("venue_trade_recorded", VenueTradeRecorded),
+        ("account_equity_recorded", AccountEquityRecorded),
         ("recovery_state_changed", RecoveryStateChanged),
     ],
 )

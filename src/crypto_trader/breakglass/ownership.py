@@ -22,6 +22,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import sqlite3
+import threading
+from contextlib import contextmanager
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,16 +36,108 @@ from uuid import UUID, uuid4
 from .errors import BreakGlassConfigError, OwnershipStateError, StaleWriterFenceError
 
 __all__ = [
+    "OWNERSHIP_IDENTITY_SCHEMA_VERSION",
     "OWNERSHIP_SCHEMA_VERSION",
     "OwnerKind",
     "OwnershipRecord",
     "OwnershipStore",
     "WriterFence",
     "WriterGuard",
+    "journal_binding_mismatch",
+    "journal_identity_mismatch",
+    "journal_realpath",
 ]
 
 #: Schema version of the persisted ownership record (not of any event).
 OWNERSHIP_SCHEMA_VERSION = 1
+#: Schema of a record bound to a journal identity (journal_id). Builds before identities refuse it,
+#: so they can never read such a lease and rewrite it without its journal_id.
+OWNERSHIP_IDENTITY_SCHEMA_VERSION = 2
+
+# One local lock per canonical store path, plus a SQLite writer lock for other processes.
+# The lock database contains no trading data. It must stay beside the ownership record.
+_LOCKS_GUARD = threading.Lock()
+_LOCKS: dict[str, threading.RLock] = {}
+_HELD_LOCKS = threading.local()
+_LOCK_TIMEOUT_SECONDS = 10.0
+
+
+def _optional_path(value: Any) -> str | None:
+    """A persisted journal binding is absent or a non-empty string; anything else fails closed."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("a journal binding must be a non-empty string")
+    return value
+
+
+def _optional_journal_id(value: Any) -> UUID | None:
+    """A persisted journal identity is absent or a UUID string; anything else fails closed."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("a journal identity must be a UUID string")
+    return UUID(value)
+
+
+def journal_realpath(path: str) -> str:
+    """The resolved real path that identifies one journal file (links and junctions followed)."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def journal_binding_mismatch(record: "OwnershipRecord | None", journal_path: str | None) -> str | None:
+    """Why ``journal_path`` is not the journal this lease is bound to; None when it is or unbound.
+
+    The bound journal is the same file (real path) under the same spelling (abspath): a writer and
+    its readers share -wal/-shm through that spelling, so another alias of the file is refused too.
+    """
+    if record is None or record.journal_realpath is None or journal_path is None:
+        return None
+    actual = journal_realpath(journal_path)
+    if os.path.normcase(actual) != os.path.normcase(record.journal_realpath):
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path} (real path "
+            f"{record.journal_realpath}), but {journal_path} resolves to {actual}; refusing to "
+            "pair a journal with another system's ownership state."
+        )
+    spelled = os.path.normcase(os.path.abspath(journal_path))
+    if record.journal_path is not None and spelled != os.path.normcase(record.journal_path):
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path}, but "
+            f"{journal_path} is another spelling of that file; refusing to switch the journal "
+            "path a writer and its readers share (-wal/-shm) while the lease is bound to it."
+        )
+    return None
+
+
+def journal_identity_mismatch(
+    record: "OwnershipRecord | None", journal_path: str | None, journal_id: UUID | None
+) -> str | None:
+    """Why the journal open at ``journal_path`` is not the one this lease is bound to; else None.
+
+    A real path names whatever file is there now (another journal moved onto it, or one founded
+    anew there), so a lease that recorded its journal's identity requires the open connection to
+    report that same identity. Identities are minted only at founding and never backfilled, so a
+    lease bound without one accepts only a journal without one (judged by its path alone).
+    """
+    if record is None or record.journal_realpath is None or journal_path is None:
+        return None
+    if record.journal_id is None:
+        if journal_id is None:
+            return None
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path} without a "
+            f"journal_id, but the journal open at {journal_path} has journal_id {journal_id}; "
+            "refusing to pair a journal with another system's ownership state."
+        )
+    if journal_id != record.journal_id:
+        found = "no journal_id" if journal_id is None else f"journal_id {journal_id}"
+        return (
+            f"the trading-state lease is bound to journal {record.journal_path} (journal_id "
+            f"{record.journal_id}), but the journal open at {journal_path} has {found}; refusing "
+            "to pair a journal with another system's ownership state."
+        )
+    return None
 
 
 class OwnerKind(str, Enum):
@@ -86,9 +181,15 @@ class OwnershipRecord:
     reason_code: str
     session_id: UUID
     schema_version: int = OWNERSHIP_SCHEMA_VERSION
+    #: The exact path the lease owner writes its journal at (readers open the same path, so they
+    #: share its -wal/-shm), and that file's real path when the lease was taken (its identity).
+    journal_path: str | None = None
+    journal_realpath: str | None = None
+    #: The bound journal's identity (its journal_id), when the journal recorded one.
+    journal_id: UUID | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != OWNERSHIP_SCHEMA_VERSION:
+        if self.schema_version not in (OWNERSHIP_SCHEMA_VERSION, OWNERSHIP_IDENTITY_SCHEMA_VERSION):
             raise OwnershipStateError(
                 f"unsupported ownership schema {self.schema_version}; refusing to guess."
             )
@@ -102,6 +203,29 @@ class OwnershipRecord:
             raise OwnershipStateError("an ownership record requires a reason code.")
         if self.acquired_at.tzinfo is None or self.acquired_at.utcoffset() is None:
             raise OwnershipStateError("acquired_at must be timezone-aware.")
+        if (self.journal_path is None) != (self.journal_realpath is None):
+            raise OwnershipStateError(
+                "the ownership record is partially bound to a journal (journal_path and "
+                "journal_realpath must be recorded together); refusing to guess its binding."
+            )
+        if self.journal_id is not None and not isinstance(self.journal_id, UUID):
+            raise OwnershipStateError("an ownership record's journal_id must be a UUID.")
+        if self.journal_id is not None and self.journal_path is None:
+            raise OwnershipStateError(
+                "the ownership record is partially bound to a journal (a journal_id needs its "
+                "journal_path and journal_realpath); refusing to guess its binding."
+            )
+        if self.journal_id is not None and self.schema_version != OWNERSHIP_IDENTITY_SCHEMA_VERSION:
+            raise OwnershipStateError(
+                f"ownership schema {self.schema_version} never carries a journal_id (a lease bound "
+                f"to a journal identity is schema {OWNERSHIP_IDENTITY_SCHEMA_VERSION}); refusing to "
+                "guess its binding."
+            )
+        if self.journal_id is None and self.schema_version == OWNERSHIP_IDENTITY_SCHEMA_VERSION:
+            raise OwnershipStateError(
+                f"ownership schema {OWNERSHIP_IDENTITY_SCHEMA_VERSION} requires a journal_id; "
+                "refusing to guess its binding."
+            )
 
     @property
     def fence(self) -> WriterFence:
@@ -118,6 +242,9 @@ class OwnershipRecord:
             "previous_owner_id": self.previous_owner_id,
             "reason_code": self.reason_code,
             "session_id": str(self.session_id),
+            **({} if self.journal_path is None else {"journal_path": self.journal_path}),
+            **({} if self.journal_realpath is None else {"journal_realpath": self.journal_realpath}),
+            **({} if self.journal_id is None else {"journal_id": str(self.journal_id)}),
         }
 
     @classmethod
@@ -138,6 +265,9 @@ class OwnershipRecord:
                 ),
                 reason_code=str(payload["reason_code"]),
                 session_id=UUID(str(payload["session_id"])),
+                journal_path=_optional_path(payload.get("journal_path")),
+                journal_realpath=_optional_path(payload.get("journal_realpath")),
+                journal_id=_optional_journal_id(payload.get("journal_id")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise OwnershipStateError(f"the ownership record is not usable: {exc}") from exc
@@ -158,10 +288,71 @@ class OwnershipStore:
     def path(self) -> Path:
         return self._path
 
+    @contextmanager
+    def exclusive(self, *, purpose: str = "control"):
+        """Serialize ownership/control changes with final authorization through submission.
+
+        OS-backed SQLite locking covers independent processes; RLock covers separate store
+        instances in one process. Lock failures refuse the operation. A takeover cannot re-enter
+        a submission callback. Emergency control waits for an already-admitted send to finish;
+        once takeover completes, no older writer can begin a send.
+        """
+        record_path = self._path.resolve()
+        lock_path = record_path.with_name(record_path.name + ".lock.db")
+        key = os.path.normcase(str(lock_path))
+        with _LOCKS_GUARD:
+            local_lock = _LOCKS.setdefault(key, threading.RLock())
+        if not local_lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
+            raise OwnershipStateError("ownership operation lock timed out; refusing mutation")
+        connection = None
+        active = getattr(_HELD_LOCKS, "active", None)
+        if active is None:
+            active = _HELD_LOCKS.active = {}
+        try:
+            if key in active:
+                if active[key] == "submission" or purpose == "submission":
+                    raise OwnershipStateError("ownership mutation cannot re-enter a submission")
+                yield
+                return
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(str(lock_path), timeout=_LOCK_TIMEOUT_SECONDS)
+                connection.execute("BEGIN IMMEDIATE")
+            except (OSError, sqlite3.Error) as exc:
+                raise OwnershipStateError("ownership operation lock unavailable; refusing mutation") from exc
+            active[key] = purpose
+            try:
+                yield
+            finally:
+                del active[key]
+        finally:
+            try:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            finally:
+                local_lock.release()
+
     # --- reads ---
 
     def read(self) -> OwnershipRecord | None:
         """Return the current record, ``None`` when absent, or fail closed when unusable."""
+        return self._load()
+
+    def journal_binding_error(self, journal_path: str | None, journal_id: UUID | None) -> str | None:
+        """Why the journal open at ``journal_path`` (reporting ``journal_id``) is not this lease's.
+
+        An unreadable lease raises OwnershipStateError: its binding cannot be judged, so the caller
+        refuses before any side effect instead of proceeding as if the lease were unbound.
+        """
+        record = self._load()
+        return journal_binding_mismatch(record, journal_path) or journal_identity_mismatch(
+            record, journal_path, journal_id
+        )
+
+    def _load(self) -> OwnershipRecord | None:
         if not self._path.exists():
             return None
         try:
@@ -221,32 +412,58 @@ class OwnershipStore:
         acquired_at: datetime,
         reason_code: str,
         session_id: UUID | None = None,
+        journal_path: str | None = None,
+        journal_id: UUID | None = None,
     ) -> OwnershipRecord:
         """Explicitly take the lease over and mint a NEW, higher fencing term.
 
         Every token minted before this call becomes stale, which is exactly how the normal writer is
-        prevented from trading concurrently with emergency control.
+        prevented from trading concurrently with emergency control. ``journal_id`` is the identity
+        the writer's open journal connection reports for ``journal_path``.
         """
-        if owner_kind not in (OwnerKind.NORMAL, OwnerKind.EMERGENCY):
-            raise OwnershipStateError("takeover requires an OwnerKind.")
-        if not isinstance(owner_id, str) or not owner_id.strip():
-            raise OwnershipStateError("takeover requires a non-empty owner id.")
-        if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
-            raise OwnershipStateError("acquired_at must be timezone-aware.")
-        previous = self.read()
-        previous_owner = None if previous is None else previous.owner_id
-        term = 1 if previous is None else previous.term + 1
-        record = OwnershipRecord(
-            term=term,
-            owner_id=owner_id,
-            owner_kind=owner_kind,
-            acquired_at=acquired_at.astimezone(timezone.utc),
-            previous_owner_id=previous_owner,
-            reason_code=reason_code,
-            session_id=uuid4() if session_id is None else session_id,
-        )
-        self._write(record)
-        return record
+        with self.exclusive(purpose="takeover"):
+            if owner_kind not in (OwnerKind.NORMAL, OwnerKind.EMERGENCY):
+                raise OwnershipStateError("takeover requires an OwnerKind.")
+            if not isinstance(owner_id, str) or not owner_id.strip():
+                raise OwnershipStateError("takeover requires a non-empty owner id.")
+            if acquired_at.tzinfo is None or acquired_at.utcoffset() is None:
+                raise OwnershipStateError("acquired_at must be timezone-aware.")
+            previous = self.read()
+            mismatch = journal_binding_mismatch(previous, journal_path) or journal_identity_mismatch(
+                previous, journal_path, journal_id
+            )
+            if mismatch is not None:
+                raise OwnershipStateError(mismatch)
+            previous_owner = None if previous is None else previous.owner_id
+            if journal_path is None and previous is not None:
+                # Carry the binding forward: a takeover never silently unbinds the state dir.
+                bound_path, bound_real = previous.journal_path, previous.journal_realpath
+                bound_id = previous.journal_id
+            elif journal_path is None:
+                bound_path = bound_real = bound_id = None
+            else:
+                bound_path, bound_real = os.path.abspath(journal_path), journal_realpath(journal_path)
+                # Checked above: the recorded identity, none for a lease bound without one, or the
+                # identity a new binding records first. A takeover never upgrades a bound lease.
+                bound_id = journal_id
+            term = 1 if previous is None else previous.term + 1
+            record = OwnershipRecord(
+                schema_version=(
+                    OWNERSHIP_SCHEMA_VERSION if bound_id is None else OWNERSHIP_IDENTITY_SCHEMA_VERSION
+                ),
+                term=term,
+                owner_id=owner_id,
+                owner_kind=owner_kind,
+                acquired_at=acquired_at.astimezone(timezone.utc),
+                previous_owner_id=previous_owner,
+                reason_code=reason_code,
+                session_id=uuid4() if session_id is None else session_id,
+                journal_path=bound_path,
+                journal_realpath=bound_real,
+                journal_id=bound_id,
+            )
+            self._write(record)
+            return record
 
     def _write(self, record: OwnershipRecord) -> None:
         payload = json.dumps(record.to_record(), indent=2, sort_keys=True)

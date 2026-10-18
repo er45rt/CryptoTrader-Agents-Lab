@@ -40,6 +40,10 @@ from .errors import (
     ProductionStateError,
 )
 from .fence import FenceCheck, ProductionFence
+from .equity import EquityChainState, load_equity_chain
+from .risk_state import ProductionRiskStateSource, derive_risk_state
+from .admission import ProductionAdmissionController
+from .backfill import TradeBackfillMaintenanceWriter, TradeBackfillWriteReport
 from .runtime import (
     PRODUCTION_PRODUCER,
     IntentPreparation,
@@ -58,15 +62,18 @@ __all__ = [
     "PRODUCTION_PRODUCER",
     "EnvironmentDecision",
     "EnvironmentEndpointMismatchError",
+    "EquityChainState",
     "FenceCheck",
     "IntentPreparation",
     "MainnetDisabledError",
+    "ProductionAdmissionController",
     "ProductionConfigError",
     "ProductionExecutionOutcome",
     "ProductionFence",
     "ProductionFenceError",
     "ProductionIntent",
     "ProductionRecoveryRequiredError",
+    "ProductionRiskStateSource",
     "ProductionRuntime",
     "ProductionRuntimeError",
     "ProductionSafetyBlockedError",
@@ -74,9 +81,13 @@ __all__ = [
     "ProductionStartupReport",
     "ProductionStateError",
     "ProductionSubmitResult",
+    "TradeBackfillMaintenanceWriter",
+    "TradeBackfillWriteReport",
     "TradingEnvironment",
     "assert_endpoint_matches_environment",
+    "derive_risk_state",
     "endpoint_for",
+    "load_equity_chain",
     "parse_environment",
     "production_control",
     "resolve_environment",

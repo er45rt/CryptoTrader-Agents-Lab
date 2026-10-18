@@ -9,9 +9,10 @@ credentials, endpoints and permission profile stay strictly separate.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+import time
 from typing import Any
 
 from crypto_trader.execution.binance_testnet import (
@@ -57,6 +58,7 @@ class MainnetReadOnlyClient:
     base_url: str = SPOT_MAINNET_REST_BASE
     symbol: str = "BTCUSDT"
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    sleep: Callable[[float], None] = time.sleep
     _request_log: list[str] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
@@ -197,6 +199,7 @@ class MainnetReadOnlyClient:
             except (TransportTimeout, TransportError):
                 if attempt >= self.retry.max_attempts:
                     raise
+                self.sleep(self.retry.delay_for_attempt(attempt))
                 continue
             if response.status_code == 200:
                 return response.body

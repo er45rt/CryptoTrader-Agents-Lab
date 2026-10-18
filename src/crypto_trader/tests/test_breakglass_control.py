@@ -14,7 +14,12 @@ from crypto_trader.breakglass import (
     OwnerKind,
     parse_operator_command,
 )
-from crypto_trader.events import OPERATOR_COMMAND_EVENT_TYPE, SAFETY_EVENT_TYPE
+from crypto_trader.events import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    SAFETY_EVENT_TYPE,
+    OperatorCommandRecordPayload,
+    OperatorCommandRecorded,
+)
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.risk import HardRiskEngine, RiskRequest, RiskStateSnapshot, Side, load_limits
@@ -83,13 +88,130 @@ def test_halt_engages_the_kill_switch_and_refuses_new_risk(control):
 
 
 def test_reduce_only_is_a_policy_mode_and_never_invents_an_exchange_flag(control):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    before = control.ownership_store.require_fence()
+
     outcome = control.handle(command("reduce_only"))
     status = control.status()
+    after = control.ownership_store.require_fence()
 
     assert outcome.resulting_safety_state == "reduce_only"
     assert status.new_risk_permitted is False
     assert status.kill_switch_engaged is False
+    assert status.epoch_open is False
+    assert status.operator_acknowledgement_pending is False
     assert outcome.safety_transitions == ("normal->reduce_only",)
+    assert outcome.reconciliation_required is False
+    assert outcome.reconciliation_status == "not_required"
+    assert outcome.operator_acknowledgement_pending is False
+    assert outcome.emergency_owner is None
+    assert after == before
+    assert after.owner_kind is OwnerKind.NORMAL
+
+
+def test_restore_normal_from_reduce_only_is_operator_audited_without_takeover(control):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    before = control.ownership_store.require_fence()
+    reduced = control.handle(command("reduce_only", seed="reduce-direct"))
+    assert reduced.accepted
+    assert control.status().epoch_open is False
+
+    restored = control.handle(command("restore_normal", seed="restore-direct"))
+    after = control.ownership_store.require_fence()
+
+    assert restored.accepted
+    assert restored.reason_code == "normal_restored_by_operator"
+    assert restored.previous_safety_state == "reduce_only"
+    assert restored.resulting_safety_state == "normal"
+    assert restored.reconciliation_required is False
+    assert restored.reconciliation_status == "not_required"
+    assert restored.operator_acknowledgement_pending is False
+    assert restored.epoch_closed is False
+    assert restored.emergency_owner is None
+    assert after == before
+    assert control.status().safety_mode == "normal"
+    assert control.status().epoch_open is False
+
+
+def test_restore_normal_from_reduce_only_fails_closed_when_ownership_is_unreadable(
+    control, journal, tmp_path
+):
+    # Review N-01: an unreadable lease cannot vouch for this journal, so the restore is refused
+    # before anything is written (it used to journal a rejection beside the unusable lease).
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("reduce_only", seed="reduce-corrupt-owner")).accepted
+    ownership_path = tmp_path / "state" / "ownership.json"
+    ownership_path.write_text("{not-json", encoding="utf-8")
+    before = journal.revision()
+
+    with pytest.raises(OwnershipStateError, match="the ownership record could not be read"):
+        control.handle(command("restore_normal", seed="restore-corrupt-owner"))
+
+    assert journal.revision() == before
+    assert ownership_path.read_text(encoding="utf-8") == "{not-json"
+    assert control.load_safety_state().controller.mode.value == "reduce_only"
+
+
+def test_reduce_only_then_halt_escalates_to_emergency_takeover(control):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    before = control.ownership_store.require_fence()
+
+    reduced = control.handle(command("reduce_only", seed="reduce-before-halt"))
+    after_reduce = control.ownership_store.require_fence()
+    halted = control.handle(command("halt_new_risk", seed="halt-after-reduce"))
+    after_halt = control.ownership_store.require_fence()
+
+    assert reduced.accepted
+    assert after_reduce == before
+    assert control.status().epoch_open is True
+    assert halted.accepted
+    assert halted.resulting_safety_state == "halt_new_risk"
+    assert after_halt.owner_kind is OwnerKind.EMERGENCY
+    assert after_halt.term == before.term + 1
+
+
+def test_legacy_reduce_only_epoch_replays_as_open_recovery_obligation(control, journal):
+    legacy = command("reduce_only", seed="legacy-reduce-only-epoch")
+    journal.append(
+        OperatorCommandRecorded(
+            event_id=uuid5(NAMESPACE, "legacy-reduce-only-record"),
+            occurred_at=BASE,
+            correlation_id=legacy.command_id,
+            causation_id=legacy.causation_id,
+            producer="application.breakglass",
+            sequence_number=100,
+            payload=OperatorCommandRecordPayload(
+                command_id=legacy.command_id,
+                command_type="reduce_only",
+                requested_at=legacy.requested_at,
+                operator_label=legacy.operator_label,
+                operator_identity=legacy.operator_identity,
+                reason=legacy.reason,
+                source=legacy.source,
+                previous_safety_state="normal",
+                resulting_safety_state="reduce_only",
+                disposition="accepted",
+                reason_code="operator_reduce_only",
+                command_digest=legacy.digest,
+                mode_path=("normal", "reduce_only"),
+                venue_control="not_requested",
+                reconciliation_status="pending",
+                epoch_opened=True,
+                epoch_closed=False,
+                fence_term=2,
+            ),
+        )
+    )
+
+    epoch = control.load_ledger().epoch
+
+    assert epoch is not None
+    assert epoch.is_open is True
+    assert epoch.current_mode == "reduce_only"
+    assert epoch.reconciliation_status == "pending"
+    assert epoch.fence_term == 2
 
 
 def test_break_glass_actions_never_downgrade_the_safety_ladder(control):
@@ -168,6 +290,7 @@ def test_lifecycle_commands_without_an_epoch_are_refused_and_change_nothing(cont
         outcome = control.handle(command(command_type, seed=f"no-epoch-{command_type}"))
         assert outcome.disposition == "rejected"
         assert outcome.reason_code == "no_break_glass_epoch_open"
+        assert outcome.operator_acknowledgement_pending is False
     assert control.status().safety_mode == "normal"
     assert control.status().epoch_open is False
 
@@ -197,6 +320,29 @@ def test_repeated_delivery_of_a_command_id_produces_one_logical_effect(control, 
     assert len(command_events) == 1
     assert len(safety_events) == 1
     assert control.status().safety_mode == "halt_new_risk"
+
+
+def test_duplicate_reduce_only_without_epoch_does_not_report_ack_pending(control):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    command_id = str(uuid5(NAMESPACE, "duplicate-reduce-only"))
+    first = control.handle(
+        command("reduce_only", seed="duplicate-reduce-only", command_id=command_id)
+    )
+    second = control.handle(
+        command(
+            "reduce_only",
+            seed="duplicate-reduce-only",
+            command_id=command_id,
+            requested_at=BASE + timedelta(minutes=1),
+        )
+    )
+
+    assert first.accepted
+    assert first.operator_acknowledgement_pending is False
+    assert second.duplicate
+    assert second.accepted
+    assert second.operator_acknowledgement_pending is False
+    assert control.status().operator_acknowledgement_pending is False
 
 
 def test_reusing_a_command_id_for_a_different_command_is_refused(control, journal):
@@ -355,8 +501,13 @@ def test_outcome_records_are_structured_secret_free_audit_evidence(control, comm
     assert record["command_id"] == str(outcome.command_id)
     assert record["disposition"] in {"accepted", "rejected"}
     assert record["safety_transitions"]
-    assert record["reconciliation"]["required"] is True
-    assert record["operator_acknowledgement_pending"] is True
+    if command_type == "reduce_only":
+        assert record["reconciliation"]["required"] is False
+        assert record["reconciliation"]["status"] == "not_required"
+        assert record["operator_acknowledgement_pending"] is False
+    else:
+        assert record["reconciliation"]["required"] is True
+        assert record["operator_acknowledgement_pending"] is True
     assert record["new_risk_permitted"] is False
     assert record["venue_control"]["disposition"] in {
         "not_requested",
@@ -376,3 +527,123 @@ def test_status_is_read_only(control, journal):
     control.load_ledger()
     control.load_epoch()
     assert journal.count() == before
+
+
+def test_rejected_command_reports_absent_ownership_diagnostic(control, journal):
+    outcome = control.handle(command("restore_normal", seed="ownership-absent-diagnostic"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+    ][-1]
+
+    assert outcome.disposition == "rejected"
+    assert outcome.fence_term == 0
+    assert recorded.payload.fence_term == 0
+    assert any("ownership absent" in note for note in outcome.notes)
+
+
+def _install_counted_ownership_read(control, monkeypatch, *, fail_after_first=False):
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
+    original = control.ownership_store.read
+    calls = []
+
+    def read():
+        calls.append(len(calls) + 1)
+        if fail_after_first and len(calls) > 1:
+            raise OwnershipStateError("forced second ownership read failure")
+        return original()
+
+    monkeypatch.setattr(control.ownership_store, "read", read)
+    return calls
+
+
+def test_reduce_only_uses_one_ownership_observation(control, monkeypatch):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    calls = _install_counted_ownership_read(control, monkeypatch)
+
+    outcome = control.handle(command("reduce_only", seed="single-read-reduce-only"))
+
+    assert outcome.accepted
+    assert calls == [1]
+
+
+def test_restore_from_reduce_only_uses_one_ownership_observation(control, monkeypatch):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("reduce_only", seed="single-read-restore-setup")).accepted
+    calls = _install_counted_ownership_read(control, monkeypatch)
+
+    outcome = control.handle(command("restore_normal", seed="single-read-restore"))
+
+    assert outcome.accepted
+    assert calls == [1]
+
+
+def test_reconcile_uses_one_ownership_observation_for_journal_and_outcome(
+    control, journal, monkeypatch
+):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("halt_new_risk", seed="single-read-reconcile-setup")).accepted
+    expected = control.ownership_store.read()
+    calls = _install_counted_ownership_read(control, monkeypatch, fail_after_first=True)
+
+    outcome = control.handle(command("reconcile", seed="single-read-reconcile"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+        and event.payload.command_id == outcome.command_id
+    ][-1]
+
+    assert calls == [1]
+    assert outcome.fence_term == expected.term
+    assert recorded.payload.fence_term == expected.term
+
+
+def test_acknowledge_uses_one_ownership_observation_for_journal_and_outcome(
+    control, journal, monkeypatch
+):
+    control.claim_normal_writer(owner_id="normal:runtime")
+    assert control.handle(command("halt_new_risk", seed="single-read-ack-setup")).accepted
+    assert control.handle(command("reconcile", seed="single-read-ack-reconcile")).accepted
+    expected = control.ownership_store.read()
+    calls = _install_counted_ownership_read(control, monkeypatch, fail_after_first=True)
+
+    outcome = control.handle(command("acknowledge", seed="single-read-ack"))
+    recorded = [
+        event for event in journal.read_range()
+        if event.event_type == OPERATOR_COMMAND_EVENT_TYPE
+        and event.payload.command_id == outcome.command_id
+    ][-1]
+
+    assert calls == [1]
+    assert outcome.fence_term == expected.term
+    assert recorded.payload.fence_term == expected.term
+
+
+def test_rejected_command_reports_unreadable_ownership_once(control, monkeypatch):
+    from crypto_trader.breakglass.errors import OwnershipStateError
+
+    calls = []
+
+    def unreadable():
+        calls.append(1)
+        raise OwnershipStateError("forced unreadable ownership")
+
+    monkeypatch.setattr(control.ownership_store, "read", unreadable)
+    outcome = control.handle(command("restore_normal", seed="ownership-unreadable-diagnostic"))
+
+    assert calls == [1]
+    assert outcome.fence_term == 0
+    assert any("ownership unreadable" in note for note in outcome.notes)
+
+
+def test_duplicate_preserves_historical_zero_fence_term_after_owner_appears(control):
+    original = command("restore_normal", seed="historical-zero-duplicate")
+    first = control.handle(original)
+    assert first.fence_term == 0
+
+    control.claim_normal_writer(owner_id="normal:runtime")
+    duplicate = control.handle(original)
+
+    assert duplicate.duplicate
+    assert duplicate.fence_term == 0

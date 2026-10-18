@@ -266,3 +266,18 @@ def test_market_observation_validation():
             local_ingest_ts=BASE,
             market_reference="obs-1",
         )
+
+def test_a_future_market_event_ts_is_rejected_as_stale_not_accepted():
+    """A market_event_ts ahead of `now` (clock skew or a bad producer) fails closed."""
+    future_request = request(market_offset_s=5.0, completed_offset_s=5.0)
+
+    decision = gate().evaluate(
+        future_request,
+        market_state=LiveMarketStateProvider(lambda symbol: None),
+        now=BASE,
+    )
+
+    assert decision.disposition is Disposition.STALE
+    assert decision.reason_code == "market_event_ts_in_future"
+    assert decision.decision_age_seconds < 0
+

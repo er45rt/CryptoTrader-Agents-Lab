@@ -18,6 +18,7 @@ from crypto_trader.breakglass import (
     parse_operator_command,
 )
 from crypto_trader.execution import (
+    ExecutionCapability,
     ExecutionObservation,
     ExecutionOrderType,
     ExecutionRequest,
@@ -27,8 +28,15 @@ from crypto_trader.execution import (
     InstrumentSpec,
 )
 from crypto_trader.execution.binance_testnet import BinanceSpotTestnetClient, TestnetOrderRuntime
+from crypto_trader.events import AccountEquityRecorded, AccountEquityRecordPayload
 from crypto_trader.persistence import EventJournal
-from crypto_trader.production import ProductionIntent, ProductionRuntime
+from crypto_trader.production import (
+    ProductionAdmissionController,
+    ProductionIntent,
+    ProductionRiskStateSource,
+    ProductionRuntime,
+    ProductionStateError,
+)
 from crypto_trader.recovery import ReconciliationPolicy, load_policy as load_recovery_policy
 from crypto_trader.risk import (
     PendingIntentRegistry,
@@ -215,6 +223,9 @@ def persist_safety_state(
 class RecordingExecutionPort:
     """Deterministic engine-independent execution port double (records, never networks)."""
 
+    #: Explicit Stage-3 capability: this double never writes to an external venue.
+    capability = ExecutionCapability.NON_WRITING
+
     def __init__(self, instrument: InstrumentSpec) -> None:
         self._instrument = instrument
         self._state = ExecutionRuntimeState.STOPPED
@@ -267,8 +278,9 @@ def build_runtime(
     venue_sources=(),
     pending: PendingIntentRegistry | None = None,
     when: datetime = BASE,
+    bind_admission: bool = False,
 ) -> ProductionRuntime:
-    return ProductionRuntime(
+    runtime = ProductionRuntime(
         journal=journal,
         state_dir=state_dir,
         instrument=INSTRUMENT,
@@ -287,6 +299,56 @@ def build_runtime(
         clock=clock(when),
         pending=pending,
     )
+    if bind_admission:
+        bind_test_admission(runtime, when=when)
+    return runtime
+
+
+def bind_test_admission(
+    runtime: ProductionRuntime,
+    *,
+    when: datetime = BASE,
+) -> ProductionAdmissionController:
+    """Bind the real admission capability for tests that exercise venue-writing internals."""
+    return ProductionAdmissionController(
+        runtime=runtime,
+        max_size=8,
+        max_per_strategy_queued=2,
+        max_retired=32,
+        max_per_strategy_retired=8,
+        max_rejection_strategies=8,
+        clock=clock(when),
+    )
+
+
+def _bound_admission_token(runtime: ProductionRuntime) -> object:
+    token = runtime._admission_token
+    if token is None:
+        raise ProductionStateError("test runtime has no bound production admission controller.")
+    return token
+
+
+def admitted_prepare(runtime: ProductionRuntime, intent_obj: ProductionIntent, **kwargs):
+    return runtime.prepare_intent(
+        intent_obj,
+        _admission_token=_bound_admission_token(runtime),
+        **kwargs,
+    )
+
+
+def admitted_submit(runtime: ProductionRuntime, preparation):
+    return runtime.submit_prepared(
+        preparation,
+        _admission_token=_bound_admission_token(runtime),
+    )
+
+
+def admitted_execute(runtime: ProductionRuntime, intent_obj: ProductionIntent, **kwargs):
+    return runtime.execute_intent(
+        intent_obj,
+        _admission_token=_bound_admission_token(runtime),
+        **kwargs,
+    )
 
 
 def testnet_runtime(
@@ -299,10 +361,101 @@ def testnet_runtime(
 ) -> tuple[ProductionRuntime, TestnetOrderRuntime]:
     """Wire the production runtime to the real Phase 11 Spot Testnet adapter (scripted transport)."""
     port = TestnetOrderRuntime(client=client, instrument=instrument, journal=journal)
+    active_control = control or control_for(journal, state_dir)
+    risk_source = canonical_test_risk_source(
+        journal=journal, control=active_control, client=client
+    )
     runtime = build_runtime(
         journal=journal,
         state_dir=state_dir,
         execution=port,
-        control=control,
+        control=active_control,
+        risk_state_source=risk_source,
+        bind_admission=True,
     )
     return runtime, port
+
+
+def startup_responses(*, can_withdraw=False, can_trade=True):
+    """Offline G6 collection (time/openOrders), then execution environment checks."""
+    from crypto_trader.tests import testnet_fixtures as fx
+    return [fx.time_response(), fx.open_orders_response(), *fx.environment_responses(
+        can_withdraw=can_withdraw, can_trade=can_trade,
+    )]
+
+
+def seed_canonical_equity_root(
+    journal: EventJournal,
+    *,
+    occurred_at: datetime | None = None,
+    base_balance: Decimal = Decimal("0"),
+    quote_balance: Decimal = Decimal("100000"),
+    mark_price: Decimal = PRICE,
+) -> UUID:
+    """Seed a deterministic synthetic equity root for tests not exercising the maintenance writer."""
+    root_time = occurred_at or datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    event_id = uuid5(NAMESPACE, f"canonical-equity-root:{root_time.isoformat()}")
+    equity = quote_balance + base_balance * mark_price
+    journal.append(
+        AccountEquityRecorded(
+            event_id=event_id,
+            occurred_at=root_time,
+            correlation_id=uuid5(NAMESPACE, f"canonical-equity-corr:{root_time.isoformat()}"),
+            producer="application.production.equity",
+            symbol=INSTRUMENT.symbol,
+            payload=AccountEquityRecordPayload(
+                kind="baseline",
+                environment="binance-spot-testnet",
+                venue_account_id="123456789",
+                base_asset=INSTRUMENT.base_currency,
+                quote_asset=INSTRUMENT.quote_currency,
+                base_balance=base_balance,
+                quote_balance=quote_balance,
+                mark_price=mark_price,
+                mark_reference="synthetic-test-baseline",
+                mark_event_ts=root_time,
+                equity_quote=equity,
+                peak_equity_quote=equity,
+                baseline_event_id=event_id,
+                previous_event_id=None,
+                fence_term=1,
+                reason="synthetic canonical test root",
+            ),
+        )
+    )
+    return event_id
+
+
+def canonical_test_risk_source(
+    *,
+    journal: EventJournal,
+    control: BreakGlassControl,
+    client: BinanceSpotTestnetClient,
+) -> ProductionRiskStateSource:
+    return ProductionRiskStateSource(
+        journal=journal,
+        control=control,
+        client=client,
+        instrument=INSTRUMENT,
+        environment="binance-spot-testnet",
+        venue_account_id="123456789",
+        max_account_age_seconds=5,
+        max_mark_age_seconds=5,
+    )
+
+
+def canonical_risk_refresh_responses():
+    """Strict read-only venue evidence consumed by one ProductionRiskStateSource evaluation."""
+    from crypto_trader.tests import testnet_fixtures as fx
+    account = fx.account_response()
+    for balance in account.body["balances"]:
+        if balance["asset"] == INSTRUMENT.base_currency:
+            balance["free"] = "0"
+            balance["locked"] = "0"
+    return [
+        fx.time_response(fx.SERVER_TIME_MS + 1),
+        fx.open_orders_response(),
+        account,
+        fx.price_response(str(PRICE)),
+        fx.open_orders_response(),
+    ]

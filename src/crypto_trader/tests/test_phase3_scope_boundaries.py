@@ -255,11 +255,15 @@ def test_agent_definitions_and_prompts_are_unchanged():
     assert not any("llm" in config for config in agents.values())
 
 
-def test_no_new_tools_were_added():
+def test_only_authorized_public_tools_and_derivatives_contract_exist():
     tools_dir = PACKAGE_DIR / "tools"
     tool_modules = {path.name for path in tools_dir.glob("*.py")}
 
-    assert tool_modules == {"__init__.py", "binance_public_tool.py"}
+    assert tool_modules == {
+        "__init__.py", "binance_public_tool.py",
+        "binance_futures_public_tool.py", "derivatives_schema.py",
+        "safe_scrape_tool.py",
+    }
 
 
 def test_events_layer_does_not_import_llm_or_agent_internals():

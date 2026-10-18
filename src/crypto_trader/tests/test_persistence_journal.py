@@ -20,6 +20,7 @@ from crypto_trader.events import (
 from crypto_trader.persistence import (
     JOURNAL_SCHEMA_VERSION,
     EventIdConflictError,
+    JournalRevisionMismatchError,
     JournalSchemaError,
     SQLiteEventJournal,
 )
@@ -59,12 +60,90 @@ def journal(tmp_path: Path):
 
 # --- basics ---
 
+def test_r03_full_foundation_header_and_schema_roll_back_together(tmp_path, monkeypatch):
+    path = tmp_path / "interrupted-genesis.db"
+    connect = sqlite3.connect
+
+    class InterruptedFoundation(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("PRAGMA application_id="):
+                assert self.in_transaction
+                assert super().execute("PRAGMA synchronous").fetchone()[0] == 2
+                raise RuntimeError("offline interrupted founding transaction")
+            return result
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(
+            *args, **kwargs, factory=InterruptedFoundation,
+        ))
+        with pytest.raises(RuntimeError, match="interrupted founding"):
+            SQLiteEventJournal(path, venue_writes=True)
+    with connect(path) as reader:
+        assert reader.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert reader.execute("SELECT name FROM sqlite_schema").fetchall() == []
+    with pytest.raises(JournalSchemaError, match="retrospective"):
+        SQLiteEventJournal(path, venue_writes=True)
+
+
 def test_append_and_read_back_round_trip(journal):
     event = decision()
 
     assert journal.append(event) is True
     assert journal.count() == 1
     assert journal.read_by_id(event.event_id) == event
+
+
+def test_r03_full_foundation_active_connection_and_header(tmp_path, record_property):
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    with _r03_journal(tmp_path / "full.db") as journal:
+        synchronous = journal._conn.execute("PRAGMA synchronous").fetchone()[0]
+        application = journal._conn.execute("PRAGMA application_id").fetchone()[0]
+        record_property("synchronous", synchronous)
+        record_property("application_id", application)
+        assert journal.journal_mode().lower() == "wal"
+        assert synchronous == 2
+        assert application == 0x43544647
+        assert journal._conn.execute("PRAGMA user_version").fetchone()[0] == 0
+        journal.append(decision())
+
+
+def test_full_founding_mints_one_journal_id_that_every_open_reads_back(tmp_path):
+    # Review F-02: the identity is minted in the founding transaction, never on a later open.
+    path = tmp_path / "full.db"
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        minted = journal.journal_id()
+    assert isinstance(minted, UUID)
+    with SQLiteEventJournal(path, venue_writes=True, must_exist=True) as journal:
+        assert journal.journal_id() == minted
+    with SQLiteEventJournal(path, read_only=True) as journal:
+        assert journal.journal_id() == minted
+    with SQLiteEventJournal(tmp_path / "other.db", venue_writes=True) as journal:
+        assert journal.journal_id() != minted
+    with SQLiteEventJournal(tmp_path / "plain.db") as journal:
+        assert journal.journal_id() is None
+    with sqlite3.connect(path) as raw:
+        raw.execute("UPDATE journal_meta SET value = 'not-a-uuid' WHERE key = 'journal_id'")
+    raw.close()
+    with SQLiteEventJournal(path, read_only=True) as journal:
+        with pytest.raises(JournalSchemaError, match="journal identity is malformed"):
+            journal.journal_id()
+
+
+def test_r03_refuse_full_stamp_on_populated_legacy_journal(tmp_path):
+    from crypto_trader.tests.test_testnet_durable_submission import _r03_journal
+    path = tmp_path / "legacy.db"
+    original = decision()
+    with SQLiteEventJournal(path) as journal:
+        journal.append(original)
+    with pytest.raises(JournalSchemaError):
+        with _r03_journal(path):
+            pass
+    with SQLiteEventJournal(path) as journal:
+        assert journal.read_by_id(original.event_id) == original
+        assert journal.count() == 1
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert journal._conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
 
 def test_duplicate_append_is_idempotent(journal):
@@ -120,6 +199,517 @@ def test_batch_with_conflict_writes_nothing(journal):
 
     assert journal.count() == 1, "a conflicting batch must not partially apply"
     assert journal.read_by_id(fresh_one.event_id) is None
+
+
+@pytest.mark.parametrize("method", ["batch", "conditional", "conditional_all_new"])
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("reverse_conflict", [False, True])
+def test_f5_intra_batch_conflicting_event_id_writes_nothing(
+    journal, method, seeded, reverse_conflict, record_property,
+):
+    prior = decision(-1)
+    if seeded:
+        journal.append(prior)
+    before = journal.revision()
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="conflicting intra-batch content",
+        ),
+    })
+    pair = [original, conflicting]
+    if reverse_conflict:
+        pair.reverse()
+    fresh_one, fresh_two = decision(1), decision(2)
+    events = [fresh_one, *pair, fresh_two]
+
+    error = None
+    try:
+        if method == "batch":
+            journal.append_batch(events)
+        else:
+            journal.append_batch_if_revision(
+                events, expected=before, require_all_new=method == "conditional_all_new",
+            )
+    except Exception as exc:
+        error = exc
+
+    after = journal.revision()
+    newly_persisted = [
+        str(event.event_id) for event in (fresh_one, original, fresh_two)
+        if journal.read_by_id(event.event_id) is not None
+    ]
+    observed = {
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "new_events": len(newly_persisted),
+        "revision_unchanged": after == before,
+    }
+    record_property("f5_observed", str(observed))
+    assert type(error) is EventIdConflictError, observed
+    assert error.event_id == original.event_id
+    assert str(error) == (
+        f"event_id {original.event_id} already exists with different content; refusing to overwrite "
+        "an append-only journal entry."
+    )
+    assert after == before
+    assert journal.count() == int(seeded)
+    assert newly_persisted == []
+    assert journal.read_by_id(prior.event_id) == (prior if seeded else None)
+
+
+def test_f5_intra_batch_identical_duplicates_remain_idempotent(journal):
+    first, second = decision(0), decision(1)
+    events = [first, first, second, second]
+
+    assert journal.append_batch(events) == 2
+    before = journal.revision()
+    assert journal.append_batch(events) == 0
+    assert journal.revision() == before
+    assert journal.count() == 2
+    assert journal.read_by_id(first.event_id) == first
+    assert journal.read_by_id(second.event_id) == second
+
+
+@pytest.mark.parametrize("require_all_new", [False, True])
+def test_f5_conditional_identical_intra_batch_duplicates_keep_schema_rejection(
+    journal, require_all_new,
+):
+    event = decision(0)
+    before = journal.revision()
+
+    with pytest.raises(JournalSchemaError) as caught:
+        journal.append_batch_if_revision(
+            [event, event], expected=before, require_all_new=require_all_new,
+        )
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"conditional append batch contains duplicate event_id {event.event_id}."
+    )
+    assert journal.revision() == before
+    assert journal.count() == 0
+
+
+def test_f5_conditional_identical_redelivery_remains_idempotent(journal):
+    event = decision(0)
+    journal.append(event)
+    before = journal.revision()
+
+    result = journal.append_batch_if_revision([event], expected=before)
+
+    assert result.inserted == 0
+    assert result.before == result.after == journal.revision() == before
+    assert journal.read_by_id(event.event_id) == event
+
+
+class _InterleaveBeforeFirstInsert:
+    """Delegating connection: runs ``interleave`` once, just before the first event INSERT."""
+
+    def __init__(self, conn, interleave):
+        self._real = conn
+        self._interleave = interleave
+        self.fired = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def execute(self, sql, *args, **kwargs):
+        if not self.fired and sql.lstrip().startswith("INSERT INTO events"):
+            self.fired = True
+            self._interleave()
+        return self._real.execute(sql, *args, **kwargs)
+
+
+def test_f5_cross_writer_conflict_cannot_slip_between_batch_precheck_and_insert(
+    tmp_path, record_property,
+):
+    path = tmp_path / "writers.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="conflicting cross-writer content",
+        ),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        interleaved = {}
+
+        def other_writer():
+            try:
+                interleaved["result"] = b.append_batch([conflicting])
+            except Exception as exc:
+                interleaved["error"] = exc
+
+        conn = a._conn
+        proxy = _InterleaveBeforeFirstInsert(conn, other_writer)
+        a._conn = proxy
+        try:
+            inserted = a.append_batch([original])
+        finally:
+            a._conn = conn
+
+        stored = a.read_by_id(original.event_id)
+        error = interleaved.get("error")
+        observed = {
+            "interleaved": proxy.fired,
+            "a_inserted": inserted,
+            "stored_rationale": None if stored is None else stored.payload.rationale,
+            "b_result": interleaved.get("result"),
+            "b_error_type": type(error).__name__,
+            "b_error_message": str(error),
+        }
+        record_property("f5_cross_writer_observed", str(observed))
+        assert proxy.fired, observed
+        assert inserted == 1, observed
+        assert stored == original, observed
+        assert "result" not in interleaved, observed
+        assert type(error) is JournalSchemaError, observed
+        assert str(error) == "journal batch failed: database is locked"
+        assert type(error.__cause__) is sqlite3.OperationalError
+        assert not b._conn.in_transaction
+
+        with pytest.raises(EventIdConflictError) as caught:
+            b.append_batch([conflicting])
+        assert caught.value.event_id == original.event_id
+        assert str(caught.value) == (
+            f"event_id {original.event_id} already exists with different content; "
+            "refusing to overwrite an append-only journal entry."
+        )
+        assert b.count() == 1
+        assert b.read_by_id(original.event_id) == original
+
+
+def test_f5_cross_writer_identical_redelivery_remains_idempotent(tmp_path):
+    path = tmp_path / "writers.db"
+    event = decision(0)
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path) as b:
+        assert a.append_batch([event]) == 1
+        before = b.revision()
+
+        assert b.append_batch([event]) == 0
+
+        assert b.revision() == before
+        assert a.count() == b.count() == 1
+        assert b.read_by_id(event.event_id) == event
+
+
+def test_f5_batch_refuses_to_start_inside_an_existing_transaction(journal):
+    event = decision(0)
+    journal._conn.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(JournalSchemaError) as caught:
+            journal.append_batch([event])
+        assert type(caught.value) is JournalSchemaError
+        assert str(caught.value) == "append batch refuses to start inside an existing transaction."
+        assert journal._conn.in_transaction
+    finally:
+        journal._conn.rollback()
+    assert journal.count() == 0
+    assert journal.read_by_id(event.event_id) is None
+
+
+def test_read_only_open_never_creates_a_missing_journal(tmp_path):
+    path = tmp_path / "missing.db"
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"journal {path} is not an existing file; a read-only open never creates it."
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_read_only_open_reads_without_changing_the_journal_file(tmp_path):
+    path = tmp_path / "journal.db"
+    event = decision(0)
+    with SQLiteEventJournal(path) as writer:
+        writer.append(event)
+    founded = path.read_bytes()
+
+    with SQLiteEventJournal(path, read_only=True) as reader:
+        assert reader.count() == 1
+        assert reader.read_by_id(event.event_id) == event
+        assert reader.schema_version() == JOURNAL_SCHEMA_VERSION
+
+    assert path.read_bytes() == founded
+
+
+@pytest.mark.parametrize("method", ["append", "batch", "conditional"])
+def test_read_only_journal_refuses_every_write(tmp_path, method):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+    founded = path.read_bytes()
+    event = decision(0)
+
+    with SQLiteEventJournal(path, read_only=True) as reader:
+        with pytest.raises(JournalSchemaError) as caught:
+            if method == "append":
+                reader.append(event)
+            elif method == "batch":
+                reader.append_batch([event])
+            else:
+                reader.append_batch_if_revision([event], expected=reader.revision())
+        assert not reader._conn.in_transaction
+        assert reader.count() == 0
+
+    prefix = {
+        "append": "journal write failed",
+        "batch": "journal batch failed",
+        "conditional": "conditional journal batch failed",
+    }[method]
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == f"{prefix}: attempt to write a readonly database"
+    assert path.read_bytes() == founded
+
+
+@pytest.mark.parametrize("stored", ["99", None])
+def test_read_only_open_refuses_a_missing_or_unsupported_schema_version(tmp_path, stored):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+    raw = sqlite3.connect(path)
+    with raw:
+        if stored is None:
+            raw.execute("DELETE FROM journal_meta WHERE key = 'schema_version'")
+        else:
+            raw.execute("UPDATE journal_meta SET value = ? WHERE key = 'schema_version'", (stored,))
+    raw.close()
+    founded = path.read_bytes()
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        "read-only journal has no schema version; refusing to open it."
+        if stored is None
+        else f"journal schema version {stored} is not supported by this build "
+        f"(expected {JOURNAL_SCHEMA_VERSION}); refusing to open it."
+    )
+    assert path.read_bytes() == founded
+
+
+def test_read_only_open_refuses_venue_writes(tmp_path):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True, venue_writes=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == "a read-only journal cannot be opened for venue writes."
+
+
+class _InterleaveAfterPrecheck(_InterleaveBeforeFirstInsert):
+    """Runs ``interleave`` once, right after the batch conflict precheck SELECT has executed."""
+
+    def execute(self, sql, *args, **kwargs):
+        result = self._real.execute(sql, *args, **kwargs)
+        if not self.fired and sql.lstrip().startswith("SELECT event_id, payload_sha256 FROM events"):
+            self.fired = True
+            self._interleave()
+        return result
+
+
+def test_f5_cross_writer_is_locked_out_right_after_the_precheck(tmp_path):
+    path = tmp_path / "writers.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(
+            action="sell", confidence="low", rationale="written right after the precheck",
+        ),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        interleaved = {}
+
+        def other_writer():
+            try:
+                interleaved["result"] = b.append_batch([conflicting])
+            except JournalSchemaError as exc:
+                interleaved["error"] = exc
+
+        conn = a._conn
+        proxy = _InterleaveAfterPrecheck(conn, other_writer)
+        a._conn = proxy
+        try:
+            inserted = a.append_batch([original])
+        finally:
+            a._conn = conn
+
+        assert proxy.fired
+        assert (inserted, "result" in interleaved) == (1, False), interleaved
+        assert str(interleaved["error"]) == "journal batch failed: database is locked"
+        assert a.read_by_id(original.event_id) == original
+
+
+def test_f5_conflict_refusal_releases_the_write_lock(tmp_path):
+    path = tmp_path / "journal.db"
+    original = decision(0)
+    conflicting = original.model_copy(update={
+        "payload": StrategyDecisionPayload(action="sell", confidence="low", rationale="conflict"),
+    })
+    with SQLiteEventJournal(path) as a, SQLiteEventJournal(path, timeout_seconds=0.1) as b:
+        a.append(original)
+        with pytest.raises(EventIdConflictError) as caught:
+            a.append_batch([conflicting])
+        assert caught.value.event_id == original.event_id
+        assert not a._conn.in_transaction
+        assert b.append(decision(1)) is True
+
+
+def test_empty_batch_is_a_no_op_without_a_transaction(journal):
+    assert journal.append_batch([]) == 0
+    assert not journal._conn.in_transaction
+    assert journal.count() == 0
+
+
+class _RaiseOnNthInsert:
+    """Delegating connection that raises ``exc`` just before its ``nth`` event INSERT."""
+
+    def __init__(self, conn, nth, exc):
+        self._real, self._nth, self._exc, self._seen = conn, nth, exc, 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.lstrip().startswith("INSERT INTO events"):
+            self._seen += 1
+            if self._seen == self._nth:
+                raise self._exc
+        return self._real.execute(sql, *args, **kwargs)
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("method", ["batch", "conditional"])
+def test_interrupt_mid_batch_rolls_back_and_releases_the_write_lock(tmp_path, method, interrupt):
+    path = tmp_path / "journal.db"
+    first, second, later = decision(0), decision(1), decision(2)
+    with SQLiteEventJournal(path) as journal, SQLiteEventJournal(path, timeout_seconds=0.1) as other:
+        conn = journal._conn
+        journal._conn = _RaiseOnNthInsert(conn, 2, interrupt())
+        try:
+            with pytest.raises(interrupt):
+                if method == "batch":
+                    journal.append_batch([first, second])
+                else:
+                    journal.append_batch_if_revision([first, second], expected=journal.revision())
+        finally:
+            journal._conn = conn
+
+        assert not conn.in_transaction
+        assert other.append(later) is True
+        assert journal.append(decision(3)) is True
+        assert journal.count() == 2
+        assert journal.read_by_id(first.event_id) is None
+        assert journal.read_by_id(second.event_id) is None
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_r03_interrupted_full_foundation_rolls_back_and_releases_the_lock(
+    tmp_path, monkeypatch, interrupt,
+):
+    path = tmp_path / "interrupted-genesis.db"
+    connect = sqlite3.connect
+
+    class InterruptedFoundation(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("PRAGMA application_id="):
+                raise interrupt()
+            return result
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(
+            *args, **kwargs, factory=InterruptedFoundation,
+        ))
+        with pytest.raises(interrupt) as caught:  # keeps the interrupted writer alive
+            SQLiteEventJournal(path, venue_writes=True)
+    with pytest.raises(JournalSchemaError, match="retrospective"):
+        SQLiteEventJournal(path, venue_writes=True, timeout_seconds=0.1)
+    with connect(path) as reader:
+        assert reader.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert reader.execute("SELECT name FROM sqlite_schema").fetchall() == []
+    assert caught.type is interrupt
+
+
+def test_read_only_open_turns_an_os_error_into_a_clean_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "journal.db"
+    with SQLiteEventJournal(path):
+        pass
+
+    def denied(self):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path, read_only=True)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == (
+        f"journal {path} could not be checked read-only: [Errno 13] access denied"
+    )
+    assert type(caught.value.__cause__) is PermissionError
+
+
+def test_read_only_open_sees_a_live_writers_uncheckpointed_events(tmp_path):
+    path = tmp_path / "journal.db"
+    first, second = decision(0), decision(1)
+    with SQLiteEventJournal(path) as writer:
+        writer.append(first)
+        assert Path(f"{path}-wal").stat().st_size > 0
+        with SQLiteEventJournal(path, read_only=True) as reader:
+            assert reader.read_by_id(first.event_id) == first
+            writer.append(second)
+            assert reader.count() == 2
+
+
+def test_read_only_open_through_a_symlink_shares_the_writers_wal(tmp_path):
+    target = tmp_path / "real" / "journal.db"
+    target.parent.mkdir()
+    with SQLiteEventJournal(target):
+        pass
+    link = tmp_path / "link.db"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are not available here: {exc}")
+    event = decision(0)
+    with SQLiteEventJournal(link) as writer:
+        writer.append(event)
+        with SQLiteEventJournal(link, read_only=True) as reader:
+            assert reader.read_by_id(event.event_id) == event
+
+
+def test_writer_open_turns_an_os_error_into_a_clean_refusal(tmp_path, monkeypatch):
+    path = tmp_path / "journal.db"
+
+    def denied(self):
+        raise PermissionError(13, "access denied")
+
+    monkeypatch.setattr(Path, "exists", denied)
+    with pytest.raises(JournalSchemaError) as caught:
+        SQLiteEventJournal(path)
+
+    assert type(caught.value) is JournalSchemaError
+    assert str(caught.value) == f"journal {path} could not be checked: [Errno 13] access denied"
+    assert type(caught.value.__cause__) is PermissionError
 
 
 def test_replay_order_is_deterministic_regardless_of_insertion_order(tmp_path: Path):
@@ -240,3 +830,92 @@ def test_journal_durably_survives_a_fresh_process(tmp_path: Path):
     assert len(events) == 5
     assert [event.occurred_at for event in events] == sorted(event.occurred_at for event in events)
     assert {str(event.correlation_id) for event in events} == {"11111111-1111-4111-8111-111111111111"}
+
+
+def test_journal_revision_tracks_exact_stored_payload_bytes(journal):
+    first = decision(0)
+    journal.append(first)
+
+    revision = journal.revision()
+
+    assert revision.count == 1
+    assert revision.event_ids == (first.event_id,)
+    assert len(revision.entries[0][1]) == 64
+    assert len(revision.fingerprint) == 64
+
+    journal.append(decision(1))
+    assert journal.revision() != revision
+
+
+def test_conditional_append_commits_only_when_revision_matches(journal):
+    first = decision(0)
+    fresh = decision(1)
+    journal.append(first)
+    expected = journal.revision()
+
+    result = journal.append_batch_if_revision([fresh], expected=expected)
+
+    assert result.before == expected
+    assert result.inserted == 1
+    assert result.after == journal.revision()
+    assert result.after.count == 2
+    assert journal.read_by_id(fresh.event_id) == fresh
+
+
+def test_conditional_append_revision_mismatch_writes_nothing(journal):
+    first = decision(0)
+    unrelated = decision(1)
+    planned = decision(2)
+    journal.append(first)
+    stale = journal.revision()
+    journal.append(unrelated)
+    before = journal.revision()
+
+    with pytest.raises(JournalRevisionMismatchError):
+        journal.append_batch_if_revision([planned], expected=stale)
+
+    assert journal.revision() == before
+    assert journal.read_by_id(planned.event_id) is None
+
+
+def test_conditional_append_detects_cross_connection_drift_before_write(tmp_path: Path):
+    path = tmp_path / "conditional-cross-connection.db"
+    planned = decision(2)
+    with SQLiteEventJournal(path) as first:
+        first.append(decision(0))
+        stale = first.revision()
+        with SQLiteEventJournal(path) as second:
+            second.append(decision(1))
+
+        with pytest.raises(JournalRevisionMismatchError):
+            first.append_batch_if_revision([planned], expected=stale)
+
+        assert first.read_by_id(planned.event_id) is None
+        assert first.count() == 2
+
+
+def test_revision_refuses_payload_hash_corruption(journal):
+    event = decision(0)
+    journal.append(event)
+    journal._conn.execute(
+        "UPDATE events SET payload_json = ? WHERE event_id = ?",
+        ('{"corrupt":true}', str(event.event_id)),
+    )
+    journal._conn.commit()
+
+    with pytest.raises(JournalSchemaError, match="payload hash mismatch"):
+        journal.revision()
+
+
+def test_conditional_append_refuses_an_already_open_transaction_without_rolling_it_back(journal):
+    journal.append(decision(0))
+    expected = journal.revision()
+    planned = decision(1)
+    journal._conn.execute("BEGIN")
+    try:
+        with pytest.raises(JournalSchemaError, match="existing transaction"):
+            journal.append_batch_if_revision([planned], expected=expected)
+        assert journal._conn.in_transaction is True
+        assert journal.read_by_id(planned.event_id) is None
+    finally:
+        journal._conn.rollback()
