@@ -1214,7 +1214,11 @@ class BinanceSpotTestnetClient:
         results: list[TestnetOrder] = []
         pending: str | None = None
         try:
-            for order in self.open_orders(symbol):
+            # Review FZ-10: the strict listing refuses a body that is not a list (a 200 that is empty
+            # or not JSON arrives as None), so it is never taken as "no open orders".
+            for order in self.startup_open_orders(symbol):
+                # Adopted as the lenient listing did, so the cancel cross-checks the listed order.
+                self._orders[order.client_order_id] = order
                 pending = order.client_order_id
                 results.append(self.cancel_order(symbol, pending))
                 pending = None

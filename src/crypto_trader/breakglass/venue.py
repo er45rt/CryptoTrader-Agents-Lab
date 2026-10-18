@@ -336,7 +336,8 @@ class BinanceSpotTestnetEmergencyControl:
         None when the venue cannot list them: the open orders stay unknown, never assumed empty.
         """
         try:
-            orders = self.client.open_orders(self.symbol)
+            # Review FZ-10: strict, so a 200 that is empty, not JSON or not a list is no listing.
+            orders = self.client.startup_open_orders(self.symbol)
         except BinanceTestnetError:
             return None
         references = tuple(order.client_order_id for order in orders)

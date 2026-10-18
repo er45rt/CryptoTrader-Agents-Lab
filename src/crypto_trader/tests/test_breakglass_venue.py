@@ -130,6 +130,30 @@ def test_cancel_open_cancels_through_the_adapter_and_confirms_once(journal):
     assert client.request_log()
 
 
+def test_a_cancel_answering_for_another_venue_order_is_ambiguous(journal):
+    # Review FZ-10: the strict listing is adopted as the lenient one was, so the cancel still
+    # cross-checks the venue order it listed; an answer for another venue order id is not a
+    # confirmed cancel of the listed one.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1"),
+            txf.cancel_response("ct-1", order_id=999),
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
+
+    assert outcome.disposition == "ambiguous"
+    assert outcome.cancelled_order_references == ()
+    assert outcome.unconfirmed_order_references == ("ct-1",)
+
+
 def test_an_ambiguous_cancel_is_never_retried(journal):
     control, _, _, transport = venue(
         journal,
@@ -526,6 +550,21 @@ _NEVER_LEARNED_THE_OPEN_ORDERS = {
     ),
     # The venue could not even be verified, so the cancel was never attempted.
     "venue unreachable": ([TransportError("down")], "unavailable"),
+    # Review FZ-10: a 200 whose body is empty or not JSON reaches the client as None, and a body
+    # that is not a list names no orders either; neither is a listing of zero open orders.
+    "listing body empty or not JSON": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), txf.response(200, None)],
+        "rejected",
+    ),
+    "listing body not a list": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.response(200, {"orders": []}),
+        ],
+        "rejected",
+    ),
 }
 
 
@@ -589,6 +628,9 @@ def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
             "pending",
             "reconciliation_missing_venue_evidence_for_listed_orders",
         ),
+        # Review FZ-10: an empty, non-JSON or non-list 200 body is no listing at all.
+        ([txf.response(200, None)], "pending", "reconciliation_missing_open_orders_listing"),
+        ([txf.response(200, {"orders": []})], "pending", "reconciliation_missing_open_orders_listing"),
     ],
     ids=[
         "nothing open",
@@ -596,6 +638,8 @@ def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
         "listing fails again",
         "listed order status -2013",
         "listed order status -1003",
+        "listing body empty or not JSON",
+        "listing body not a list",
     ],
 )
 def test_reconcile_lists_the_open_orders_a_failed_cancel_never_learned(
