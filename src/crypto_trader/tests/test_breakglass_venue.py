@@ -815,6 +815,30 @@ def test_a_run_that_died_before_recording_what_it_saw_keeps_the_epoch_unsettled(
     )
 
 
+def test_status_names_every_reconcile_run_gate_that_blocks_restore(journal, tmp_path):
+    # Review F-03: after a run died before journaling what it saw, status listed only the missing
+    # acknowledgement, so an operator was sent to acknowledge and then refused for another reason.
+    state_dir = tmp_path / "state"
+    process = _halted_process(journal, state_dir)
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    crashing = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_CrashesOnReports(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    with pytest.raises(_Crash):
+        crashing.handle(_operator_command("reconcile"))
+
+    assert process.status().restore_blockers == (
+        "observation_possibly_lost",
+        "reconciliation_run_incomplete",
+        "operator_acknowledgement_missing",
+    )
+
+
 def test_a_failed_venue_read_inside_a_run_is_recorded_and_the_next_run_settles(journal, tmp_path):
     # Review F-03: an ordinary venue failure inside a run is journaled with the run's observation
     # (evidence unavailable, so pending), never left as a lost observation; the next run settles.

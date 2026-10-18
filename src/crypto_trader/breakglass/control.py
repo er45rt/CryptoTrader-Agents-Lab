@@ -132,6 +132,8 @@ _IDENTITY_WARNING = (
 #: Review F-03: a reconcile run that journaled its intake but never what it observed may have seen
 #: venue orders nobody recorded; nothing settles that yet, so the epoch never resolves after it.
 OBSERVATION_POSSIBLY_LOST = "observation_possibly_lost"
+#: The latest reconcile run started after the last completed one, so no result covers its reads.
+RECONCILIATION_RUN_INCOMPLETE = "reconciliation_run_incomplete"
 #: The terminal venue statuses that settle an external order the venue shows never executed.
 SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
@@ -392,6 +394,11 @@ class BreakGlassControl:
         epoch = self._effective_epoch(controller, ledger)
         ownership = self._read_ownership()
         acknowledgement = None if epoch is None else epoch.acknowledgement
+        # The reconcile-run gates refuse restore before the epoch's own blockers (review F-03).
+        run_gates = (
+            *((OBSERVATION_POSSIBLY_LOST,) if ledger.observations.unobserved_intakes else ()),
+            *((RECONCILIATION_RUN_INCOMPLETE,) if ledger.observations.run_incomplete else ()),
+        )
         return BreakGlassStatus(
             safety_mode=controller.mode.value,
             kill_switch_engaged=controller.kill_switch_engaged,
@@ -414,7 +421,7 @@ class BreakGlassControl:
             operator_acknowledged_by=(
                 None if acknowledgement is None else acknowledgement.operator_label
             ),
-            restore_blockers=() if epoch is None else epoch.restore_blockers,
+            restore_blockers=() if epoch is None else (*run_gates, *epoch.restore_blockers),
             recorded_commands=len(ledger.commands),
             last_command_id=(None if not ledger.records else ledger.records[-1].command_id),
         )
@@ -1498,7 +1505,7 @@ class BreakGlassControl:
             )
         if observations.run_incomplete:
             return (
-                "reconciliation_run_incomplete",
+                RECONCILIATION_RUN_INCOMPLETE,
                 "the latest reconcile run never completed; reconcile again first.",
             )
         return None
