@@ -478,8 +478,13 @@ class BreakGlassControl:
         self._identity_unverified = self._journal_identity_unverified()
         if self._identity_unverified and command.command_type in IDENTITY_TRUST_COMMANDS:
             raise OwnershipStateError(self._identity_refusal(command.command_type))
-        delivered_at = self._now()
         ledger = derive_ledger(self._journal)
+        # Replay orders by occurred_at first: a command journaled with a wall clock stepped back
+        # behind the journal would replay before what already happened. The delivery time never
+        # goes below the latest journaled event; the batch sequence numbers then order the tie.
+        delivered_at = self._now()
+        if ledger.latest_occurred_at is not None:
+            delivered_at = max(delivered_at, ledger.latest_occurred_at)
         load = self._safety_store.load(self._journal)
         controller = load.controller
 

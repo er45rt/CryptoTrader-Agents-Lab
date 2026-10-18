@@ -327,6 +327,7 @@ class BreakGlassLedger:
     epoch: BreakGlassEpoch | None = None
     commands: dict[UUID, RecordedOperatorCommand] = field(default_factory=dict)
     observations: EpochObservations = field(default_factory=EpochObservations)
+    latest_occurred_at: datetime | None = None
 
     def command(self, command_id: UUID) -> RecordedOperatorCommand | None:
         return self.commands.get(command_id)
@@ -400,7 +401,9 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     observed: set[UUID] = set()
     external: list[str] = []
     last_intake = last_completed = -1
+    latest_occurred_at: datetime | None = None
     for index, event in enumerate(journal.replay()):
+        latest_occurred_at = event.occurred_at  # replay is ordered by occurred_at
         if event.event_type in _RUN_EVENT_TYPES:
             # A run for a synthesised epoch (no journaled one) settles nothing.
             if epoch is None:
@@ -474,7 +477,12 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
         unobserved_intakes=tuple(intake for intake in intakes if intake not in observed),
         run_incomplete=last_intake > last_completed,
     )
-    return BreakGlassLedger(epoch=epoch, commands=commands, observations=observations)
+    return BreakGlassLedger(
+        epoch=epoch,
+        commands=commands,
+        observations=observations,
+        latest_occurred_at=latest_occurred_at,
+    )
 
 
 def _reduce_epoch(

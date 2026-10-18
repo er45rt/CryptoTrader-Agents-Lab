@@ -1,6 +1,6 @@
 """Phase 13: venue-side emergency control (Spot Testnet only, cancel-open only, never retried)."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -753,6 +753,32 @@ def test_a_later_reconcile_run_requires_a_fresh_acknowledgement(journal, tmp_pat
     assert (stale.accepted, stale.reason_code) == (False, "restore_denied_acknowledgement_missing")
     assert process.handle(_operator_command("acknowledge")).accepted
     assert process.handle(_operator_command("restore_normal")).accepted
+
+
+def test_a_clock_stepped_back_never_replays_a_later_run_before_the_acknowledgement(
+    journal, tmp_path
+):
+    # Replay orders by occurred_at first. With the wall clock stepped back after the acknowledgement
+    # (an NTP correction), the later run was journaled before it, so the stale acknowledgement
+    # survived and normal was restored on evidence nobody acknowledged.
+    now = [BASE]
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        clock=lambda: now[0],
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    now[0] = BASE + timedelta(seconds=10)
+    assert process.handle(_operator_command("acknowledge")).accepted
+    now[0] = BASE + timedelta(seconds=5)
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+
+    stale = process.handle(_operator_command("restore_normal"))
+
+    assert (stale.accepted, stale.reason_code) == (False, "restore_denied_acknowledgement_missing")
+    assert stale.delivered_at == BASE + timedelta(seconds=10)
 
 
 def test_a_run_that_died_before_recording_what_it_saw_keeps_the_epoch_unsettled(journal, tmp_path):
