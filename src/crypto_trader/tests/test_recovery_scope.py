@@ -111,6 +111,8 @@ def test_recovery_reuses_the_phase3_recovery_contract_without_adding_one():
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
         "breakglass.reconciliation.settled",
+        # Review G-4 additive contract (existing schemas unchanged).
+        "order.venue_identity.recorded",
     }
     source = "\n".join(file.read_text(encoding="utf-8") for file in _files())
     assert "from crypto_trader.events import" in source

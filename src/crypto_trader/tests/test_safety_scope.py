@@ -123,6 +123,8 @@ def test_safety_reuses_the_phase3_state_and_only_adds_one_contract():
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
         "breakglass.reconciliation.settled",
+        # Review G-4 additive contract (existing schemas unchanged).
+        "order.venue_identity.recorded",
     }
 
 

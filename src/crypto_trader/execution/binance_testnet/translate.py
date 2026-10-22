@@ -14,6 +14,8 @@ from crypto_trader.events import (
     FillRecordPayload,
     OrderStateChanged,
     OrderStateChangePayload,
+    OrderVenueIdentityPayload,
+    OrderVenueIdentityRecorded,
 )
 from crypto_trader.recovery.models import LocalOrderState, OrderStateName
 
@@ -28,6 +30,7 @@ __all__ = [
     "deterministic_fill_event_uuid",
     "lifecycle_state_name",
     "testnet_order_to_phase3_events",
+    "testnet_order_venue_identity_event",
     "to_local_order_state",
 ]
 
@@ -112,6 +115,32 @@ def to_local_order_state(
         remaining_quantity=order.remaining_quantity,
         admitted_locally=True,
         submission_attempted=submission_attempted,
+    )
+
+
+def testnet_order_venue_identity_event(
+    order: TestnetOrder, *, intent_id: UUID, correlation_id: UUID
+) -> OrderVenueIdentityRecorded:
+    """Bind the venue order id of our own accepted write to the attempt it answered (review G-4).
+
+    The event id is stable per attempt, so the journal refuses a second, different identity for it.
+    """
+    if not order.client_order_id or not order.venue_order_id:
+        raise ValueError("a client order id and a venue order id are required.")
+    if order.transact_time is None:
+        raise ValueError("a stable venue timestamp is required for an order observation.")
+    return OrderVenueIdentityRecorded(
+        event_id=uuid5(_ORDER_NAMESPACE, f"{order.client_order_id}:venue-identity:{intent_id}"),
+        occurred_at=order.transact_time,
+        correlation_id=correlation_id,
+        producer=PRODUCER,
+        order_id=deterministic_order_uuid(order.client_order_id),
+        symbol=order.symbol,
+        payload=OrderVenueIdentityPayload(
+            venue_reference=order.client_order_id,
+            intent_id=intent_id,
+            venue_order_id=order.venue_order_id,
+        ),
     )
 
 

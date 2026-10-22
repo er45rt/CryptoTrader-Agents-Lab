@@ -98,6 +98,9 @@ class LocalOrderState:
     ``submission_attempted`` MUST be recorded BEFORE a send is attempted, so its absence proves
     that no submission could have reached the venue. That is what makes a crash *before* a send
     distinguishable from an ambiguous (possibly sent) submission.
+
+    ``venue_order_id`` is the venue order id journaled from the venue's answer to our own write
+    (review G-4), or ``None`` when our journal never learned it.
     """
 
     order_id: UUID
@@ -110,6 +113,7 @@ class LocalOrderState:
     remaining_quantity: Decimal = ZERO
     admitted_locally: bool = True
     submission_attempted: bool = False
+    venue_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.order_reference:

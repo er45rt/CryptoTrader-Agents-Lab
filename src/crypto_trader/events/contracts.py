@@ -41,6 +41,8 @@ Additive contracts added by later phases (existing schemas unchanged):
     venue order it listed that the journal does not know
 17. ``breakglass.reconciliation.settled``  (review F-03) - the external orders that run proved
     terminal at the venue without any execution
+18. ``order.venue_identity.recorded``      (review G-4) - the venue order id the venue gave our
+    own write, bound to the submission attempt it answered
 """
 
 from __future__ import annotations
@@ -69,6 +71,7 @@ __all__ = [
     "TRADE_INTENT_EVENT_TYPE",
     "ORDER_STATE_EVENT_TYPE",
     "ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE",
+    "ORDER_VENUE_IDENTITY_EVENT_TYPE",
     "EXECUTION_FILL_EVENT_TYPE",
     "VENUE_TRADE_EVENT_TYPE",
     "ACCOUNT_EQUITY_EVENT_TYPE",
@@ -81,6 +84,8 @@ __all__ = [
     "OrderStateChanged",
     "OrderSubmissionAttemptPayload",
     "OrderSubmissionAttempted",
+    "OrderVenueIdentityPayload",
+    "OrderVenueIdentityRecorded",
     "ExecutionFillRecorded",
     "VenueTradeRecordPayload",
     "VenueTradeRecorded",
@@ -158,6 +163,8 @@ STREAM_LIFECYCLE_EVENT_TYPE = "stream.lifecycle.recorded"
 RECONCILIATION_INTAKE_EVENT_TYPE = "breakglass.reconciliation.intake"
 RECONCILIATION_OBSERVED_EVENT_TYPE = "breakglass.reconciliation.observed"
 RECONCILIATION_SETTLED_EVENT_TYPE = "breakglass.reconciliation.settled"
+#: Review G-4 additive contract: our venue order id, bound to our own submission attempt.
+ORDER_VENUE_IDENTITY_EVENT_TYPE = "order.venue_identity.recorded"
 
 #: Order lifecycle states. This is a state *contract*, not a workflow engine.
 OrderState = Literal[
@@ -388,6 +395,54 @@ class OrderSubmissionAttempted(DomainEvent):
     event_type: Literal["order.submission.attempted"] = ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
     schema_version: Literal[1] = 1
     payload: OrderSubmissionAttemptPayload
+
+
+# --- 4c. Venue order identity (review G-4, additive) -----------------------
+
+class OrderVenueIdentityPayload(EventPayload):
+    """The venue order id the venue gave our own write, bound to the attempt it answered.
+
+    The client order identity alone cannot tell our order from another order that reuses it, so
+    the venue's answer to our own write is journaled with the ``venue_reference`` and ``intent_id``
+    of that ``order.submission.attempted`` record. The envelope carries the same ``order_id`` and
+    ``symbol`` as the attempt.
+    """
+
+    venue_reference: str = Field(
+        min_length=1, max_length=128, description="The client order identity of our attempt."
+    )
+    intent_id: UUID = Field(description="The intent of the attempt this identity answers.")
+    venue_order_id: str = Field(
+        min_length=1, max_length=128, description="The venue order id the venue gave our write."
+    )
+
+    @field_validator("venue_reference")
+    @classmethod
+    def _non_blank_reference(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a venue identity needs a non-blank client order id.")
+        return value
+
+    @field_validator("venue_order_id")
+    @classmethod
+    def _canonical_venue_id(cls, value: str) -> str:
+        if not value.isascii() or not value.isdigit() or value.startswith("0"):
+            raise ValueError("a venue order id must be a canonical positive integer.")
+        return value
+
+
+class OrderVenueIdentityRecorded(DomainEvent):
+    """Our venue order id was recorded for one submission attempt (review G-4)."""
+
+    event_type: Literal["order.venue_identity.recorded"] = ORDER_VENUE_IDENTITY_EVENT_TYPE
+    schema_version: Literal[1] = 1
+    payload: OrderVenueIdentityPayload
+
+    @model_validator(mode="after")
+    def _bound_to_an_order(self) -> "OrderVenueIdentityRecorded":
+        if self.order_id is None or not self.symbol:
+            raise ValueError("a venue identity record requires an order_id and a symbol.")
+        return self
 
 
 # --- 5. Execution / fill ---------------------------------------------------
@@ -1177,6 +1232,7 @@ V1_CONTRACTS: tuple[type[DomainEvent], ...] = (
     ReconciliationIntakeRecorded,
     ReconciliationObservedRecorded,
     ReconciliationSettledRecorded,
+    OrderVenueIdentityRecorded,
 )
 
 V2_CONTRACTS: tuple[type[DomainEvent], ...] = (RiskEvaluationRecordedV2, OperatorCommandRecordedV2)

@@ -25,6 +25,7 @@ from crypto_trader.events import (
     OrderStateChanged,
     OrderStateChangePayload,
     OrderSubmissionAttempted,
+    OrderVenueIdentityRecorded,
     ReconciliationObservedRecorded,
     ReconciliationSettledRecorded,
     RecoveryStateChanged,
@@ -532,6 +533,8 @@ def test_every_v1_contract_is_registered_with_a_stable_type_and_version():
         "breakglass.reconciliation.intake",
         "breakglass.reconciliation.observed",
         "breakglass.reconciliation.settled",
+        # Review G-4 additive contract (existing schemas unchanged).
+        "order.venue_identity.recorded",
     }
     assert all(contract.model_fields["schema_version"].default == 1 for contract in V1_CONTRACTS)
 
@@ -644,6 +647,55 @@ def test_a_reconciliation_settlement_is_caused_by_its_intake():
 def test_a_reconciliation_settlement_refuses_anything_but_a_proven_unexecuted_order(overrides):
     with pytest.raises(ValidationError):
         ReconciliationSettledRecorded(**_settlement(**overrides))
+
+
+# --- Review G-4: our venue order id, bound to our own attempt ----------------
+
+INTENT_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
+
+
+def _venue_identity(*, order_id=ORDER_ID, symbol="SYNTHUSDT", intent_id=INTENT_ID, venue_id="101"):
+    return base_fields(
+        order_id=order_id,
+        symbol=symbol,
+        payload={"venue_reference": "ct-9", "intent_id": intent_id, "venue_order_id": venue_id},
+    )
+
+
+def test_a_venue_identity_names_one_attempt_and_one_venue_order():
+    event = OrderVenueIdentityRecorded(**_venue_identity())
+
+    assert event.event_type == "order.venue_identity.recorded"
+    assert (event.order_id, event.payload.venue_reference, event.payload.intent_id) == (
+        ORDER_ID, "ct-9", INTENT_ID
+    )
+    assert event.payload.venue_order_id == "101"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"order_id": None},
+        {"symbol": None},
+        {"intent_id": None},
+        {"venue_id": ""},
+        {"venue_id": "0101"},
+        {"venue_id": "-1"},
+        {"venue_id": "\u0661\u0660\u0661"},
+    ],
+    ids=[
+        "no order id",
+        "no symbol",
+        "no intent",
+        "no venue id",
+        "venue id with a leading zero",
+        "negative venue id",
+        "non-ASCII venue id digits",
+    ],
+)
+def test_a_venue_identity_refuses_an_unbound_or_non_canonical_identity(overrides):
+    with pytest.raises(ValidationError):
+        OrderVenueIdentityRecorded(**_venue_identity(**overrides))
 
 
 def test_decimal_precision_is_exact_for_string_inputs():

@@ -54,6 +54,7 @@ from .translate import (
     lifecycle_state_name,
     legacy_fill_event_ids,
     testnet_order_to_phase3_events,
+    testnet_order_venue_identity_event,
 )
 
 __all__ = ["TestnetOrderRuntime", "TestnetVenueStateSource"]
@@ -303,6 +304,16 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             )
             self._pending_submissions.pop(client_order_id, None)
             raise
+        if not order.deduplicated:
+            # Review G-4: only the venue's answer to our own write names our venue order; a later
+            # read by client order id may show another order reusing it. Journaled before the
+            # state, so no accepted state exists without its identity.
+            assert self.journal is not None
+            self.journal.append(
+                testnet_order_venue_identity_event(
+                    order, intent_id=request.intent_id, correlation_id=request.correlation_id
+                )
+            )
         self._record(order, correlation_id=request.correlation_id)
         self._pending_submissions.pop(client_order_id, None)
         return client_order_id

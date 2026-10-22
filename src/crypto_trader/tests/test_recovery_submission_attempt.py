@@ -22,6 +22,8 @@ from crypto_trader.events import (
     OrderStateChangePayload,
     OrderSubmissionAttemptPayload,
     OrderSubmissionAttempted,
+    OrderVenueIdentityPayload,
+    OrderVenueIdentityRecorded,
 )
 from crypto_trader.execution.binance_testnet import PRODUCER as VENUE_PRODUCER
 from crypto_trader.execution.binance_testnet import deterministic_order_uuid
@@ -987,3 +989,188 @@ def test_local_completion_before_attempt_is_fenced_when_attempt_arrives(journal)
     assert "filled_completion_requires_authoritative_venue_evidence" in (
         reconstructor.conflicts()[CLIENT_ORDER_ID]
     )
+
+
+# --- review G-4: our venue order id, bound to the attempt it answers --------------
+
+OTHER_CLIENT_ORDER_ID = "ct-33333333333333333333"
+OTHER_ORDER_ID = deterministic_order_uuid(OTHER_CLIENT_ORDER_ID)
+OTHER_INTENT_ID = UUID("33333333-3333-4333-8333-333333333333")
+
+
+def identity_event(
+    venue_order_id: str = "4242",
+    *,
+    index: int = 1,
+    client_order_id: str = CLIENT_ORDER_ID,
+    order_id: UUID = ORDER_ID,
+    intent_id: UUID = INTENT_ID,
+    symbol: str = SYMBOL,
+    producer: str = VENUE_PRODUCER,
+) -> OrderVenueIdentityRecorded:
+    return OrderVenueIdentityRecorded(
+        event_id=uuid4(),
+        occurred_at=BASE + timedelta(seconds=index),
+        correlation_id=CORRELATION,
+        producer=producer,
+        order_id=order_id,
+        symbol=symbol,
+        payload=OrderVenueIdentityPayload(
+            venue_reference=client_order_id, intent_id=intent_id, venue_order_id=venue_order_id
+        ),
+    )
+
+
+@pytest.mark.parametrize("attempt_index", [0, 3], ids=["attempt first", "venue answer first"])
+def test_our_venue_identity_binds_to_the_attempt_it_answers(journal, attempt_index):
+    # The venue stamps its answer, so replay may order it before our locally stamped attempt.
+    journal.append_batch(
+        [
+            attempt_event(index=attempt_index),
+            identity_event(index=1),
+            state_event("accepted", index=1),
+            identity_event(index=2),  # the same identity again is idempotent
+        ]
+    )
+
+    reconstructor = recovered(journal)
+
+    assert reconstructor.state_for(CLIENT_ORDER_ID).venue_order_id == "4242"
+    assert reconstructor.conflicts() == {}
+
+
+@pytest.mark.parametrize(
+    "events,venue_ids,conflicts",
+    [
+        (
+            lambda: [attempt_event(index=0), identity_event(index=1), identity_event("777", index=2)],
+            ["4242"],
+            {CLIENT_ORDER_ID: ("conflicting_venue_order_identity",)},
+        ),
+        (
+            lambda: [state_event("accepted", index=0), identity_event(index=1)],
+            [None],
+            {CLIENT_ORDER_ID: ("venue_identity_without_a_matching_attempt",)},
+        ),
+        (
+            lambda: [attempt_event(index=0), identity_event(intent_id=OTHER_INTENT_ID)],
+            [None],
+            {CLIENT_ORDER_ID: ("venue_identity_bound_to_a_different_attempt",)},
+        ),
+        (
+            lambda: [attempt_event(index=0), identity_event(order_id=OTHER_ORDER_ID)],
+            [None],
+            {CLIENT_ORDER_ID: ("venue_identity_bound_to_a_different_attempt",)},
+        ),
+        (
+            lambda: [attempt_event(index=0), identity_event(symbol="OTHERUSDT")],
+            [None],
+            {CLIENT_ORDER_ID: ("venue_identity_bound_to_a_different_attempt",)},
+        ),
+        (
+            lambda: [attempt_event(index=0), identity_event(producer=LOCAL_PRODUCER)],
+            [None],
+            {CLIENT_ORDER_ID: ("venue_identity_requires_the_attempt_venue_producer",)},
+        ),
+        (
+            lambda: [
+                attempt_event(index=0),
+                identity_event(index=1),
+                attempt_event(
+                    index=2,
+                    client_order_id=OTHER_CLIENT_ORDER_ID,
+                    order_id=OTHER_ORDER_ID,
+                    intent_id=OTHER_INTENT_ID,
+                ),
+                identity_event(
+                    index=3,
+                    client_order_id=OTHER_CLIENT_ORDER_ID,
+                    order_id=OTHER_ORDER_ID,
+                    intent_id=OTHER_INTENT_ID,
+                ),
+            ],
+            [None, "4242"],
+            {
+                OTHER_CLIENT_ORDER_ID: ("venue_order_identity_claimed_by_another_attempt",),
+                CLIENT_ORDER_ID: ("venue_order_identity_claimed_by_another_attempt",),
+            },
+        ),
+    ],
+    ids=[
+        "a second venue id for our attempt",
+        "no attempt to bind to",
+        "another intent",
+        "another order id",
+        "another symbol",
+        "not the attempt's venue producer",
+        "one venue order claimed by two attempts",
+    ],
+)
+def test_an_unbound_or_contradicting_venue_identity_is_a_conflict(
+    journal, events, venue_ids, conflicts
+):
+    journal.append_batch(events())
+
+    reconstructor = recovered(journal)
+
+    assert [state.venue_order_id for state in reconstructor.states()] == venue_ids
+    assert reconstructor.conflicts() == conflicts
+
+
+def test_a_snapshot_keeps_our_venue_identity_and_its_first_binding(tmp_path):
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        journal.append_batch(
+            [attempt_event(index=0), identity_event(index=1), state_event("accepted", index=2)]
+        )
+        _before, snapshot = _snapshot_of(journal)
+        journal.append_batch(
+            [
+                identity_event("777", index=3),
+                attempt_event(
+                    index=4,
+                    client_order_id=OTHER_CLIENT_ORDER_ID,
+                    order_id=OTHER_ORDER_ID,
+                    intent_id=OTHER_INTENT_ID,
+                ),
+                identity_event(
+                    index=5,
+                    client_order_id=OTHER_CLIENT_ORDER_ID,
+                    order_id=OTHER_ORDER_ID,
+                    intent_id=OTHER_INTENT_ID,
+                ),
+            ]
+        )
+        restored, _tail = reconstruct_order_states(journal, snapshot=snapshot)
+
+    assert restored.state_for(CLIENT_ORDER_ID).venue_order_id == "4242"
+    assert restored.conflicts() == {
+        OTHER_CLIENT_ORDER_ID: ("venue_order_identity_claimed_by_another_attempt",),
+        CLIENT_ORDER_ID: (
+            "conflicting_venue_order_identity",
+            "venue_order_identity_claimed_by_another_attempt",
+        ),
+    }
+
+    # A snapshot written before review G-4 restores with the identity unknown.
+    legacy = dict(
+        snapshot.state,
+        orders=[
+            {key: value for key, value in entry.items() if key != "venue_order_id"}
+            for entry in snapshot.state["orders"]
+        ],
+    )
+    unknown = OrderStateReconstructor()
+    unknown.restore_state(legacy)
+    assert unknown.state_for(CLIENT_ORDER_ID).venue_order_id is None
+
+
+def test_a_snapshot_keeps_a_venue_identity_that_arrived_before_its_attempt(tmp_path):
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        journal.append_batch([state_event("accepted", index=1), identity_event(index=1)])
+        before, snapshot = _snapshot_of(journal)
+        journal.append(attempt_event(index=3))
+        restored, _tail = reconstruct_order_states(journal, snapshot=snapshot)
+
+    assert before.conflicts() == {CLIENT_ORDER_ID: ("venue_identity_without_a_matching_attempt",)}
+    assert restored.state_for(CLIENT_ORDER_ID).venue_order_id == "4242"
+    assert restored.conflicts() == {}

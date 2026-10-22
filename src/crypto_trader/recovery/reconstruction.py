@@ -40,6 +40,13 @@ evidence resolves it.
 Journals written before this contract keep their original semantics: the reference falls back to
 ``str(order_id)`` and ``submission_attempted`` is derived from the lifecycle rank, exactly as
 before.
+
+Our venue order identity (review G-4)
+-------------------------------------
+``order.venue_identity.recorded`` binds the venue order id of our own accepted write to the attempt
+it answered (``LocalOrderState.venue_order_id``). Only the first identity from the attempt's venue
+producer, with the same reference, intent, order id and symbol, is bound. Every contradiction is a
+conflict, and an order whose identity was never journaled keeps ``venue_order_id`` unknown.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ from crypto_trader.events import (
     EXECUTION_FILL_EVENT_TYPE,
     ORDER_STATE_EVENT_TYPE,
     ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    ORDER_VENUE_IDENTITY_EVENT_TYPE,
     EventEnvelope,
 )
 from crypto_trader.persistence import EventJournal, IdempotentConsumer, RebuildSummary, rebuild_state
@@ -174,6 +182,17 @@ class _CompletionFact:
     remaining_quantity: Decimal | None = None
 
 
+@dataclass(frozen=True)
+class _IdentityFact:
+    """Our journaled venue order identity (review G-4), held until its attempt is replayed."""
+
+    order_id: UUID | None
+    intent_id: UUID
+    symbol: str | None
+    producer: str
+    venue_order_id: str
+
+
 def _to_ns(value: Any) -> int:
     return int(value.timestamp() * 1_000_000_000)
 
@@ -186,6 +205,8 @@ class OrderStateReconstructor(IdempotentConsumer):
         self._states: dict[str, LocalOrderState] = {}
         self._attempts: dict[str, AttemptAnchors] = {}
         self._reference_by_order_id: dict[UUID, str] = {}
+        self._reference_by_venue_order: dict[tuple[str, str], str] = {}
+        self._identity_facts: dict[str, list[_IdentityFact]] = {}
         self._completion_facts: dict[str, _CompletionFact] = {}
         self._last_applied_ns: dict[str, int] = {}
         self._conflicts: dict[str, list[str]] = {}
@@ -202,6 +223,8 @@ class OrderStateReconstructor(IdempotentConsumer):
             self._apply_state_change(event)
         elif event.event_type == EXECUTION_FILL_EVENT_TYPE:
             self._apply_fill(event)
+        elif event.event_type == ORDER_VENUE_IDENTITY_EVENT_TYPE:
+            self._apply_venue_identity(event)
 
     # --- the durable pre-send attempt (fact merge, never a lifecycle regression) ---
 
@@ -277,6 +300,7 @@ class OrderStateReconstructor(IdempotentConsumer):
                 submission_attempted=True,
             )
             self._last_applied_ns[reference] = anchors.occurred_at_ns
+            self._bind_held_identities(reference)
             return
 
         self._states[reference] = replace(
@@ -290,6 +314,62 @@ class OrderStateReconstructor(IdempotentConsumer):
         completion = self._completion_facts.get(reference)
         if state.state is _FILLED and completion is not None:
             self._validate_completion_fact(reference, completion, recorded)
+        self._bind_held_identities(reference)
+
+    # --- our venue order identity (review G-4) ---
+
+    def _apply_venue_identity(self, event: EventEnvelope) -> None:
+        payload = event.payload
+        reference = str(payload.venue_reference)
+        fact = _IdentityFact(
+            order_id=event.order_id,
+            intent_id=payload.intent_id,
+            symbol=event.symbol,
+            producer=event.producer,
+            venue_order_id=str(payload.venue_order_id),
+        )
+        if reference not in self._attempts:
+            # Replay runs in time order and the venue stamps its answer, so the attempt may follow.
+            self._identity_facts.setdefault(reference, []).append(fact)
+            return
+        self._bind_venue_identity(reference, fact)
+
+    def _bind_held_identities(self, reference: str) -> None:
+        for fact in self._identity_facts.pop(reference, []):
+            self._bind_venue_identity(reference, fact)
+
+    def _bind_venue_identity(self, reference: str, fact: _IdentityFact) -> None:
+        """Bind our venue order id to the attempt it answered; a contradiction is a conflict."""
+        anchors = self._attempts[reference]
+        state = self._states.get(reference)
+        if state is None:
+            self._record_conflict(reference, "venue_identity_without_a_matching_attempt")
+            return
+        if (anchors.order_id, anchors.intent_id, anchors.symbol) != (
+            fact.order_id, fact.intent_id, fact.symbol
+        ):
+            self._record_conflict(reference, "venue_identity_bound_to_a_different_attempt")
+            return
+        if (
+            anchors.venue_producer not in _RECOGNIZED_VENUE_PRODUCERS
+            or fact.producer != anchors.venue_producer
+        ):
+            self._record_conflict(reference, "venue_identity_requires_the_attempt_venue_producer")
+            return
+        venue_order_id = fact.venue_order_id
+        if state.venue_order_id is not None:
+            if state.venue_order_id != venue_order_id:
+                self._record_conflict(reference, "conflicting_venue_order_identity")
+            return
+        key = (anchors.symbol, venue_order_id)
+        claimed_by = self._reference_by_venue_order.get(key)
+        if claimed_by is not None:
+            # One venue order cannot be two of our attempts: neither binding can be trusted.
+            self._record_conflict(claimed_by, "venue_order_identity_claimed_by_another_attempt")
+            self._record_conflict(reference, "venue_order_identity_claimed_by_another_attempt")
+            return
+        self._reference_by_venue_order[key] = reference
+        self._states[reference] = replace(state, venue_order_id=venue_order_id)
 
     def _validate_completion_fact(
         self, reference: str, completion: _CompletionFact, anchors: AttemptAnchors
@@ -594,10 +674,16 @@ class OrderStateReconstructor(IdempotentConsumer):
 
     def conflicts(self) -> dict[str, tuple[str, ...]]:
         """Lifecycle conflicts by reference: authoritative contradictions, never dropped."""
-        return {reference: tuple(reasons) for reference, reasons in sorted(self._conflicts.items())}
+        conflicts = {reference: list(reasons) for reference, reasons in self._conflicts.items()}
+        for reference in self._identity_facts:
+            # A venue identity whose attempt never arrived names no attempt of ours.
+            reasons = conflicts.setdefault(reference, [])
+            if "venue_identity_without_a_matching_attempt" not in reasons:
+                reasons.append("venue_identity_without_a_matching_attempt")
+        return {reference: tuple(reasons) for reference, reasons in sorted(conflicts.items())}
 
     def conflicted_references(self) -> tuple[str, ...]:
-        return tuple(sorted(self._conflicts))
+        return tuple(self.conflicts())
 
     @property
     def out_of_order_events_skipped(self) -> int:
@@ -637,6 +723,16 @@ class OrderStateReconstructor(IdempotentConsumer):
         self._reference_by_order_id = {
             anchors.order_id: reference for reference, anchors in self._attempts.items()
         }
+        self._reference_by_venue_order = {
+            (self._attempts[reference].symbol, order.venue_order_id): reference
+            for reference, order in self._states.items()
+            if order.venue_order_id is not None and reference in self._attempts
+        }
+        self._identity_facts = {}
+        for entry in state.get("venue_identity_facts", []):
+            self._identity_facts.setdefault(str(entry["order_reference"]), []).append(
+                _identity_fact_from_dict(entry)
+            )
         bookkeeping = state.get("bookkeeping", {})
         self._last_applied_ns = {
             str(reference): int(value)
@@ -669,6 +765,11 @@ class OrderStateReconstructor(IdempotentConsumer):
             "completion_facts": [
                 _completion_to_dict(reference, self._completion_facts[reference])
                 for reference in sorted(self._completion_facts)
+            ],
+            "venue_identity_facts": [
+                _identity_fact_to_dict(reference, fact)
+                for reference in sorted(self._identity_facts)
+                for fact in self._identity_facts[reference]
             ],
             "bookkeeping": {
                 "last_applied_ns": {
@@ -756,6 +857,7 @@ def _local_state_to_dict(state: LocalOrderState) -> dict[str, Any]:
         "remaining_quantity": str(state.remaining_quantity),
         "admitted_locally": bool(state.admitted_locally),
         "submission_attempted": bool(state.submission_attempted),
+        "venue_order_id": state.venue_order_id,
     }
 
 
@@ -773,6 +875,10 @@ def _local_state_from_dict(entry: dict[str, Any]) -> LocalOrderState:
         remaining_quantity=Decimal(str(entry["remaining_quantity"])),
         admitted_locally=bool(entry.get("admitted_locally", True)),
         submission_attempted=bool(entry.get("submission_attempted", False)),
+        # Additive key (review G-4): a legacy snapshot leaves our venue identity unknown.
+        venue_order_id=(
+            None if entry.get("venue_order_id") is None else str(entry["venue_order_id"])
+        ),
     )
 
 
@@ -824,6 +930,27 @@ def _completion_from_dict(entry: dict[str, Any]) -> _CompletionFact:
             if entry.get("remaining_quantity") is None
             else Decimal(str(entry["remaining_quantity"]))
         ),
+    )
+
+
+def _identity_fact_to_dict(reference: str, fact: _IdentityFact) -> dict[str, Any]:
+    return {
+        "order_reference": reference,
+        "order_id": None if fact.order_id is None else str(fact.order_id),
+        "intent_id": str(fact.intent_id),
+        "symbol": fact.symbol,
+        "producer": fact.producer,
+        "venue_order_id": fact.venue_order_id,
+    }
+
+
+def _identity_fact_from_dict(entry: dict[str, Any]) -> _IdentityFact:
+    return _IdentityFact(
+        order_id=None if entry.get("order_id") is None else UUID(entry["order_id"]),
+        intent_id=UUID(entry["intent_id"]),
+        symbol=None if entry.get("symbol") is None else str(entry["symbol"]),
+        producer=str(entry["producer"]),
+        venue_order_id=str(entry["venue_order_id"]),
     )
 
 

@@ -10,6 +10,7 @@ from crypto_trader.events import (
     EXECUTION_FILL_EVENT_TYPE,
     ORDER_STATE_EVENT_TYPE,
     ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    ORDER_VENUE_IDENTITY_EVENT_TYPE,
 )
 from crypto_trader.execution import (
     ExecutionOrderType,
@@ -19,6 +20,7 @@ from crypto_trader.execution import (
     InstrumentSpec,
 )
 from crypto_trader.execution.binance_testnet import (
+    PRODUCER,
     AmbiguousOrderError,
     ScriptedTransport,
     TransportTimeout,
@@ -37,6 +39,7 @@ from crypto_trader.recovery import (
     ReconciliationEngine,
     ReconciliationOutcome,
     load_policy,
+    reconstruct_order_states,
 )
 from crypto_trader.safety import SafetyController, SafetyMode
 from crypto_trader.tests import testnet_fixtures as fx
@@ -51,6 +54,8 @@ CLIENT_ORDER_ID = f"ct-{INTENT_ID.hex[:20]}"
 def journal(tmp_path: Path, request):
     writing = request.node.originalname in {
         "test_submit_places_an_order_and_journals_lifecycle_events",
+        "test_our_write_answer_journals_our_venue_identity_before_its_state",
+        "test_reads_by_client_order_id_never_journal_a_venue_identity",
         "test_ambiguous_submission_is_marked_pending_and_not_marked_failed",
         "test_reconciliation_resolves_an_ambiguous_submission_from_venue_evidence",
         "test_ambiguous_submission_stays_pending_when_the_venue_has_no_record",
@@ -137,6 +142,63 @@ def test_submit_places_an_order_and_journals_lifecycle_events(journal):
     assert fill_events[0].order_id is not None
     assert fill_events[0].correlation_id == CORRELATION_ID
     assert fill_events[0].payload.quantity == Decimal("0.00100000")
+
+
+def test_our_write_answer_journals_our_venue_identity_before_its_state(journal, monkeypatch):
+    """Review G-4: the venue's answer to our own write binds its venue order id to our attempt."""
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID, order_id=4242)]
+    )
+    instance = started_runtime(transport, journal=journal)
+    appended = []
+    append = journal.append
+    monkeypatch.setattr(
+        journal, "append", lambda event: appended.append(event.event_type) or append(event)
+    )
+
+    instance.submit(execution_request())
+
+    assert appended[-2:] == [ORDER_VENUE_IDENTITY_EVENT_TYPE, ORDER_STATE_EVENT_TYPE]
+    events = {event.event_type: event for event in journal.read_range()}
+    assert set(events) == {
+        ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+        ORDER_VENUE_IDENTITY_EVENT_TYPE,
+        ORDER_STATE_EVENT_TYPE,
+    }
+    attempt = events[ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE]
+    identity = events[ORDER_VENUE_IDENTITY_EVENT_TYPE]
+    assert (identity.order_id, identity.symbol, identity.producer, identity.correlation_id) == (
+        attempt.order_id, "BTCUSDT", PRODUCER, CORRELATION_ID
+    )
+    assert identity.payload.venue_reference == CLIENT_ORDER_ID
+    assert identity.payload.intent_id == INTENT_ID
+    assert identity.payload.venue_order_id == "4242"
+    reconstructor, _ = reconstruct_order_states(journal)
+    assert reconstructor.state_for(CLIENT_ORDER_ID).venue_order_id == "4242"
+    assert reconstructor.conflicts() == {}
+
+
+def test_reads_by_client_order_id_never_journal_a_venue_identity(journal):
+    """Review G-4: a status or cancel read may show another order that reuses our client order id."""
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.order_response(CLIENT_ORDER_ID, order_id=777),  # the duplicate's identity re-read
+            fx.order_response(CLIENT_ORDER_ID, order_id=777),  # a refresh
+            fx.order_response(CLIENT_ORDER_ID, order_id=777),  # the restart lookup
+            fx.cancel_response(CLIENT_ORDER_ID, order_id=777),
+        ]
+    )
+    instance = started_runtime(transport, journal=journal)
+
+    instance.submit(execution_request())
+    instance.refresh(CLIENT_ORDER_ID)
+    instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID)
+    instance.cancel(CLIENT_ORDER_ID)
+
+    assert ORDER_STATE_EVENT_TYPE in {event.event_type for event in journal.read_range()}
+    assert ORDER_VENUE_IDENTITY_EVENT_TYPE not in {event.event_type for event in journal.read_range()}
 
 
 def test_client_order_id_is_deterministic_across_restarts():
