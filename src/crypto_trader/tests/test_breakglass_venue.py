@@ -1160,6 +1160,78 @@ def test_a_listing_naming_a_client_order_id_twice_keeps_the_epoch_unsettled(jour
     assert _settled_events(journal) == []
 
 
+@pytest.mark.parametrize(
+    "ended",
+    [OrderStateName.CANCELED, OrderStateName.FILLED, OrderStateName.REJECTED, OrderStateName.EXPIRED],
+)
+def test_a_listed_order_reusing_an_ended_local_id_stays_outstanding_until_settled(
+    journal, tmp_path, ended
+):
+    # Review SOL-F2: the listing named ct-8 as venue order 100, but the journal knew ct-8 only as an
+    # order of ours that had ended, so the observation dropped it as local. Once that external order
+    # left the listing, a later run resolved and restore_normal passed with no proof it ended
+    # unexecuted. Only a locally open order is ours to reconcile: this one is journaled as external
+    # and settles only on the exact venue order's evidence.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    ours = LocalOrderState(
+        order_id=uuid4(),
+        order_reference="ct-8",
+        intent_id=None,
+        correlation_id=None,
+        symbol=txf.SYMBOL,
+        state=ended,
+        submission_attempted=True,
+    )
+
+    def process(responses):
+        venue_control, client, _, _ = venue(journal, responses)
+        client.clock.synchronize(txf.SERVER_TIME_MS)
+        return BreakGlassControl(
+            journal=journal,
+            state_dir=state_dir,
+            venue=venue_control,
+            clock=lambda: BASE,
+            reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+            local_state_provider=lambda: (ours,),
+        )
+
+    seen = process(
+        [txf.open_orders_response("ct-8"), txf.order_response("ct-8", order_id=100)]
+    ).handle(_operator_command("reconcile"))
+    executed = txf.order_response(
+        "ct-8", status="FILLED", order_id=100, executed_qty="0.00100000"
+    )
+    gone = process([txf.open_orders_response(), executed])
+    later = gone.handle(_operator_command("reconcile"))
+    acknowledge = gone.handle(_operator_command("acknowledge"))
+    restore = gone.handle(_operator_command("restore_normal"))
+
+    assert (later.reconciliation_status, later.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert seen.reconciliation_status == "pending"
+    assert gone.load_ledger().observations.external_orders == (("ct-8", "100"),)
+
+    proven = process(
+        [txf.open_orders_response(), txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    )
+    settled = proven.handle(_operator_command("reconcile"))
+
+    assert (settled.reconciliation_status, settled.reconciliation_result) == (
+        "resolved",
+        "reconciliation_confirmed_by_evidence",
+    )
+    assert [
+        (order.client_order_id, order.venue_order_id)
+        for order in _settled_events(journal)[0].payload.settled_orders
+    ] == [("ct-8", "100")]
+    assert proven.handle(_operator_command("acknowledge")).accepted
+    assert proven.handle(_operator_command("restore_normal")).accepted
+
+
 # --- Review ADV-04: a listing run journaled before reconcile runs recorded anything ------------
 
 

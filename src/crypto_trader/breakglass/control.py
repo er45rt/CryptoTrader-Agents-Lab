@@ -1408,7 +1408,10 @@ class BreakGlassControl:
                 f"the open-orders listing named client order id(s) {', '.join(repeated)} more "
                 "than once; nothing records what it showed, so the epoch stays unsettled."
             )
-        local_references = {state.order_reference for state in local_states}
+        # Review SOL-F2: only a locally open order is ours to reconcile. A listed order whose local
+        # namesake already ended is another venue order, so it is journaled as external and settles
+        # only on that exact venue order's evidence.
+        local_references = {state.order_reference for state in local_states if state.is_open}
         listed_ids = getattr(self._venue, "listed_venue_order_ids", None)
         venue_order_ids = {}
         if listing == "complete" and callable(listed_ids):
