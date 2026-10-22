@@ -1399,6 +1399,15 @@ class BreakGlassControl:
                         )
         except Exception:  # an interrupt is never masked: its intake then stays unobserved
             evidence_complete = False
+        # Review SOL-F1: a listing that names one client order id more than once is contradictory
+        # evidence, and journaling it would keep one venue order and lose the other. Nothing
+        # records what it showed, so its intake stays unobserved and the epoch stays unsettled.
+        repeated = sorted({reference for reference in listed if listed.count(reference) > 1})
+        if repeated:
+            raise BreakGlassIncompleteError(
+                f"the open-orders listing named client order id(s) {', '.join(repeated)} more "
+                "than once; nothing records what it showed, so the epoch stays unsettled."
+            )
         local_references = {state.order_reference for state in local_states}
         listed_ids = getattr(self._venue, "listed_venue_order_ids", None)
         venue_order_ids = {}

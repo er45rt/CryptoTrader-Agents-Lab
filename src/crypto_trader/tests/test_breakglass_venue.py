@@ -8,7 +8,12 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from crypto_trader.breakglass import BreakGlassControl, OwnerKind, parse_operator_command
+from crypto_trader.breakglass import (
+    BreakGlassControl,
+    BreakGlassIncompleteError,
+    OwnerKind,
+    parse_operator_command,
+)
 from crypto_trader.breakglass.venue import (
     BinanceSpotTestnetEmergencyControl,
     PolicyOnlyVenueControl,
@@ -1103,6 +1108,56 @@ def test_settling_a_reused_client_order_id_settles_only_that_venue_order(journal
     )
     assert [order.venue_order_id for order in settled] == ["205"]
     assert ledger.observations.external_orders == (("ct-9", "100"),)
+
+
+def test_a_listing_naming_a_client_order_id_twice_keeps_the_epoch_unsettled(journal, tmp_path):
+    # Review SOL-F1: the strict listing named ct-9 as venue orders 100 and 101 and only 101 was
+    # journaled, so settling 101 resolved the epoch and restore_normal passed while 100 had no
+    # proof it ended unexecuted. Such a listing is contradictory: nothing records what it showed,
+    # and the epoch stays unsettled.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    seen, client, _, _ = venue(
+        journal,
+        [txf.open_orders_response("ct-9", "ct-9"), txf.order_response("ct-9", order_id=101)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    try:
+        _reconcile_in_a_new_process_with(journal, state_dir, seen)
+    except BreakGlassIncompleteError as exc:
+        refused = str(exc)
+    else:
+        refused = None
+    later, client, _, _ = venue(
+        journal,
+        [txf.open_orders_response(), txf.order_response("ct-9", status="CANCELED", order_id=101)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "observation_possibly_lost",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_observation_possibly_lost",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_observation_possibly_lost",
+    )
+    assert refused is not None and "ct-9" in refused
+    assert _settled_events(journal) == []
 
 
 # --- Review ADV-04: a listing run journaled before reconcile runs recorded anything ------------
