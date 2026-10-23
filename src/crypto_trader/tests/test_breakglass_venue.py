@@ -44,6 +44,8 @@ from crypto_trader.events import (
     OperatorCommandRecorded,
     OrderSubmissionAttemptPayload,
     OrderSubmissionAttempted,
+    OrderVenueIdentityPayload,
+    OrderVenueIdentityRecorded,
 )
 from crypto_trader.events.contracts import OperatorCommandRecordPayloadV3
 from crypto_trader.persistence import SQLiteEventJournal
@@ -1747,4 +1749,78 @@ def test_an_order_whose_venue_identity_was_never_journaled_never_restores(journa
         "pending",
         "reconciliation_left_orders_unresolved",
     )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+# --- Review SOL-F4: a report without a venue order id never proves our order -----------------
+
+
+def _listing_of_ct8(venue_order_id):
+    response = txf.open_orders_response("ct-8")
+    response.body[0]["orderId"] = venue_order_id
+    return response
+
+
+def _our_attempt_and_identity(journal):
+    """Our ct-8 as the venue's answer to our write named it: venue order 100."""
+    _our_attempt_only(journal)
+    attempt = next(
+        event for event in journal.read_range() if event.event_type == "order.submission.attempted"
+    )
+    journal.append(
+        OrderVenueIdentityRecorded(
+            occurred_at=BASE,
+            correlation_id=attempt.correlation_id,
+            producer=VENUE_PRODUCER,
+            order_id=attempt.order_id,
+            symbol=attempt.symbol,
+            payload=OrderVenueIdentityPayload(
+                venue_reference="ct-8", intent_id=attempt.payload.intent_id, venue_order_id="100"
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("status", ["NEW", "CANCELED"])
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_a_report_without_a_venue_order_id_never_restores_our_known_order(
+    journal, tmp_path, path, status
+):
+    # Review SOL-F4 (GPT-6.1 Sol High on 5375d9d): our ct-8 is journaled as venue order 100, but a
+    # status answer for ct-8 carried no orderId, so it may be another order reusing ct-8. Its
+    # missing id passed the identity comparison and the epoch returned to normal.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        before = [_listing_of_ct8(100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                _listing_of_ct8(777),
+                txf.cancel_response("ct-8", order_id=777),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        before = []
+    answer = txf.order_response("ct-8", status=status, order_id=777)
+    del answer.body["orderId"]
+    process = _journal_process(journal, state_dir, [*before, answer])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
     assert (acknowledge.accepted, restore.accepted) == (False, False)

@@ -257,6 +257,12 @@ class ReconciliationEngine:
                 ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
                 "venue_order_identity_unknown",
             )
+        if self._require_known_venue_identity and report.venue_order_id is None:
+            # Review SOL-F4: a report naming no venue order cannot prove ours.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_unreported",
+            )
         local_ahead = (
             local.state.rank > report.state.rank
             or local.filled_quantity > report.filled_quantity

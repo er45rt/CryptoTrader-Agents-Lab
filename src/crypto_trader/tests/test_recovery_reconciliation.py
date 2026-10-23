@@ -583,3 +583,24 @@ def test_strictness_keeps_an_order_of_unknown_venue_identity_pending(
     report = strict_engine.reconcile([local], [_venue(state=state)])
 
     assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)
+
+
+@pytest.mark.parametrize(
+    ("strict", "outcome", "reason"),
+    [
+        (True, ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION, "venue_order_identity_unreported"),
+        (False, ReconciliationOutcome.MATCHED, "local_and_venue_agree"),
+    ],
+    ids=["strict", "default unchanged"],
+)
+def test_strictness_needs_the_report_to_name_our_venue_order(strict, outcome, reason):
+    # Review SOL-F4: a report without a venue order id may answer for another order reusing our
+    # client order id, so it cannot prove our journaled venue order.
+    local = replace(_local(attempted=True), venue_order_id="V-1")
+    strict_engine = ReconciliationEngine(
+        load_policy({"policy_id": "recovery-v1"}), require_known_venue_identity=strict
+    )
+
+    report = strict_engine.reconcile([local], [_venue(venue_order_id=None)])
+
+    assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)
