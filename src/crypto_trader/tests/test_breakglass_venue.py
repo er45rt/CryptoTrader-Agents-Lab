@@ -1232,6 +1232,111 @@ def test_a_listed_order_reusing_an_ended_local_id_stays_outstanding_until_settle
     assert proven.handle(_operator_command("restore_normal")).accepted
 
 
+# --- Review G-4: our open order is ours only under our journaled venue order id ---------------
+
+
+def _our_open_order():
+    """Our open ct-8, which the journal knows as venue order 100."""
+    return LocalOrderState(
+        order_id=uuid4(),
+        order_reference="ct-8",
+        intent_id=None,
+        correlation_id=None,
+        symbol=txf.SYMBOL,
+        state=OrderStateName.ACCEPTED,
+        remaining_quantity=Decimal("0.001"),
+        submission_attempted=True,
+        venue_order_id="100",
+    )
+
+
+def _process_for(journal, state_dir, venue_control, ours):
+    return BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+        local_state_provider=lambda: (ours,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("listed_id", "status", "result", "external", "restored"),
+    [
+        (777, "pending", "reconciliation_left_orders_unresolved", (("ct-8", "777"),), False),
+        (100, "resolved", "reconciliation_confirmed_by_evidence", (), True),
+    ],
+    ids=["another venue order under our id", "our own venue order"],
+)
+def test_a_listing_under_our_open_id_is_ours_only_with_our_venue_id(
+    journal, tmp_path, listed_id, status, result, external, restored
+):
+    # Review G-4: matched by client order id alone, a listing of ct-8 as venue order 777 passed as
+    # our order 100, so 777 was never journaled and the run resolved. Our journaled venue id tells
+    # them apart: 777 is external, and our order stays unresolved while the venue reports only 777.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    listing = txf.open_orders_response("ct-8")
+    listing.body[0]["orderId"] = listed_id
+    venue_control, client, _, _ = venue(
+        journal, [listing, txf.order_response("ct-8", order_id=listed_id)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = _process_for(journal, state_dir, venue_control, _our_open_order())
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (status, result)
+    assert process.load_ledger().observations.external_orders == external
+    assert (acknowledge.accepted, restore.accepted) == (restored, restored)
+
+
+def test_a_confirmed_cancel_answered_for_another_venue_order_never_restores(journal, tmp_path):
+    # Review G-4: cancelling ct-8 by client order id cancelled venue order 777, not our order 100,
+    # and the venue then reported 777 cancelled. Matched by client order id alone, our order
+    # resolved as cancelled and restore_normal passed while it may still be open or filled.
+    state_dir = tmp_path / "state"
+    ours = _our_open_order()
+    listing = txf.open_orders_response("ct-8")
+    listing.body[0]["orderId"] = 777
+    first, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            listing,
+            txf.cancel_response("ct-8", order_id=777),
+        ],
+    )
+    cancelling = _process_for(journal, state_dir, first, ours)
+    cancelling.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+    later, client, _, _ = venue(
+        journal, [txf.order_response("ct-8", status="CANCELED", order_id=777)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = _process_for(journal, state_dir, later, ours)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
 # --- Review ADV-04: a listing run journaled before reconcile runs recorded anything ------------
 
 

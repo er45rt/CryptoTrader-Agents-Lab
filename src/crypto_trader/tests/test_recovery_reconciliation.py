@@ -1,5 +1,6 @@
 """Phase 8: deterministic reconciliation engine tests (every required scenario)."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -500,3 +501,47 @@ def test_current_venue_evidence_releases_a_terminal_order_end_to_end(tmp_path):
     assert adjustment.after.state is OrderStateName.FILLED
     assert adjustment.after.filled_quantity == Decimal("1.00000000")
     assert adjustment.after.remaining_quantity == 0
+
+
+# --- review G-4: our journaled venue order id is compared --------------------------
+
+@pytest.mark.parametrize(
+    ("local_id", "venue_id", "venue_state", "outcome", "reason"),
+    [
+        (
+            "100", "777", OrderStateName.CANCELED,
+            ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION, "venue_order_identity_mismatch",
+        ),
+        (
+            "100", "777", OrderStateName.ACCEPTED,
+            ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION, "venue_order_identity_mismatch",
+        ),
+        (
+            "100", "100", OrderStateName.CANCELED,
+            ReconciliationOutcome.RESOLVED_FROM_VENUE, "venue_state_adopted",
+        ),
+        ("100", "100", OrderStateName.ACCEPTED, ReconciliationOutcome.MATCHED, "local_and_venue_agree"),
+        ("100", None, OrderStateName.ACCEPTED, ReconciliationOutcome.MATCHED, "local_and_venue_agree"),
+    ],
+    ids=[
+        "another venue order cancelled",
+        "another venue order open",
+        "our venue order cancelled",
+        "our venue order open",
+        "report without a venue id",
+    ],
+)
+def test_a_report_for_another_venue_order_never_resolves_ours(
+    local_id, venue_id, venue_state, outcome, reason
+):
+    # Review G-4: the venue may answer for another order that reuses our client order id.
+    local = replace(_local(attempted=True), venue_order_id=local_id)
+
+    report = engine().reconcile([local], [_venue(state=venue_state, venue_order_id=venue_id)])
+
+    pending = outcome is ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION
+    assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)
+    assert report.is_fully_resolved is not pending
+    if pending:
+        assert report.adjustments == []
+        assert report.requires_halt_new_risk is True

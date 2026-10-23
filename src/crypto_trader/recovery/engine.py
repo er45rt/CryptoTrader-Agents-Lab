@@ -234,6 +234,16 @@ class ReconciliationEngine:
         local: LocalOrderState,
         report: VenueOrderReport,
     ) -> _Resolution:
+        if (
+            local.venue_order_id is not None
+            and report.venue_order_id is not None
+            and report.venue_order_id != local.venue_order_id
+        ):
+            # Review G-4: the venue answered for another order that reuses our client order id.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_mismatch",
+            )
         local_ahead = (
             local.state.rank > report.state.rank
             or local.filled_quantity > report.filled_quantity

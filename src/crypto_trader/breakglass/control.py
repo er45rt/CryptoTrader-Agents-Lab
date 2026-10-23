@@ -1411,11 +1411,21 @@ class BreakGlassControl:
         # Review SOL-F2: only a locally open order is ours to reconcile. A listed order whose local
         # namesake already ended is another venue order, so it is journaled as external and settles
         # only on that exact venue order's evidence.
-        local_references = {state.order_reference for state in local_states if state.is_open}
         listed_ids = getattr(self._venue, "listed_venue_order_ids", None)
         venue_order_ids = {}
         if listing == "complete" and callable(listed_ids):
             venue_order_ids = dict(listed_ids())
+        # Review G-4: and only under our journaled venue order id, when we know it. A listed order
+        # under our client order id but another venue order id is external too.
+        local_references = {
+            state.order_reference
+            for state in local_states
+            if state.is_open
+            and (
+                state.venue_order_id is None
+                or venue_order_ids.get(state.order_reference) in (None, state.venue_order_id)
+            )
+        }
         self._append_run_event(
             ReconciliationObservedRecorded,
             ReconciliationObservedPayload(
