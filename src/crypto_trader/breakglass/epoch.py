@@ -351,27 +351,45 @@ class BreakGlassLedger:
     def open_epoch(self) -> BreakGlassEpoch | None:
         return self.epoch if self.epoch is not None and self.epoch.is_open else None
 
+    def _open_epoch_records(self) -> list[tuple[int, RecordedOperatorCommand]]:
+        """The open epoch's records with their replay index (reviews P5-F1 and F-1).
+
+        Replay orders records by journaled time, which code before the logical clock took from the
+        raw wall clock, so a record of the open epoch can replay before the record that opened it.
+        A record belongs to the open epoch when it replays at or after the opening record, carries
+        the epoch's session as its correlation, or has a sequence number above the opening
+        record's (written after it). A record that replays earlier and cannot be placed because a
+        sequence number is missing counts as well (fail-closed).
+        """
+        epoch = self.open_epoch
+        if epoch is None:
+            return []
+        records = self.records
+        opened = max((index for index, record in enumerate(records) if record.epoch_opened), default=0)
+        anchor = records[opened].sequence_number
+        return [
+            (index, record)
+            for index, record in enumerate(records)
+            if index >= opened
+            or record.correlation_id == epoch.session_id
+            or anchor is None
+            or record.sequence_number is None
+            or record.sequence_number > anchor
+        ]
+
     def open_epoch_order_references(self) -> tuple[str, ...]:
-        """Order references cancelled since the open epoch was opened, in journal order."""
-        if self.open_epoch is None:
-            return ()
+        """Order references cancelled in the open epoch, in journal order."""
         references: list[str] = []
-        for record in self.records:
-            if record.epoch_opened:
-                references = []
+        for _, record in self._open_epoch_records():
             for reference in record.cancelled_order_references:
                 if reference not in references:
                     references.append(reference)
         return tuple(references)
 
     def open_epoch_unconfirmed_references(self) -> tuple[str, ...]:
-        """Order references whose cancel stayed unconfirmed since the open epoch was opened."""
-        if self.open_epoch is None:
-            return ()
+        """Order references whose cancel stayed unconfirmed in the open epoch."""
         references: list[str] = []
-        for record in self.records:
-            if record.epoch_opened:
-                references = []
+        for _, record in self._open_epoch_records():
             for reference in record.unconfirmed_order_references:
                 if reference not in references:
                     references.append(reference)
@@ -384,15 +402,7 @@ class BreakGlassLedger:
         open orders failed, or the cancel could not be attempted) leaves them unknown: only a
         complete venue listing can settle what is open (review F-03).
         """
-        if self.open_epoch is None:
-            return False
-        unknown = False
-        for record in self.records:
-            if record.epoch_opened:
-                unknown = False
-            if _leaves_open_orders_unknown(record):
-                unknown = True
-        return unknown
+        return any(_leaves_open_orders_unknown(record) for _, record in self._open_epoch_records())
 
     def open_epoch_legacy_listing_run(self) -> bool:
         """Whether a reconcile run journaled before intakes existed listed the open orders.
@@ -401,21 +411,12 @@ class BreakGlassLedger:
         journaled nothing it saw, so no later run can tell which venue orders it may have found.
 
         Review P5-F1: that older code took the raw wall clock, so its record can replay before the
-        cancel it followed, even before the record that opened the epoch. A record belongs to the
-        open epoch by its replay position or by the epoch's session, and an older run counts as
-        earlier than such a cancel only when replay order and the writer's sequence numbers both
-        say so; otherwise it is taken as a listing run.
+        cancel it followed, even before the record that opened the epoch. The epoch's records are
+        placed as ``_open_epoch_records`` does (review F-1), and an older run counts as earlier
+        than such a cancel only when replay order and the writer's sequence numbers both say so;
+        otherwise it is taken as a listing run.
         """
-        epoch = self.open_epoch
-        if epoch is None:
-            return False
-        records = self.records
-        opened = max((index for index, record in enumerate(records) if record.epoch_opened), default=0)
-        members = [
-            (index, record)
-            for index, record in enumerate(records)
-            if index >= opened or record.correlation_id == epoch.session_id
-        ]
+        members = self._open_epoch_records()
         cancels = [(index, record) for index, record in members if _leaves_open_orders_unknown(record)]
         runs = [
             (index, record)

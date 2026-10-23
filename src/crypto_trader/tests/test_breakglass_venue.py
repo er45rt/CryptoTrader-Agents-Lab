@@ -45,6 +45,7 @@ from crypto_trader.events import (
     OperatorCommandRecordPayloadV2,
     OperatorCommandRecorded,
     OperatorCommandRecordedV2,
+    OperatorCommandRecordedV3,
     OrderSubmissionAttemptPayload,
     OrderSubmissionAttempted,
     OrderVenueIdentityPayload,
@@ -2113,3 +2114,196 @@ def test_an_older_run_journaled_with_an_earlier_time_still_keeps_the_epoch_unset
         False,
         "restore_denied_legacy_external_evidence_unverifiable",
     )
+
+
+# --- Review F-1: a record of the open epoch counts wherever its journaled time replays it --------
+
+
+def _journal_an_older_code_record(
+    journal,
+    command_type,
+    *,
+    occurred_at,
+    sequence_number,
+    correlation_id,
+    epoch_opened=False,
+    venue_control="not_requested",
+    cancelled=(),
+    unconfirmed=(),
+):
+    """A record as the code before the logical clock wrote it: raw wall clock, its own sequence."""
+    records = derive_ledger(journal).records
+    previous = records[-1].resulting_safety_state if records else "normal"
+    resulting = "halt_new_risk" if command_type == "halt_new_risk" else previous
+    command = _operator_command(command_type)
+    fields = dict(
+        command_id=command.command_id,
+        command_type=command_type,
+        requested_at=BASE,
+        operator_label=command.operator_label,
+        operator_identity=command.operator_identity,
+        reason=command.reason,
+        source=command.source,
+        previous_safety_state=previous,
+        resulting_safety_state=resulting,
+        disposition="accepted",
+        reason_code="UNKNOWN_PENDING_RECONCILIATION",
+        command_digest=command.digest,
+        mode_path=[previous, resulting],
+        venue_control=venue_control,
+        reconciliation_status="pending",
+        epoch_opened=epoch_opened,
+        epoch_closed=False,
+        fence_term=2,
+        cancelled_order_references=list(cancelled),
+    )
+    envelope = dict(
+        event_id=uuid4(),
+        occurred_at=occurred_at,
+        correlation_id=correlation_id,
+        causation_id=command.causation_id,
+        producer="application.breakglass",
+        sequence_number=sequence_number,
+    )
+    if unconfirmed:
+        event = OperatorCommandRecordedV3(
+            **envelope,
+            payload=OperatorCommandRecordPayloadV3(
+                **fields, unconfirmed_order_references=list(unconfirmed)
+            ),
+        )
+    else:
+        event = OperatorCommandRecordedV2(**envelope, payload=OperatorCommandRecordPayloadV2(**fields))
+    journal.append(event)
+
+
+def _an_older_epoch_opened_by_a_halt(journal, session):
+    _journal_an_older_code_record(
+        journal,
+        "halt_new_risk",
+        occurred_at=BASE,
+        sequence_number=200,
+        correlation_id=session,
+        epoch_opened=True,
+    )
+
+
+_REPLAYS_BEFORE_THE_OPENING = {
+    # Only the epoch's session places it (its sequence is lower than the opening's).
+    "session correlation": lambda session: (session, 100),
+    # An operator-supplied correlation id; only its later sequence places it.
+    "operator correlation, later sequence": lambda session: (uuid4(), 300),
+    # An operator-supplied correlation id and no sequence: it cannot be placed, so it counts.
+    "operator correlation, no sequence": lambda session: (uuid4(), None),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REPLAYS_BEFORE_THE_OPENING))
+def test_a_failed_cancel_replaying_before_the_epoch_opening_still_needs_a_listing(
+    journal, tmp_path, case
+):
+    # Review F-1 (DeepSeek "Saeed" re-verifying item 17): a failed cancel written after the halt
+    # that opened the epoch, but with a stepped-back raw clock, replayed before that opening record.
+    # The open-orders gate only looked after the opening, so no listing was taken and the epoch
+    # returned to normal while the venue still listed an open order (ct-9).
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    correlation, sequence = _REPLAYS_BEFORE_THE_OPENING[case](session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=sequence,
+        correlation_id=correlation,
+        venue_control="rejected",
+    )
+    assert derive_ledger(journal).open_epoch_open_orders_unknown()
+    process = _journal_process(journal, tmp_path / "state", [txf.open_orders_response("ct-9")])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert process.load_ledger().observations.external_orders == (("ct-9", "100"),)
+
+
+@pytest.mark.parametrize("kind", ["cancelled", "unconfirmed"])
+def test_a_cancel_replaying_before_the_epoch_opening_keeps_its_order_references(journal, kind):
+    # Review F-1: the order references of such a cancel are still read for Phase 8.
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=300,
+        correlation_id=uuid4(),
+        venue_control="confirmed" if kind == "cancelled" else "ambiguous",
+        cancelled=("ct-8",) if kind == "cancelled" else (),
+        unconfirmed=("ct-8",) if kind == "unconfirmed" else (),
+    )
+    ledger = derive_ledger(journal)
+
+    references = (
+        ledger.open_epoch_order_references()
+        if kind == "cancelled"
+        else ledger.open_epoch_unconfirmed_references()
+    )
+    assert references == ("ct-8",)
+
+
+def test_an_older_run_after_an_operator_correlated_failed_cancel_keeps_the_epoch_unsettled(
+    journal, tmp_path
+):
+    # Review F-1 (owner's option B): the legacy-run check of item 17 places the epoch's records by
+    # the same rule, so an operator-correlated failed cancel replaying before the opening still
+    # marks a later intake-less run as a listing run.
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=300,
+        correlation_id=uuid4(),
+        venue_control="rejected",
+    )
+    _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=5), 401)
+    process = _journal_process(journal, tmp_path / "state", [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+def test_a_closed_earlier_epoch_never_marks_a_new_one(journal, tmp_path, monkeypatch):
+    # Review F-1: records of an earlier epoch (other session, lower sequence) stay out of the open
+    # one, so its failed cancel neither forces a listing nor adds references.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_ListsWithIdentities(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    ledger = derive_ledger(journal)
+    assert ledger.open_epoch is not None
+    assert not ledger.open_epoch_open_orders_unknown()
+    assert not ledger.open_epoch_legacy_listing_run()
+    assert ledger.open_epoch_order_references() == ()
+    assert ledger.open_epoch_unconfirmed_references() == ()
