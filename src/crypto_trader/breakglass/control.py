@@ -137,6 +137,9 @@ RECONCILIATION_RUN_INCOMPLETE = "reconciliation_run_incomplete"
 #: Review ADV-04: a reconcile run journaled before intakes existed listed the open orders and
 #: journaled nothing it saw; only re-establishing on a newly founded journal clears it.
 LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE = "legacy_external_evidence_unverifiable"
+#: Review N-1: a cancel reached the venue after the latest reconciliation, so neither it nor its
+#: acknowledgement covers the venue any more; reconcile again before restoring normal.
+RECONCILIATION_SUPERSEDED_BY_VENUE_ACTION = "reconciliation_superseded_by_venue_action"
 #: The terminal venue statuses that settle an external order the venue shows never executed.
 SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
@@ -406,6 +409,11 @@ class BreakGlassControl:
                 else ()
             ),
             *((RECONCILIATION_RUN_INCOMPLETE,) if ledger.observations.run_incomplete else ()),
+            *(
+                (RECONCILIATION_SUPERSEDED_BY_VENUE_ACTION,)
+                if ledger.open_epoch_reconciliation_superseded()
+                else ()
+            ),
         )
         return BreakGlassStatus(
             safety_mode=controller.mode.value,
@@ -1563,6 +1571,12 @@ class BreakGlassControl:
             return (
                 RECONCILIATION_RUN_INCOMPLETE,
                 "the latest reconcile run never completed; reconcile again first.",
+            )
+        if ledger.open_epoch_reconciliation_superseded():
+            return (
+                RECONCILIATION_SUPERSEDED_BY_VENUE_ACTION,
+                "a cancel reached the venue after the latest reconciliation, so it no longer covers "
+                "the venue; reconcile again first.",
             )
         return None
 

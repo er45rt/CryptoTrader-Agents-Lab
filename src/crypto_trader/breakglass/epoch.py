@@ -427,6 +427,29 @@ class BreakGlassLedger:
         ]
         return any(not _written_before(run, cancel) for run in runs for cancel in cancels)
 
+    def open_epoch_reconciliation_superseded(self) -> bool:
+        """Whether a cancel reached the venue after the open epoch's latest reconciliation (N-1).
+
+        A reconciliation, and the acknowledgement of it, cover the venue as it was then. A cancel
+        that reached the venue later may have changed it, so neither may restore normal until a new
+        reconciliation runs. A cancel counts as earlier only when replay order and the writer's
+        sequence numbers both say so; otherwise it supersedes (fail-closed).
+        """
+        members = self._open_epoch_records()
+        runs = [
+            (index, record)
+            for index, record in members
+            if record.accepted and record.command_type == "reconcile"
+        ]
+        if not runs:
+            return False
+        latest = runs[-1]
+        return any(
+            not _written_before((index, record), latest)
+            for index, record in members
+            if record.command_type == "cancel_open" and record.venue_control != "not_requested"
+        )
+
 
 def _written_before(
     first: tuple[int, RecordedOperatorCommand], second: tuple[int, RecordedOperatorCommand]

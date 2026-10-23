@@ -2307,3 +2307,118 @@ def test_a_closed_earlier_epoch_never_marks_a_new_one(journal, tmp_path, monkeyp
     assert not ledger.open_epoch_legacy_listing_run()
     assert ledger.open_epoch_order_references() == ()
     assert ledger.open_epoch_unconfirmed_references() == ()
+
+
+# --- Review N-1: a cancel after the latest reconciliation voids it for restore -----------------
+
+
+def _reconciled_and_acknowledged(journal, state_dir):
+    """halt -> reconcile resolved -> acknowledge, with a venue that has nothing to report."""
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_SilentVenue(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+
+
+_LATER_CANCELS = {
+    # The venue could not list the open orders: the cancel learned no reference.
+    "failed": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+        "rejected",
+    ),
+    # The venue confirmed a cancel of ct-8, which no reconciliation has read.
+    "confirmed": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-8"),
+            txf.cancel_response("ct-8", order_id=100),
+        ],
+        "confirmed",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_LATER_CANCELS))
+def test_a_cancel_after_the_acknowledged_reconciliation_refuses_restore(journal, tmp_path, kind):
+    # Review N-1 (DeepSeek "Saeed" while re-verifying item 18): after halt, a resolved reconcile and
+    # an acknowledgement, a cancel reached the venue; restore_normal was still accepted on the
+    # earlier reconciliation, so normal returned while the open orders were unknown (or a cancelled
+    # order was never read), and the epoch closed with no way to reconcile again.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses, disposition = _LATER_CANCELS[kind]
+    cancelling = _journal_process(journal, state_dir, responses)
+    assert cancelling.handle(_operator_command("cancel_open")).venue_control == disposition
+
+    acknowledge = cancelling.handle(_operator_command("acknowledge"))
+    restore = cancelling.handle(_operator_command("restore_normal"))
+
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_reconciliation_superseded_by_venue_action",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_reconciliation_superseded_by_venue_action",
+    )
+    assert "reconciliation_superseded_by_venue_action" in cancelling.status().restore_blockers
+    assert cancelling.status().epoch_open
+
+
+def test_a_new_reconciliation_after_the_cancel_lets_normal_return(journal, tmp_path):
+    # Review N-1: the way back is a new reconciliation (it lists the open orders the failed cancel
+    # never learned) and a fresh acknowledgement.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses, _ = _LATER_CANCELS["failed"]
+    assert _journal_process(journal, state_dir, responses).handle(
+        _operator_command("cancel_open")
+    ).venue_control == "rejected"
+    process = _journal_process(journal, state_dir, [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "resolved"
+    assert (acknowledge.accepted, restore.accepted) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("venue_control", "superseded"),
+    [("rejected", True), ("not_requested", False)],
+    ids=["cancel reached the venue", "cancel never reached the venue"],
+)
+def test_an_older_cancel_numbered_after_the_reconciliation_still_supersedes_it(
+    journal, tmp_path, venue_control, superseded
+):
+    # Review N-1: a cancel journaled by code before the logical clock can replay before the
+    # reconciliation it followed; only replay order and sequence together prove it came first.
+    # A cancel refused before any venue call never supersedes a reconciliation.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=401,
+        correlation_id=derive_ledger(journal).open_epoch.session_id,
+        venue_control=venue_control,
+    )
+    process = _journal_process(journal, state_dir, [])
+
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert restore.accepted is not superseded
+    blockers = BreakGlassControl(
+        journal=journal, state_dir=state_dir, clock=lambda: BASE
+    ).status().restore_blockers
+    assert ("reconciliation_superseded_by_venue_action" in blockers) is superseded
