@@ -275,6 +275,8 @@ class RecordedOperatorCommand:
     causation_id: UUID | None
     cancelled_order_references: tuple[str, ...] = ()
     unconfirmed_order_references: tuple[str, ...] = ()
+    #: The writer's envelope sequence number, None when the event carries none (review P5-F1).
+    sequence_number: int | None = None
 
     @property
     def accepted(self) -> bool:
@@ -342,7 +344,7 @@ class BreakGlassLedger:
 
     @property
     def records(self) -> list[RecordedOperatorCommand]:
-        """Every recorded command in authoritative journal (arrival) order."""
+        """Every recorded command in journal replay order (by journaled time, then sequence)."""
         return list(self.commands.values())
 
     @property
@@ -397,23 +399,45 @@ class BreakGlassLedger:
 
         Review ADV-04: such a run listed the open orders a failed cancel never learned and
         journaled nothing it saw, so no later run can tell which venue orders it may have found.
+
+        Review P5-F1: that older code took the raw wall clock, so its record can replay before the
+        cancel it followed, even before the record that opened the epoch. A record belongs to the
+        open epoch by its replay position or by the epoch's session, and an older run counts as
+        earlier than such a cancel only when replay order and the writer's sequence numbers both
+        say so; otherwise it is taken as a listing run.
         """
-        if self.open_epoch is None:
+        epoch = self.open_epoch
+        if epoch is None:
             return False
-        unknown = legacy = False
-        for record in self.records:
-            if record.epoch_opened:
-                unknown = legacy = False
-            if _leaves_open_orders_unknown(record):
-                unknown = True
-            if (
-                unknown
-                and record.accepted
-                and record.command_type == "reconcile"
-                and record.command_id not in self.reconcile_run_commands
-            ):
-                legacy = True
-        return legacy
+        records = self.records
+        opened = max((index for index, record in enumerate(records) if record.epoch_opened), default=0)
+        members = [
+            (index, record)
+            for index, record in enumerate(records)
+            if index >= opened or record.correlation_id == epoch.session_id
+        ]
+        cancels = [(index, record) for index, record in members if _leaves_open_orders_unknown(record)]
+        runs = [
+            (index, record)
+            for index, record in members
+            if record.accepted
+            and record.command_type == "reconcile"
+            and record.command_id not in self.reconcile_run_commands
+        ]
+        return any(not _written_before(run, cancel) for run in runs for cancel in cancels)
+
+
+def _written_before(
+    first: tuple[int, RecordedOperatorCommand], second: tuple[int, RecordedOperatorCommand]
+) -> bool:
+    """Whether a record was written before another: replay order and sequence agree (P5-F1)."""
+    (first_index, first_record), (second_index, second_record) = first, second
+    return (
+        first_index < second_index
+        and first_record.sequence_number is not None
+        and second_record.sequence_number is not None
+        and first_record.sequence_number < second_record.sequence_number
+    )
 
 
 def _leaves_open_orders_unknown(record: RecordedOperatorCommand) -> bool:
@@ -502,6 +526,7 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
                     str(reference)
                     for reference in getattr(payload, "unconfirmed_order_references", ())
                 ),
+                sequence_number=event.sequence_number,
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise BreakGlassStateError(

@@ -42,12 +42,15 @@ from crypto_trader.events import (
     RECONCILIATION_OBSERVED_EVENT_TYPE,
     RECONCILIATION_SETTLED_EVENT_TYPE,
     OperatorCommandRecordPayload,
+    OperatorCommandRecordPayloadV2,
     OperatorCommandRecorded,
+    OperatorCommandRecordedV2,
     OrderSubmissionAttemptPayload,
     OrderSubmissionAttempted,
     OrderVenueIdentityPayload,
     OrderVenueIdentityRecorded,
 )
+from crypto_trader.breakglass.epoch import derive_ledger
 from crypto_trader.events.contracts import OperatorCommandRecordPayloadV3
 from crypto_trader.persistence import SQLiteEventJournal
 from crypto_trader.recovery import LocalOrderState, OrderStateName
@@ -1995,3 +1998,118 @@ def test_only_a_confirmed_absence_drops_a_tracked_order_from_the_venue_reports(j
     else:
         with pytest.raises(RejectedError):
             control.venue_reports()
+
+
+# --- Review P5-F1: an older run is judged by when it was written, not by its journaled time ------
+
+
+def _journal_an_older_code_listing_run(journal, occurred_at, sequence_number):
+    """The record the code before review F-03 journaled for an accepted reconcile run: no intake,
+    the raw wall clock as its time, and the open epoch's session as its correlation."""
+    ledger = derive_ledger(journal)
+    last = ledger.records[-1]
+    command = _operator_command("reconcile")
+    journal.append(
+        OperatorCommandRecordedV2(
+            event_id=uuid4(),
+            occurred_at=occurred_at,
+            correlation_id=ledger.open_epoch.session_id,
+            causation_id=command.causation_id,
+            producer="application.breakglass",
+            sequence_number=sequence_number,
+            payload=OperatorCommandRecordPayloadV2(
+                command_id=command.command_id,
+                command_type="reconcile",
+                requested_at=BASE,
+                operator_label=command.operator_label,
+                operator_identity=command.operator_identity,
+                reason=command.reason,
+                source=command.source,
+                previous_safety_state=last.resulting_safety_state,
+                resulting_safety_state=last.resulting_safety_state,
+                disposition="accepted",
+                reason_code="UNKNOWN_PENDING_RECONCILIATION",
+                command_digest=command.digest,
+                mode_path=[last.resulting_safety_state],
+                venue_control="not_requested",
+                reconciliation_status="pending",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=last.fence_term,
+                cancelled_order_references=[],
+            ),
+        )
+    )
+
+
+def _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir):
+    """An epoch opened by a halt at BASE; ten seconds later a cancel never learned the open orders."""
+    now = [BASE]
+    control, _, _, _ = venue(
+        journal,
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: now[0],
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("halt_new_risk")).accepted
+    now[0] = BASE + timedelta(seconds=10)
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "replays before the cancel that opened the epoch",
+        "replays between the epoch opening and the cancel",
+        "replays between the epoch opening and the cancel, no sequence number",
+        "replays after the cancel, numbered before it",
+    ],
+)
+def test_an_older_run_journaled_with_an_earlier_time_still_keeps_the_epoch_unsettled(
+    journal, tmp_path, case
+):
+    # Review P5-F1 (DeepSeek "Saeed" on 6ad0558, confirmed by GPT-6.1 Sol High adjudication): the
+    # code before review F-03 took the raw wall clock, so its reconcile record, written after a
+    # cancel that never learned the open orders, can carry an earlier time. ADV-04 judged the older
+    # run by replay order, missed it, and the epoch returned to normal on an empty listing.
+    state_dir = tmp_path / "state"
+    if case == "replays before the cancel that opened the epoch":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        _journal_an_older_code_listing_run(journal, BASE - timedelta(seconds=5), 201)
+    elif case == "replays after the cancel, numbered before it":
+        # Replay order and sequence disagree, so neither proves the run came first.
+        _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir)
+        _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=15), 101)
+    else:
+        _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir)
+        sequence = None if case.endswith("no sequence number") else 301
+        _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=5), sequence)
+    process = _journal_process(journal, state_dir, [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_legacy_external_evidence_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_legacy_external_evidence_unverifiable",
+    )
