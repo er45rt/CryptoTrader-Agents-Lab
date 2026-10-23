@@ -32,6 +32,7 @@ from crypto_trader.execution.binance_testnet import (
 from crypto_trader.execution.binance_testnet import (
     TestnetEndpointError as EndpointError,
     TestnetOrderRuntime as OrderRuntime,
+    TestnetRejectedError as RejectedError,
 )
 from crypto_trader.execution.binance_testnet import PRODUCER as VENUE_PRODUCER
 from crypto_trader.execution.binance_testnet import deterministic_order_uuid
@@ -638,10 +639,11 @@ def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
             "pending",
             "reconciliation_missing_venue_evidence_for_listed_orders",
         ),
+        # Review SOL-F5: a rejected status read is no proof of absence; the run's evidence fails.
         (
             [txf.open_orders_response("ct-9"), txf.rejected(-1003, "Too many requests.")],
             "pending",
-            "reconciliation_missing_venue_evidence_for_listed_orders",
+            "reconciliation_venue_evidence_unavailable",
         ),
         # Review FZ-10: an empty, non-JSON or non-list 200 body is no listing at all.
         ([txf.response(200, None)], "pending", "reconciliation_missing_open_orders_listing"),
@@ -1386,7 +1388,7 @@ def test_a_listing_run_by_older_code_keeps_the_epoch_unsettled(journal, tmp_path
     acknowledge = process.handle(_operator_command("acknowledge"))
     restore = process.handle(_operator_command("restore_normal"))
 
-    assert legacy.reconciliation_result == "reconciliation_missing_venue_evidence_for_listed_orders"
+    assert legacy.reconciliation_result == "reconciliation_venue_evidence_unavailable"
     assert (later.reconciliation_status, later.reason_code) == (
         "pending",
         "legacy_external_evidence_unverifiable",
@@ -1920,3 +1922,76 @@ def test_an_order_the_venue_already_reported_is_not_read_again(journal, tmp_path
 
     assert outcome.reconciliation_status == "resolved"
     assert [request.method for request in transport.requests] == ["GET", "GET"]
+
+
+# --- Review SOL-F5: our tracked orders are read only through the strict reader ---------------
+
+
+@pytest.mark.parametrize(
+    "case", ["wrong symbol", "missing executedQty", "missing origQty", "inconsistent quote"]
+)
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_a_tracked_order_report_must_prove_its_symbol_and_quantities(
+    journal, tmp_path, path, case
+):
+    # Review SOL-F5 (GPT-6.1 Sol High on 71aec66): venue_reports() read our tracked ct-8 through
+    # the lenient reader, so an answer for another symbol, or with missing or contradictory
+    # quantities, became a report, the strict read of item 15 never ran, and the epoch returned
+    # to normal.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        before = [_listing_of_ct8(100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                _listing_of_ct8(100),
+                txf.cancel_response("ct-8", order_id=100),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        before = []
+    answer = txf.order_response("ct-8", status="CANCELED", order_id=100)
+    if case == "wrong symbol":
+        answer.body["symbol"] = "ETHUSDT"
+    elif case == "inconsistent quote":
+        answer.body["cummulativeQuoteQty"] = "1"
+    else:
+        del answer.body[case.removeprefix("missing ")]
+    process = _journal_process(journal, state_dir, [*before, answer])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert process.status().new_risk_permitted is False
+
+
+@pytest.mark.parametrize("code", [-2013, -1100], ids=["order absent", "another rejection"])
+def test_only_a_confirmed_absence_drops_a_tracked_order_from_the_venue_reports(journal, code):
+    # Review SOL-F5: only the venue confirming that the order does not exist (-2013) leaves it
+    # without a report; any other rejection fails the read, so the run's venue evidence is
+    # incomplete instead of silently missing an order.
+    control, client, _, _ = venue(journal, [txf.rejected(code, "refused")])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    control.track_order_references(["ct-5"])
+
+    if code == -2013:
+        assert control.venue_reports() == ()
+    else:
+        with pytest.raises(RejectedError):
+            control.venue_reports()

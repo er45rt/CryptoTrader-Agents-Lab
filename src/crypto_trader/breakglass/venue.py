@@ -29,13 +29,13 @@ from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient,
     BinanceTestnetError,
     TestnetOrderRuntime,
-    TestnetVenueStateSource,
     UnsafeTestnetAccountError,
     WithdrawalPolicy,
     assert_no_mainnet_reference,
     is_testnet_host,
     require_testnet_base_url,
 )
+from crypto_trader.execution.binance_testnet.errors import OrderNotFoundError
 from crypto_trader.execution.binance_testnet.translate import lifecycle_state_name
 from crypto_trader.recovery import VenueOrderReport
 from crypto_trader.safety import SafetyController
@@ -321,11 +321,21 @@ class BinanceSpotTestnetEmergencyControl:
         )
 
     def venue_reports(self) -> Sequence[VenueOrderReport]:
-        """The venue view used by Phase 8 reconciliation (evidence, never authority)."""
-        source = TestnetVenueStateSource(
-            client=self.client, order_references=tuple(self._order_references)
-        )
-        return source.reports()
+        """The venue view used by Phase 8 reconciliation (evidence, never authority).
+
+        Review SOL-F5: every tracked order is read through the strict reader, so an answer for
+        another symbol, or with missing or contradictory quantities, never becomes a report. Only
+        the venue confirming that the order does not exist (-2013) leaves it without a report; any
+        other failed read raises, so the run records its venue evidence as incomplete.
+        """
+        reports: list[VenueOrderReport] = []
+        for reference in self._order_references:
+            try:
+                order = self.client.startup_order_status(self.symbol, reference)
+            except OrderNotFoundError:
+                continue
+            reports.append(_strict_report(order))
+        return tuple(reports)
 
     def track_order_references(self, references: Sequence[str]) -> None:
         """Record order references discovered from the journal so reconciliation can query them."""
@@ -377,17 +387,22 @@ class BinanceSpotTestnetEmergencyControl:
             order = self.client.startup_order_status(self.symbol, client_order_id)
         except BinanceTestnetError:
             return None
-        return VenueOrderReport(
-            order_reference=order.client_order_id,
-            venue_order_id=order.venue_order_id,
-            state=lifecycle_state_name(order.state),
-            filled_quantity=order.executed_quantity,
-            remaining_quantity=order.remaining_quantity,
-            reported_at=order.transact_time,
-        )
+        return _strict_report(order)
 
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""
     if not reason_code or not detail:
         raise VenueControlError("an unavailable venue outcome requires a code and a detail.")
     return VenueControlOutcome(disposition="unavailable", reason_code=reason_code, detail=detail)
+
+
+def _strict_report(order) -> VenueOrderReport:
+    """A Phase 8 report from one strictly parsed venue order."""
+    return VenueOrderReport(
+        order_reference=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        state=lifecycle_state_name(order.state),
+        filled_quantity=order.executed_quantity,
+        remaining_quantity=order.remaining_quantity,
+        reported_at=order.transact_time,
+    )
