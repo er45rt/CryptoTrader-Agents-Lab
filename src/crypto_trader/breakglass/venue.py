@@ -36,6 +36,7 @@ from crypto_trader.execution.binance_testnet import (
     is_testnet_host,
     require_testnet_base_url,
 )
+from crypto_trader.execution.binance_testnet.translate import lifecycle_state_name
 from crypto_trader.recovery import VenueOrderReport
 from crypto_trader.safety import SafetyController
 
@@ -366,6 +367,24 @@ class BinanceSpotTestnetEmergencyControl:
         except BinanceTestnetError:
             return None
         return order.venue_order_id, order.status, order.executed_quantity
+
+    def strict_order_report(self, client_order_id: str) -> VenueOrderReport | None:
+        """Strict status evidence for one of our orders, as a Phase 8 report (review SOL-F3).
+
+        None when the strict read fails or the venue has no such order: the order stays unproven.
+        """
+        try:
+            order = self.client.startup_order_status(self.symbol, client_order_id)
+        except BinanceTestnetError:
+            return None
+        return VenueOrderReport(
+            order_reference=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            state=lifecycle_state_name(order.state),
+            filled_quantity=order.executed_quantity,
+            remaining_quantity=order.remaining_quantity,
+            reported_at=order.transact_time,
+        )
 
 def unavailable_outcome(reason_code: str, detail: str) -> VenueControlOutcome:
     """A helper for callers that must report a venue control they could not even attempt."""

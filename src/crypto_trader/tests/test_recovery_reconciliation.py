@@ -604,3 +604,24 @@ def test_strictness_needs_the_report_to_name_our_venue_order(strict, outcome, re
     report = strict_engine.reconcile([local], [_venue(venue_order_id=None)])
 
     assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)
+
+
+@pytest.mark.parametrize(
+    ("strict", "outcome", "reason"),
+    [
+        (True, ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION, "venue_order_identity_unproven"),
+        (False, ReconciliationOutcome.MATCHED, "terminal_order_no_venue_evidence"),
+    ],
+    ids=["strict", "default unchanged"],
+)
+def test_strictness_never_trusts_an_ended_order_without_a_report(strict, outcome, reason):
+    # Review SOL-F3: a read or cancel by client order id may have journaled another order's answer
+    # as our order's end. Startup (the default engine) keeps its behaviour (residual R-9).
+    local = replace(_local(state=OrderStateName.CANCELED, attempted=True), venue_order_id="V-1")
+    strict_engine = ReconciliationEngine(
+        load_policy({"policy_id": "recovery-v1"}), require_known_venue_identity=strict
+    )
+
+    report = strict_engine.reconcile([local], [])
+
+    assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)

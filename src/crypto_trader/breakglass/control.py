@@ -1375,6 +1375,17 @@ class BreakGlassControl:
                 if found is not None:
                     listing, listed = "complete", tuple(found)
             venue_reports.extend(self._venue.venue_reports())
+            # Review SOL-F3: an order of ours with a journaled venue order id and no report gets a
+            # strict status read; its local state alone never proves it (the engine keeps it
+            # pending without a report).
+            read_report = getattr(self._venue, "strict_order_report", None)
+            if callable(read_report):
+                reported_now = {report.order_reference for report in venue_reports}
+                for state in local_states:
+                    if state.venue_order_id is not None and state.order_reference not in reported_now:
+                        found_report = read_report(state.order_reference)
+                        if found_report is not None:
+                            venue_reports.append(found_report)
             # An outstanding external order settles only on strict evidence that the exact venue
             # order first observed ended without any execution.
             read_evidence = getattr(self._venue, "order_settlement_evidence", None)

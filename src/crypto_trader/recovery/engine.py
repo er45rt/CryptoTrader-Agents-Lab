@@ -221,6 +221,13 @@ class ReconciliationEngine:
                 adjustment,
             )
 
+        if self._require_known_venue_identity and local.is_terminal:
+            # Review SOL-F3: a read or cancel by client order id may have journaled another
+            # order's answer as this order's end, so only a current venue report can prove it.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_unproven",
+            )
         if local.is_terminal:
             # A terminal order whose terminal state came from our own recorded lifecycle/fills
             # needs no venue correction when the venue view simply has nothing to report. The

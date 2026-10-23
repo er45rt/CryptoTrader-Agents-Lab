@@ -1213,9 +1213,11 @@ def test_a_listed_order_reusing_an_ended_local_id_stays_outstanding_until_settle
     acknowledge = gone.handle(_operator_command("acknowledge"))
     restore = gone.handle(_operator_command("restore_normal"))
 
+    # Review SOL-F3: our ended ct-8, whose venue order id was never journaled, cannot be proven
+    # once the venue shows ct-8 as another order, so it keeps the epoch pending as well.
     assert (later.reconciliation_status, later.reconciliation_result) == (
         "pending",
-        "reconciliation_external_orders_outstanding",
+        "reconciliation_left_orders_unresolved",
     )
     assert (acknowledge.accepted, restore.accepted) == (False, False)
     assert seen.reconciliation_status == "pending"
@@ -1226,16 +1228,18 @@ def test_a_listed_order_reusing_an_ended_local_id_stays_outstanding_until_settle
     )
     settled = proven.handle(_operator_command("reconcile"))
 
-    assert (settled.reconciliation_status, settled.reconciliation_result) == (
-        "resolved",
-        "reconciliation_confirmed_by_evidence",
-    )
+    # The external order settles on its exact evidence; our unproven order still blocks restore.
     assert [
         (order.client_order_id, order.venue_order_id)
         for order in _settled_events(journal)[0].payload.settled_orders
     ] == [("ct-8", "100")]
-    assert proven.handle(_operator_command("acknowledge")).accepted
-    assert proven.handle(_operator_command("restore_normal")).accepted
+    assert proven.load_ledger().observations.external_orders == ()
+    assert (settled.reconciliation_status, settled.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert not proven.handle(_operator_command("acknowledge")).accepted
+    assert not proven.handle(_operator_command("restore_normal")).accepted
 
 
 # --- Review G-4: our open order is ours only under our journaled venue order id ---------------
@@ -1824,3 +1828,95 @@ def test_a_report_without_a_venue_order_id_never_restores_our_known_order(
 
     assert outcome.reconciliation_status == "pending"
     assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+# --- Review SOL-F3: our order's local state alone never vouches for it ----------------------
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["identity known", "identity unknown"])
+@pytest.mark.parametrize("read", ["refresh", "cancel"])
+def test_a_state_journaled_from_another_order_never_restores_by_silence(
+    journal, tmp_path, read, known
+):
+    # Review SOL-F3 (GPT-6.1 Sol High on 5375d9d): a refresh or cancel of ct-8 by client order id
+    # answered for venue order 777, and the runtime journaled 777's CANCELED as our state. A later
+    # epoch with nothing to read trusted that ended state, and the epoch returned to normal.
+    if known:
+        _our_attempt_and_identity(journal)
+    else:
+        _our_attempt_only(journal)
+    answer = (
+        txf.order_response("ct-8", status="CANCELED", order_id=777)
+        if read == "refresh"
+        else txf.cancel_response("ct-8", order_id=777)
+    )
+    _, client, runtime, _ = venue(journal, [answer])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    getattr(runtime, read)("ct-8")
+    strict_read = txf.order_response("ct-8", status="CANCELED", order_id=777)
+    process = _journal_process(journal, tmp_path / "state", [strict_read] if known else [])
+
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+@pytest.mark.parametrize("symbol", [txf.SYMBOL, "ETHUSDT"], ids=["our order", "another symbol"])
+def test_our_ended_order_is_proven_by_a_strict_read_of_our_venue_order(journal, tmp_path, symbol):
+    # Review SOL-F3: with nothing else to read, break-glass reads our ended order strictly, and
+    # only the venue showing our own venue order 100 ended lets the epoch resolve. The strict
+    # reader refuses an answer for another symbol.
+    _our_attempt_and_identity(journal)
+    _, client, runtime, _ = venue(
+        journal, [txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    runtime.refresh("ct-8")
+    answer = txf.order_response("ct-8", status="CANCELED", order_id=100)
+    answer.body["symbol"] = symbol
+    venue_control, client, _, transport = venue(journal, [answer])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    proven = symbol == txf.SYMBOL
+    assert outcome.reconciliation_status == ("resolved" if proven else "pending")
+    assert [request.method for request in transport.requests] == ["GET"]
+    assert (acknowledge.accepted, restore.accepted) == (proven, proven)
+
+
+def test_an_order_the_venue_already_reported_is_not_read_again(journal, tmp_path):
+    # Review SOL-F3: the strict read is only for our orders the run has no report for.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    venue_control, client, _, transport = venue(
+        journal, [_listing_of_ct8(100), txf.order_response("ct-8", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    outcome = process.handle(_operator_command("reconcile"))
+
+    assert outcome.reconciliation_status == "resolved"
+    assert [request.method for request in transport.requests] == ["GET", "GET"]
