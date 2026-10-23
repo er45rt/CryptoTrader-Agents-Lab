@@ -33,6 +33,8 @@ from crypto_trader.execution.binance_testnet import (
     TestnetEndpointError as EndpointError,
     TestnetOrderRuntime as OrderRuntime,
 )
+from crypto_trader.execution.binance_testnet import PRODUCER as VENUE_PRODUCER
+from crypto_trader.execution.binance_testnet import deterministic_order_uuid
 from crypto_trader.events import (
     OPERATOR_COMMAND_EVENT_TYPE,
     RECONCILIATION_INTAKE_EVENT_TYPE,
@@ -40,6 +42,8 @@ from crypto_trader.events import (
     RECONCILIATION_SETTLED_EVENT_TYPE,
     OperatorCommandRecordPayload,
     OperatorCommandRecorded,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
 )
 from crypto_trader.events.contracts import OperatorCommandRecordPayloadV3
 from crypto_trader.persistence import SQLiteEventJournal
@@ -1664,3 +1668,83 @@ def test_failed_second_cancel_never_reuses_stale_preflight_evidence(journal):
     assert first.preflight is not None
     assert second.disposition == "unavailable"
     assert second.preflight is None
+
+
+# --- Review G-4 item 13: a crash before our venue identity was journaled --------------------
+
+
+def _our_attempt_only(journal):
+    """The venue accepted our ct-8, and we crashed before journaling its identity or state."""
+    journal.append(
+        OrderSubmissionAttempted(
+            occurred_at=BASE,
+            correlation_id=uuid4(),
+            producer="application.production",
+            order_id=deterministic_order_uuid("ct-8"),
+            symbol=txf.SYMBOL,
+            payload=OrderSubmissionAttemptPayload(
+                venue_reference="ct-8",
+                intent_id=uuid4(),
+                side="buy",
+                order_type="limit",
+                quantity=Decimal("0.001"),
+                limit_price=Decimal("27000"),
+                time_in_force="gtc",
+                venue_producer=VENUE_PRODUCER,
+            ),
+        )
+    )
+
+
+def _journal_process(journal, state_dir, responses):
+    venue_control, client, _, _ = venue(journal, responses)
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    return BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_an_order_whose_venue_identity_was_never_journaled_never_restores(journal, tmp_path, path):
+    # Review G-4: without our journaled venue order id, a venue report for ct-8 may be another
+    # order that reuses it, so break-glass never resolves our order from it (P-L and P-C).
+    state_dir = tmp_path / "state"
+    _our_attempt_only(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        reports = [txf.open_orders_response("ct-8"), txf.order_response("ct-8", order_id=100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                txf.open_orders_response("ct-8"),
+                txf.cancel_response("ct-8", order_id=100),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        reports = [txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    process = _journal_process(journal, state_dir, reports)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)

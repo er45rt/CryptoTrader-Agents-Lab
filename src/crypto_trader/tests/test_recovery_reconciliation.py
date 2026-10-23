@@ -545,3 +545,41 @@ def test_a_report_for_another_venue_order_never_resolves_ours(
     if pending:
         assert report.adjustments == []
         assert report.requires_halt_new_risk is True
+
+
+# --- review G-4 item 13: break-glass never resolves an order of unknown venue identity ------
+
+_PENDING = (ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION, "venue_order_identity_unknown")
+_AGREE = (ReconciliationOutcome.MATCHED, "local_and_venue_agree")
+
+
+@pytest.mark.parametrize(
+    ("strict", "local_id", "state", "attempted", "outcome", "reason"),
+    [
+        (False, None, OrderStateName.ACCEPTED, True, *_AGREE),
+        (True, None, OrderStateName.ACCEPTED, True, *_PENDING),
+        (True, "V-1", OrderStateName.ACCEPTED, True, *_AGREE),
+        (True, None, OrderStateName.CANCELED, True, *_PENDING),
+        (True, None, OrderStateName.ACCEPTED, False, *_PENDING),
+    ],
+    ids=[
+        "default unchanged",
+        "strict, unknown identity",
+        "strict, our venue id",
+        "strict, ended order",
+        "strict, never sent",
+    ],
+)
+def test_strictness_keeps_an_order_of_unknown_venue_identity_pending(
+    strict, local_id, state, attempted, outcome, reason
+):
+    # The venue may be answering for another order that reuses our client order id, and without
+    # our journaled venue order id nothing tells them apart, even for an order that looks ended.
+    local = replace(_local(state=state, attempted=attempted), venue_order_id=local_id)
+    strict_engine = ReconciliationEngine(
+        load_policy({"policy_id": "recovery-v1"}), require_known_venue_identity=strict
+    )
+
+    report = strict_engine.reconcile([local], [_venue(state=state)])
+
+    assert (report.outcome_for("O-1"), report.reason_for("O-1")) == (outcome, reason)

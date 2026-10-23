@@ -1470,7 +1470,10 @@ class BreakGlassControl:
         unverified = tuple(reference for reference in references if reference not in reported)
         # A listing only names the open orders: each listed one needs its own venue report too.
         unverified_listed = tuple(reference for reference in listed if reference not in reported)
-        engine = ReconciliationEngine(self._reconciliation_policy)
+        # Review G-4: an order of ours whose venue order id was never journaled is not resolved.
+        engine = ReconciliationEngine(
+            self._reconciliation_policy, require_known_venue_identity=True
+        )
         source = StaticVenueStateSource(entries=tuple(venue_reports), name="breakglass.venue")
         recovery = RestartRecovery(
             engine=engine,

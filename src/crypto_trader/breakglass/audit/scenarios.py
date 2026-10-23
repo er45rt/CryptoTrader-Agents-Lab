@@ -714,6 +714,7 @@ def scenario_reconciliation_after_emergency_action(workspace: Path) -> BreakGlas
             symbol=SYMBOL,
             state=OrderStateName.SUBMITTED,
             submission_attempted=True,
+            venue_order_id="42",  # our journaled venue order id (review G-4)
         )
     ]
     reports = [
@@ -1317,6 +1318,7 @@ def scenario_venue_state_ahead_of_local(workspace: Path) -> BreakGlassScenarioRe
         symbol=SYMBOL,
         state=OrderStateName.ACCEPTED,
         submission_attempted=True,
+        venue_order_id="9",  # our journaled venue order id (review G-4)
     )
     reports = [
         VenueOrderReport(
