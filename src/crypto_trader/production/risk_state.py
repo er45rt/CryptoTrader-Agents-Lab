@@ -359,6 +359,9 @@ def derive_risk_state(
                 raise _fail("authoritative venue open-order side disagrees with durable attempt.")
             if anchor.order_type == "limit" and remote.price != anchor.limit_price:
                 raise _fail("authoritative venue open-order price disagrees with durable attempt.")
+            # Review A-2: our order is ours only under the venue order id journaled from our write.
+            if local.venue_order_id is not None and remote.venue_order_id != local.venue_order_id:
+                raise _fail("authoritative venue open-order identity disagrees with durable venue identity.")
 
     current_notional = position * mark.price
     signed_worst = _worse_signed(current_notional, open_buy, open_sell)
@@ -508,8 +511,10 @@ class ProductionRiskStateSource:
         except Exception as exc:
             raise _fail("authoritative venue risk evidence refresh failed.") from exc
 
-        if tuple((o.client_order_id, o.status, o.remaining_quantity) for o in venue_before) != tuple(
-            (o.client_order_id, o.status, o.remaining_quantity) for o in venue_after
+        if tuple(
+            (o.client_order_id, o.venue_order_id, o.status, o.remaining_quantity) for o in venue_before
+        ) != tuple(
+            (o.client_order_id, o.venue_order_id, o.status, o.remaining_quantity) for o in venue_after
         ):
             raise _fail("venue open orders changed during risk evidence refresh.")
 

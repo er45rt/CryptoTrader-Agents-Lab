@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -11,7 +12,18 @@ from crypto_trader.production import ProductionStateError
 from crypto_trader.production.equity import AccountEquityBaselineWriter, load_equity_chain
 from crypto_trader.production.risk_state import ProductionRiskStateSource
 from crypto_trader.tests import testnet_fixtures as fx
-from crypto_trader.tests.production_fixtures import INSTRUMENT, control_for
+from crypto_trader.tests import test_recovery_submission_attempt as attempts
+from crypto_trader.tests.production_fixtures import (
+    INSTRUMENT,
+    admitted_prepare,
+    admitted_submit,
+    canonical_risk_refresh_responses,
+    control_for,
+    intent,
+    seed_canonical_equity_root,
+    startup_responses,
+    testnet_runtime as production_on_testnet,
+)
 from crypto_trader.validity import MarketObservation, ReplayMarketStateProvider
 
 UTC = timezone.utc
@@ -180,3 +192,103 @@ def test_venue_open_orders_changing_during_refresh_fail_closed(journal, state_di
         risk_source(NOW, guard=guard)
 
     assert journal.count() == 1
+
+
+# --- Review A-2: the risk refresh admits new risk only on our journaled venue order id ----------
+
+OUR_REFERENCE = attempts.CLIENT_ORDER_ID
+OUR_INTENT = UUID("44444444-4444-4444-4444-444444444444")
+
+
+def _listing_naming_our_reference(venue_order_id):
+    response = fx.open_orders_response(OUR_REFERENCE)
+    response.body[0]["orderId"] = venue_order_id
+    return response
+
+
+def _running_with_our_open_order(journal, tmp_path, *, identity_journaled=True):
+    """Our open order: its write attempt, and (normally) the venue order id 100 that answered it."""
+    seed_canonical_equity_root(journal)
+    journal.append(
+        attempts.attempt_event(quantity="0.001", limit_price="27000", intent_id=OUR_INTENT)
+        .model_copy(update={"symbol": INSTRUMENT.symbol})
+    )
+    if identity_journaled:
+        journal.append(
+            attempts.identity_event("100", index=0, symbol=INSTRUMENT.symbol, intent_id=OUR_INTENT)
+        )
+    startup = startup_responses()
+    startup[1] = _listing_naming_our_reference(100)
+    transport = fx.ScriptedTransport(startup)
+    runtime, port = production_on_testnet(
+        journal=journal, state_dir=tmp_path / "state", client=fx.client(transport, retries=1)
+    )
+    runtime.start()
+    return runtime, port, transport
+
+
+def _risk_refresh_listing(before, after):
+    responses = canonical_risk_refresh_responses()
+    responses[1] = _listing_naming_our_reference(before)
+    responses[4] = _listing_naming_our_reference(after)
+    return responses
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        (777, 777, "identity disagrees with durable venue identity"),
+        (100, 777, "open orders changed"),
+        (777, 100, "open orders changed"),
+    ],
+)
+def test_a_listed_order_under_another_venue_id_admits_no_new_risk(
+    tmp_path, before, after, refusal
+):
+    # Review A-2 (GPT-6 Astra; adjudicated High and blocking by the GPT-6.1 Sol High adjudication):
+    # the venue lists our client order id under venue order 777 while the journal bound it to 100.
+    # Matching on the client id, quantity, side and price alone admitted the new intent and POSTed it.
+    # 777 then 100 is refused only by the before/after comparison: the listing the snapshot is derived
+    # from shows our id, but another order held our client id while the evidence was read.
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        runtime, _, transport = _running_with_our_open_order(journal, tmp_path)
+        transport.responses.extend(_risk_refresh_listing(before, after))
+        records = journal.count()
+
+        with pytest.raises(ProductionStateError, match=refusal):
+            admitted_prepare(runtime, intent("a2-new-risk", quantity=Decimal("0.001")))
+
+        assert [request for request in transport.requests if request.method == "POST"] == []
+        assert journal.count() == records
+
+
+def test_our_listed_order_under_our_venue_id_still_admits_new_risk(tmp_path):
+    # Review A-2 guard: our journaled venue order id in both listings is not a refusal.
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        runtime, port, transport = _running_with_our_open_order(journal, tmp_path)
+        transport.responses.extend(_risk_refresh_listing(100, 100))
+        new = intent("a2-new-risk", quantity=Decimal("0.001"))
+
+        prepared = admitted_prepare(runtime, new)
+        assert prepared.approved
+        new_reference = port.client_order_id_for(new.intent_id)
+        transport.responses.append(
+            fx.order_response(new_reference, order_id=888, transact_time=fx.SERVER_TIME_MS + 2)
+        )
+
+        assert admitted_submit(runtime, prepared).order_reference == new_reference
+        assert len([request for request in transport.requests if request.method == "POST"]) == 1
+
+
+def test_an_open_order_of_unknown_venue_identity_is_matched_as_before(tmp_path):
+    # Review A-2, option A2-L (owner's decision; residual recorded with R-9): with no journaled venue
+    # order id (a crash after the POST, or a journal written before item 11) there is nothing to
+    # compare, so the listing is matched on client id, quantity, side and price as before. The strict
+    # alternative refuses the protected post-crash restart flow (review R-03).
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        runtime, _, transport = _running_with_our_open_order(
+            journal, tmp_path, identity_journaled=False
+        )
+        transport.responses.extend(_risk_refresh_listing(777, 777))
+
+        assert admitted_prepare(runtime, intent("a2-new-risk", quantity=Decimal("0.001"))).approved
