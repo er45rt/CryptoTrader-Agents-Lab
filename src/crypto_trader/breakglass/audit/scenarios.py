@@ -911,7 +911,9 @@ def scenario_ambiguous_cancel_unknown_pending_reconciliation(
         and "degraded" in status.epoch_escalation_path
         and status.epoch_escalation_path[-1] == "recovery_required"
         and len(deletes) == 1
-        and restore.reason_code == "restore_denied_reconciliation_pending"
+        # Review H-1: the unconfirmed cancel cannot prove it covered its listing, so restore is
+        # refused by that gate first.
+        and restore.reason_code == "restore_denied_cancel_listing_unverifiable"
     ):
         return _ok(
             "ambiguous_cancel_unknown_pending_reconciliation",

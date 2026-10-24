@@ -427,6 +427,21 @@ class BreakGlassLedger:
         ]
         return any(not _written_before(run, cancel) for run in runs for cancel in cancels)
 
+    def open_epoch_cancel_listing_unverifiable(self) -> bool:
+        """Whether a cancel of the open epoch failed part-way through its listing (review H-1).
+
+        A cancel the venue did not confirm (rejected, ambiguous or unavailable) that recorded
+        references stopped somewhere in its strict listing. The orders listed after that point were
+        neither cancelled nor journaled, and the journal cannot tell whether there were any, so no
+        reconciliation can prove what became of them: only re-establishment clears it.
+        """
+        return any(
+            record.command_type == "cancel_open"
+            and record.venue_control in ("rejected", "ambiguous", "unavailable")
+            and bool(record.cancelled_order_references or record.unconfirmed_order_references)
+            for _, record in self._open_epoch_records()
+        )
+
     def open_epoch_reconciliation_superseded(self) -> bool:
         """Whether a cancel reached the venue after the open epoch's latest reconciliation (N-1).
 

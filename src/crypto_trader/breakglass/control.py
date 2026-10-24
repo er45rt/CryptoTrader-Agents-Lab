@@ -140,6 +140,9 @@ LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE = "legacy_external_evidence_unverifiable"
 #: Review N-1: a cancel reached the venue after the latest reconciliation, so neither it nor its
 #: acknowledgement covers the venue any more; reconcile again before restoring normal.
 RECONCILIATION_SUPERSEDED_BY_VENUE_ACTION = "reconciliation_superseded_by_venue_action"
+#: Review H-1: a cancel failed part-way through its listing, so the orders after that point were
+#: never reached or journaled; only re-establishing on a newly founded journal clears it.
+CANCEL_LISTING_UNVERIFIABLE = "cancel_listing_unverifiable"
 #: The terminal venue statuses that settle an external order the venue shows never executed.
 SETTLED_WITHOUT_EXECUTION_STATUSES = frozenset({"CANCELED", "EXPIRED", "REJECTED"})
 
@@ -406,6 +409,11 @@ class BreakGlassControl:
             *(
                 (LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE,)
                 if ledger.open_epoch_legacy_listing_run()
+                else ()
+            ),
+            *(
+                (CANCEL_LISTING_UNVERIFIABLE,)
+                if ledger.open_epoch_cancel_listing_unverifiable()
                 else ()
             ),
             *((RECONCILIATION_RUN_INCOMPLETE,) if ledger.observations.run_incomplete else ()),
@@ -1481,6 +1489,8 @@ class BreakGlassControl:
             run_blocker = OBSERVATION_POSSIBLY_LOST
         elif ledger.open_epoch_legacy_listing_run():
             run_blocker = LEGACY_EXTERNAL_EVIDENCE_UNVERIFIABLE
+        elif ledger.open_epoch_cancel_listing_unverifiable():
+            run_blocker = CANCEL_LISTING_UNVERIFIABLE
         if not evidence_complete:
             # Absence of evidence is not evidence of absence: Phase 8 never runs on a failed read.
             return False, "reconciliation_venue_evidence_unavailable", run_blocker
@@ -1566,6 +1576,13 @@ class BreakGlassControl:
                 "a reconcile run journaled by older code listed the open orders and journaled "
                 "nothing it saw; cancel open orders directly at the exchange and re-establish on a "
                 "newly founded journal.",
+            )
+        if ledger.open_epoch_cancel_listing_unverifiable():
+            return (
+                CANCEL_LISTING_UNVERIFIABLE,
+                "a cancel failed part-way through its listing and cannot prove which listed orders "
+                "it never reached; cancel open orders directly at the exchange and re-establish on "
+                "a newly founded journal.",
             )
         if observations.run_incomplete:
             return (

@@ -2422,3 +2422,179 @@ def test_an_older_cancel_numbered_after_the_reconciliation_still_supersedes_it(
         journal=journal, state_dir=state_dir, clock=lambda: BASE
     ).status().restore_blockers
     assert ("reconciliation_superseded_by_venue_action" in blockers) is superseded
+
+
+# --- Review H-1: a cancel that failed part-way cannot prove which listed orders it never reached --
+
+
+def _listing_of(*pairs):
+    response = txf.open_orders_response(*[reference for reference, _ in pairs])
+    for body, (_, order_id) in zip(response.body, pairs):
+        body["orderId"] = order_id
+    return response
+
+
+def _a_cancel_failing_part_way(journal, state_dir, listed, confirmed_before):
+    """Our ct-8 (venue order 100) is journaled; the strict listing names ``listed`` in order, the
+    cancels in ``confirmed_before`` succeed and the next one fails, so the rest is never reached."""
+    _our_attempt_and_identity(journal)
+    responses = [txf.time_response(), txf.exchange_info_response(), txf.account_response(), _listing_of(*listed)]
+    responses += [
+        txf.cancel_response(reference, order_id=order_id)
+        for reference, order_id in listed
+        if reference in confirmed_before
+    ]
+    responses.append(txf.rejected(-2011, "Unknown order sent."))
+    first = _journal_process(journal, state_dir, responses)
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control in ("rejected", "ambiguous")
+
+
+_PART_WAY = {
+    "first cancel fails": ([("ct-8", 100), ("ct-2", 101)], ()),
+    "middle cancel fails": ([("ct-1", 99), ("ct-8", 100), ("ct-2", 101)], ("ct-1",)),
+}
+
+
+@pytest.mark.parametrize("tail", ["still open", "gone"])
+@pytest.mark.parametrize("case", sorted(_PART_WAY))
+def test_a_cancel_failing_part_way_keeps_the_epoch_unsettled(journal, tmp_path, case, tail):
+    # Review H-1 (DeepSeek "Saeed" hypothesis, promoted with a replay by the GPT-6.1 Sol High
+    # adjudication): the cancel failed on ct-8, so ct-2 after it in the listing was neither cancelled
+    # nor journaled. A later reconcile read only the journaled references, resolved, and restore
+    # succeeded while ct-2 could still be open, or could have filled and left the listing.
+    state_dir = tmp_path / "state"
+    listed, confirmed_before = _PART_WAY[case]
+    _a_cancel_failing_part_way(journal, state_dir, listed, confirmed_before)
+    answers = [
+        txf.order_response(reference, status="CANCELED", order_id=order_id)
+        for reference, order_id in listed
+        if reference in confirmed_before or reference == "ct-8"
+    ]
+    if derive_ledger(journal).open_epoch_open_orders_unknown():
+        answers.insert(0, _listing_of(("ct-2", 101)) if tail == "still open" else txf.open_orders_response())
+    process = _journal_process(journal, state_dir, answers)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "cancel_listing_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_cancel_listing_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_cancel_listing_unverifiable",
+    )
+    assert "cancel_listing_unverifiable" in process.status().restore_blockers
+
+
+def test_a_cancel_failing_part_way_after_the_acknowledgement_still_refuses_restore(journal, tmp_path):
+    # Review H-1 with review N-1 (item 19): reconciled and acknowledged first, then the part-way
+    # cancel; a new reconcile cannot settle what the cancel never reached.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses = [
+        txf.time_response(),
+        txf.exchange_info_response(),
+        txf.account_response(),
+        _listing_of(("ct-5", 100), ("ct-2", 101)),
+        txf.rejected(-2011, "Unknown order sent."),
+    ]
+    assert _journal_process(journal, state_dir, responses).handle(
+        _operator_command("cancel_open")
+    ).venue_control in ("rejected", "ambiguous")
+    process = _journal_process(journal, state_dir, [txf.order_response("ct-5", status="CANCELED", order_id=100)])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == ("pending", "cancel_listing_unverifiable")
+    assert (restore.accepted, restore.reason_code) == (False, "restore_denied_cancel_listing_unverifiable")
+
+
+def test_a_cancel_that_never_reached_a_listed_order_is_not_quarantined(journal, tmp_path):
+    # Review H-1: only a failed cancel that recorded references is quarantined. A cancel whose
+    # listing failed recorded none; it leaves the open orders unknown (review F-03) instead.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = _journal_process(journal, state_dir, [])
+
+    assert derive_ledger(journal).open_epoch_open_orders_unknown()
+    assert "cancel_listing_unverifiable" not in process.status().restore_blockers
+
+
+def _journal_an_older_code_restore(journal, session, sequence_number):
+    """A restore_normal record closing the epoch, as code before review H-1 could write it."""
+    command = _operator_command("restore_normal")
+    journal.append(
+        OperatorCommandRecordedV2(
+            event_id=uuid4(),
+            occurred_at=BASE,
+            correlation_id=session,
+            causation_id=command.causation_id,
+            producer="application.breakglass",
+            sequence_number=sequence_number,
+            payload=OperatorCommandRecordPayloadV2(
+                command_id=command.command_id,
+                command_type="restore_normal",
+                requested_at=BASE,
+                operator_label=command.operator_label,
+                operator_identity=command.operator_identity,
+                reason=command.reason,
+                source=command.source,
+                previous_safety_state="halt_new_risk",
+                resulting_safety_state="normal",
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                command_digest=command.digest,
+                mode_path=["halt_new_risk", "normal"],
+                venue_control="not_requested",
+                reconciliation_status="resolved",
+                epoch_opened=False,
+                epoch_closed=True,
+                fence_term=2,
+                cancelled_order_references=[],
+            ),
+        )
+    )
+
+
+def test_a_part_way_cancel_of_a_closed_earlier_epoch_never_quarantines_a_new_one(journal, tmp_path):
+    # Review H-1: the gate judges the open epoch's records only. Code before the gate could close an
+    # epoch after such a cancel; a later epoch is judged on its own records.
+    state_dir = tmp_path / "state"
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE,
+        sequence_number=300,
+        correlation_id=session,
+        venue_control="ambiguous",
+        unconfirmed=("ct-8",),
+    )
+    _journal_an_older_code_restore(journal, session, 400)
+    assert derive_ledger(journal).open_epoch is None
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_SilentVenue(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    assert derive_ledger(journal).open_epoch is not None
+    assert "cancel_listing_unverifiable" not in process.status().restore_blockers
