@@ -833,6 +833,9 @@ class BinanceSpotTestnetClient:
                 "body); the order outcome is unknown and the order is not retried."
             )
         try:
+            # Review A-1: this answer becomes our journaled state and venue identity, so it gets the
+            # strict proof a cancel answer or an adoption read gets before the lenient parse.
+            self._parse_startup_order(body, prepared.symbol, prepared.client_order_id)
             order = self._parse_order(body)
         except BinanceTestnetError as exc:
             raise AmbiguousOrderError(

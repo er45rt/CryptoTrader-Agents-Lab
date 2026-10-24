@@ -1827,3 +1827,76 @@ def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path
         assert len(attempt_events(journal)) == 1
         assert instance.local_states()[0].state.value == "submitted"
         assert instance.client.known_orders() == ()
+
+
+# --- Review A-1: our own write answer is journaled only after the strict proof ------------------
+
+
+def _write_answer(*, status, executed="0", quote=None, drop=(), **fields):
+    answer = fx.order_response(
+        CLIENT_ORDER_ID, status=status, order_id=4242, executed_qty=executed, cummulative_quote=quote
+    )
+    for name in drop:
+        answer.body.pop(name)
+    answer.body.update(fields)
+    return answer
+
+
+_MALFORMED_WRITE_ANSWERS = [
+    pytest.param(dict(status="FILLED", drop=("executedQty",)), id="filled_without_executed_quantity"),
+    pytest.param(dict(status="CANCELED", drop=("executedQty",)), id="canceled_without_executed_quantity"),
+    pytest.param(dict(status="EXPIRED", drop=("origQty",)), id="expired_without_original_quantity"),
+    pytest.param(dict(status="FILLED", executed="0.00050000"), id="filled_short_of_its_quantity"),
+    pytest.param(dict(status="NEW", executed="0.00050000"), id="new_with_an_execution"),
+    pytest.param(dict(status="PARTIALLY_FILLED", executed="0.00200000"), id="executed_over_its_quantity"),
+    pytest.param(dict(status="NEW", quote="27.00"), id="quote_without_an_execution"),
+    pytest.param(dict(status="CANCELED", symbol="ETHUSDT"), id="another_symbol"),
+    pytest.param(dict(status="NEW", drop=("side",)), id="without_a_side"),
+]
+
+
+@pytest.mark.parametrize("answer", _MALFORMED_WRITE_ANSWERS)
+def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, answer):
+    # Review A-1 (GPT-6 Astra; adjudicated High and blocking by the GPT-6.1 Sol High adjudication,
+    # as the no-reuse extension of R-9): our own POST answer was parsed only leniently, so a missing
+    # executedQty became 0 and a terminal status with missing or contradictory quantities was
+    # journaled as our order's ended state, with our venue identity. Startup never re-reads an ended
+    # order. The answer is now proved strictly first; a malformed one leaves the outcome unknown.
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(**answer)])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+@pytest.mark.parametrize(
+    ("answer", "state"),
+    [
+        pytest.param(dict(status="NEW"), "accepted", id="new"),
+        pytest.param(
+            dict(status="PARTIALLY_FILLED", executed="0.00050000"), "partially_filled", id="partially_filled"
+        ),
+        pytest.param(dict(status="FILLED", executed="0.00100000"), "filled", id="filled"),
+        pytest.param(dict(status="CANCELED", executed="0"), "canceled", id="canceled"),
+    ],
+)
+def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_path, answer, state):
+    # Review A-1 guard: a consistent answer is journaled as before, with our venue identity.
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(**answer)])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        instance.submit(execution_request())
+
+        rebuilt, _ = reconstruct_order_states(journal)
+        local = rebuilt.state_for(CLIENT_ORDER_ID)
+        assert (local.state.value, local.venue_order_id) == (state, "4242")
