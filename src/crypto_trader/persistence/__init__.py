@@ -18,6 +18,7 @@ from .journal import (
     EventJournal,
     JournalRevision,
     SQLiteEventJournal,
+    check_journalable,
 )
 from .replay import IdempotentConsumer, RebuildSummary, rebuild_state
 from .snapshots import SNAPSHOT_SCHEMA_VERSION, SnapshotRecord, SnapshotStore
@@ -38,5 +39,6 @@ __all__ = [
     "SnapshotError",
     "SnapshotRecord",
     "SnapshotStore",
+    "check_journalable",
     "rebuild_state",
 ]

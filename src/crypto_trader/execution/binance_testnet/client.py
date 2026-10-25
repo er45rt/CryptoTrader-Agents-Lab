@@ -27,6 +27,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
+from ...persistence import JournalError, check_journalable
 from ..exchange_filters import (
     ExchangeFilterValidationError,
     parse_exchange_filters,
@@ -79,7 +80,11 @@ from .transport import (
     TransportError,
     TransportTimeout,
 )
-from .translate import deterministic_order_uuid, testnet_order_to_phase3_events
+from .translate import (
+    deterministic_order_uuid,
+    testnet_order_to_phase3_events,
+    testnet_order_venue_identity_event,
+)
 
 __all__ = ["AttemptAuthorization", "BinanceSpotTestnetClient", "PreparedTestnetOrder"]
 
@@ -874,11 +879,17 @@ class BinanceSpotTestnetClient:
             # answer they came in. Our FULL answer lists every fill of an execution.
             self._require_matching_fills(body)
             order = self._parse_order(body)
-            # Review RV-F1..RV-F4: accepted only once the very events it will be journaled as can be
-            # built and serialized, so no part of it can fail after our identity or state is written.
-            for event in testnet_order_to_phase3_events(order, correlation_id=UUID(int=0)):
-                event.to_json()
-        except (BinanceTestnetError, ValueError, TypeError, ArithmeticError) as exc:
+            # Review RV-F1..RV-F4, L1/L2: accepted only once every event it will be journaled as, our
+            # venue identity included, can be built and stored, so no part of it can fail after it is
+            # cached or after our identity or state is written.
+            events = list(testnet_order_to_phase3_events(order, correlation_id=UUID(int=0)))
+            if order.client_order_id and order.venue_order_id:
+                events.append(
+                    testnet_order_venue_identity_event(order, intent_id=UUID(int=0), correlation_id=UUID(int=0))
+                )
+            for event in events:
+                check_journalable(event)
+        except (BinanceTestnetError, JournalError, ValueError, TypeError, ArithmeticError) as exc:
             raise AmbiguousOrderError(
                 "the write returned HTTP 200 with an unparseable order payload "
                 f"({type(exc).__name__}); the order outcome is unknown and the order is not retried."

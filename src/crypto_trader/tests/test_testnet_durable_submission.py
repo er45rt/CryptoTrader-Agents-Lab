@@ -1941,6 +1941,18 @@ _MALFORMED_WRITE_ANSWERS = [
     ),
     pytest.param(dict(status="NEW", drop=("transactTime",)), id="without_a_transaction_time"),
     pytest.param(dict(status="NEW", transactTime=10**1000), id="an_overflowing_transaction_time"),
+    # Review L1/L2 (Astra's re-verification of item 25): our venue identity and every event time must
+    # fit the journal too, or the order is cached and only then fails to be journaled.
+    pytest.param(dict(status="NEW", orderId=int("9" * 129)), id="a_venue_order_id_too_long_to_journal"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")], orderId=int("9" * 129)),
+        id="a_filled_answer_with_a_venue_order_id_too_long_to_journal",
+    ),
+    pytest.param(dict(status="NEW", transactTime=9223372036855), id="a_transaction_time_past_the_journal"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")], transactTime=9223372036855),
+        id="a_filled_answer_timed_past_the_journal",
+    ),
 ]
 
 
@@ -1965,6 +1977,28 @@ def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, an
         journaled = [event.event_type for event in journal.read_range()]
         assert ORDER_STATE_EVENT_TYPE not in journaled
         assert "order.venue_identity.recorded" not in journaled
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(dict(orderId=int("9" * 128)), id="the_longest_venue_order_id"),
+        pytest.param(dict(transactTime=9223372036854), id="the_latest_journal_time"),
+    ],
+)
+def test_a_write_answer_at_the_journal_limits_is_still_journaled(tmp_path, fields):
+    # Review L1/L2 guard: the limits themselves are journaled as before.
+    written = _write_answer(status="NEW", **fields)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), written])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        instance.submit(execution_request())
+
+        rebuilt, _ = reconstruct_order_states(journal)
+        local = rebuilt.state_for(CLIENT_ORDER_ID)
+        assert (local.state.value, local.venue_order_id) == ("accepted", str(written.body["orderId"]))
+        assert len(instance.client.known_orders()) == 1
 
 
 @pytest.mark.parametrize(

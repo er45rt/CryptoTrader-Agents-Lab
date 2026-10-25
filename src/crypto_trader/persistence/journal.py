@@ -180,7 +180,17 @@ class EventJournal(Protocol):
 def _to_ns(value: datetime) -> int:
     if value.tzinfo is None or value.utcoffset() is None:
         raise JournalSchemaError("event timestamps must be timezone-aware before journaling.")
-    return int(value.timestamp() * 1_000_000_000)
+    nanoseconds = int(value.timestamp() * 1_000_000_000)
+    # The column is a signed 64-bit SQLite INTEGER (review L2).
+    if not -(2**63) <= nanoseconds < 2**63:
+        raise JournalSchemaError("event timestamps must fit the journal's 64-bit nanosecond range.")
+    return nanoseconds
+
+
+def check_journalable(event: EventEnvelope) -> None:
+    """Raise unless the journal can store this event as it would on append (review L1/L2)."""
+    event.to_json()
+    _to_ns(event.occurred_at)
 
 
 class SQLiteEventJournal:
