@@ -79,7 +79,7 @@ from .transport import (
     TransportError,
     TransportTimeout,
 )
-from .translate import deterministic_order_uuid
+from .translate import deterministic_order_uuid, testnet_order_to_phase3_events
 
 __all__ = ["AttemptAuthorization", "BinanceSpotTestnetClient", "PreparedTestnetOrder"]
 
@@ -874,7 +874,11 @@ class BinanceSpotTestnetClient:
             # answer they came in. Our FULL answer lists every fill of an execution.
             self._require_matching_fills(body)
             order = self._parse_order(body)
-        except BinanceTestnetError as exc:
+            # Review RV-F1..RV-F4: accepted only once the very events it will be journaled as can be
+            # built and serialized, so no part of it can fail after our identity or state is written.
+            for event in testnet_order_to_phase3_events(order, correlation_id=UUID(int=0)):
+                event.to_json()
+        except (BinanceTestnetError, ValueError, TypeError, ArithmeticError) as exc:
             raise AmbiguousOrderError(
                 "the write returned HTTP 200 with an unparseable order payload "
                 f"({type(exc).__name__}); the order outcome is unknown and the order is not retried."

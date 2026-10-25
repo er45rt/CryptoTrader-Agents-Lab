@@ -1832,8 +1832,8 @@ def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path
 # --- Review A-1: our own write answer is journaled only after the strict proof ------------------
 
 
-def _fill(quantity, *, price="27000.00", trade_id=901, commission="0"):
-    return {"price": price, "qty": quantity, "commission": commission, "commissionAsset": "USDT", "tradeId": trade_id}
+def _fill(quantity, *, price="27000.00", trade_id=901, commission="0", asset="USDT"):
+    return {"price": price, "qty": quantity, "commission": commission, "commissionAsset": asset, "tradeId": trade_id}
 
 
 def _write_answer(*, status, executed="0", quote=None, drop=(), **fields):
@@ -1929,6 +1929,18 @@ _MALFORMED_WRITE_ANSWERS = [
         dict(status="FILLED", executed="0.00100000", fills=[_fill("1e999999", price="1e999999")]),
         id="an_overflowing_fill",
     ),
+    # Review RV-F1..RV-F4 (Astra's re-verification of item 24): a value our JSON decoder hands us
+    # that cannot become the journaled events, found only after the identity or state was written.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", asset="\ud800")]),
+        id="a_commission_asset_that_cannot_be_journaled",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", trade_id="\ud800")]),
+        id="a_trade_id_that_cannot_be_journaled",
+    ),
+    pytest.param(dict(status="NEW", drop=("transactTime",)), id="without_a_transaction_time"),
+    pytest.param(dict(status="NEW", transactTime=10**1000), id="an_overflowing_transaction_time"),
 ]
 
 
