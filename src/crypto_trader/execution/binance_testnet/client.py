@@ -170,6 +170,8 @@ _ACCOUNT_BALANCE_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _MARK_PRICE_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 _WEIGHT_EXCHANGE_INFO = 20
 _WEIGHT_WRITE = 1
+# Review V1/V3: the decimal exponents a venue number may have (see _in_domain).
+_VENUE_EXPONENT_LIMIT = 100
 
 #: Documented error code for a timestamp outside the receive window.
 CODE_TIMESTAMP_OUTSIDE_RECV_WINDOW = -1021
@@ -889,6 +891,8 @@ class BinanceSpotTestnetClient:
                 )
             for event in events:
                 check_journalable(event)
+            # Review V1: and once the observation it is reported as can be built.
+            order.to_observation(intent_id=UUID(int=0), correlation_id=UUID(int=0))
         except (BinanceTestnetError, JournalError, ValueError, TypeError, ArithmeticError) as exc:
             raise AmbiguousOrderError(
                 "the write returned HTTP 200 with an unparseable order payload "
@@ -1449,6 +1453,17 @@ class BinanceSpotTestnetClient:
                 return "<redacted venue message>"
         return message
 
+    @staticmethod
+    def _in_domain(value: Decimal) -> Decimal:
+        """Review V1/V3: a venue number lies in the domain our arithmetic runs in, or it is malformed.
+
+        Real venue numbers are far inside 10**-100..10**100; outside it, a later sum or product of
+        them (remaining quantity, fees, risk) can overflow after the order is journaled.
+        """
+        if value.is_finite() and value and not -_VENUE_EXPONENT_LIMIT <= value.adjusted() <= _VENUE_EXPONENT_LIMIT:
+            raise ValueError("a venue number is outside the arithmetic domain.")
+        return value
+
     def _parse_order(self, body: Any) -> TestnetOrder:
         if not isinstance(body, Mapping):
             raise BinanceTestnetError("the testnet order response was not understood.")
@@ -1461,9 +1476,9 @@ class BinanceSpotTestnetClient:
         try:
             fills = tuple(
                 TestnetFill(
-                    price=Decimal(str(item.get("price", "0"))),
-                    quantity=Decimal(str(item.get("qty", "0"))),
-                    commission=Decimal(str(item.get("commission", "0"))),
+                    price=self._in_domain(Decimal(str(item.get("price", "0")))),
+                    quantity=self._in_domain(Decimal(str(item.get("qty", "0")))),
+                    commission=self._in_domain(Decimal(str(item.get("commission", "0")))),
                     commission_asset=(
                         None if item.get("commissionAsset") is None
                         else str(item["commissionAsset"])
@@ -1472,7 +1487,7 @@ class BinanceSpotTestnetClient:
                 )
                 for item in (body.get("fills") or ())
             )
-            executed = Decimal(str(body.get("executedQty", "0")))
+            executed = self._in_domain(Decimal(str(body.get("executedQty", "0"))))
             return TestnetOrder(
                 symbol=str(body.get("symbol", self.symbol)),
                 client_order_id=str(
@@ -1481,12 +1496,12 @@ class BinanceSpotTestnetClient:
                 venue_order_id=None if body.get("orderId") is None else str(body["orderId"]),
                 state=state,
                 status=status,
-                original_quantity=Decimal(str(body.get("origQty", executed))),
+                original_quantity=self._in_domain(Decimal(str(body.get("origQty", executed)))),
                 executed_quantity=executed,
-                cummulative_quote_quantity=Decimal(
+                cummulative_quote_quantity=self._in_domain(Decimal(
                     str(body.get("cummulativeQuoteQty", body.get("cumulativeQuoteQty", "0")))
-                ),
-                price=Decimal(str(body.get("price", "0"))),
+                )),
+                price=self._in_domain(Decimal(str(body.get("price", "0")))),
                 fills=fills,
                 transact_time=utc_from_ms(
                     body.get("transactTime") or body.get("updateTime") or body.get("time")

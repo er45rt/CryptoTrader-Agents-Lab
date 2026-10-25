@@ -338,4 +338,8 @@ def utc_from_ms(value: int | None) -> datetime | None:
     """Convert a millisecond epoch to an aware UTC datetime."""
     if value is None:
         return None
-    return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError) as exc:
+        # Review V2: the platform's own range error (OSError on Windows) is one malformed value.
+        raise ValueError("a venue timestamp is outside the representable calendar.") from exc

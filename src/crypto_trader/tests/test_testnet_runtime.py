@@ -155,6 +155,12 @@ def test_our_write_answer_journals_our_venue_identity_before_its_state(journal, 
     monkeypatch.setattr(
         journal, "append", lambda event: appended.append(event.event_type) or append(event)
     )
+    append_batch = journal.append_batch
+    monkeypatch.setattr(
+        journal,
+        "append_batch",
+        lambda events: appended.extend(event.event_type for event in events) or append_batch(events),
+    )
 
     instance.submit(execution_request())
 

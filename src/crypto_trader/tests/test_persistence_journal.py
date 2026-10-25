@@ -23,6 +23,7 @@ from crypto_trader.persistence import (
     JournalRevisionMismatchError,
     JournalSchemaError,
     SQLiteEventJournal,
+    check_journalable,
 )
 
 from decimal import Decimal
@@ -919,3 +920,15 @@ def test_conditional_append_refuses_an_already_open_transaction_without_rolling_
         assert journal.read_by_id(planned.event_id) is None
     finally:
         journal._conn.rollback()
+
+
+@pytest.mark.parametrize("sequence", [2**63, 2**64])
+def test_an_event_whose_integers_do_not_fit_the_journal_is_refused_before_writing(tmp_path, sequence):
+    # Review V4: check_journalable applies exactly the row an append binds, 64-bit integers included.
+    event = decision(sequence=sequence)
+    with pytest.raises(JournalSchemaError):
+        check_journalable(event)
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        with pytest.raises(JournalSchemaError):
+            journal.append(event)
+        assert journal.count() == 0

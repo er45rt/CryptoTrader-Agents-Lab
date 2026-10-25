@@ -304,17 +304,21 @@ class TestnetOrderRuntime(DurableVenueWritePort):
             )
             self._pending_submissions.pop(client_order_id, None)
             raise
+        leading = ()
         if not order.deduplicated:
             # Review G-4: only the venue's answer to our own write names our venue order; a later
             # read by client order id may show another order reusing it. Journaled before the
             # state, so no accepted state exists without its identity.
             assert self.journal is not None
-            self.journal.append(
+            leading = (
                 testnet_order_venue_identity_event(
                     order, intent_id=request.intent_id, correlation_id=request.correlation_id
-                )
+                ),
             )
-        self._record(order, correlation_id=request.correlation_id)
+        # Review V1-V3: everything this answer is journaled and observed as is built and checked
+        # before the first append, so nothing can fail once our identity or state is written.
+        events, observation = self._prepare_record(order, correlation_id=request.correlation_id)
+        self._commit_record(order, events, observation, leading=leading)
         self._pending_submissions.pop(client_order_id, None)
         return client_order_id
 
@@ -468,8 +472,16 @@ class TestnetOrderRuntime(DurableVenueWritePort):
     # --- internals ---
 
     def _record(self, order: TestnetOrder, *, correlation_id: UUID | None) -> None:
+        events, observation = self._prepare_record(order, correlation_id=correlation_id)
+        self._commit_record(order, events, observation)
+
+    def _prepare_record(
+        self, order: TestnetOrder, *, correlation_id: UUID | None
+    ) -> tuple[list, ExecutionObservation | None]:
+        """Build and check what an order is journaled and observed as; nothing is written (review V1-V3)."""
         correlation = correlation_id or UUID(int=0)
         events = testnet_order_to_phase3_events(order, correlation_id=correlation)
+        prepared = []
         historical_fills = []
         if self.journal is not None and order.fills:
             historical_fills = [event for event in self.journal.read_range()
@@ -501,13 +513,27 @@ class TestnetOrderRuntime(DurableVenueWritePort):
                     elif existing.payload != event.payload:
                         raise RuntimeStateError("conflicting payload for a recorded venue state")
                     event = existing
-                self.journal.append(event)
-            self._journaled.append(event)
+            prepared.append(event)
         intent_id = self._intents.get(order.client_order_id)
+        observation = None
         if intent_id is not None:
-            self._observations.append(
-                order.to_observation(
-                    intent_id=intent_id, correlation_id=correlation, producer=self.producer
-                )
+            observation = order.to_observation(
+                intent_id=intent_id, correlation_id=correlation, producer=self.producer
             )
+        return prepared, observation
+
+    def _commit_record(
+        self,
+        order: TestnetOrder,
+        events: list,
+        observation: ExecutionObservation | None,
+        *,
+        leading: tuple = (),
+    ) -> None:
+        if self.journal is not None and (leading or events):
+            # One transaction: no identity or ended state is durable without the rest (option PB).
+            self.journal.append_batch([*leading, *events])
+        self._journaled.extend(events)
+        if observation is not None:
+            self._observations.append(observation)
         self._orders[order.client_order_id] = order

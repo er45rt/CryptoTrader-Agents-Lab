@@ -187,10 +187,36 @@ def _to_ns(value: datetime) -> int:
     return nanoseconds
 
 
+def _int64(value: int, what: str) -> int:
+    if not -(2**63) <= value < 2**63:
+        raise JournalSchemaError(f"{what} must fit the journal's signed 64-bit INTEGER column.")
+    return value
+
+
+def _row_values(event: EventEnvelope, payload_json: str, digest: str) -> tuple:
+    """The exact row an append binds for this event (review V4: its integers checked too)."""
+    return (
+        str(event.event_id),
+        event.event_type,
+        _int64(int(event.schema_version), "schema_version"),
+        _to_ns(event.occurred_at),
+        event.occurred_at.astimezone(timezone.utc).isoformat(),
+        str(event.correlation_id),
+        None if event.causation_id is None else str(event.causation_id),
+        event.producer,
+        event.strategy_id,
+        None if event.order_id is None else str(event.order_id),
+        event.symbol,
+        None if event.sequence_number is None else _int64(int(event.sequence_number), "sequence_number"),
+        payload_json,
+        digest,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
 def check_journalable(event: EventEnvelope) -> None:
-    """Raise unless the journal can store this event as it would on append (review L1/L2)."""
-    event.to_json()
-    _to_ns(event.occurred_at)
+    """Raise unless the journal can store this event: the very row an append binds (review L1/L2, V4)."""
+    _row_values(event, event.to_json(), "")
 
 
 class SQLiteEventJournal:
@@ -614,23 +640,7 @@ class SQLiteEventJournal:
             raise
 
     def _row_for(self, event: EventEnvelope, payload_json: str, digest: str) -> tuple:
-        return (
-            str(event.event_id),
-            event.event_type,
-            int(event.schema_version),
-            _to_ns(event.occurred_at),
-            event.occurred_at.astimezone(timezone.utc).isoformat(),
-            str(event.correlation_id),
-            None if event.causation_id is None else str(event.causation_id),
-            event.producer,
-            event.strategy_id,
-            None if event.order_id is None else str(event.order_id),
-            event.symbol,
-            event.sequence_number,
-            payload_json,
-            digest,
-            datetime.now(timezone.utc).isoformat(),
-        )
+        return _row_values(event, payload_json, digest)
 
     # --- reads ---
 

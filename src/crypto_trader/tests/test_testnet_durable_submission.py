@@ -47,7 +47,7 @@ from crypto_trader.execution.binance_testnet import deterministic_order_uuid
 from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
 from crypto_trader.execution.binance_testnet.errors import ClockDriftError
 from crypto_trader.execution.binance_testnet import HttpRequest
-from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.persistence import JournalSchemaError, SQLiteEventJournal
 from crypto_trader.recovery import (
     ReconciliationEngine,
     ReconciliationOutcome,
@@ -1953,6 +1953,19 @@ _MALFORMED_WRITE_ANSWERS = [
         dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")], transactTime=9223372036855),
         id="a_filled_answer_timed_past_the_journal",
     ),
+    # Review V1-V3 (Astra's re-verification of items 25-26): every number and time of the answer must
+    # lie in the domain our arithmetic and calendar run in, or it fails after it is journaled.
+    pytest.param(
+        dict(status="CANCELED", executed="0", origQty="1e1000000"),
+        id="a_zero_fill_cancel_with_an_unrepresentable_original_quantity",
+    ),
+    pytest.param(dict(status="NEW", origQty="1e1000000"), id="a_new_answer_with_an_unrepresentable_original_quantity"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="1e1000000")]),
+        id="a_commission_outside_the_arithmetic_domain",
+    ),
+    pytest.param(dict(status="NEW", transactTime=253402300799000), id="a_transaction_time_at_the_end_of_the_calendar"),
+    pytest.param(dict(status="NEW", transactTime=-9223372036855), id="a_transaction_time_far_before_the_epoch"),
 ]
 
 
@@ -1977,6 +1990,81 @@ def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, an
         journaled = [event.event_type for event in journal.read_range()]
         assert ORDER_STATE_EVENT_TYPE not in journaled
         assert "order.venue_identity.recorded" not in journaled
+
+
+def test_nothing_is_journaled_when_preparing_our_record_fails(tmp_path, monkeypatch):
+    # Review V1-V3: our identity and every event and observation are built and checked before the
+    # first append, so a failure while preparing them leaves only the durable attempt.
+    from crypto_trader.execution.binance_testnet import runtime as runtime_module
+
+    def refuse(order, **kwargs):
+        raise RuntimeError("preparing the record failed")
+
+    monkeypatch.setattr(runtime_module, "testnet_order_to_phase3_events", refuse)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(status="NEW")])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(RuntimeError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+def test_a_journal_failure_inside_our_record_leaves_only_the_attempt(tmp_path, monkeypatch):
+    # Option PB: our identity, state and fills are one transaction, so a failure (or a crash) while
+    # journaling a fill never leaves an ended state without its fills.
+    answer = _write_answer(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")])
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), answer])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        append, append_batch = journal.append, journal.append_batch
+
+        def failing_append(event):
+            if event.event_type == "execution.fill.recorded":
+                raise JournalSchemaError("journal failure while journaling the fill")
+            return append(event)
+
+        def failing_batch(events):
+            if any(event.event_type == "execution.fill.recorded" for event in events):
+                raise JournalSchemaError("journal failure while journaling the fill")
+            return append_batch(events)
+
+        monkeypatch.setattr(journal, "append", failing_append)
+        monkeypatch.setattr(journal, "append_batch", failing_batch)
+
+        with pytest.raises(JournalSchemaError):
+            instance.submit(execution_request())
+
+        assert len(attempt_events(journal)) == 1
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+def test_our_observation_is_proved_before_the_answer_is_accepted(tmp_path, monkeypatch):
+    # Review V1: the observation our answer is reported as is built in the proof, before the client
+    # caches the order, so a failure to build it is a malformed answer and nothing is journaled.
+    from crypto_trader.execution.binance_testnet.models import TestnetOrder
+
+    def refuse(self, **kwargs):
+        raise ValueError("the observation cannot be built")
+
+    monkeypatch.setattr(TestnetOrder, "to_observation", refuse)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(status="NEW")])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert instance.client.known_orders() == ()
+        assert len(attempt_events(journal)) == 1
+        assert ORDER_STATE_EVENT_TYPE not in [event.event_type for event in journal.read_range()]
 
 
 @pytest.mark.parametrize(
