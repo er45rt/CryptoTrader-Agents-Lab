@@ -833,12 +833,28 @@ class BinanceSpotTestnetClient:
             fills = []
         if not isinstance(fills, list) or not all(isinstance(item, Mapping) for item in fills):
             raise BinanceTestnetError("the write answer fills are malformed.")
+        # Review RV1-RV3: each fill is proved before anything is journaled. The journal keys a fill
+        # by its trade id, so a repeated one would be journaled once while counted twice here.
+        quantity = quote = Decimal("0")
+        trade_ids: set[str] = set()
         try:
-            quantity = sum((Decimal(str(item["qty"])) for item in fills), Decimal("0"))
-            quote = sum(
-                (Decimal(str(item["qty"])) * Decimal(str(item["price"])) for item in fills), Decimal("0")
-            )
-        except (KeyError, InvalidOperation) as exc:
+            for item in fills:
+                fill_quantity = Decimal(str(item["qty"]))
+                fill_price = Decimal(str(item["price"]))
+                commission = Decimal(str(item.get("commission", "0")))
+                trade_id = item.get("tradeId")
+                if (
+                    not fill_quantity.is_finite() or fill_quantity <= 0
+                    or not fill_price.is_finite() or fill_price <= 0
+                    or not commission.is_finite() or commission < 0
+                    or isinstance(trade_id, bool) or trade_id is None or not str(trade_id).strip()
+                    or str(trade_id) in trade_ids
+                ):
+                    raise BinanceTestnetError("the write answer has a malformed or repeated fill.")
+                trade_ids.add(str(trade_id))
+                quantity += fill_quantity
+                quote += fill_quantity * fill_price
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             raise BinanceTestnetError("the write answer fills are malformed.") from exc
         if quantity != Decimal(str(body["executedQty"])) or quote != Decimal(str(body["cummulativeQuoteQty"])):
             raise BinanceTestnetError("the write answer fills contradict its execution.")

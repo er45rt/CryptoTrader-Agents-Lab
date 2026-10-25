@@ -1832,8 +1832,8 @@ def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path
 # --- Review A-1: our own write answer is journaled only after the strict proof ------------------
 
 
-def _fill(quantity, *, price="27000.00"):
-    return {"price": price, "qty": quantity, "commission": "0", "commissionAsset": "USDT", "tradeId": 901}
+def _fill(quantity, *, price="27000.00", trade_id=901, commission="0"):
+    return {"price": price, "qty": quantity, "commission": commission, "commissionAsset": "USDT", "tradeId": trade_id}
 
 
 def _write_answer(*, status, executed="0", quote=None, drop=(), **fields):
@@ -1877,6 +1877,58 @@ _MALFORMED_WRITE_ANSWERS = [
     # Review A1-W1-02: an unhashable side is malformed, not a TypeError.
     pytest.param(dict(status="NEW", side=[]), id="side_a_list"),
     pytest.param(dict(status="NEW", side={}), id="side_a_mapping"),
+    # Review RV1-RV3 (Astra's re-verification of item 23): every fill is proved, not only the sums.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000"), _fill("0.00050000")]),
+        id="a_repeated_trade_id",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[{"price": "27000.00", "qty": "0.00100000"}]),
+        id="a_fill_without_a_trade_id",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", trade_id="")]),
+        id="an_empty_trade_id",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[_fill("-0.00050000", trade_id=901), _fill("0.00150000", trade_id=902)],
+        ),
+        id="a_negative_quantity_offset",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[_fill("0", trade_id=902), _fill("0.00100000", trade_id=901)],
+        ),
+        id="a_zero_quantity_fill",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[
+                _fill("0.00050000", price="-1000.00", trade_id=901),
+                _fill("0.00050000", price="55000.00", trade_id=902),
+            ],
+        ),
+        id="a_negative_price_offset",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="NaN")]),
+        id="a_nan_commission",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="-1")]),
+        id="a_negative_commission",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("1e999999", price="1e999999")]),
+        id="an_overflowing_fill",
+    ),
 ]
 
 
@@ -1913,7 +1965,11 @@ def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, an
             id="partially_filled",
         ),
         pytest.param(
-            dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000"), _fill("0.00050000")]),
+            dict(
+                status="FILLED",
+                executed="0.00100000",
+                fills=[_fill("0.00050000", trade_id=901), _fill("0.00050000", trade_id=902)],
+            ),
             "filled",
             id="filled",
         ),
@@ -1926,8 +1982,10 @@ def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, an
     ],
 )
 def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_path, answer, state):
-    # Review A-1 guard: a consistent answer is journaled as before, with our venue identity.
-    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(**answer)])
+    # Review A-1 guard: a consistent answer is journaled as before, with our venue identity, and
+    # (review RV1) every fill it lists is journaled, so the journaled fills add up to the answer.
+    written = _write_answer(**answer)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), written])
     with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
         instance = started(transport, journal)
 
@@ -1936,3 +1994,8 @@ def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_pat
         rebuilt, _ = reconstruct_order_states(journal)
         local = rebuilt.state_for(CLIENT_ORDER_ID)
         assert (local.state.value, local.venue_order_id) == (state, "4242")
+        fills = [event.payload for event in journal.read_range() if event.event_type == "execution.fill.recorded"]
+        assert sum((fill.quantity for fill in fills), Decimal("0")) == Decimal(written.body["executedQty"])
+        assert sum((fill.quantity * fill.price for fill in fills), Decimal("0")) == Decimal(
+            written.body["cummulativeQuoteQty"]
+        )
