@@ -1832,6 +1832,10 @@ def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path
 # --- Review A-1: our own write answer is journaled only after the strict proof ------------------
 
 
+def _fill(quantity, *, price="27000.00"):
+    return {"price": price, "qty": quantity, "commission": "0", "commissionAsset": "USDT", "tradeId": 901}
+
+
 def _write_answer(*, status, executed="0", quote=None, drop=(), **fields):
     answer = fx.order_response(
         CLIENT_ORDER_ID, status=status, order_id=4242, executed_qty=executed, cummulative_quote=quote
@@ -1852,6 +1856,27 @@ _MALFORMED_WRITE_ANSWERS = [
     pytest.param(dict(status="NEW", quote="27.00"), id="quote_without_an_execution"),
     pytest.param(dict(status="CANCELED", symbol="ETHUSDT"), id="another_symbol"),
     pytest.param(dict(status="NEW", drop=("side",)), id="without_a_side"),
+    # Review A1-W1-01 (Astra's re-verification of item 22): the fills must agree with the answer.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000")]),
+        id="filled_with_fills_short_of_its_execution",
+    ),
+    pytest.param(
+        dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00100000")]),
+        id="fills_over_its_execution",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", price="28000.00")]),
+        id="fills_contradicting_its_quote",
+    ),
+    pytest.param(dict(status="FILLED", executed="0.00100000", fills=[]), id="an_execution_without_fills"),
+    pytest.param(dict(status="FILLED", executed="0.00100000", fills="0.001"), id="fills_not_a_list"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[{"price": "27000.00"}]), id="a_fill_without_quantity"
+    ),
+    # Review A1-W1-02: an unhashable side is malformed, not a TypeError.
+    pytest.param(dict(status="NEW", side=[]), id="side_a_list"),
+    pytest.param(dict(status="NEW", side={}), id="side_a_mapping"),
 ]
 
 
@@ -1883,10 +1908,21 @@ def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, an
     [
         pytest.param(dict(status="NEW"), "accepted", id="new"),
         pytest.param(
-            dict(status="PARTIALLY_FILLED", executed="0.00050000"), "partially_filled", id="partially_filled"
+            dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            "partially_filled",
+            id="partially_filled",
         ),
-        pytest.param(dict(status="FILLED", executed="0.00100000"), "filled", id="filled"),
+        pytest.param(
+            dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000"), _fill("0.00050000")]),
+            "filled",
+            id="filled",
+        ),
         pytest.param(dict(status="CANCELED", executed="0"), "canceled", id="canceled"),
+        pytest.param(
+            dict(status="CANCELED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            "canceled",
+            id="canceled_after_a_partial_fill",
+        ),
     ],
 )
 def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_path, answer, state):

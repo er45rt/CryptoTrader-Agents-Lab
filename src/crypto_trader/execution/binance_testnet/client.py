@@ -825,6 +825,24 @@ class BinanceSpotTestnetClient:
             f"{code}): {self._safe_message(message)}"
         )
 
+    @staticmethod
+    def _require_matching_fills(body: Mapping[str, Any]) -> None:
+        """Our write answer's fills sum to its executed quantity and its cumulative quote."""
+        fills = body.get("fills")
+        if fills is None:
+            fills = []
+        if not isinstance(fills, list) or not all(isinstance(item, Mapping) for item in fills):
+            raise BinanceTestnetError("the write answer fills are malformed.")
+        try:
+            quantity = sum((Decimal(str(item["qty"])) for item in fills), Decimal("0"))
+            quote = sum(
+                (Decimal(str(item["qty"])) * Decimal(str(item["price"])) for item in fills), Decimal("0")
+            )
+        except (KeyError, InvalidOperation) as exc:
+            raise BinanceTestnetError("the write answer fills are malformed.") from exc
+        if quantity != Decimal(str(body["executedQty"])) or quote != Decimal(str(body["cummulativeQuoteQty"])):
+            raise BinanceTestnetError("the write answer fills contradict its execution.")
+
     def _parse_write_success(self, body: Any, prepared: PreparedTestnetOrder) -> TestnetOrder:
         """A write must be mechanically recognizable as successful, or it is ambiguous."""
         if not isinstance(body, Mapping):
@@ -836,6 +854,9 @@ class BinanceSpotTestnetClient:
             # Review A-1: this answer becomes our journaled state and venue identity, so it gets the
             # strict proof a cancel answer or an adoption read gets before the lenient parse.
             self._parse_startup_order(body, prepared.symbol, prepared.client_order_id)
+            # Review A1-W1-01: the fills are journaled as our executions, so they must agree with the
+            # answer they came in. Our FULL answer lists every fill of an execution.
+            self._require_matching_fills(body)
             order = self._parse_order(body)
         except BinanceTestnetError as exc:
             raise AmbiguousOrderError(
@@ -1153,7 +1174,7 @@ class BinanceSpotTestnetClient:
             or body.get("symbol") != symbol
             or not isinstance(status, str) or status not in STATUS_TO_STATE
             or type(venue_id) is not int or venue_id <= 0
-            or side not in {"BUY", "SELL"}
+            or not isinstance(side, str) or side not in {"BUY", "SELL"}
         ):
             raise BinanceTestnetError("startup order identity, symbol or status is invalid.")
         quantities = []
