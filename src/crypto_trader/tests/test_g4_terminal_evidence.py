@@ -177,3 +177,54 @@ def test_duplicate_partial_fill_blocks_restarted_post(tmp_path,path):
  out=run(tmp_path,base="0.00025",**args)
  print("ROUTE",path,out,flush=True)
  assert out["second_POST"]==0,out
+
+# G4 parser kill-switch mutation coverage (offline, direct parser boundary).
+"""Direct order-read parser guard test; offline, no transport requests."""
+import pytest
+from crypto_trader.tests import testnet_fixtures as fx
+from crypto_trader.execution.binance_testnet import BinanceTestnetError
+
+@pytest.mark.parametrize("status",["CANCELED","EXPIRED","REJECTED","FILLED","NEW"])
+def test_every_venue_order_read_requires_explicit_executed_qty(status):
+    client=fx.client(fx.ScriptedTransport([]))
+    body=fx.order_response("ct-abcdef123456abcdef12",status=status,
+                           executed_qty="0").body
+    body.pop("executedQty")
+    with pytest.raises(BinanceTestnetError, match="lacks explicit executedQty"):
+        client._parse_order(body)
+
+def test_boolean_executed_qty_rejected():
+    client=fx.client(fx.ScriptedTransport([]))
+    body=fx.order_response("ct-abcdef123456abcdef12",status="CANCELED",
+                           executed_qty="0").body
+    body["executedQty"]=False
+    with pytest.raises(BinanceTestnetError, match="lacks explicit executedQty"):
+        client._parse_order(body)
+
+# Direct wiring coverage: a separately proven terminal-status read must be
+# checked before the subsequent risk decision, not merely block by side effect.
+from crypto_trader.production import ProductionRiskStateSource
+
+def test_terminal_attestation_callsite_is_invoked_before_new_risk(tmp_path, monkeypatch):
+    original = ProductionRiskStateSource._check_terminal_execution_evidence
+    observed = []
+
+    def traced(self, events, chain):
+        if any(event.event_type == "order.state.changed" for event in events):
+            observed.append("terminal-path")
+        return original(self, events, chain)
+
+    monkeypatch.setattr(
+        ProductionRiskStateSource, "_check_terminal_execution_evidence", traced
+    )
+
+    def canceled(port, transport, reference):
+        transport.responses.append(cancel_answer(reference, executed="0"))
+        port.cancel(reference)
+
+    outcome = run(
+        tmp_path, first=lambda reference: [answer(reference, status="NEW")],
+        after=canceled,
+    )
+    assert observed, ("TERMINAL_ATTESTATION_SKIPPED", outcome)
+    assert outcome["second_POST"] == 1, outcome
