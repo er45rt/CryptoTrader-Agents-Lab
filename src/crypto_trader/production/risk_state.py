@@ -167,6 +167,19 @@ def derive_risk_state(
                 raise _fail("a post-root order attempt is missing durable strategy attribution.")
             post_root_references.add(reference)
 
+    # Execution-evidence read guard (review F4): an execution of our order counts only when its
+    # journaled fills prove it. A FILLED order short of its quantity, or a partial fill with no fill,
+    # holds new risk until the evidence arrives (a strict read or trade backfill), whatever the
+    # balances say.
+    for state in reconstructor.states():
+        anchor = anchors.get(state.order_reference)
+        if anchor is None or state.order_reference not in post_root_references:
+            continue
+        if (state.state.value == "filled" and state.filled_quantity != anchor.quantity) or (
+            state.state.value == "partially_filled" and state.filled_quantity <= ZERO
+        ):
+            raise _fail("an order's reported execution is not proven by its journaled fills.")
+
     for state in reconstructor.open_states():
         anchor = anchors.get(state.order_reference)
         if anchor is None:

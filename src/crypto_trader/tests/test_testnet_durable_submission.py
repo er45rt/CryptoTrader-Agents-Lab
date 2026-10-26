@@ -2133,3 +2133,180 @@ def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_pat
         assert sum((fill.quantity * fill.price for fill in fills), Decimal("0")) == Decimal(
             written.body["cummulativeQuoteQty"]
         )
+
+
+# --- Review F4: an execution the venue reports is journaled only with fills that prove it ---------
+
+
+def _read_answer(*, status, executed="0", order_id=4242):
+    # A status read (GET /api/v3/order) carries no fills.
+    answer = fx.order_response(CLIENT_ORDER_ID, status=status, order_id=order_id, executed_qty=executed)
+    answer.body.pop("fills")
+    return answer
+
+
+def _states(journal):
+    return [event.payload.state for event in journal.read_range() if event.event_type == ORDER_STATE_EVENT_TYPE]
+
+
+@pytest.mark.parametrize(
+    ("status", "executed"),
+    [
+        pytest.param("FILLED", "0.00100000", id="filled"),
+        pytest.param("CANCELED", "0.00050000", id="canceled_after_a_partial_fill"),
+        pytest.param("PARTIALLY_FILLED", "0.00050000", id="partially_filled"),
+    ],
+)
+def test_an_adopted_execution_without_its_fills_journals_no_state(tmp_path, status, executed):
+    # Review F4 (Saeed's note, widened by the coordinator's proof): after a duplicate POST we adopt the
+    # venue's view by a status read, which lists no fills. Journaling that view as filled (or as ended
+    # after a partial fill) left an execution without its fills; with balances matching that journal a
+    # restart admitted new risk. The state is now left out until fills bound to our order prove it.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            _read_answer(status=status, executed=executed),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert _states(journal) == []
+        rebuilt, _ = reconstruct_order_states(journal)
+        assert rebuilt.state_for(CLIENT_ORDER_ID).state.value == "submitted"
+
+
+def test_an_adopted_order_with_nothing_executed_is_journaled_as_before(tmp_path):
+    # Review F4 guard: a cancel with no execution needs no fill, and is journaled as before.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            _read_answer(status="CANCELED"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        started(transport, journal).submit(execution_request())
+
+        assert _states(journal) == ["canceled"]
+
+
+def test_a_refreshed_execution_without_its_fills_journals_no_new_state(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            _write_answer(status="NEW"),
+            _read_answer(status="FILLED", executed="0.00100000"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+
+        instance.refresh(CLIENT_ORDER_ID)
+
+        assert _states(journal) == ["accepted"]
+
+
+@pytest.mark.parametrize(
+    ("executed", "states"),
+    [
+        pytest.param("0.00050000", ["accepted"], id="after_a_partial_fill"),
+        pytest.param("0", ["accepted", "canceled"], id="with_nothing_executed"),
+    ],
+)
+def test_a_cancel_answer_is_journaled_only_when_its_execution_is_proven(tmp_path, executed, states):
+    # A cancel answer lists no fills either: a cancel after a partial fill keeps the order unresolved
+    # until its fills arrive, while a cancel with no execution is journaled as before.
+    cancel = fx.cancel_response(CLIENT_ORDER_ID, order_id=4242)
+    cancel.body.update(
+        executedQty=executed, cummulativeQuoteQty=str(Decimal(executed) * Decimal("27000.00"))
+    )
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), _write_answer(status="NEW"), cancel]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+
+        instance.cancel(CLIENT_ORDER_ID)
+
+        assert _states(journal) == states
+
+
+@pytest.mark.parametrize(
+    ("written", "states"),
+    [
+        pytest.param(
+            dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            ["partially_filled"],
+            id="the_rest_of_the_execution_unproven",
+        ),
+        pytest.param(
+            dict(
+                status="FILLED",
+                executed="0.00100000",
+                fills=[_fill("0.00050000", trade_id=901), _fill("0.00050000", trade_id=902)],
+            ),
+            ["filled"],
+            id="the_execution_already_proven_by_journaled_fills",
+        ),
+    ],
+)
+def test_a_later_read_counts_the_fills_already_journaled_for_our_order(tmp_path, written, states):
+    # Fills arrive in parts: the proof is the fills already journaled for our order plus the answer's
+    # new ones. A read reporting FILLED adds a state only when they add up to the reported execution.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            _write_answer(**written),
+            _read_answer(status="FILLED", executed="0.00100000"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+
+        instance.refresh(CLIENT_ORDER_ID)
+
+        assert _states(journal) == states
+
+
+@pytest.mark.parametrize(
+    "second_fills",
+    [
+        pytest.param(("2",), id="only_its_new_fill"),
+        pytest.param(("2", "1"), id="its_new_fill_and_the_one_already_journaled"),
+    ],
+)
+def test_fills_arriving_in_parts_prove_each_reported_execution(tmp_path, second_fills):
+    # The fills already journaled for our order count once, plus the answer's new ones, so each partial
+    # execution the venue reports is journaled when its fills arrive in parts or are delivered again.
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from crypto_trader.execution import OrderLifecycleState
+    from crypto_trader.execution.binance_testnet.models import TestnetFill, TestnetOrder
+
+    fills = {trade: TestnetFill(price=Decimal("27000"), quantity=Decimal("1"), trade_id=trade) for trade in ("1", "2")}
+    first = TestnetOrder(
+        symbol="BTCUSDT", client_order_id=CLIENT_ORDER_ID, venue_order_id="4242",
+        state=OrderLifecycleState.PARTIALLY_FILLED, status="PARTIALLY_FILLED", original_quantity=Decimal("3"),
+        executed_quantity=Decimal("1"), price=Decimal("27000"),
+        transact_time=datetime(2026, 1, 1, tzinfo=timezone.utc), fills=(fills["1"],),
+    )
+    second = replace(
+        first, executed_quantity=Decimal("2"), transact_time=first.transact_time + timedelta(seconds=1),
+        fills=tuple(fills[trade] for trade in second_fills),
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(ScriptedTransport(responses=[*fx.environment_responses()]), journal)
+
+        instance._record(first, correlation_id=uuid4())
+        instance._record(second, correlation_id=uuid4())
+
+        assert _states(journal) == ["partially_filled", "partially_filled"]

@@ -292,3 +292,78 @@ def test_an_open_order_of_unknown_venue_identity_is_matched_as_before(tmp_path):
         transport.responses.extend(_risk_refresh_listing(777, 777))
 
         assert admitted_prepare(runtime, intent("a2-new-risk", quantity=Decimal("0.001"))).approved
+
+
+# --- Review F4: new risk waits until our order's reported execution is proven by its fills ---------
+
+
+def _running_after_a_journaled_execution(journal, tmp_path, *, state, fills, listing):
+    """Our order with its attempt and identity, then a venue state journaled with `fills` only."""
+    seed_canonical_equity_root(journal)
+    journal.append(
+        attempts.attempt_event(quantity="0.001", limit_price="27000", intent_id=OUR_INTENT)
+        .model_copy(update={"symbol": INSTRUMENT.symbol})
+    )
+    journal.append(attempts.identity_event("100", index=0, symbol=INSTRUMENT.symbol, intent_id=OUR_INTENT))
+    journal.append(attempts.state_event(state, index=1).model_copy(update={"symbol": INSTRUMENT.symbol}))
+    for quantity in fills:
+        journal.append(
+            attempts.fill_event(quantity, index=1, remaining="0").model_copy(update={"symbol": INSTRUMENT.symbol})
+        )
+    startup = startup_responses()
+    startup[1] = listing()
+    transport = fx.ScriptedTransport(startup)
+    runtime, port = production_on_testnet(
+        journal=journal, state_dir=tmp_path / "state", client=fx.client(transport, retries=1)
+    )
+    runtime.start()
+    return runtime, transport
+
+
+def _our_partial_listing():
+    response = fx.open_orders_response(OUR_REFERENCE, status="PARTIALLY_FILLED", executed_qty="0.0005")
+    response.body[0]["orderId"] = 100
+    return response
+
+
+@pytest.mark.parametrize(
+    ("state", "listing"),
+    [
+        pytest.param("filled", fx.open_orders_response, id="filled_without_its_fill"),
+        pytest.param("partially_filled", _our_partial_listing, id="partially_filled_without_a_fill"),
+    ],
+)
+def test_an_execution_not_proven_by_journaled_fills_admits_no_new_risk(tmp_path, state, listing):
+    # Review F4 read guard: a journal (also one written before the write guard) holding our order as
+    # filled, or partially filled, without the fills of that execution must not admit new risk even
+    # when the venue balances match the journal.
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        runtime, transport = _running_after_a_journaled_execution(
+            journal, tmp_path, state=state, fills=(), listing=listing
+        )
+        responses = canonical_risk_refresh_responses()
+        responses[1] = listing()
+        responses[4] = listing()
+        transport.responses.extend(responses)
+
+        with pytest.raises(ProductionStateError, match="not proven by its journaled fills"):
+            admitted_prepare(runtime, intent("f4-new-risk", quantity=Decimal("0.001")))
+
+        assert [request for request in transport.requests if request.method == "POST"] == []
+
+
+def test_an_execution_proven_by_its_journaled_fill_still_admits_new_risk(tmp_path):
+    # Review F4 guard: the same order with the fill of its whole execution counts as before.
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        runtime, transport = _running_after_a_journaled_execution(
+            journal, tmp_path, state="filled", fills=("0.001",), listing=fx.open_orders_response
+        )
+        responses = canonical_risk_refresh_responses()
+        for balance in responses[2].body["balances"]:
+            if balance["asset"] == "BTC":
+                balance["free"] = "0.001"
+            elif balance["asset"] == "USDT":
+                balance["free"] = "99999.9"
+        transport.responses.extend(responses)
+
+        assert admitted_prepare(runtime, intent("f4-new-risk", quantity=Decimal("0.001"))).approved

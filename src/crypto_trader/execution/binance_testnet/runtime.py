@@ -13,6 +13,7 @@ This is the only place where the authenticated testnet client is driven. It:
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from decimal import Decimal
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -482,6 +483,7 @@ class TestnetOrderRuntime(DurableVenueWritePort):
         correlation = correlation_id or UUID(int=0)
         events = testnet_order_to_phase3_events(order, correlation_id=correlation)
         prepared = []
+        new_fills = []
         historical_fills = []
         if self.journal is not None and order.fills:
             historical_fills = [event for event in self.journal.read_range()
@@ -513,7 +515,15 @@ class TestnetOrderRuntime(DurableVenueWritePort):
                     elif existing.payload != event.payload:
                         raise RuntimeStateError("conflicting payload for a recorded venue state")
                     event = existing
+            if event.event_type == "execution.fill.recorded" and (self.journal is None or existing is None):
+                new_fills.append(event)
             prepared.append(event)
+        if self._execution_unproven(order, new_fills):
+            # Execution-evidence write guard (review F4): the lifecycle state the venue reports is
+            # journaled only when fills bound to our order prove its executed quantity. Without that
+            # proof the state is left out (its new fills are still journaled), so restart reads the
+            # order again and new risk waits for the rest of the evidence (trade backfill).
+            prepared = [event for event in prepared if event.event_type != "order.state.changed"]
         intent_id = self._intents.get(order.client_order_id)
         observation = None
         if intent_id is not None:
@@ -521,6 +531,17 @@ class TestnetOrderRuntime(DurableVenueWritePort):
                 intent_id=intent_id, correlation_id=correlation, producer=self.producer
             )
         return prepared, observation
+
+    def _execution_unproven(self, order: TestnetOrder, new_fills: list) -> bool:
+        """True unless fills bound to our order (journaled, plus this answer's new ones) add up to the
+        executed quantity the venue reports. Balances or a reported quantity alone prove nothing."""
+        journaled = Decimal(0)
+        if self.journal is not None:
+            order_id = deterministic_order_uuid(order.client_order_id)
+            journaled = sum((event.payload.quantity for event in self.journal.read_range()
+                             if event.order_id == order_id and event.event_type == "execution.fill.recorded"),
+                            Decimal(0))
+        return journaled + sum((event.payload.quantity for event in new_fills), Decimal(0)) != order.executed_quantity
 
     def _commit_record(
         self,
