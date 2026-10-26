@@ -481,6 +481,10 @@ class TestnetOrderRuntime(DurableVenueWritePort):
     ) -> tuple[list, ExecutionObservation | None]:
         """Build and check what an order is journaled and observed as; nothing is written (review V1-V3)."""
         correlation = correlation_id or UUID(int=0)
+        # Do not permit a read/adoption/cancel answer to count the SAME venue trade twice.
+        trade_ids = [fill.trade_id for fill in order.fills]
+        if len(trade_ids) != len(set(trade_ids)):
+            raise RuntimeStateError("venue answer repeats a trade identity.")
         events = testnet_order_to_phase3_events(order, correlation_id=correlation)
         prepared = []
         new_fills = []

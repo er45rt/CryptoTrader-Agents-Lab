@@ -462,6 +462,7 @@ class ProductionRiskStateSource:
         self._max_account_age_seconds = max_account_age_seconds
         self._max_mark_age_seconds = max_mark_age_seconds
         self._producer = producer
+        self._verified_terminal_orders: set[tuple] = set()
 
     def _stable_events(self):
         try:
@@ -484,6 +485,58 @@ class ProductionRiskStateSource:
             base_asset=self._instrument.base_currency,
             quote_asset=self._instrument.quote_currency,
         )
+
+    def _check_terminal_execution_evidence(self, events, chain) -> None:
+        """Trial: before new risk, compare every post-root terminal order with an exact signed read.
+
+        The old lifecycle journal does not persist executedQty for canceled/expired orders.
+        An apparent zero in the rebuilt state is NOT proof of a zero-execution cancellation.
+        """
+        baseline = next((e for e in events if e.event_id == chain.baseline_event_id), None)
+        if baseline is None:
+            raise _fail("terminal execution check lacks its equity baseline.")
+        cutoff = int(baseline.occurred_at.timestamp() * 1_000_000_000)
+        rebuilt = OrderStateReconstructor()
+        try:
+            for event in sorted(events, key=_event_key):
+                rebuilt.handle(event)
+        except RecoveryError as exc:
+            raise _fail("terminal execution check failed to reconstruct orders.") from exc
+        if rebuilt.conflicts():
+            raise _fail("terminal execution check found a conflicting journal.")
+        anchors = rebuilt.attempt_anchor_map()
+        for state in rebuilt.states():
+            if state.state.value not in {"canceled", "expired", "rejected"}:
+                continue
+            anchor = anchors.get(state.order_reference)
+            if anchor is None or anchor.occurred_at_ns <= cutoff:
+                continue
+            # Reuse only an attestation made for this exact immutable terminal evidence.
+            # The cache is process-local. Restart ALWAYS forces a fresh signed read.
+            facts = tuple(sorted(str(e.event_id) for e in events if e.order_id == anchor.order_id))
+            key = (chain.baseline_event_id, anchor.identity_key(),
+                   state.state.value, state.filled_quantity, state.remaining_quantity,
+                   state.venue_order_id, facts)
+            if key in self._verified_terminal_orders:
+                continue
+            try:
+                remote = self._client.startup_order_status(
+                    self._instrument.symbol, state.order_reference
+                )
+            except Exception as exc:
+                raise _fail("strict signed terminal-order evidence unavailable.") from exc
+            if (
+                remote.client_order_id != state.order_reference
+                or remote.status != state.state.value.upper()
+                or remote.venue_order_id != state.venue_order_id
+                   and state.venue_order_id is not None
+                or remote.side != anchor.side.upper()
+                or remote.original_quantity != anchor.quantity
+                or anchor.limit_price is not None and remote.price != anchor.limit_price
+                or remote.executed_quantity != state.filled_quantity
+            ):
+                raise _fail("terminal-order execution is not proved by exact venue evidence.")
+            self._verified_terminal_orders.add(key)
 
     def __call__(
         self,
@@ -510,6 +563,7 @@ class ProductionRiskStateSource:
 
         try:
             self._client.synchronize_clock()
+            self._check_terminal_execution_evidence(events, chain)
             venue_before = self._client.startup_open_orders(self._instrument.symbol)
             account = self._client.startup_account_snapshot(
                 self._instrument.base_currency,

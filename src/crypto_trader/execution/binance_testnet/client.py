@@ -1487,7 +1487,10 @@ class BinanceSpotTestnetClient:
                 )
                 for item in (body.get("fills") or ())
             )
-            executed = self._in_domain(Decimal(str(body.get("executedQty", "0"))))
+            # A missing executedQty in a venue READ cannot mean zero execution.
+            if "executedQty" not in body or isinstance(body["executedQty"], bool):
+                raise BinanceTestnetError("venue order read lacks explicit executedQty.")
+            executed = self._in_domain(Decimal(str(body["executedQty"])))
             return TestnetOrder(
                 symbol=str(body.get("symbol", self.symbol)),
                 client_order_id=str(
