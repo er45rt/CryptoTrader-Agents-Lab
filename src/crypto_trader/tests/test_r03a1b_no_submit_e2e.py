@@ -184,3 +184,57 @@ def test_main_default_stays_advisory_only_without_gateway(host, monkeypatch):
     assert not authority._tickets
     assert (output_dir / "trading_plan_BTCUSDT_offline.md").is_file()
     assert not any(request.method == "POST" for request in transport.requests)
+
+def test_main_explicit_receipt_exposes_trusted_intent_without_private_ticket_access(
+    host, monkeypatch,
+):
+    journal, authority, runtime, admission, transport, output_dir = host
+    baseline = {event.event_id for event in journal.read_range()}
+    gateway = CrewDecisionGateway(
+        journal=journal, runtime=runtime, authority=authority,
+        producer="gateway.crew_strategist", policy=_policy(),
+    )
+    _cli_context(monkeypatch, output_dir)
+    receipt = cli.run(advisory_gateway=gateway, return_origin_receipt=True)
+    from crypto_trader.crew_decision_gateway import CrewAdvisoryReceipt
+
+    assert isinstance(receipt, CrewAdvisoryReceipt)
+    assert receipt.raw_plan == plan()
+    assert receipt.source_delivery_id.version == 4
+    assert receipt.intent.quantity == Decimal("0.0100")
+    additions = [event for event in journal.read_range() if event.event_id not in baseline]
+    created = next(event for event in additions if isinstance(event, TradeIntentCreated))
+    assert receipt.intent.intent_id == created.event_id
+    assert admission.offer(receipt.intent) == (True, "accepted")
+    prepared = runtime.prepare_intent(
+        receipt.intent, _admission_token=admission._runtime_token,
+    )
+    assert prepared.approved
+    assert not any(request.method == "POST" for request in transport.requests)
+
+def test_main_refuses_receipt_request_without_trusted_gateway(host, monkeypatch):
+    from crypto_trader.production.errors import ProductionStateError
+
+    journal, _authority, _runtime, _admission, transport, output_dir = host
+    before = tuple(journal.read_range())
+    _cli_context(monkeypatch, output_dir)
+    with pytest.raises(ProductionStateError, match="trusted.*gateway"):
+        cli.run(return_origin_receipt=True)
+    assert tuple(journal.read_range()) == before
+    assert not (output_dir / "trading_plan_BTCUSDT_offline.md").exists()
+    assert not any(request.method == "POST" for request in transport.requests)
+
+
+def test_main_receipt_fails_closed_for_stale_host_market_quote(host, monkeypatch):
+    journal, authority, runtime, _admission, transport, output_dir = host
+    before = tuple(journal.read_range())
+    gateway = CrewDecisionGateway(
+        journal=journal, runtime=runtime, authority=authority,
+        producer="gateway.crew_strategist", policy=_policy(stale=True),
+    )
+    _cli_context(monkeypatch, output_dir)
+    with pytest.raises(SystemExit) as exc:
+        cli.run(advisory_gateway=gateway, return_origin_receipt=True)
+    assert exc.value.code == 1
+    assert tuple(journal.read_range()) == before
+    assert not any(request.method == "POST" for request in transport.requests)

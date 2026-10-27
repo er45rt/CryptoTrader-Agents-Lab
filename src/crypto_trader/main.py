@@ -11,7 +11,7 @@ from crypto_trader.input_security import require_https_base_url, valid_market_sy
 from datetime import datetime
 
 if TYPE_CHECKING:
-    from crypto_trader.crew_decision_gateway import CrewDecisionGateway
+    from crypto_trader.crew_decision_gateway import CrewAdvisoryReceipt, CrewDecisionGateway
 
 # Configure logging
 logging.basicConfig(
@@ -165,7 +165,8 @@ def create_inputs(config: Dict[str, Any]) -> Dict[str, Any]:
 def run_crew(
     inputs: Dict[str, Any], output_dir: Path,
     *, advisory_gateway: "CrewDecisionGateway | None" = None,
-) -> Optional[str]:
+    return_origin_receipt: bool = False,
+) -> Any:
     """
     Initialize and run the CryptoTraderCrew with the given inputs.
     
@@ -174,8 +175,19 @@ def run_crew(
         output_dir: Directory to save output files
         
     Returns:
-        Optional[str]: Result of the crew execution or None if an error occurred
+        Legacy Crew output by default; an inert typed receipt only on explicit
+        trusted host request, or None on an execution error.
     """
+    if type(return_origin_receipt) is not bool:
+        from crypto_trader.production.errors import ProductionStateError
+        raise ProductionStateError("return_origin_receipt must be an explicit boolean.")
+    if return_origin_receipt:
+        from crypto_trader.production.errors import ProductionStateError
+        from crypto_trader.crew_decision_gateway import CrewDecisionGateway
+        if type(advisory_gateway) is not CrewDecisionGateway:
+            raise ProductionStateError(
+                "origin receipt requires an explicit trusted CrewDecisionGateway."
+            )
     # The optional gateway is research-only and cannot submit an order. A host
     # delivery identity is durably reserved BEFORE the actual CrewAI kickoff.
     attempt = (None if advisory_gateway is None else
@@ -196,9 +208,17 @@ def run_crew(
             file_path = save_trading_plan(raw_plan, output_dir, output_filename, exclusive=True)
             advisory_gateway.delivery_ledger.complete(attempt, raw_plan, file_path)
             # Advisory origin events only; NEVER prepare, admit, submit, or trade.
-            advisory_gateway.issue(raw_plan, source_delivery_id=attempt.delivery_id)
+            issued_intent = advisory_gateway.issue(
+                raw_plan, source_delivery_id=attempt.delivery_id,
+            )
         logger.info(f"📝 Trading Plan saved to: {file_path}")
 
+        if return_origin_receipt:
+            from crypto_trader.crew_decision_gateway import CrewAdvisoryReceipt
+            return CrewAdvisoryReceipt(
+                raw_plan=raw_plan, intent=issued_intent,
+                source_delivery_id=attempt.delivery_id,
+            )
         return result
     except Exception as e:
         logger.error(f"An error occurred during crew execution: {e}", exc_info=True)
@@ -224,8 +244,18 @@ def parse_arguments():
     
     return parser.parse_args()
 
-def run(*, advisory_gateway: "CrewDecisionGateway | None" = None):
-    """Run the CLI workflow; only a trusted host can opt into advisory origin."""
+def run(
+    *, advisory_gateway: "CrewDecisionGateway | None" = None,
+    return_origin_receipt: bool = False,
+):
+    """Run the CLI; only a trusted host can explicitly request an inert origin receipt."""
+    if type(return_origin_receipt) is not bool or (
+        return_origin_receipt and advisory_gateway is None
+    ):
+        from crypto_trader.production.errors import ProductionStateError
+        raise ProductionStateError(
+            "origin receipt requires an explicit trusted advisory gateway and boolean flag."
+        )
     # Parse command line arguments
     args = parse_arguments()
     
@@ -256,8 +286,13 @@ def run(*, advisory_gateway: "CrewDecisionGateway | None" = None):
     # Create inputs for the crew
     inputs = create_inputs(config)
     
-    # Keep the legacy advisory-only call contract when no host gateway was supplied.
-    if advisory_gateway is None:
+    # Preserve the legacy call contract; return a typed receipt only on explicit host opt-in.
+    if return_origin_receipt:
+        result = run_crew(
+            inputs, output_dir, advisory_gateway=advisory_gateway,
+            return_origin_receipt=True,
+        )
+    elif advisory_gateway is None:
         result = run_crew(inputs, output_dir)
     else:
         # Only the trusted host may supply a provenance gateway; never submit here.
@@ -269,6 +304,8 @@ def run(*, advisory_gateway: "CrewDecisionGateway | None" = None):
         sys.exit(1)
 
     logger.info("Trading plan generation completed successfully.")
+    if return_origin_receipt:
+        return result  # Inert, typed origin receipt; never an admission or submission.
     # Optional: Add a summary of the trading plan here if needed
 
 if __name__ == "__main__":

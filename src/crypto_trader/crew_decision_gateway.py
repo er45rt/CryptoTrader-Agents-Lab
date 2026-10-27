@@ -44,6 +44,25 @@ class CrewDeliveryAttempt:
     directory: Path
 
 
+@dataclass(frozen=True)
+class CrewAdvisoryReceipt:
+    """Public, inert host handoff for a journaled origin-bound intent.
+
+    This is neither venue execution authority nor permission to dequeue.
+    The host must independently perform admission, risk and safety checks.
+    """
+
+    raw_plan: str
+    intent: ProductionIntent
+    source_delivery_id: UUID
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.raw_plan, str) or not self.raw_plan
+                or not isinstance(self.intent, ProductionIntent)
+                or not isinstance(self.source_delivery_id, UUID)):
+            raise ProductionStateError("advisory receipt must contain typed host-issued evidence.")
+
+
 class CrewDeliveryLedger:
     """Fail-closed local origin ledger; persistent evidence, session-only issuance.
 
