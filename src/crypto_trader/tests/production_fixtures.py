@@ -279,6 +279,9 @@ def build_runtime(
     pending: PendingIntentRegistry | None = None,
     when: datetime = BASE,
     bind_admission: bool = False,
+    require_origin_binding: bool = False,
+    trusted_origin_producer: str | None = None,
+    origin_authority: object | None = None,
 ) -> ProductionRuntime:
     runtime = ProductionRuntime(
         journal=journal,
@@ -298,6 +301,9 @@ def build_runtime(
         control=control,
         clock=clock(when),
         pending=pending,
+        require_origin_binding=require_origin_binding,
+        trusted_origin_producer=trusted_origin_producer,
+        origin_authority=origin_authority,
     )
     if bind_admission:
         bind_test_admission(runtime, when=when)

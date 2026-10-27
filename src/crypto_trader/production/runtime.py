@@ -45,6 +45,7 @@ from crypto_trader.events import (
     EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
     RISK_EVALUATION_EVENT_TYPE, VALIDITY_EVENT_TYPE, TRADE_INTENT_EVENT_TYPE,
     OrderSubmissionAttempted,
+    StrategyDecisionRecorded, TradeIntentCreated,
 )
 from crypto_trader.execution import (
     DurableVenueWritePort,
@@ -104,6 +105,7 @@ _STRATEGY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 
 __all__ = [
     "PRODUCTION_PRODUCER",
+    "CrewOriginAuthority",
     "IntentPreparation",
     "ProductionExecutionOutcome",
     "ProductionIntent",
@@ -224,10 +226,15 @@ class ProductionIntent:
     time_in_force: ExecutionTimeInForce = ExecutionTimeInForce.GTC
     valid_until: datetime | None = None
     decision_scope: str = "default"
+    # Stable IDs of journaled, causally linked producer evidence; not a trade approval.
+    origin_decision_event_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.correlation_id, UUID) or not isinstance(self.intent_id, UUID):
             raise ProductionStateError("an intent requires correlation_id and intent_id UUIDs.")
+        if (self.origin_decision_event_id is not None
+                and not isinstance(self.origin_decision_event_id, UUID)):
+            raise ProductionStateError("origin_decision_event_id must be a UUID if supplied.")
         if not isinstance(self.side, ExecutionSide):
             raise ProductionStateError("an intent requires an ExecutionSide.")
         if not isinstance(self.order_type, ExecutionOrderType):
@@ -267,6 +274,39 @@ class ProductionIntent:
     def risk_price(self) -> Decimal:
         """The deterministic price Hard Risk evaluates against (never a guessed market price)."""
         return self.limit_price if self.limit_price is not None else self.reference_price
+
+
+class CrewOriginAuthority:
+    """Session-only in-process origin receipts; independent of any LLM or broker.
+
+    A journal append or matching producer string does not grant a receipt.
+    The trusted owner-process gateway is the only registered issuer. This
+    guards against journal-only spoofing, not hostile code within the process.
+    """
+
+    def __init__(self) -> None:
+        self._gateway: object | None = None
+        self._tickets: dict[UUID, tuple[ProductionIntent, str, str]] = {}
+
+    def _bind(self, gateway: object) -> None:
+        if self._gateway is not None:
+            raise ProductionStateError("origin authority is already bound to a gateway.")
+        self._gateway = gateway
+
+    def _seal(self, gateway: object, intent: ProductionIntent,
+              decision: StrategyDecisionRecorded, created: TradeIntentCreated) -> None:
+        if self._gateway is not gateway or intent.intent_id in self._tickets:
+            raise ProductionStateError("origin authority cannot issue an unbound or repeated attestation.")
+        self._tickets[intent.intent_id] = (
+            intent, canonical_event(decision), canonical_event(created),
+        )
+
+    def verified(self, intent: ProductionIntent,
+                 decision: StrategyDecisionRecorded, created: TradeIntentCreated) -> bool:
+        receipt = self._tickets.get(intent.intent_id)
+        return receipt is not None and receipt == (
+            intent, canonical_event(decision), canonical_event(created),
+        )
 
 
 def validity_request_for(intent: ProductionIntent) -> ValidityRequest:
@@ -465,6 +505,9 @@ class ProductionRuntime:
         clock: Callable[[], datetime] | None = None,
         pending: PendingIntentRegistry | None = None,
         producer: str = PRODUCTION_PRODUCER,
+        require_origin_binding: bool = False,
+        trusted_origin_producer: str | None = None,
+        origin_authority: object | None = None,
     ) -> None:
         if journal is None:
             raise ProductionStateError("the production runtime requires the event journal.")
@@ -483,6 +526,15 @@ class ProductionRuntime:
             raise ProductionStateError("the production runtime requires a risk-state provider.")
         if not isinstance(owner_id, str) or not owner_id.strip():
             raise ProductionStateError("the production runtime requires a non-empty owner id.")
+        if type(require_origin_binding) is not bool:
+            raise ProductionStateError("require_origin_binding must be an explicit boolean.")
+        if require_origin_binding and (
+            not isinstance(trusted_origin_producer, str) or not trusted_origin_producer.strip()
+        ):
+            raise ProductionStateError("strict origin binding needs a configured decision producer.")
+        if origin_authority is not None:
+            if type(origin_authority) is not CrewOriginAuthority or not require_origin_binding:
+                raise ProductionStateError("authenticated origin authority requires strict binding.")
 
         # SQLiteEventJournal is thread-affine. The production runtime must be constructed
         # and subsequently used on that same owner thread; producer threads use admission only.
@@ -526,6 +578,10 @@ class ProductionRuntime:
         self._prepared_revisions = {}
         self._prior_session_intents: frozenset[UUID] = frozenset()
         self._prior_session_trade_intents: dict[UUID, str] = {}
+        self._prior_session_origin_ids: frozenset[UUID] = frozenset()
+        self._require_origin_binding = require_origin_binding
+        self._trusted_origin_producer = trusted_origin_producer
+        self._origin_authority = origin_authority
         self._session_evidence: tuple[tuple[UUID, str], ...] = ()
         self._admission_token: object | None = None
         self._producer = producer
@@ -703,9 +759,18 @@ class ProductionRuntime:
                 )
                 prior_trade_intents = {identity: contents for identity, contents, event in prior_events
                                        if event["event_type"] == TRADE_INTENT_EVENT_TYPE}
+                prior_origin_ids = frozenset(
+                    identity for identity, _, event in prior_events
+                    if event["event_type"] == "strategy.decision.recorded"
+                ) | frozenset(
+                    UUID(event["causation_id"]) for _, _, event in prior_events
+                    if event["event_type"] == TRADE_INTENT_EVENT_TYPE
+                    and event["causation_id"] is not None
+                )
                 prior_identity_evidence = tuple(
                     (identity, contents) for identity, contents, event in prior_events
-                    if event["event_type"] in explicit_identity_types | {TRADE_INTENT_EVENT_TYPE}
+                    if event["event_type"] in explicit_identity_types | {TRADE_INTENT_EVENT_TYPE,
+                                                                           "strategy.decision.recorded"}
                 )
                 batch = collector.collect(
                     nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
@@ -792,6 +857,7 @@ class ProductionRuntime:
                             self._pending.remove(item.intent_id)
                     self._prior_session_intents = prior_intents
                     self._prior_session_trade_intents = prior_trade_intents
+                    self._prior_session_origin_ids = prior_origin_ids
                     self._session_evidence = prior_identity_evidence + tuple(
                         (identity, canonical_event(self._journal.read_by_id(identity)))
                         for identity in run.journaled_event_ids
@@ -844,6 +910,8 @@ class ProductionRuntime:
             self._require_session_evidence()
             if self._intent_predates_session(intent):
                 return self._blocked(intent, ["session:abandoned"], "prior_session_intent", controller, now)
+            if self._require_origin_binding:
+                self._verify_durable_origin(intent)
         if (
             controller.kill_switch_engaged
             or controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}
@@ -1189,11 +1257,64 @@ class ProductionRuntime:
         except Exception:
             return True  # Failure to prove absence never releases economic risk.
 
+    def _verify_durable_origin(self, intent: ProductionIntent) -> None:
+        """Strict opt-in decision lineage for a durable writer; no authority from an ID alone.
+
+        This proves journal consistency, not source authentication. A trusted origin
+        producer/adapter must separately prevent fabricated fresh root decisions.
+        """
+        if not self._durable_venue_writes or not self._require_origin_binding:
+            return
+        if self._startup is None or intent.origin_decision_event_id is None:
+            raise ProductionStateError("strict origin binding requires a running session and origin ID.")
+        if intent.origin_decision_event_id in self._prior_session_origin_ids:
+            raise ProductionStateError("strict origin binding refuses a prior-session decision.")
+        decision = self._journal.read_by_id(intent.origin_decision_event_id)
+        created = self._journal.read_by_id(intent.intent_id)
+        if not isinstance(decision, StrategyDecisionRecorded) or not isinstance(created, TradeIntentCreated):
+            raise ProductionStateError("strict origin binding requires persisted decision and intent events.")
+        if (
+            decision.producer != self._trusted_origin_producer
+            or created.producer != self._trusted_origin_producer
+            or decision.event_id != created.causation_id
+            or decision.correlation_id != intent.correlation_id
+            or created.correlation_id != intent.correlation_id
+            or decision.symbol != intent.symbol or created.symbol != intent.symbol
+            or decision.strategy_id != intent.strategy_id
+            or created.strategy_id != intent.strategy_id
+            or decision.payload.action != intent.side.value
+            or created.payload.side != intent.side.value
+            or created.payload.quantity != intent.quantity
+            or created.payload.order_type != intent.order_type.value
+            or created.payload.limit_price != intent.limit_price
+            or decision.occurred_at < self._startup.started_at
+            or created.occurred_at < self._startup.started_at
+            or decision.occurred_at > self._now()
+            or created.occurred_at > self._now()
+        ):
+            raise ProductionStateError("strict origin binding has conflicting producer, economics or causation.")
+        if self._origin_authority is not None and not self._origin_authority.verified(
+            intent, decision, created,
+        ):
+            raise ProductionStateError("strict origin requires an issued session authority attestation.")
+        if any(
+            isinstance(event, TradeIntentCreated)
+            and event.causation_id == decision.event_id
+            and event.event_id != intent.intent_id
+            for event in self._journal.read_range()
+        ):
+            raise ProductionStateError("strict origin binding found competing intents for one decision.")
+
     def _intent_predates_session(self, intent: ProductionIntent) -> bool:
-        """Known persisted identities only; general producer provenance is R-03a-1b."""
+        """Previously consumed origin and intent identities cannot be reissued."""
         if not self._durable_venue_writes or self._startup is None:
             return False
         boundary = self._startup.started_at
+        if self._require_origin_binding and (
+            intent.origin_decision_event_id is None
+            or intent.origin_decision_event_id in self._prior_session_origin_ids
+        ):
+            return True
         if (intent.intent_id in self._prior_session_intents
                 or intent.decision_completed_at < boundary or intent.market_event_ts < boundary):
             return True

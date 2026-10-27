@@ -4,11 +4,14 @@ import os
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from dotenv import load_dotenv
 from crypto_trader.crew import CryptoTraderCrew
 from crypto_trader.input_security import require_https_base_url, valid_market_symbol
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from crypto_trader.crew_decision_gateway import CrewDecisionGateway
 
 # Configure logging
 logging.basicConfig(
@@ -106,7 +109,7 @@ def prepare_output_directory(config: Dict[str, Any]) -> Path:
     logger.info(f"Output directory for trading plan: {output_dir}")
     return output_dir
 
-def save_trading_plan(content: Any, output_dir: Path, filename: str) -> Path:
+def save_trading_plan(content: Any, output_dir: Path, filename: str, *, exclusive: bool = False) -> Path:
     """
     Save the trading plan to a file.
     
@@ -119,12 +122,21 @@ def save_trading_plan(content: Any, output_dir: Path, filename: str) -> Path:
         Path: Path to the saved file
     """
     file_path = output_dir / filename
-    with open(file_path, 'w', encoding='utf-8') as f:
-        # Handle CrewOutput object by converting to string
-        if hasattr(content, '__str__'):
-            f.write(str(content))
-        else:
-            f.write(content)
+    if exclusive:
+        # Binary write preserves the exact SHA256-referenced UTF-8 bytes on
+        # Windows as well (text mode would silently translate LF to CRLF).
+        if not isinstance(content, str):
+            raise TypeError("Durable Crew delivery artifact must be plain text.")
+        with open(file_path, 'xb') as f:
+            f.write(content.encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+    else:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            if hasattr(content, '__str__'):
+                f.write(str(content))
+            else:
+                f.write(content)
     return file_path
 
 def create_inputs(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -150,7 +162,10 @@ def create_inputs(config: Dict[str, Any]) -> Dict[str, Any]:
         'filename_datetime': filename_datetime_str
     }
 
-def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
+def run_crew(
+    inputs: Dict[str, Any], output_dir: Path,
+    *, advisory_gateway: "CrewDecisionGateway | None" = None,
+) -> Optional[str]:
     """
     Initialize and run the CryptoTraderCrew with the given inputs.
     
@@ -161,6 +176,10 @@ def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
     Returns:
         Optional[str]: Result of the crew execution or None if an error occurred
     """
+    # The optional gateway is research-only and cannot submit an order. A host
+    # delivery identity is durably reserved BEFORE the actual CrewAI kickoff.
+    attempt = (None if advisory_gateway is None else
+               advisory_gateway.delivery_ledger.begin(output_dir, symbol=inputs['target_symbol']))
     crypto_crew_instance = CryptoTraderCrew().crew()
     
     logger.info(f"🚀 Kicking off the CryptoTraderCrew for target symbol: {inputs['target_symbol']}...")
@@ -168,10 +187,18 @@ def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
         result = crypto_crew_instance.kickoff(inputs=inputs)
         
         logger.info("\n\n✅ Crew execution finished!")
-        output_filename = f"trading_plan_{inputs['target_symbol']}_{inputs['filename_datetime']}.md"
-        file_path = save_trading_plan(result, output_dir, output_filename)
+        if attempt is None:
+            output_filename = f"trading_plan_{inputs['target_symbol']}_{inputs['filename_datetime']}.md"
+            file_path = save_trading_plan(result, output_dir, output_filename)
+        else:
+            output_filename = f"trading_plan_{attempt.symbol}_{attempt.delivery_id}.md"
+            raw_plan = str(result)
+            file_path = save_trading_plan(raw_plan, output_dir, output_filename, exclusive=True)
+            advisory_gateway.delivery_ledger.complete(attempt, raw_plan, file_path)
+            # Advisory origin events only; NEVER prepare, admit, submit, or trade.
+            advisory_gateway.issue(raw_plan, source_delivery_id=attempt.delivery_id)
         logger.info(f"📝 Trading Plan saved to: {file_path}")
-        
+
         return result
     except Exception as e:
         logger.error(f"An error occurred during crew execution: {e}", exc_info=True)
