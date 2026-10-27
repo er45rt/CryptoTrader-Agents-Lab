@@ -310,3 +310,59 @@ def test_main_legacy_run_remains_advisory_without_delivery_or_journal(verified, 
     assert not list(output_dir.glob("crew_delivery_*.pending.json"))
     assert len(journal.read_range()) == before
     assert not [req for req in transport.requests if req.method == "POST"]
+
+
+
+def test_verified_host_policy_binds_real_gateway_with_no_submission(verified):
+    """No Crew/LLM percent may mint an unbudgeted, unquoted venue instruction."""
+    from datetime import timedelta
+    from decimal import Decimal
+
+    from crypto_trader.crew_intent_policy import (
+        ApprovedIntentConfig, HostDecisionTimes, InstrumentFilters,
+        VerifiedMarketQuote, make_policy,
+    )
+    from crypto_trader.risk import RiskLimits
+
+    journal, authority, runtime, admission, transport, output_dir = verified
+    limits = RiskLimits(
+        limits_version="offline-only", max_order_notional_quote=Decimal("500"),
+        max_symbol_exposure_quote=Decimal("600"), max_gross_exposure_quote=Decimal("700"),
+        max_net_exposure_quote=Decimal("700"), max_strategy_exposure_quote=Decimal("500"),
+        loss_limit_quote=Decimal("300"), max_drawdown_pct=Decimal("10"),
+        concentration_limit_pct=Decimal("50"), max_open_orders=2, max_open_positions=2,
+    )
+    host_policy = make_policy(
+        config=ApprovedIntentConfig(
+            venue="BINANCE", symbol="BTCUSDT", strategy_id="offline.r03",
+            approved_notional_quote=Decimal("270"),
+            max_snapshot_age=timedelta(seconds=8),
+            intent_valid_for=timedelta(seconds=5),
+        ),
+        market_quote=VerifiedMarketQuote(
+            venue="BINANCE", symbol="BTCUSDT", reference_id="offline-quote-15",
+            event_ts=NOW,
+            received_at=NOW,
+            best_bid=Decimal("26999"), best_ask=Decimal("27000"),
+        ),
+        host_times=HostDecisionTimes(
+            started_at=NOW, completed_at=NOW,
+        ),
+        instrument_filters=InstrumentFilters(
+            venue="BINANCE", symbol="BTCUSDT", tick_size=Decimal("0.01"),
+            quantity_step=Decimal("0.0001"), minimum_quantity=Decimal("0.0001"),
+            minimum_notional_quote=Decimal("5"),
+        ),
+        risk_limits=limits,
+    )
+    gateway = CrewDecisionGateway(
+        journal=journal, runtime=runtime, authority=authority,
+        producer="gateway.crew_strategist", policy=host_policy,
+    )
+    candidate, _ = trusted_issue(gateway, plan(), output_dir)
+    assert candidate.quantity == Decimal("0.0100")
+    assert candidate.limit_price == Decimal("27000.00")
+    assert candidate.quantity * candidate.limit_price == Decimal("270")
+    runtime._verify_durable_origin(candidate)
+    assert admission.offer(candidate) == (True, "accepted")
+    assert not [req for req in transport.requests if req.method == "POST"]
