@@ -134,3 +134,53 @@ def test_invalid_host_facts_cannot_issue_intent_or_reach_venue(host, monkeypatch
     assert not authority._tickets
     assert admission.depth() == 0
     assert not any(request.method == "POST" for request in transport.requests)
+
+def _cli_context(monkeypatch, output_dir):
+    from types import SimpleNamespace
+
+    class OfflineCrew:
+        def crew(self):
+            return self
+
+        def kickoff(self, *, inputs):
+            assert inputs["target_symbol"] == "BTCUSDT"
+            return plan()
+
+    monkeypatch.setattr(cli, "CryptoTraderCrew", OfflineCrew)
+    monkeypatch.setattr(cli, "parse_arguments", lambda: SimpleNamespace(
+        symbol="BTCUSDT", interval="4h", limit=72, output="offline", verbose=False,
+    ))
+    monkeypatch.setattr(cli, "setup_environment", lambda: True)
+    monkeypatch.setattr(cli, "prepare_output_directory", lambda _config: output_dir)
+    monkeypatch.setattr(cli, "create_inputs", lambda _config: {
+        "target_symbol": "BTCUSDT", "filename_datetime": "offline",
+    })
+
+
+def test_main_optin_uses_trusted_gateway_without_any_order_post(host, monkeypatch):
+    journal, authority, runtime, _admission, transport, output_dir = host
+    before = {event.event_id for event in journal.read_range()}
+    gateway = CrewDecisionGateway(
+        journal=journal, runtime=runtime, authority=authority,
+        producer="gateway.crew_strategist", policy=_policy(),
+    )
+    _cli_context(monkeypatch, output_dir)
+    cli.run(advisory_gateway=gateway)
+    events = [event for event in journal.read_range() if event.event_id not in before]
+    assert len(events) == 2
+    assert {type(event) for event in events} == {
+        StrategyDecisionRecorded, TradeIntentCreated,
+    }
+    assert len(authority._tickets) == 1
+    assert not any(request.method == "POST" for request in transport.requests)
+
+
+def test_main_default_stays_advisory_only_without_gateway(host, monkeypatch):
+    journal, authority, _runtime, _admission, transport, output_dir = host
+    before = tuple(journal.read_range())
+    _cli_context(monkeypatch, output_dir)
+    cli.run()
+    assert tuple(journal.read_range()) == before
+    assert not authority._tickets
+    assert (output_dir / "trading_plan_BTCUSDT_offline.md").is_file()
+    assert not any(request.method == "POST" for request in transport.requests)

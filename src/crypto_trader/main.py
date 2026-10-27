@@ -224,10 +224,8 @@ def parse_arguments():
     
     return parser.parse_args()
 
-def run():
-    """
-    Main function to run the CryptoTraderCrew.
-    """
+def run(*, advisory_gateway: "CrewDecisionGateway | None" = None):
+    """Run the CLI workflow; only a trusted host can opt into advisory origin."""
     # Parse command line arguments
     args = parse_arguments()
     
@@ -258,8 +256,12 @@ def run():
     # Create inputs for the crew
     inputs = create_inputs(config)
     
-    # Run the crew
-    result = run_crew(inputs, output_dir)
+    # Keep the legacy advisory-only call contract when no host gateway was supplied.
+    if advisory_gateway is None:
+        result = run_crew(inputs, output_dir)
+    else:
+        # Only the trusted host may supply a provenance gateway; never submit here.
+        result = run_crew(inputs, output_dir, advisory_gateway=advisory_gateway)
     
     # Display summary of results
     if result is None:
