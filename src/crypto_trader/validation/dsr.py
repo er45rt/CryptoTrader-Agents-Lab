@@ -21,13 +21,20 @@ Project policies (NOT published formulas):
   them before any metrics exist. STARTED, ABORTED or INTERRUPTED_UNRESOLVED attempts may hide
   performance-related outcomes, so they refuse the result.
 * Every COMPLETED attempt must be supplied with registration proof; dropping one refuses.
-* At least MIN_OBSERVATIONS aligned observations with one period label for every trial.
+* At least MIN_OBSERVATIONS aligned observations with one period label for every trial;
+  alignment additionally requires one identical observation_index_sha256 in every trial's
+  metrics (the SHA256 of the shared observation timestamps, supplied by the evaluator).
+* The registry head is read before and after all registry reads; any change refuses.
+* Adding FAILED attempts with the COMPLETED set fixed never improves the result; adding a
+  COMPLETED attempt can raise DSR (V_cross may fall), so monotonicity is not claimed there.
 * Serial dependence is screened on the selected trial by lag-1 autocorrelation only:
   |rho1| > 1.96 / sqrt(T) refuses (Lo 2002); higher-order dependence is not screened.
 
 Numerics use only ``decimal`` (validation sandbox): Phi by the erf Taylor series with
-working precision raised by the cancellation size, exact 0/1 beyond |x| >= 20 (error < 1e-88);
-Phi^-1 by bisection. The registry is UNANCHORED local evidence.
+working precision raised by the cancellation size and pi computed at that precision; for
+x <= -5 by the Mills-ratio continued fraction phi(t)/(t + 1/(t + 2/(t + ...))) with t = -x,
+which has no subtraction; exact 1 for x >= 20 (error < 1e-88). Phi^-1 by bisection on
+[-40, 20]. A DSR outside [0, 1] refuses. The registry is UNANCHORED local evidence.
 """
 from __future__ import annotations
 
@@ -36,7 +43,7 @@ from decimal import (
     Context, Decimal, DivisionByZero, InvalidOperation, Overflow, ROUND_HALF_EVEN, localcontext,
 )
 
-from .canonical import CanonicalError, content_hash, parse_json_strict
+from .canonical import CanonicalError, content_hash, parse_json_strict, sha256_text
 from .contracts import RegistryError
 from .registry import TrialRegistry
 
@@ -48,14 +55,16 @@ VALID = "VALID_RESEARCH_RESULT"
 INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
 
 _PREC = 50
-_PI = Decimal("3.14159265358979323846264338327950288419716939937510582097494459")
 _EULER_GAMMA = Decimal("0.577215664901532860606512090082402431042159335939923598805767")
 _ZERO, _ONE, _TWO = Decimal(0), Decimal(1), Decimal(2)
 _CLAMP = Decimal(20)
+_PPF_LOW = Decimal(-40)
+_TAIL = Decimal(-5)
 _GRID_H = Decimal("0.01")
 _GRID_STEPS = 2000  # [-10, 10]
 _grid_cache: list = []
 _amax_cache: dict = {}
+_pi_cache: dict = {}
 
 LIMITATIONS = (
     "N_DSR equals counted attempts M; N_eff estimation and block bootstrap are deferred",
@@ -63,6 +72,9 @@ LIMITATIONS = (
     "FAILED attempts are counted in M without a Sharpe ratio (policy)",
     "serial dependence screened by lag-1 autocorrelation of the selected trial only",
     "expected maximum assumes independent standard-normal trial statistics",
+    "monotonicity is claimed only for added FAILED attempts with the COMPLETED set fixed; "
+    "adding a COMPLETED attempt can raise DSR",
+    "observation alignment relies on the evaluator-supplied observation_index_sha256",
     "registry evidence is UNANCHORED local evidence; research outside the approved path is not covered",
     "a research result grants no promotion, Paper, Testnet or Live permission",
 )
@@ -79,13 +91,51 @@ def _finite(value) -> Decimal:
     return value
 
 
+def _pi(prec: int) -> Decimal:
+    """pi to ``prec`` digits (series from the ``decimal`` documentation recipe)."""
+    if prec not in _pi_cache:
+        with localcontext(_ctx(prec + 5)):
+            three = Decimal(3)
+            lasts, t, s, n, na, d, da = 0, three, 3, 1, 0, 0, 24
+            while s != lasts:
+                lasts = s
+                n, na = n + na, na + 8
+                d, da = d + da, da + 32
+                t = (t * n) / d
+                s += t
+        with localcontext(_ctx(prec)):
+            _pi_cache[prec] = +s
+    return _pi_cache[prec]
+
+
+def _lower_tail(t: Decimal) -> Decimal:
+    """Phi(-t) for t >= 5 by the Mills-ratio continued fraction (modified Lentz); no subtraction."""
+    prec = _PREC + 20
+    with localcontext(_ctx(prec)):
+        tiny = Decimal(10) ** (-(prec - 5))
+        f = c = t
+        d = _ZERO
+        n = 0
+        while True:
+            n += 1
+            d = _ONE / (t + n * d)
+            c = t + n / c
+            delta = c * d
+            f *= delta
+            if abs(delta - 1) < tiny:
+                break
+        value = (-(t * t) / 2).exp() / (2 * _pi(prec)).sqrt() / f
+    with localcontext(_ctx()):
+        return +value
+
+
 def normal_cdf(x: Decimal) -> Decimal:
-    """Standard normal CDF Phi(x) to about 50 significant digits."""
+    """Standard normal CDF Phi(x) to about 50 significant digits (relative, also in the lower tail)."""
     x = _finite(x)
     if x >= _CLAMP:
         return _ONE
-    if x <= -_CLAMP:
-        return _ZERO
+    if x <= _TAIL:
+        return _lower_tail(-x)
     prec = 60 + int(x * x / 2 * Decimal("0.4343")) + 10
     with localcontext(_ctx(prec)):
         z = x / _TWO.sqrt()
@@ -100,19 +150,21 @@ def normal_cdf(x: Decimal) -> Decimal:
             total += add
             if n > z2 and abs(add) < tiny:
                 break
-        value = (1 + 2 * total / _PI.sqrt()) / 2
+        value = (1 + 2 * total / _pi(prec).sqrt()) / 2
     with localcontext(_ctx()):
         return +value
 
 
 def normal_ppf(p: Decimal) -> Decimal:
-    """Inverse standard normal CDF by bisection on [-20, 20]."""
+    """Inverse standard normal CDF by bisection on [-40, 20]."""
     p = _finite(p)
     if not _ZERO < p < _ONE:
         raise RegistryError("probability must be strictly between 0 and 1")
-    lo, hi = -_CLAMP, _CLAMP
+    if p <= normal_cdf(_PPF_LOW):
+        raise RegistryError("probability below the supported range")
+    lo, hi = _PPF_LOW, _CLAMP
     with localcontext(_ctx()):
-        for _ in range(140):
+        for _ in range(160):
             mid = (lo + hi) / 2
             if normal_cdf(mid) < p:
                 lo = mid
@@ -124,7 +176,7 @@ def normal_ppf(p: Decimal) -> Decimal:
 def _grid():
     if not _grid_cache:
         with localcontext(_ctx()):
-            norm = (2 * _PI).sqrt()
+            norm = (2 * _pi(_PREC)).sqrt()
             for i in range(_GRID_STEPS + 1):
                 z = Decimal(-10) + _GRID_H * i
                 _grid_cache.append((z, (-(z * z) / 2).exp() / norm, normal_cdf(z).ln()))
@@ -210,7 +262,12 @@ def _parse_returns(metrics):
     if type(metrics) is not dict:
         return None
     period, raw = metrics.get("period"), metrics.get("excess_returns")
+    index = metrics.get("observation_index_sha256")
     if type(period) is not str or not period or type(raw) is not list:
+        return None
+    try:
+        sha256_text(index)
+    except CanonicalError:
         return None
     values = []
     for item in raw:
@@ -223,7 +280,7 @@ def _parse_returns(metrics):
         if not value.is_finite():
             return None
         values.append(value)
-    return period, values
+    return period, index, values
 
 
 def _moments(xs):
@@ -249,8 +306,8 @@ def deflated_sharpe(registry: TrialRegistry, study_id: str, results, *,
     """DSR for the selected trial of a registered study. Evidence problems return INSUFFICIENT_EVIDENCE."""
     if not isinstance(registry, TrialRegistry):
         raise RegistryError("a TrialRegistry is required")
-    counts = registry.status_counts(study_id)
     head = registry.verify().head_hash
+    counts = registry.status_counts(study_id)
     m_total = sum(counts.values())
     m = m_total - counts.get("REJECTED_PRECHECK", 0)
     reasons: list[str] = []
@@ -261,7 +318,7 @@ def deflated_sharpe(registry: TrialRegistry, study_id: str, results, *,
     if m < 1:
         reasons.append("no_counted_attempts")
 
-    series: dict[str, tuple[str, list]] = {}
+    series: dict[str, tuple[str, str, list]] = {}
     hashes: list[str] = []
     for result in list(results):
         proven = _verified_series(registry, result, study_id)
@@ -278,17 +335,20 @@ def deflated_sharpe(registry: TrialRegistry, study_id: str, results, *,
             continue
         series[trial_id] = parsed
         hashes.append(f"trial:{trial_id}:{output_hash}")
+    if registry.verify().head_hash != head:
+        reasons.append("registry_changed_during_read")
     k = len(series)
     if k != counts.get("COMPLETED", 0):
         reasons.append("completed_results_missing_or_extra")
     if selected_trial_id not in series:
         reasons.append("selected_trial_not_in_results")
 
-    lengths = {len(v) for _, v in series.values()}
-    periods = {p for p, _ in series.values()}
+    lengths = {len(v) for _, _, v in series.values()}
+    periods = {p for p, _, _ in series.values()}
+    indexes = {ix for _, ix, _ in series.values()}
     if len(periods) > 1:
         reasons.append("mixed_periods")
-    if len(lengths) > 1:
+    if len(lengths) > 1 or len(indexes) > 1:
         reasons.append("unaligned_observations")
     elif lengths and min(lengths) < MIN_OBSERVATIONS:
         reasons.append("insufficient_observations")
@@ -303,7 +363,7 @@ def deflated_sharpe(registry: TrialRegistry, study_id: str, results, *,
 
     with localcontext(_ctx()):
         stats = {}
-        for trial_id, (_, xs) in series.items():
+        for trial_id, (_, _, xs) in series.items():
             moments = _moments(xs)
             if moments is None:
                 reasons.append("zero_variance")
@@ -334,6 +394,8 @@ def deflated_sharpe(registry: TrialRegistry, study_id: str, results, *,
             sr0 = v_used.sqrt() * a_n
         z = (sr - sr0) * Decimal(t - 1).sqrt() / numerator.sqrt()
         value = normal_cdf(z)
+        if not _ZERO <= value <= _ONE:
+            return DSRReport(status=INSUFFICIENT, reasons=("dsr_outside_unit_interval",), **base)
     return DSRReport(
         status=VALID, reasons=(), n_dsr=m, observations=t,
         sharpe_selected=sr, skewness_selected=g3, kurtosis_selected=g4,

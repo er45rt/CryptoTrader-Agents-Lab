@@ -1,9 +1,11 @@
 """P4-03: research-only Deflated Sharpe Ratio against an independent float reference."""
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 from dataclasses import replace
+from datetime import date, timedelta
 from decimal import Decimal
 from statistics import NormalDist
 
@@ -66,22 +68,36 @@ def gaussian(seed, mean, sd=0.01):
     return [f"{rng.gauss(mean, sd):.8f}" for _ in range(T)]
 
 
-def _ok(xs, period="1d"):
-    return lambda receipt, config: {"excess_returns": xs, "period": period}
+def index_hash(start=date(2025, 1, 1), n=T):
+    days = "\n".join((start + timedelta(days=i)).isoformat() for i in range(n))
+    return hashlib.sha256(days.encode("ascii")).hexdigest()
+
+
+INDEX = index_hash()
+
+
+def _ok(xs, period="1d", index=INDEX):
+    def evaluate(receipt, config):
+        metrics = {"excess_returns": xs, "period": period}
+        if index is not None:
+            metrics["observation_index_sha256"] = index
+        return metrics
+    return evaluate
 
 
 def _fail(receipt, config):
     raise ValueError("evaluation error")
 
 
-def study(tmp_path, specs, *, failed=0, prechecked=0, capacity=60):
+def study(tmp_path, specs, *, failed=0, prechecked=0, capacity=60, indexes=None):
     reg = TrialRegistry(tmp_path / "trials.sqlite")
     reg.register_study(StudySpec(
         study_id=STUDY, preregistration_hash="a" * 64, n_max=capacity,
         allowed_paths=("src/crypto_trader/paper/session.py",), cutoff="UNKNOWN",
     ))
-    results = [run_registered_trial(reg, STUDY, {"variant": i}, MANIFEST, _ok(xs))
-               for i, xs in enumerate(specs)]
+    indexes = indexes or [INDEX] * len(specs)
+    results = [run_registered_trial(reg, STUDY, {"variant": i}, MANIFEST, _ok(xs, index=ix))
+               for i, (xs, ix) in enumerate(zip(specs, indexes))]
     for j in range(failed):
         with pytest.raises(ValueError):
             run_registered_trial(reg, STUDY, {"failed": j}, MANIFEST, _fail)
@@ -105,6 +121,56 @@ def test_normal_cdf_and_ppf_match_reference():
     for p in ("0.001", "0.5", "0.8", "0.975", "0.999999"):
         exact_p = float(p)  # both sides get the identical binary probability
         assert abs(float(normal_ppf(Decimal(exact_p))) - N01.inv_cdf(exact_p)) < 1e-12
+
+
+def _erfc_cdf(x):
+    return math.erfc(-x / math.sqrt(2)) / 2
+
+
+@pytest.mark.parametrize("x", [-37, -30, -25, -20, -18, -12, -8, -5.5, -5, -4.5, -3, -1])
+def test_normal_cdf_lower_tail_has_relative_accuracy_against_erfc(x):
+    value = normal_cdf(Decimal(str(x)))
+    assert value > 0
+    # math.erfc itself carries ~1.2e-13 relative error below x = -25 on this platform
+    assert abs(float(value) / _erfc_cdf(x) - 1) < 1e-12
+
+
+def test_normal_cdf_sol_case_minus_18_is_positive_and_correct():
+    value = normal_cdf(Decimal("-18"))
+    assert value > 0
+    assert abs(float(value) - 9.7409489189372e-73) < 1e-84
+
+
+@pytest.mark.parametrize("p", ["1e-70", "1e-30", "1e-12", "3e-7"])
+def test_normal_ppf_lower_tail_inverts_erfc(p):
+    z = float(normal_ppf(Decimal(p)))
+    assert abs(_erfc_cdf(z) / float(p) - 1) < 1e-10
+
+
+def test_normal_ppf_sol_case_1e_minus_70():
+    assert abs(float(normal_ppf(Decimal("1e-70"))) - (-17.7416)) < 1e-4
+
+
+def test_sol_negative_sharpe_case_returns_dsr_inside_unit_interval(tmp_path):
+    xs = ["-0.027"] * 60 + ["-0.007"] * 60
+    random.Random(91801).shuffle(xs)
+    reg, results = _fresh(tmp_path, "a", [xs])
+    with reg:
+        report = deflated_sharpe(reg, STUDY, results, selected_trial_id=results[0].trial_id)
+        assert report.status == "VALID_RESEARCH_RESULT", report.reasons
+        assert 0 <= report.dsr <= 1
+        sr, g3, g4 = ref_stats([float(x) for x in xs])
+        z = sr * math.sqrt(T - 1) / math.sqrt(1 - g3 * sr + (g4 - 1) / 4 * sr * sr)
+        assert abs(float(report.dsr) / _erfc_cdf(z) - 1) < 1e-10
+
+
+def test_dsr_outside_unit_interval_is_refused(tmp_path, monkeypatch):
+    reg, results = _fresh(tmp_path, "a", SPECS[:1])
+    monkeypatch.setattr(dsr_module, "normal_cdf", lambda z: Decimal("-1E-64"))
+    with reg:
+        report = deflated_sharpe(reg, STUDY, results, selected_trial_id=results[0].trial_id)
+        assert report.status == "INSUFFICIENT_EVIDENCE"
+        assert "dsr_outside_unit_interval" in report.reasons and report.dsr is None
 
 
 def test_expected_max_exact_for_small_n_and_published_approximation_above():
@@ -154,7 +220,8 @@ def test_single_attempt_uses_zero_threshold(tmp_path):
         assert abs(float(report.dsr) - expected) < 1e-9
 
 
-def test_more_attempts_never_improve_the_result(tmp_path):
+def test_more_failed_attempts_with_fixed_completed_never_improve_the_result(tmp_path):
+    """Scoped claim: only FAILED attempts are added; the COMPLETED set stays fixed."""
     previous = None
     for failed in (0, 3, 10):
         reg, results = _fresh(tmp_path, f"f{failed}", SPECS, failed=failed)
@@ -165,6 +232,23 @@ def test_more_attempts_never_improve_the_result(tmp_path):
                 assert report.sr_threshold >= previous.sr_threshold
                 assert report.dsr <= previous.dsr
             previous = report
+
+
+def test_adding_a_completed_attempt_can_raise_dsr_documented_limitation(tmp_path):
+    """Sol's counterexample: monotonicity is NOT guaranteed when a COMPLETED attempt is added."""
+    noise = [(0.01, -0.01, -0.01, 0.01)[i % 4] for i in range(T)]
+    def spec(mean):
+        return [f"{mean + e:.8f}" for e in noise]
+    reports = []
+    for name, means in (("three", (0.003, -0.007, -0.002)), ("four", (0.003, -0.007, -0.002, -0.002))):
+        reg, results = _fresh(tmp_path, name, [spec(m) for m in means])
+        with reg:
+            report = deflated_sharpe(reg, STUDY, results, selected_trial_id=results[0].trial_id)
+            assert report.status == "VALID_RESEARCH_RESULT", report.reasons
+            reports.append(report)
+    assert abs(float(reports[0].dsr) - 0.0905) < 5e-5 and abs(float(reports[1].dsr) - 0.0957) < 5e-5
+    assert reports[1].dsr > reports[0].dsr
+    assert any("COMPLETED" in item and "monoton" in item for item in dsr_module.LIMITATIONS)
 
 
 def test_variance_floor_applies_when_trials_are_nearly_identical(tmp_path):
@@ -235,6 +319,39 @@ def test_mixed_periods_and_unknown_selection_are_refused(tmp_path):
         assert "mixed_periods" in _status(reg, [a, b], a.trial_id).reasons
         assert "selected_trial_not_in_results" in _status(
             reg, [a, b], "22222222-2222-4222-8222-222222222222").reasons
+
+
+def test_started_allocation_between_count_and_head_reads_is_refused(tmp_path, monkeypatch):
+    reg, results = _fresh(tmp_path, "a", SPECS[:1])
+    with reg:
+        original = reg.status_counts
+        def counts_then_allocate(study_id):
+            counts = original(study_id)
+            reg.allocate(STUDY, {"racing": 1}, MANIFEST)
+            return counts
+        monkeypatch.setattr(reg, "status_counts", counts_then_allocate)
+        report = _status(reg, results, results[0].trial_id)
+        assert report.status == "INSUFFICIENT_EVIDENCE"
+        assert "registry_changed_during_read" in report.reasons and report.dsr is None
+
+
+def test_same_length_and_period_but_disjoint_dates_are_refused(tmp_path):
+    later = index_hash(date(2025, 1, 1) + timedelta(days=365))
+    reg, results = _fresh(tmp_path, "a", SPECS[:2], indexes=[INDEX, later])
+    with reg:
+        report = _status(reg, results, results[0].trial_id)
+        assert report.status == "INSUFFICIENT_EVIDENCE" and "unaligned_observations" in report.reasons
+
+
+@pytest.mark.parametrize("index", [None, "A" * 64, "a" * 63, 7])
+def test_missing_or_malformed_observation_index_is_refused(tmp_path, index):
+    reg = TrialRegistry(tmp_path / "t.sqlite")
+    reg.register_study(StudySpec(study_id=STUDY, preregistration_hash="a" * 64, n_max=5,
+                                 allowed_paths=("src/crypto_trader/paper/session.py",)))
+    with reg:
+        a = run_registered_trial(reg, STUDY, {"v": 1}, MANIFEST, _ok(SPECS[0], index=index))
+        report = _status(reg, [a], a.trial_id)
+        assert report.status == "INSUFFICIENT_EVIDENCE" and "invalid_metrics" in report.reasons
 
 
 def test_serial_dependence_is_refused(tmp_path):
