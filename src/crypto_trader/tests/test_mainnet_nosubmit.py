@@ -142,6 +142,28 @@ def test_the_mainnet_host_is_accepted_and_a_testnet_host_is_refused():
             require_mainnet_base_url(bad)
 
 
+@pytest.mark.parametrize("malformed_origin", [
+    "https://api.binance.com/path",
+    "https://api.binance.com?x=1",
+    "https://api.binance.com#fragment",
+    "https://user:password@api.binance.com",
+    "https://api.binance.com:8443",
+    "https://api.binance.com:invalid",
+    "https://api.binance.com/path;params",
+    "https://api.binance.com?",
+    "https://api.binance.com#",
+    "https://api.binance.com/?",
+    "https://api.binance.com/#",
+])
+def test_mainnet_base_refuses_non_origin_components_before_any_network(malformed_origin):
+    with pytest.raises(MainnetEndpointError):
+        require_mainnet_base_url(malformed_origin)
+
+
+def test_mainnet_base_accepts_canonical_origin_with_trailing_slash():
+    assert require_mainnet_base_url("https://api.binance.com/") == "https://api.binance.com"
+
+
 def test_the_read_only_allowlist_accepts_only_read_paths():
     for path in sorted(READ_ONLY_PATHS):
         assert require_read_only_path(path) == path
@@ -177,3 +199,155 @@ def test_a_mutation_attempt_on_the_client_surface_is_refused_before_transport():
     with pytest.raises(MainnetMutationForbiddenError):
         client._get("/api/v3/order/../../anything", {}, signed=True)
     assert transport.requests == []
+
+
+def test_mainnet_transport_retry_uses_injected_backoff_sleep():
+    from crypto_trader.execution.binance_testnet import TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[
+            TransportTimeout("transient read timeout"),
+            fx.response(200, fx.restrictions_body()),
+        ]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    client.api_restrictions()
+
+    assert sleeps == [client.retry.delay_for_attempt(1)]
+    assert [request.method for request in transport.requests] == ["GET", "GET"]
+
+
+def test_mainnet_final_transport_failure_does_not_sleep_after_exhaustion():
+    from crypto_trader.execution.binance_testnet import TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[TransportTimeout("timeout")] * 3
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(TransportTimeout):
+        client.api_restrictions()
+
+    assert sleeps == [
+        client.retry.delay_for_attempt(1),
+        client.retry.delay_for_attempt(2),
+    ]
+    assert len(transport.requests) == 3
+
+
+def test_mainnet_non_200_response_neither_retries_nor_sleeps():
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    sleeps: list[float] = []
+    transport = ScriptedTransport(
+        responses=[fx.response(429, {"code": -1003, "msg": "Too many requests"})]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=fx.clock(),
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(MainnetEndpointError):
+        client.api_restrictions()
+
+    assert sleeps == []
+    assert len(transport.requests) == 1
+
+
+def test_mainnet_signed_retry_rebuilds_timestamp_each_attempt():
+    from urllib.parse import parse_qs
+    from crypto_trader.execution.binance_testnet import TestnetClock, TransportTimeout
+    from crypto_trader.mainnet import MainnetReadOnlyClient
+
+    ticks = iter([fx.SERVER_TIME_MS / 1000, (fx.SERVER_TIME_MS + 1000) / 1000])
+    clock = TestnetClock(time_source=lambda: next(ticks), recv_window_ms=5_000)
+    clock.synchronize(fx.SERVER_TIME_MS, local_time_ms=fx.SERVER_TIME_MS)
+    transport = ScriptedTransport(
+        responses=[
+            TransportTimeout("first signed read timed out"),
+            fx.response(200, fx.restrictions_body()),
+        ]
+    )
+    client = MainnetReadOnlyClient(
+        credentials=fx.credentials(),
+        transport=transport,
+        clock=clock,
+        sleep=lambda _seconds: None,
+    )
+
+    client.api_restrictions()
+
+    timestamps = [
+        int(parse_qs(request.query)["timestamp"][0])
+        for request in transport.requests
+    ]
+    assert timestamps == [fx.SERVER_TIME_MS, fx.SERVER_TIME_MS + 1000]
+
+
+@pytest.mark.parametrize("rebound", [
+    "https://outside.example",
+    "https://api.binance.com/other-path",
+    "https://api.binance.com?leak=1",
+    "https://api.binance.com/",
+])
+def test_mainnet_signed_read_refuses_origin_rebinding_before_transport(rebound):
+    transport = ScriptedTransport(responses=[fx.response(200, fx.restrictions_body())])
+    client = fx.client(transport)
+    client.base_url = rebound
+
+    with pytest.raises(MainnetEndpointError, match="origin"):
+        client.api_restrictions()
+
+    assert transport.requests == []
+    assert client.request_log() == ()
+
+
+def test_mainnet_signed_read_retry_rejects_origin_change_during_backoff():
+    from crypto_trader.execution.binance_testnet import TransportTimeout
+
+    transport = ScriptedTransport(responses=[
+        TransportTimeout("simulated read timeout"),
+        fx.response(200, fx.restrictions_body()),
+    ])
+    client = fx.client(transport)
+    client.sleep = lambda _delay: setattr(client, "base_url", "https://outside.example")
+
+    with pytest.raises(MainnetEndpointError, match="origin"):
+        client.api_restrictions()
+
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url == "https://api.binance.com/sapi/v1/account/apiRestrictions"
+
+
+@pytest.mark.parametrize("malformed_url", [
+    "https://user:SYNTHETIC_PASSWORD\uff20api.binance.com",
+    "https://user:SYNTHETIC_PASSWORD\u2100api.binance.com",
+    "https://api.binance.com:SYNTHETIC_PASSWORD",
+])
+def test_mainnet_origin_parser_does_not_echo_attacker_supplied_components(malformed_url):
+    from traceback import format_exception
+
+    with pytest.raises(MainnetEndpointError) as error:
+        require_mainnet_base_url(malformed_url)
+
+    assert "SYNTHETIC_PASSWORD" not in str(error.value)
+    assert "SYNTHETIC_PASSWORD" not in "".join(format_exception(error.value))
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None

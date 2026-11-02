@@ -80,16 +80,6 @@ from .errors import (
     StreamTransportError,
     SymbolFilterError,
 )
-from .faults import (
-    IMMEDIATE_REJECTION_FAULTS,
-    POST_SEND_AMBIGUITY_FAULTS,
-    AmbiguityInjectionResult,
-    FaultClass,
-    SendFault,
-    classify_send_fault,
-    inject_post_send_ambiguity,
-    require_post_send_ambiguity,
-)
 from .filters import SymbolFilters, parse_symbol_filters
 from .limitations import (
     DRY_RUN_RECONCILIATION_GAP,

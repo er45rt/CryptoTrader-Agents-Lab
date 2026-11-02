@@ -190,8 +190,14 @@ def test_analyst_output_flows_to_the_strategist_as_text_context(crew_with_fake_f
     strategist_task = crew.develop_trading_plan_task()
 
     assert [task.id for task in strategist_task.context] == [analyst_task.id]
-    # The analyst itself consumes the four upstream market/news tasks.
-    assert len(analyst_task.context) == 4
+    # Derivatives adds one advisory task to the original market/news context.
+    assert [task.id for task in analyst_task.context] == [
+        crew.fetch_binance_klines_task().id,
+        crew.fetch_binance_price_ticker_task().id,
+        crew.fetch_binance_24hr_stats_task().id,
+        crew.fetch_derivatives_snapshot_task().id,
+        crew.research_news_and_sentiment_task().id,
+    ]
 
 
 # --- Error handling hardening still applies -------------------------------

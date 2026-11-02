@@ -5,6 +5,7 @@ public/read-only) and Phase 2 (four-agent DeepSeek layer) are untouched.
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 from crewai.llms.base_llm import BaseLLM
@@ -217,8 +218,26 @@ def test_binance_tool_stays_public_and_read_only():
     assert not hasattr(tool, "rapidapi_key")
 
     source = (PACKAGE_DIR / "tools" / "binance_public_tool.py").read_text(encoding="utf-8").lower()
-    assert "requests.get" in source
     assert "requests.post" not in source
+    # Exercise the public HTTP boundary offline; a literal requests.get check
+    # would incorrectly reject a hardened Session with controlled trust/redirects.
+    with patch("crypto_trader.tools.binance_public_tool.requests.Session") as factory:
+        session = factory.return_value.__enter__.return_value
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {"symbol": "BTCUSDT", "price": "1.0"}
+        payload = tool._request_once(tool.price_ticker_endpoint_path, {"symbol": "BTCUSDT"})
+
+    assert payload["symbol"] == "BTCUSDT"
+    factory.assert_called_once()
+    session.get.assert_called_once()
+    args, kwargs = session.get.call_args
+    assert args[0] == "https://api.binance.com/api/v3/ticker/price"
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["verify"] is True
+    assert session.trust_env is False
+    assert set(kwargs["headers"]) == {"Accept", "User-Agent"}
+    for method in ("post", "put", "patch", "delete"):
+        getattr(session, method).assert_not_called()
 
 
 # --- Phase 2 four-agent layer untouched ---
@@ -255,11 +274,15 @@ def test_agent_definitions_and_prompts_are_unchanged():
     assert not any("llm" in config for config in agents.values())
 
 
-def test_no_new_tools_were_added():
+def test_only_authorized_public_tools_and_derivatives_contract_exist():
     tools_dir = PACKAGE_DIR / "tools"
     tool_modules = {path.name for path in tools_dir.glob("*.py")}
 
-    assert tool_modules == {"__init__.py", "binance_public_tool.py"}
+    assert tool_modules == {
+        "__init__.py", "binance_public_tool.py",
+        "binance_futures_public_tool.py", "derivatives_schema.py",
+        "safe_scrape_tool.py",
+    }
 
 
 def test_events_layer_does_not_import_llm_or_agent_internals():

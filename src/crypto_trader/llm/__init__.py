@@ -24,16 +24,19 @@ from .console import (
     recover_original_error,
     tolerant_console_writes,
 )
-from .factory import (
-    LLMProviderError,
-    ProviderRateLimiter,
-    ResilientLLM,
-    build_resilient_llm,
-    get_llm,
-    get_provider_rate_limiter,
-    reset_factory_state,
-    set_default_builder,
-)
+# Do not import CrewAI/LiteLLM at package initialization. Paper/stub consumers
+# need the schema only; provider infrastructure is loaded only on explicit use.
+_LAZY_FACTORY_NAMES = frozenset({
+    "LLMProviderError", "ProviderRateLimiter", "ResilientLLM", "build_resilient_llm",
+    "get_llm", "get_provider_rate_limiter", "reset_factory_state", "set_default_builder",
+})
+
+
+def __getattr__(name: str):
+    if name in _LAZY_FACTORY_NAMES:
+        from importlib import import_module
+        return getattr(import_module("crypto_trader.llm.factory"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 from .schemas import (
     StructuredOutputError,
     TakeProfitTarget,

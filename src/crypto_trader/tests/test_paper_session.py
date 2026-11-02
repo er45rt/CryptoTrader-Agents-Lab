@@ -20,6 +20,7 @@ from crypto_trader.paper import (
     PaperStateError,
     RunReport,
     ScriptedSimulationRunner,
+    SimulationOutcome,
     TradingMode,
     report_from_journal,
 )
@@ -400,3 +401,153 @@ def test_report_is_a_run_report_instance(journal):
     )
 
     assert isinstance(session.run(), RunReport)
+
+
+def test_paper_risk_equity_includes_unrealized_and_retains_peak(journal):
+    """Risk and ledger must value the same position at the same historical mark."""
+    from crypto_trader.paper.accounting import PositionLedger
+
+    session = fx.session(
+        journal,
+        decisions=fx.scripted(fx.hold_decision()),
+        data_feed=fx.feed("2800.00"),
+        simulator=ScriptedSimulationRunner(),
+    )
+    ledger = PositionLedger(Decimal("100000"))
+    ledger.apply_fill(
+        symbol="ETHUSDT", side="buy",
+        quantity=Decimal("1"), price=Decimal("2700"), fee=Decimal("0"),
+    )
+    high_mark = fx.feed("2800.00").observations()[0]
+    low_mark = fx.feed("2650.00").observations()[0]
+    high = session._risk_state(ledger, high_mark, high_mark.observed_at)
+    low = session._risk_state(ledger, low_mark, low_mark.observed_at)
+    assert high.equity_quote == Decimal("100100")
+    assert high.peak_equity_quote == Decimal("100100")
+    assert low.equity_quote == Decimal("99950")
+    assert low.peak_equity_quote == Decimal("100100")
+
+
+def test_paper_partial_fill_reduces_only_outstanding_reservation(journal):
+    from crypto_trader.execution.ports import ExecutionObservation, OrderLifecycleState
+    from crypto_trader.risk import PendingIntent, Side
+    from uuid import UUID
+
+    session = fx.session(
+        journal,
+        decisions=fx.scripted(fx.hold_decision()),
+        data_feed=fx.feed("2700.00"),
+        simulator=ScriptedSimulationRunner(),
+    )
+    intent = UUID(int=12345)
+    session._reservations[intent] = (Side.BUY, Decimal("1"), Decimal("2700"))
+    session._pending.register(PendingIntent(
+        intent_id=intent, symbol="ETHUSDT", strategy_id=session.config.strategy_id,
+        side=Side.BUY, quantity=Decimal("1"), notional=Decimal("2700"),
+    ))
+    partial = ExecutionObservation(
+        order_reference="SIM-PARTIAL", intent_id=intent,
+        correlation_id=session.config.session_id, symbol="ETHUSDT",
+        state=OrderLifecycleState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.3"), remaining_quantity=Decimal("0.7"),
+        last_fill_quantity=Decimal("0.3"), last_fill_price=Decimal("2700"),
+    )
+    session._reconcile_temporal_reservations(
+        SimulationOutcome(observations=(partial,))
+    )
+    assert session._reservations[intent][1] == Decimal("0.7")
+    assert session._pending.items()[0].quantity == Decimal("0.7")
+    assert session._pending.items()[0].notional == Decimal("1890")
+
+
+# --- Phase10 temporal integrity regression: journal sequence and partial quantities ---
+
+def _temporal_partial_validation_candidate(journal, *, remaining="0.7", filled="0.3"):
+    from crypto_trader.execution import ExecutionRequest, ExecutionOrderType, ExecutionSide
+    from crypto_trader.execution.ports import ExecutionObservation, OrderLifecycleState
+    from crypto_trader.execution.nautilus import outbound
+    from crypto_trader.risk import Side
+
+    session = fx.session(
+        journal, decisions=fx.scripted(fx.hold_decision()),
+        data_feed=fx.feed("2700.00"), simulator=ScriptedSimulationRunner(),
+    )
+    request = ExecutionRequest.create(
+        intent_id=UUID(int=19271), correlation_id=fx.SESSION_ID,
+        symbol="ETHUSDT", side=ExecutionSide.BUY, order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal("1"), limit_price=Decimal("2700"),
+    )
+    t0 = int(fx.BASE.timestamp() * 1_000_000_000)
+    session._reservations[request.intent_id] = (Side.BUY, Decimal("1"), Decimal("2700"))
+    session._temporal_decided_ns[request.intent_id] = t0
+    observation = ExecutionObservation(
+        order_reference="SIM-PARTIAL-INTEGRITY", intent_id=request.intent_id,
+        correlation_id=fx.SESSION_ID, symbol="ETHUSDT",
+        state=OrderLifecycleState.PARTIALLY_FILLED,
+        filled_quantity=Decimal(filled), remaining_quantity=Decimal(remaining),
+        last_fill_quantity=Decimal("0.3"), last_fill_price=Decimal("2700"),
+        fee=Decimal("0.01"), ts_ns=t0 + 10_000_000,
+    )
+    state_event = outbound.to_phase3_order_state_event(
+        observation, event_id=UUID(int=19272)
+    )
+    fill_event = outbound.to_phase3_fill_event(
+        observation, event_id=UUID(int=19273)
+    )
+    return session, request, observation, state_event, fill_event, t0 + 10_000_000
+
+
+def test_temporal_journal_must_preserve_native_lifecycle_then_fill_order(journal):
+    """A matching multiset is not enough: durable order must mirror native callbacks."""
+    session, req, obs, state_event, fill_event, horizon = (
+        _temporal_partial_validation_candidate(journal)
+    )
+    with pytest.raises(PaperStateError, match="order|sequence|journal"):
+        session._validate_temporal_delta(
+            SimulationOutcome(
+                observations=(obs,), phase3_events=(fill_event, state_event),
+            ),
+            [req], boundary_ns=horizon,
+        )
+    assert not event_types(journal)
+    assert session._reservations[req.intent_id][1] == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    ("remaining", "filled"),
+    [("0.9", "0.3"), ("0.7", "0.4")],
+    ids=["wrong-remaining", "wrong-cumulative"],
+)
+def test_temporal_partial_quantities_must_match_reservation_before_journal(
+    journal, remaining, filled,
+):
+    """Native leaves and cumulative fills must equal the tracked order quantities."""
+    session, req, obs, state_event, fill_event, horizon = (
+        _temporal_partial_validation_candidate(
+            journal, remaining=remaining, filled=filled,
+        )
+    )
+    with pytest.raises(PaperStateError, match="quantity|remaining|cumulative"):
+        session._validate_temporal_delta(
+            SimulationOutcome(
+                observations=(obs,), phase3_events=(state_event, fill_event),
+            ),
+            [req], boundary_ns=horizon,
+        )
+    assert not event_types(journal)
+    assert session._reservations[req.intent_id][1] == Decimal("1")
+
+
+def test_temporal_valid_partial_quantities_and_order_are_accepted(journal):
+    session, req, obs, state_event, fill_event, horizon = (
+        _temporal_partial_validation_candidate(journal)
+    )
+    closed, ids = session._validate_temporal_delta(
+        SimulationOutcome(
+            observations=(obs,), phase3_events=(state_event, fill_event),
+        ),
+        [req], boundary_ns=horizon,
+    )
+    assert not closed
+    assert ids == {state_event.event_id, fill_event.event_id}
+    assert not event_types(journal)

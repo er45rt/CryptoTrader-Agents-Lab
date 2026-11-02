@@ -1,0 +1,2542 @@
+"""Phase 15 durable ambiguity, Stage 2: durable attempt marker + transport fault semantics.
+
+Every scenario drives the REAL runtime -> client -> transport submission path; faults are injected
+at the transport boundary (or by a stub journal), never by a synthetic helper that bypasses the
+path. No network, no credentials, no live order is involved.
+"""
+
+from __future__ import annotations
+
+import ast
+import tempfile
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from uuid import UUID, uuid4
+
+import pytest
+
+from crypto_trader.events import (
+    ORDER_STATE_EVENT_TYPE,
+    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
+)
+from crypto_trader.execution import (
+    ExecutionOrderType,
+    ExecutionRequest,
+    ExecutionSide,
+    ExecutionTimeInForce,
+    InstrumentSpec,
+)
+from crypto_trader.execution.binance_testnet import (
+    PRODUCER,
+    AmbiguousOrderError,
+    AttemptJournalRequiredError,
+    BinanceSpotTestnetClient,
+    PreSendTransportError,
+    RateLimitBanError,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
+    RequestsTransport,
+    ScriptedTransport,
+    TransportError,
+    TransportTimeout,
+    VenueProtocolRejectionError,
+    WithdrawalPolicy,
+)
+from crypto_trader.execution.binance_testnet import TestnetSymbolError as SymbolError
+from crypto_trader.execution.binance_testnet import TestnetRejectedError as RejectedError
+from crypto_trader.execution.binance_testnet import deterministic_order_uuid
+from crypto_trader.execution.binance_testnet import TestnetOrderRuntime as OrderRuntime
+from crypto_trader.execution.binance_testnet.errors import ClockDriftError
+from crypto_trader.execution.binance_testnet import HttpRequest
+from crypto_trader.persistence import JournalSchemaError, SQLiteEventJournal
+from crypto_trader.recovery import (
+    ReconciliationEngine,
+    ReconciliationOutcome,
+    RestartRecovery,
+    StaticVenueStateSource,
+    load_policy,
+    reconstruct_order_states,
+)
+from crypto_trader.tests import testnet_fixtures as fx
+
+
+def _r03_journal(path):
+    """Exercise the original initializer in Red, and official FULL founding in Green."""
+    from inspect import signature
+    options = {"venue_writes": True} if "venue_writes" in signature(SQLiteEventJournal).parameters else {}
+    return SQLiteEventJournal(path, **options)
+
+
+@pytest.mark.parametrize("writer_mode", ["NORMAL", "FULL"])
+def test_r03_unfounded_journal_refused_before_attempt(tmp_path, record_property, writer_mode):
+    from crypto_trader.execution import NonDurableExecutionError
+    from crypto_trader.persistence.journal import JournalSchemaError
+    from crypto_trader.tests.test_persistence_journal import decision
+
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
+    with SQLiteEventJournal(tmp_path / "unfounded.db") as journal:
+        journal.append(decision())
+        journal._conn.execute(f"PRAGMA synchronous={writer_mode}")
+        port = started(transport, journal)
+        before = journal.revision()
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert journal._conn.execute("PRAGMA synchronous").fetchone()[0] == (
+            1 if writer_mode == "NORMAL" else 2
+        )
+        assert attempt_events(journal) == []
+        failure = None
+        try:
+            port.submit(execution_request())
+        except Exception as exc:
+            failure = exc
+        record_property("writer_mode", writer_mode)
+        record_property("new_attempt_count", len(attempt_events(journal)))
+        record_property("post_count", len(posts(transport)))
+        record_property("exception_type", type(failure).__name__)
+        record_property("exception_message", str(failure))
+        assert attempt_events(journal) == [], "unfounded journal must refuse BEFORE saving an attempt"
+        assert posts(transport) == []
+        assert journal.revision() == before
+        assert type(failure) is NonDurableExecutionError
+        assert str(failure) == "journal has no proven FULL venue-write authority."
+        assert type(failure.__cause__) is JournalSchemaError
+        assert str(failure.__cause__) == (
+            "venue POST requires a FULL-founded journal and active WAL/FULL writer."
+        )
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+
+
+def test_r03_normal_origin_cannot_post_after_connection_is_changed_to_full(tmp_path, record_property):
+    from crypto_trader.tests.test_persistence_journal import decision
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
+    with SQLiteEventJournal(tmp_path / "legacy.db") as journal:
+        journal.append(decision())
+        journal._conn.execute("PRAGMA synchronous=FULL")
+        port = started(transport, journal)
+        try:
+            port.submit(execution_request())
+        except Exception:
+            pass
+        record_property("post_count", len(posts(transport)))
+        assert journal._conn.execute("PRAGMA application_id").fetchone()[0] == 0
+        assert posts(transport) == [], "a NORMAL-founded legacy journal must never authorize POST"
+
+
+def test_r03_full_uuid_collision_is_refused_even_with_identical_economics(tmp_path, record_property):
+    reference = f"ct-{INTENT_ID.hex[:20]}"
+    collision = UUID(INTENT_ID.hex[:20] + "ffffffffffff")
+    transport = ScriptedTransport([*fx.environment_responses()])
+    with _r03_journal(tmp_path / "writer.db") as journal:
+        journal.append(_identity_attempt(reference))
+        port = started(transport, journal)
+        # A cached legacy reservation for the colliding UUID contradicts the durable full UUID.
+        # Identical economics and a shared truncated prefix cannot authorize its adoption.
+        port._intents[reference] = collision
+        before = _identity_snapshot(port, journal)
+        requests_before = tuple(transport.requests)
+
+        with pytest.raises(AmbiguousOrderError, match="conflicting intent-to-client-order"):
+            port.submit(replace(execution_request(), intent_id=collision))
+
+        record_property("post_count", len(posts(transport)))
+        assert posts(transport) == []
+        assert tuple(transport.requests) == requests_before
+        assert _identity_snapshot(port, journal) == before
+        assert attempt_events(journal)[0].payload.intent_id == INTENT_ID
+
+
+def test_r03_full_uuids_with_the_same_legacy_prefix_have_distinct_identities(tmp_path, record_property):
+    collision = UUID(INTENT_ID.hex[:20] + "ffffffffffff")
+    second_reference = f"ct2-{collision.hex}"
+    transport = ScriptedTransport([*fx.environment_responses(),
+                                  fx.order_response(CLIENT_ORDER_ID),
+                                  fx.order_response(second_reference, order_id=43)])
+    with _r03_journal(tmp_path / "writer.db") as journal:
+        port = started(transport, journal)
+        port.submit(execution_request())
+        prior = port.local_states()[0]
+        assert collision != INTENT_ID
+        assert port.client_order_id_for(collision) == second_reference != CLIENT_ORDER_ID
+        assert port.submit(replace(execution_request(), intent_id=collision)) == second_reference
+        record_property("post_count", len(posts(transport)))
+        assert len(posts(transport)) == 2
+        assert {event.payload.intent_id for event in attempt_events(journal)} == {INTENT_ID, collision}
+        assert port.local_states()[0] == prior
+
+
+def test_r03_persisted_attempt_economics_checked_on_fresh_adapter(tmp_path):
+    first = ScriptedTransport([*fx.environment_responses(), TransportTimeout("lost response")])
+    path = tmp_path / "writer.db"
+    with _r03_journal(path) as journal:
+        with pytest.raises(AmbiguousOrderError):
+            started(first, journal).submit(execution_request())
+    second = ScriptedTransport([*fx.environment_responses(),
+                               fx.order_response(CLIENT_ORDER_ID, orig_qty="0.00200000")])
+    with _r03_journal(path) as journal:
+        port = started(second, journal)
+        failure = None
+        try:
+            port.submit(execution_request(quantity="0.00200000"))
+        except Exception as exc:
+            failure = exc
+        assert failure is not None, "venue data must not replace the durable attempted economics"
+        assert posts(second) == []
+
+@pytest.mark.parametrize("phase", ["before_commit", "after_binding"])
+def test_r03_full_foundation_does_not_authorize_a_downgraded_writer(tmp_path, monkeypatch, phase):
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)])
+    with _r03_journal(tmp_path / "downgraded.db") as journal:
+        port = started(transport, journal)
+        if phase == "before_commit":
+            journal._conn.execute("PRAGMA synchronous=NORMAL")
+        else:
+            bind = port._bind_durable_authorization
+            def downgrade(prepared, marker):
+                result = bind(prepared, marker)
+                journal._conn.execute("PRAGMA synchronous=NORMAL")
+                return result
+            monkeypatch.setattr(port, "_bind_durable_authorization", downgrade)
+        with pytest.raises(Exception):
+            port.submit(execution_request())
+        assert posts(transport) == []
+        assert len(attempt_events(journal)) == (0 if phase == "before_commit" else 1)
+
+
+def test_r03_committed_attempt_before_post_is_not_retried_after_restart(tmp_path, monkeypatch):
+    path = tmp_path / "pre-post-crash.db"
+    first = ScriptedTransport([*fx.environment_responses()])
+    with _r03_journal(path) as journal:
+        port = started(first, journal)
+        def crash(*_args):
+            raise RuntimeError("offline interruption after durable commit before POST")
+        monkeypatch.setattr(port, "_bind_durable_authorization", crash)
+        with pytest.raises(RuntimeError, match="after durable commit"):
+            port.submit(execution_request())
+        assert len(attempt_events(journal)) == 1
+        assert posts(first) == []
+    restarted = ScriptedTransport([*fx.environment_responses(), fx.rejected(-2013)])
+    with _r03_journal(path) as journal:
+        with pytest.raises(AmbiguousOrderError):
+            started(restarted, journal).submit(execution_request())
+        assert len(attempt_events(journal)) == 1
+        assert posts(restarted) == []
+
+
+INSTRUMENT = InstrumentSpec(symbol="BTCUSDT", base_currency="BTC", starting_balance="100000 USDT")
+INTENT_ID = UUID("88888888-8888-4888-8888-888888888888")
+CORRELATION_ID = UUID("99999999-9999-4999-8999-999999999999")
+CLIENT_ORDER_ID = f"ct2-{INTENT_ID.hex}"
+
+
+def execution_request(*, quantity: str = "0.00100000") -> ExecutionRequest:
+    return ExecutionRequest.create(
+        correlation_id=CORRELATION_ID,
+        symbol="BTCUSDT",
+        side=ExecutionSide.BUY,
+        order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal(quantity),
+        limit_price=Decimal("27000.00"),
+        intent_id=INTENT_ID,
+    )
+
+
+def client_for(transport, *, synchronize: bool = True) -> BinanceSpotTestnetClient:
+    client = fx.client(transport)
+    if synchronize:
+        client.clock.synchronize(fx.SERVER_TIME_MS)
+    return client
+
+
+def started(transport, journal, *, synchronize: bool = True, clock=None) -> OrderRuntime:
+    instance = OrderRuntime(
+        client=client_for(transport, synchronize=synchronize),
+        instrument=INSTRUMENT,
+        journal=journal,
+        clock=clock,
+    )
+    instance.start()
+    return instance
+
+
+def posts(transport) -> list:
+    return [item for item in transport.requests if item.method == "POST"]
+
+
+def attempt_events(journal) -> list:
+    return [
+        event for event in journal.read_range() if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+    ]
+
+
+def _identity_attempt(reference, request=None):
+    request = request or execution_request()
+    return OrderSubmissionAttempted(
+        event_id=uuid4(),
+        occurred_at=datetime.fromtimestamp(fx.SERVER_TIME_MS / 1000, timezone.utc),
+        correlation_id=request.correlation_id,
+        producer="application.production",
+        strategy_id=request.strategy_id,
+        order_id=deterministic_order_uuid(reference),
+        symbol=request.symbol,
+        payload=OrderSubmissionAttemptPayload(
+            venue_reference=reference,
+            intent_id=request.intent_id,
+            side=request.side.value,
+            order_type=request.order_type.value,
+            quantity=request.quantity,
+            limit_price=request.limit_price,
+            time_in_force=request.time_in_force.value,
+            venue_producer=PRODUCER,
+        ),
+    )
+
+
+def _identity_snapshot(instance, journal):
+    return (
+        journal.revision(), instance.local_states(), instance.observations(),
+        instance.phase3_events(), instance.client.known_orders(),
+        dict(instance._intents), dict(instance._correlations), dict(instance._pending_submissions),
+    )
+
+
+@pytest.mark.parametrize("operation", ["submit", "recover"])
+def test_persisted_v2_reference_must_encode_its_full_intent_uuid(tmp_path, operation):
+    other_intent = UUID(INTENT_ID.hex[:20] + "ffffffffffff")
+    reference = f"ct2-{other_intent.hex}"
+    transport = ScriptedTransport([*fx.environment_responses()])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        journal.append(_identity_attempt(reference))
+        instance = started(transport, journal)
+        before = _identity_snapshot(instance, journal)
+        requests_before = tuple(transport.requests)
+
+        with pytest.raises(AmbiguousOrderError, match="does not encode the full intent UUID"):
+            if operation == "submit":
+                instance.submit(execution_request())
+            else:
+                instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID)
+
+        assert _identity_snapshot(instance, journal) == before
+        assert tuple(transport.requests) == requests_before
+        assert posts(transport) == []
+
+
+@pytest.mark.parametrize("recover_first", [False, True])
+def test_restarted_legacy_reference_is_reused_for_recovery_and_retry(tmp_path, recover_first):
+    reference = f"ct-{INTENT_ID.hex[:20]}"
+    path = tmp_path / "legacy.db"
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        journal.append(_identity_attempt(reference))
+    transport = ScriptedTransport([
+        *fx.environment_responses(), fx.order_response(reference), fx.order_response(reference),
+    ])
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        instance = started(transport, journal)
+        assert instance.client_order_id_for(INTENT_ID) == reference
+        if recover_first:
+            adopted = instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID)
+            assert adopted.client_order_id == reference
+        else:
+            assert instance.submit(execution_request()) == reference
+        prior = instance.local_states()
+        assert instance.submit(execution_request()) == reference
+        assert instance.local_states() == prior
+        assert len(attempt_events(journal)) == 1
+        assert attempt_events(journal)[0].payload.venue_reference == reference
+        assert posts(transport) == []
+        reads = [item for item in transport.requests if urlsplit(item.url).path == "/api/v3/order"]
+        assert len(reads) == 2
+        assert all(parse_qs(item.query)["origClientOrderId"] == [reference] for item in reads)
+
+
+def test_restarted_missing_legacy_attempt_never_posts_on_retry(tmp_path):
+    reference = f"ct-{INTENT_ID.hex[:20]}"
+    path = tmp_path / "legacy.db"
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        journal.append(_identity_attempt(reference))
+    transport = ScriptedTransport([
+        *fx.environment_responses(), fx.rejected(-2013), fx.rejected(-2013),
+    ])
+    with SQLiteEventJournal(path, venue_writes=True) as journal:
+        instance = started(transport, journal)
+        before = journal.revision()
+        assert instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID) is None
+        prior = _identity_snapshot(instance, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        assert _identity_snapshot(instance, journal) == prior
+        assert journal.revision() == before
+        assert instance.local_states()[0].order_reference == reference
+        assert posts(transport) == []
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["v2", "legacy"])
+@pytest.mark.parametrize("changes", [
+    {"quantity": Decimal("0.00200000")},
+    {"limit_price": Decimal("28000.00")},
+    {"side": ExecutionSide.SELL},
+    {"time_in_force": ExecutionTimeInForce.IOC},
+    {"order_type": ExecutionOrderType.MARKET, "limit_price": None},
+    {"strategy_id": "changed-strategy"},
+    {"correlation_id": UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")},
+])
+def test_changed_persisted_request_preserves_prior_order_state(tmp_path, legacy, changes):
+    reference = f"ct-{INTENT_ID.hex[:20]}" if legacy else CLIENT_ORDER_ID
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(reference)])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        journal.append(_identity_attempt(reference))
+        instance = started(transport, journal)
+        assert instance.submit(execution_request()) == reference
+        before = _identity_snapshot(instance, journal)
+        requests_before = tuple(transport.requests)
+
+        with pytest.raises(AmbiguousOrderError, match="economics"):
+            instance.submit(replace(execution_request(), **changes))
+
+        assert _identity_snapshot(instance, journal) == before
+        assert tuple(transport.requests) == requests_before
+        assert posts(transport) == []
+
+
+@pytest.mark.parametrize("operation", ["submit", "recover"])
+@pytest.mark.parametrize("conflict", ["two_references", "two_intents", "duplicate", "order_id"])
+def test_conflicting_persisted_mapping_preserves_prior_order_state(tmp_path, operation, conflict):
+    legacy = f"ct-{INTENT_ID.hex[:20]}"
+    transport = ScriptedTransport([*fx.environment_responses(), fx.order_response(legacy)])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        marker = _identity_attempt(legacy)
+        journal.append(marker)
+        instance = started(transport, journal)
+        assert instance.submit(execution_request()) == legacy
+        conflicting = _identity_attempt(legacy)
+        if conflict == "two_references":
+            conflicting = _identity_attempt(CLIENT_ORDER_ID)
+        elif conflict == "two_intents":
+            conflicting = _identity_attempt(
+                legacy, replace(execution_request(), intent_id=uuid4())
+            )
+        elif conflict == "order_id":
+            conflicting = conflicting.model_copy(update={"order_id": uuid4()})
+        journal.append(conflicting)
+        before = _identity_snapshot(instance, journal)
+        requests_before = tuple(transport.requests)
+
+        with pytest.raises(AmbiguousOrderError):
+            if operation == "submit":
+                instance.submit(execution_request())
+            else:
+                instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID)
+
+        assert _identity_snapshot(instance, journal) == before
+        assert tuple(transport.requests) == requests_before
+        assert posts(transport) == []
+
+
+class _FailingJournal:
+    """A journal whose durable append fails (marker commit unavailable)."""
+
+    def read_range(self, **_kwargs):
+        return []
+
+    def read_by_id(self, _event_id):
+        return None
+
+    def append(self, event):  # noqa: ANN001 - test double
+        raise RuntimeError("durable journal unavailable")
+
+
+class _UnreadableAttemptJournal:
+    """Structural durable journal whose attempt history cannot be queried."""
+
+    def append(self, _event):
+        return True
+
+    def read_by_id(self, _event_id):
+        return None
+
+
+def _MarkerVisibilityTransport(journal_path: Path, fault: Exception, inner):
+    """Observe marker visibility using an exact built-in offline sender."""
+    transport = ScriptedTransport([])
+    transport.seen_during_send = []
+
+    def send(request: HttpRequest):
+        transport.requests.append(request)
+        if not request.is_write:
+            return inner.send(request)
+        with SQLiteEventJournal(journal_path) as fresh:
+            transport.seen_during_send = [
+                event
+                for event in fresh.replay()
+                if event.event_type == ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE
+            ]
+        raise fault
+
+    transport.send = send
+    return transport
+
+
+# --- A / B: locally rejectable work happens before the marker ---------------------
+
+def test_a_prepare_validation_failure_writes_no_marker_and_no_post(tmp_path):
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        # Valid for the ExecutionRequest, invalid for the venue step size (0.00001): rejected in
+        # prepare, before any durable marker exists.
+        with pytest.raises(SymbolError):
+            instance.submit(execution_request(quantity="0.00001500"))
+
+        assert attempt_events(journal) == []
+        assert posts(transport) == []
+
+
+def test_b_rate_or_clock_precondition_failure_writes_no_marker_and_no_post(tmp_path):
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        # Drift beyond the receive window: the clock precondition rejects in prepare.
+        instance.client.clock.offset_ms = 10_000
+
+        with pytest.raises(ClockDriftError):
+            instance.submit(execution_request())
+
+        assert attempt_events(journal) == []
+        assert posts(transport) == []
+
+
+def test_b_a_banned_budget_is_admitted_before_the_marker(tmp_path):
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        instance.client.budget.banned = True
+
+        with pytest.raises(RateLimitBanError):
+            instance.submit(execution_request())
+
+        assert attempt_events(journal) == []
+        assert posts(transport) == []
+
+
+# --- C: marker commit failure -----------------------------------------------------
+
+def test_c_a_marker_commit_failure_prevents_any_post():
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)]
+    )
+    instance = OrderRuntime(
+        client=client_for(transport), instrument=INSTRUMENT, journal=_FailingJournal()
+    )
+    instance.start()
+
+    with pytest.raises(RuntimeError, match="durable journal unavailable"):
+        instance.submit(execution_request())
+
+    assert posts(transport) == []
+
+
+def test_unreadable_attempt_history_fails_closed_before_any_post():
+    transport = ScriptedTransport(responses=list(fx.environment_responses()))
+    instance = OrderRuntime(
+        client=client_for(transport), instrument=INSTRUMENT, journal=_UnreadableAttemptJournal()
+    )
+    instance.start()
+
+    with pytest.raises(AttemptJournalRequiredError, match="cannot prove prior submission attempts"):
+        instance.submit(execution_request())
+
+    assert posts(transport) == []
+
+
+# --- D / 13 / 14: durable marker committed before the exact POST ------------------
+
+def test_d_marker_is_durably_committed_before_the_exact_prepared_post(tmp_path):
+    journal_path = tmp_path / "journal.db"
+    fault = TransportTimeout("post-send ambiguity")
+    inner = ScriptedTransport(responses=list(fx.environment_responses()))
+    transport = _MarkerVisibilityTransport(journal_path, fault, inner)
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        client = client_for(transport)
+        captured: dict = {}
+        original_prepare = client.prepare_order
+
+        def spy_prepare(request, *, wait=True):  # noqa: ANN001 - test spy
+            prepared = original_prepare(request, wait=wait)
+            captured["prepared"] = prepared
+            captured["prepare_calls"] = captured.get("prepare_calls", 0) + 1
+            return prepared
+
+        client.prepare_order = spy_prepare  # type: ignore[method-assign]
+        instance = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+        instance.start()
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        markers = attempt_events(journal)
+
+    prepared = captured["prepared"]
+    assert captured["prepare_calls"] == 1
+    assert len(markers) == 1
+    marker = markers[0]
+    # Same identity persisted, derived and sent.
+    assert marker.payload.venue_reference == CLIENT_ORDER_ID
+    assert prepared.client_order_id == CLIENT_ORDER_ID
+    assert f"newClientOrderId={CLIENT_ORDER_ID}" in transport.requests[-1].query
+    # The exact prepared request object was sent: no rebuild, no re-signing.
+    assert transport.requests[-1] is prepared.request
+    assert len(posts(transport)) == 1
+    # Durable visibility at send time: a fresh journal read inside send already saw the marker.
+    assert len(transport.seen_during_send) == 1
+    assert transport.seen_during_send[0].payload.venue_reference == CLIENT_ORDER_ID
+
+
+def test_a_successful_submit_sends_exactly_one_post_and_records_the_order(tmp_path):
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID, status="NEW")]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        reference = instance.submit(execution_request())
+
+        assert reference == CLIENT_ORDER_ID
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        order_events = [
+            event for event in journal.read_range() if event.event_type == ORDER_STATE_EVENT_TYPE
+        ]
+        # The durable marker is its own contract; the venue response supplies the lifecycle fact.
+        assert [event.payload.state for event in order_events] == ["accepted"]
+
+
+# --- E / F / G: pre-send failures are typed evidence, never a retry ----------------
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        PreSendTransportError("DNS resolution failure"),
+        PreSendTransportError("connection refused before establishment"),
+        PreSendTransportError("connect timeout before establishment"),
+    ],
+    ids=["dns", "refused", "connect_timeout"],
+)
+def test_e_f_g_pre_send_failures_are_typed_and_never_retried(tmp_path, fault):
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), fault])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(PreSendTransportError):
+            instance.submit(execution_request())
+
+        assert len(attempt_events(journal)) == 1
+        assert len(posts(transport)) == 1, "exactly one POST attempt, never an automatic retry"
+        # Proven not transmitted: resolved as a pre-send failure, so the attempt is closed out.
+        canceled = [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "canceled"
+        ]
+        assert len(canceled) == 1
+        assert canceled[0].payload.reason.startswith("pre_send_failure_proven")
+
+
+# --- H: post-send ambiguity -------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        TransportTimeout("read timeout"),
+        TransportError("connection reset by peer"),
+        TransportError("remote disconnected mid-response"),
+    ],
+    ids=["read_timeout", "reset", "disconnect"],
+)
+def test_h_post_send_ambiguity_keeps_the_marker_and_never_retries(tmp_path, fault):
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), fault])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(attempt_events(journal)) == 1
+        assert len(posts(transport)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+
+
+# --- I / J / K / L: redirects are never followed ---------------------------------
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_i_j_k_l_write_redirect_is_not_followed_and_is_ambiguous(tmp_path, status):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.response(status, {}, Location="https://elsewhere.invalid/api/v3/order"),
+            fx.order_response(CLIENT_ORDER_ID),  # would only be consumed by a second POST
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1, "a redirect must never cause a second POST"
+        assert len(transport.requests) == 4, "no request was replayed to the Location"
+        assert len(attempt_events(journal)) == 1
+
+
+# --- M: HTTP 200 is never success on its own -------------------------------------
+
+def _malformed_success_cases() -> list:
+    return [
+        pytest.param(fx.response(200, None), id="empty_body"),
+        pytest.param(fx.response(200, "<html>not json</html>"), id="non_json_body"),
+        pytest.param(fx.response(200, {"clientOrderId": CLIENT_ORDER_ID, "status": "NEW"}), id="missing_order_id"),
+        pytest.param(fx.order_response(CLIENT_ORDER_ID, status="SOMETHING_NEW"), id="unrecognized_status"),
+    ]
+
+
+@pytest.mark.parametrize("response", _malformed_success_cases())
+def test_m_malformed_success_response_is_post_send_ambiguous(tmp_path, response):
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), response])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+
+# --- N: -1021 is a venue protocol rejection, not an order outcome -----------------
+
+def test_n_timestamp_rejection_records_protocol_evidence_and_never_retries(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-1021, msg="Timestamp for this request is outside of the recvWindow"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(VenueProtocolRejectionError) as error:
+            instance.submit(execution_request())
+
+        assert type(error.value).reason_code == "venue_protocol_rejection_before_order_creation"
+        assert type(error.value).evidence_code == "venue_timestamp_outside_recv_window"
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        rejected = [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "rejected"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0].payload.reason == (
+            "venue_protocol_rejection_before_order_creation:venue_timestamp_outside_recv_window"
+        )
+
+
+# --- 4: fail closed without durable attempt storage -------------------------------
+
+def test_new_submit_without_a_durable_journal_fails_closed_with_zero_posts():
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.order_response(CLIENT_ORDER_ID)]
+    )
+    instance = OrderRuntime(client=client_for(transport), instrument=INSTRUMENT, journal=None)
+    instance.start()
+
+    with pytest.raises(AttemptJournalRequiredError):
+        instance.submit(execution_request())
+
+    assert posts(transport) == []
+    assert transport.requests[-1].method != "POST"
+
+
+# --- duplicate client order identity: reconcile, never terminalise ----------------
+
+def test_duplicate_client_order_id_is_reconciled_by_identity_not_terminalised(tmp_path):
+    """A duplicate-identity response may mean the SAME order already exists at the venue."""
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=99),  # the identity lookup
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        reference = instance.submit(execution_request())
+
+        assert reference == CLIENT_ORDER_ID
+        assert len(posts(transport)) == 1, "the write is never retried"
+        adopted = instance.client.known_orders()
+        assert adopted and adopted[0].venue_order_id == "99", "the venue identity was adopted"
+        states = [
+            event.payload.state
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ]
+        assert states == ["accepted"], "the venue truth was recorded, not a rejection"
+        # No terminal rejection is journaled for a duplicate identity.
+        rejected = [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "rejected"
+        ]
+        assert rejected == []
+
+
+@pytest.mark.parametrize(
+    "read_failures",
+    [
+        pytest.param(
+            [fx.rejected(code=-2013, msg="Order does not exist.")],
+            id="not_found",
+        ),
+        pytest.param(
+            [PreSendTransportError("identity read never connected")] * 3,
+            id="pre_send_read_failure",
+        ),
+        pytest.param(
+            [TransportTimeout("identity read timed out")] * 3,
+            id="read_timeout",
+        ),
+    ],
+)
+def test_duplicate_identity_failed_reread_stays_ambiguous_and_pending(tmp_path, read_failures):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            *read_failures,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+        states = instance.local_states()
+        assert len(states) == 1
+        assert states[0].order_reference == CLIENT_ORDER_ID
+        assert states[0].state.value == "submitted"
+        assert states[0].submission_attempted is True
+
+
+@pytest.mark.parametrize(
+    "mutate_body",
+    [
+        pytest.param(
+            lambda body: {**body, "clientOrderId": "ct-different-identity"},
+            id="different_client_id",
+        ),
+        pytest.param(
+            lambda body: {**body, "symbol": "ETHUSDT"},
+            id="different_symbol",
+        ),
+        pytest.param(
+            lambda body: {key: value for key, value in body.items() if key != "orderId"},
+            id="missing_order_id",
+        ),
+    ],
+)
+def test_duplicate_identity_mismatched_reread_stays_ambiguous_and_pending(
+    tmp_path, mutate_body
+):
+    reread = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=99)
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, mutate_body(dict(reread.body))),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+        assert instance.client.known_orders() == ()
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+@pytest.mark.parametrize("reread_exists", [True, False], ids=["adopt", "not_found"])
+def test_ambiguous_submit_explicit_resubmit_never_posts_twice(tmp_path, reread_exists):
+    reread = (
+        fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=777)
+        if reread_exists
+        else fx.rejected(code=-2013, msg="Order does not exist.")
+    )
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            reread,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        if reread_exists:
+            assert instance.submit(execution_request()) == CLIENT_ORDER_ID
+            states = instance.local_states()
+            assert len(states) == 1
+            assert states[0].order_reference == CLIENT_ORDER_ID
+            assert states[0].state.value == "accepted"
+            accepted = [
+                event
+                for event in journal.read_range()
+                if event.event_type == ORDER_STATE_EVENT_TYPE
+                and event.payload.state == "accepted"
+            ]
+            assert len(accepted) == 1
+        else:
+            with pytest.raises(AmbiguousOrderError):
+                instance.submit(execution_request())
+            assert instance.local_states()[0].state.value == "submitted"
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+
+@pytest.mark.parametrize("reread_exists", [True, False], ids=["adopt", "not_found"])
+def test_restart_durable_attempt_never_posts_same_identity_again(tmp_path, reread_exists):
+    journal_path = tmp_path / "journal.db"
+    first_transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), TransportTimeout("post-send ambiguity")]
+    )
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        first = started(first_transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            first.submit(execution_request())
+        assert len(posts(first_transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+    reread = (
+        fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=778)
+        if reread_exists
+        else fx.rejected(code=-2013, msg="Order does not exist.")
+    )
+    second_transport = ScriptedTransport(responses=[*fx.environment_responses(), reread])
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        restarted = started(second_transport, journal)
+
+        if reread_exists:
+            assert restarted.submit(execution_request()) == CLIENT_ORDER_ID
+            states = restarted.local_states()
+            assert len(states) == 1
+            assert states[0].order_reference == CLIENT_ORDER_ID
+            assert states[0].state.value == "accepted"
+        else:
+            with pytest.raises(AmbiguousOrderError):
+                restarted.submit(execution_request())
+
+        assert posts(second_transport) == []
+        assert len(attempt_events(journal)) == 1
+
+
+def test_recovered_pending_identity_without_marker_is_never_posted(tmp_path):
+    """recover_order() leaves the identity pending: a later submit must fail closed, zero POSTs."""
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2013, msg="Order does not exist."),  # the recovery lookup
+            fx.rejected(code=-2013, msg="Order does not exist."),  # the identity re-read
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(transport, journal)
+        assert instance.recover_order(INTENT_ID, correlation_id=CORRELATION_ID) is None
+        assert attempt_events(journal) == []
+
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            instance.submit(execution_request())
+
+        assert posts(transport) == []
+        assert attempt_events(journal) == []
+        states = instance.local_states()
+        assert len(states) == 1
+        assert states[0].order_reference == CLIENT_ORDER_ID
+        assert states[0].state.value == "submitted"
+
+
+def test_duplicate_failed_reread_then_resubmit_still_never_posts_again(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+
+
+
+@pytest.mark.parametrize(
+    "guard_read_failures",
+    [
+        pytest.param(
+            [PreSendTransportError("guard read never connected")] * 3,
+            id="pre_send_read_failure",
+        ),
+        pytest.param(
+            [TransportTimeout("guard read timed out")] * 3,
+            id="read_timeout",
+        ),
+    ],
+)
+def test_existing_durable_attempt_guard_read_failure_never_reposts(tmp_path, guard_read_failures):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            *guard_read_failures,
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == []
+
+
+def test_existing_durable_attempt_guard_rejects_mismatched_identity_without_caching(tmp_path):
+    reread = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad_body = {**dict(reread.body), "clientOrderId": "ct-foreign-identity"}
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad_body),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.client.known_orders() == ()
+        assert "ct-foreign-identity" not in instance.client._orders
+
+
+def test_durable_attempt_for_one_identity_does_not_block_a_different_identity(tmp_path):
+    second_intent = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    second_correlation = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    second_reference = f"ct2-{second_intent.hex}"
+    second_request = ExecutionRequest.create(
+        correlation_id=second_correlation,
+        symbol="BTCUSDT",
+        side=ExecutionSide.BUY,
+        order_type=ExecutionOrderType.LIMIT,
+        quantity=Decimal("0.00100000"),
+        limit_price=Decimal("27000.00"),
+        intent_id=second_intent,
+    )
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("first identity is ambiguous"),
+            fx.order_response(second_reference, status="NEW", order_id=780),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert instance.submit(second_request) == second_reference
+
+        assert len(posts(transport)) == 2
+        attempts = attempt_events(journal)
+        assert {event.payload.venue_reference for event in attempts} == {
+            CLIENT_ORDER_ID,
+            second_reference,
+        }
+
+
+@pytest.mark.parametrize(
+    "first_outcome,first_error",
+    [
+        pytest.param(
+            PreSendTransportError("write never connected"),
+            PreSendTransportError,
+            id="pre_send_canceled",
+        ),
+        pytest.param(
+            fx.rejected(
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow",
+            ),
+            VenueProtocolRejectionError,
+            id="timestamp_rejected",
+        ),
+        pytest.param(
+            fx.rejected(code=-2019, msg="Margin is insufficient"),
+            RejectedError,
+            id="ordinary_rejected",
+        ),
+    ],
+)
+def test_terminal_durable_attempt_identity_is_never_reposted_in_process(
+    tmp_path, first_outcome, first_error
+):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            first_outcome,
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(first_error):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+
+@pytest.mark.parametrize(
+    "first_outcome,first_error",
+    [
+        pytest.param(
+            PreSendTransportError("write never connected"),
+            PreSendTransportError,
+            id="pre_send_canceled",
+        ),
+        pytest.param(
+            fx.rejected(
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow",
+            ),
+            VenueProtocolRejectionError,
+            id="timestamp_rejected",
+        ),
+        pytest.param(
+            fx.rejected(code=-2019, msg="Margin is insufficient"),
+            RejectedError,
+            id="ordinary_rejected",
+        ),
+    ],
+)
+def test_terminal_durable_attempt_identity_is_never_reposted_after_restart(
+    tmp_path, first_outcome, first_error
+):
+    journal_path = tmp_path / "terminal-identity.db"
+    first_transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), first_outcome]
+    )
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        first = started(first_transport, journal)
+        with pytest.raises(first_error):
+            first.submit(execution_request())
+        assert len(posts(first_transport)) == 1
+        assert len(attempt_events(journal)) == 1
+
+    second_transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2013, msg="Order does not exist."),
+        ]
+    )
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        restarted = started(second_transport, journal)
+        with pytest.raises(AmbiguousOrderError, match="permanently ineligible"):
+            restarted.submit(execution_request())
+
+        assert posts(second_transport) == []
+        assert len(attempt_events(journal)) == 1
+
+
+def test_ordinary_deterministic_rejection_still_terminalises(tmp_path):
+    """Control: a real venue rejection (not a duplicate identity) keeps terminal semantics."""
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), fx.rejected(code=-2019, msg="Margin is insufficient")]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(RejectedError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        rejected = [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE and event.payload.state == "rejected"
+        ]
+        assert len(rejected) == 1
+
+
+# --- 4: 429 / 418 keep the attempt fenced, never terminal -------------------------
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (fx.rate_limited("1"), WriteRateLimitedOutcomeUnknownError),
+        (fx.banned("120"), WriteIpBannedOutcomeUnknownError),
+    ],
+    ids=["429", "418"],
+)
+def test_rate_limit_responses_keep_the_marker_and_never_terminalise(tmp_path, response, expected):
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), response])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(expected) as caught:
+            instance.submit(execution_request())
+
+        assert isinstance(caught.value, AmbiguousOrderError)
+        assert len(posts(transport)) == 1, "no automatic POST retry"
+        assert len(attempt_events(journal)) == 1, "the durable attempt stays for reconciliation"
+        assert CLIENT_ORDER_ID in instance._pending_submissions
+        assert instance.local_states()[0].submission_attempted is True
+        assert [
+            event
+            for event in journal.read_range()
+            if event.event_type == ORDER_STATE_EVENT_TYPE
+        ] == [], "429/418 prove no final order outcome, so no terminal lifecycle event"
+
+
+# --- 12: durable restart / recovery proof -----------------------------------------
+
+def test_restart_recovers_the_durable_attempt_from_the_journal_only(tmp_path):
+    journal_path = tmp_path / "journal.db"
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), TransportTimeout("no response")]
+    )
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        assert instance.local_states()[0].submission_attempted is True
+
+    # The runtime instance is gone; the journal is the sole authority.
+    with SQLiteEventJournal(journal_path) as fresh:
+        reconstructor, _summary = reconstruct_order_states(fresh)
+        states = reconstructor.states()
+        anchors = reconstructor.attempt_anchors(CLIENT_ORDER_ID)
+        run = RestartRecovery(
+            engine=ReconciliationEngine(load_policy({"policy_id": "recovery-v1"})),
+            journal=fresh,
+            venue_sources=[StaticVenueStateSource(entries=())],
+            producer="application.recovery",
+        ).run(now=datetime.fromtimestamp(fx.SERVER_TIME_MS / 1000, tz=timezone.utc))
+
+    assert len(states) == 1
+    state = states[0]
+    assert state.order_reference == CLIENT_ORDER_ID
+    assert state.submission_attempted is True
+    assert anchors is not None
+    assert anchors.intent_id == INTENT_ID
+    assert anchors.quantity == Decimal("0.00100000")
+    assert anchors.limit_price == Decimal("27000.00")
+    assert anchors.venue_producer == "infrastructure.binance_testnet"
+    # Safely unresolved and fenced until authoritative venue evidence exists.
+    assert run.report.outcome_for(CLIENT_ORDER_ID) is (
+        ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION
+    )
+    assert run.report.requires_halt_new_risk is True
+    assert run.recovery_state == "failed"
+
+
+# --- transport classification (real RequestsTransport, no network) ---------------
+
+def _stub_requests(monkeypatch, exc: Exception) -> list:
+    import requests
+
+    calls: list = []
+
+    def fake_request(session, method, url, headers=None, timeout=None, allow_redirects=None):
+        calls.append({"method": method, "allow_redirects": allow_redirects})
+        raise exc
+
+    monkeypatch.setattr(requests.sessions.Session, "request", fake_request)
+    return calls
+
+
+def _new_connection_error() -> BaseException:
+    from requests.packages.urllib3.exceptions import NewConnectionError
+
+    return NewConnectionError(None, "connection refused")
+
+
+def _connection_error_with_cause(requests, cause: BaseException):
+    """Model requests' actual ConnectionError(MaxRetryError(reason=...)) wrapper."""
+    from urllib3 import HTTPSConnectionPool
+    from urllib3.exceptions import MaxRetryError
+
+    return requests.exceptions.ConnectionError(MaxRetryError(
+        HTTPSConnectionPool('testnet.binance.vision'), '/api/v3/order', cause,
+    ))
+
+
+def _request() -> HttpRequest:
+    return HttpRequest(method="POST", url="https://testnet.binance.vision/api/v3/order", query="a=1", is_write=True)
+
+
+def test_transport_never_inherits_ambient_proxy_or_netrc(monkeypatch):
+    """A signed venue request must not consult ambient proxy or netrc settings."""
+    import requests
+
+    def forbidden_ambient(*args, **kwargs):
+        raise AssertionError("ambient proxy/netrc settings were consulted")
+
+    # Never send anything: this intercepts the *last* Requests network boundary.
+    captured = []
+
+    def fake_send(session, prepared, **kwargs):
+        captured.append((session.trust_env, kwargs.get("proxies", {})))
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"ok":true}'
+        return response
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:49151")
+    monkeypatch.setenv("NETRC", "not-a-real-netrc-file")
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", forbidden_ambient)
+    monkeypatch.setattr(requests.sessions, "get_environ_proxies", forbidden_ambient)
+    monkeypatch.setattr(requests.sessions.Session, "send", fake_send)
+
+    response = RequestsTransport(timeout_seconds=1.0).send(_request())
+
+    assert response.status_code == 200
+    assert response.body == {"ok": True}
+    assert len(captured) == 1
+    assert captured[0][0] is False
+    assert not any(captured[0][1].values())
+
+
+@pytest.mark.parametrize(
+    "exc_factory,expected,pre_send",
+    [
+        (lambda r: r.exceptions.ConnectTimeout("connect timed out"), PreSendTransportError, True),
+        (lambda r: r.exceptions.SSLError("tls handshake failed"), TransportError, False),
+        (lambda r: r.exceptions.ConnectionError("connection aborted"), TransportError, False),
+        (lambda r: r.exceptions.ReadTimeout("read timed out"), TransportTimeout, False),
+        (lambda r: r.exceptions.RequestException("unknown socket failure"), TransportError, False),
+    ],
+    ids=["connect_timeout", "tls", "aborted", "read_timeout", "unknown"],
+)
+def test_transport_classifies_only_proven_pre_send_failures(monkeypatch, exc_factory, expected, pre_send):
+    import requests
+
+    calls = _stub_requests(monkeypatch, exc_factory(requests))
+    transport = RequestsTransport(timeout_seconds=1.0)
+
+    with pytest.raises(expected) as error:
+        transport.send(_request())
+
+    assert isinstance(error.value, expected)
+    assert isinstance(error.value, PreSendTransportError) is pre_send
+    assert calls and calls[0]["allow_redirects"] is False
+
+
+def _urllib3_cause(kind: str) -> BaseException:
+    """Build the real urllib3 exception an installed requests/urllib3 chain carries."""
+    from urllib3.exceptions import NameResolutionError, NewConnectionError
+
+    if kind == "dns":
+        return NameResolutionError("testnet.binance.vision", None, OSError("name resolution failed"))
+    return NewConnectionError(None, "connection refused")
+
+
+@pytest.mark.parametrize("kind", ["dns", "refused"])
+def test_transport_classifies_dns_and_refused_independently(monkeypatch, kind):
+    """Each proven pre-send class is entered through its own real exception chain."""
+    import requests
+
+    cause = _urllib3_cause(kind)
+    error_raised = _connection_error_with_cause(requests, cause)
+    calls = _stub_requests(monkeypatch, error_raised)
+    transport = RequestsTransport(timeout_seconds=1.0)
+
+    with pytest.raises(PreSendTransportError) as error:
+        transport.send(_request())
+
+    # Classification remains typed; the unsafe signed-URL cause chain is discarded.
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert error.value.reason_code == "pre_send_connection_failure_proven"
+    assert type(cause).__name__ in {"NameResolutionError", "NewConnectionError"}
+    assert calls and calls[0]["allow_redirects"] is False
+
+
+def test_dns_and_refused_are_distinguishable_in_urllib3():
+    """Evidence for the classifier's cause-chain names (urllib3 2.x semantics)."""
+    import urllib3
+    from urllib3.exceptions import NameResolutionError, NewConnectionError
+
+    assert urllib3.__version__.startswith("2.")
+    assert issubclass(NameResolutionError, NewConnectionError)
+    assert type(_urllib3_cause("dns")).__name__ == "NameResolutionError"
+    assert type(_urllib3_cause("refused")).__name__ == "NewConnectionError"
+
+
+def test_transport_never_follows_redirects(monkeypatch):
+    import requests
+
+    captured: dict = {}
+
+    class _Response:
+        status_code = 307
+        content = b""
+        headers: dict = {}
+
+        def json(self):
+            raise ValueError("no json")
+
+    def fake_request(session, method, url, headers=None, timeout=None, allow_redirects=None):
+        captured["allow_redirects"] = allow_redirects
+        return _Response()
+
+    monkeypatch.setattr(requests.sessions.Session, "request", fake_request)
+
+    response = RequestsTransport(timeout_seconds=1.0).send(_request())
+
+    assert response.status_code == 307
+    assert captured["allow_redirects"] is False
+
+
+# --- 5: the venue-write boundary requires durable authorization -------------------
+
+def _fresh_prepared(client):  # noqa: ANN001 - test helper
+    prepared = client.prepare_order(fx.limit_order_request(CLIENT_ORDER_ID))
+    assert prepared.request is not None, "this test must exercise the non-dedup path"
+    return prepared
+
+
+def test_place_order_refuses_a_fresh_write_without_a_durable_attempt():
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), fx.order_response(CLIENT_ORDER_ID)]
+    )
+    client = client_for(transport)
+
+    with pytest.raises(AttemptJournalRequiredError):
+        client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+
+    assert posts(transport) == []
+
+
+def test_submit_prepared_refuses_a_fresh_write_without_authorization():
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), fx.order_response(CLIENT_ORDER_ID)]
+    )
+    client = client_for(transport)
+    prepared = _fresh_prepared(client)
+
+    with pytest.raises(AttemptJournalRequiredError):
+        client.submit_prepared(prepared)
+
+    assert posts(transport) == []
+
+
+def test_place_order_still_adopts_an_existing_order_without_a_marker(tmp_path):
+    """The dedup path needs no marker and performs no POST."""
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW"),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW"),  # the dedup status lookup
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+        markers_before = len(attempt_events(journal))
+        posts_before = len(posts(transport))
+
+        adopted = instance.client.place_order(fx.limit_order_request(CLIENT_ORDER_ID))
+
+        assert adopted.deduplicated is True
+        assert adopted.client_order_id == CLIENT_ORDER_ID
+        assert len(posts(transport)) == posts_before, "no POST for an already-known order"
+        assert len(attempt_events(journal)) == markers_before, "no marker for a dedup adoption"
+
+
+def _marker_fields(prepared, **overrides):  # noqa: ANN001 - test helper
+    fields = {
+        "marker_event_id": prepared.attempt_marker_event_id,
+        "venue_reference": prepared.client_order_id,
+        "order_id": deterministic_order_uuid(prepared.client_order_id),
+        "intent_id": uuid4(),
+        "correlation_id": uuid4(),
+        "symbol": prepared.symbol,
+        "side": prepared.side,
+        "order_type": prepared.order_type,
+        "quantity": prepared.quantity,
+        "limit_price": prepared.limit_price,
+        "time_in_force": prepared.time_in_force,
+    }
+    fields.update(overrides)
+    return fields
+
+
+@pytest.mark.parametrize(
+    "field,tamper",
+    [
+        ("venue_reference", lambda prepared: "ct-someone-else"),
+        ("order_id", lambda prepared: uuid4()),
+        ("symbol", lambda prepared: "ETHUSDT"),
+        ("side", lambda prepared: "sell"),
+        ("quantity", lambda prepared: prepared.quantity + 1),
+        ("limit_price", lambda prepared: prepared.limit_price + 1),
+    ],
+)
+def test_authorization_refuses_any_tampered_marker_field(field, tamper):
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), fx.order_response(CLIENT_ORDER_ID)]
+    )
+    client = client_for(transport)
+    prepared = _fresh_prepared(client)
+    fields = _marker_fields(prepared)
+    fields[field] = tamper(prepared)
+
+    with pytest.raises(AttemptJournalRequiredError):
+        fx.authorize_prepared(client, prepared, **fields)
+
+    assert posts(transport) == []
+
+
+def test_authorization_is_accepted_for_the_exact_prepared_order():
+    transport = ScriptedTransport(
+        responses=[fx.exchange_info_response(), fx.order_response(CLIENT_ORDER_ID, status="NEW")]
+    )
+    client = client_for(transport)
+    prepared = _fresh_prepared(client)
+
+    authorized = fx.authorize_prepared(client, prepared, **_marker_fields(prepared))
+    order = client.submit_prepared(authorized)
+
+    assert order.client_order_id == CLIENT_ORDER_ID
+    assert len(posts(transport)) == 1
+
+
+# --- 7 / 13: the authorization binds to the committed marker ---------------------
+
+def test_marker_visibility_binds_the_authorization_marker_id(tmp_path):
+    journal_path = tmp_path / "journal.db"
+    fault = TransportTimeout("post-send ambiguity")
+    inner = ScriptedTransport(responses=list(fx.environment_responses()))
+    transport = _MarkerVisibilityTransport(journal_path, fault, inner)
+    with SQLiteEventJournal(journal_path, venue_writes=True) as journal:
+        client = client_for(transport)
+        captured: dict = {}
+        original_authorize = client._authorize_attempt
+
+        def spy_authorize(prepared, **fields):  # noqa: ANN001 - test spy
+            authorized = original_authorize(prepared, **fields)
+            captured["authorization"] = authorized.attempt_authorization
+            return authorized
+
+        client._authorize_attempt = spy_authorize  # type: ignore[method-assign]
+        instance = OrderRuntime(client=client, instrument=INSTRUMENT, journal=journal)
+        instance.start()
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        markers = attempt_events(journal)
+
+    authorization = captured["authorization"]
+    assert authorization is not None
+    assert len(markers) == 1
+    assert authorization.marker_event_id == markers[0].event_id
+    assert authorization.client_order_id == markers[0].payload.venue_reference == CLIENT_ORDER_ID
+    assert authorization.order_id == markers[0].order_id
+    assert transport.requests[-1] is not None and len(posts(transport)) == 1
+
+
+# --- 4 / 1F: production call-site restriction (AST) ------------------------------
+
+RUNTIME_ONLY_ATTRIBUTES = ("_authorize_attempt", "submit_prepared")
+RUNTIME_FILE = Path("execution/binance_testnet/runtime.py")
+
+
+def _production_source_files() -> list[Path]:
+    package = Path(__file__).resolve().parents[1]
+    return [
+        path
+        for path in package.rglob("*.py")
+        if "__pycache__" not in path.parts and "tests" not in path.parts
+    ]
+
+
+#: The single proven pre-existing Phase-14 name collision: ``ProductionRuntime`` defines its OWN
+#: ``submit_prepared`` (definition at ``production/runtime.py:596``) and calls it on ``self``
+#: (``production/runtime.py:669``). The exemption below matches exactly that coordinate set.
+PHASE14_RUNTIME_FILE = Path("production/runtime.py")
+PHASE14_CLASS_NAME = "ProductionRuntime"
+
+
+def _is_exact_phase14_collision(
+    node: ast.Call, classes: tuple[ast.ClassDef, ...], relative_path: Path, attribute: str
+) -> bool:
+    """The one exact exemption: Phase-14 ``ProductionRuntime`` calling its own method on ``self``.
+
+    Every coordinate must match exactly: path, attribute, the simple ``self`` receiver, and the
+    INNERMOST enclosing class name. No ancestor-class match, no other receiver, no other file, no
+    other attribute (``_authorize_attempt`` never qualifies), and it can never apply inside the
+    adapter package.
+    """
+    return (
+        relative_path == PHASE14_RUNTIME_FILE
+        and attribute == "submit_prepared"
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and bool(classes)
+        and classes[-1].name == PHASE14_CLASS_NAME
+    )
+
+
+def _classify_restricted_production_calls(tree: ast.AST, relative_path: Path) -> list[str]:
+    """Classify production-source calls that violate the Stage-2 write-boundary rules.
+
+    Rules (identifier-based, direct attribute calls only):
+
+    1. a direct ``.place_order(...)`` invocation is banned in production source (the method may
+       still be *defined*: definitions are FunctionDef nodes, not Call nodes);
+    2. a direct ``._authorize_attempt(...)`` / ``.submit_prepared(...)`` invocation is allowed only
+       in ``execution/binance_testnet/runtime.py``, regardless of the receiver expression (``self``,
+       ``client``, ``self._client``, ``runtime.client``, ...);
+    3. exactly one narrow exemption, for the verified pre-existing Phase-14 call site:
+       ``production/runtime.py`` + innermost enclosing class ``ProductionRuntime`` + attribute
+       ``submit_prepared`` + receiver the simple name ``self``. That method is an unrelated
+       same-name method, not the Binance adapter write boundary. Anything else - another file,
+       another class, a nested or ancestor class, another receiver such as ``client``, or the
+       attribute ``_authorize_attempt`` - is a violation, and the exemption can never apply inside
+       ``execution/binance_testnet/``.
+
+    Method-name *definitions* never matter: the guard inspects ``ast.Call`` nodes, not
+    ``FunctionDef`` declarations, so a class that merely defines ``submit_prepared``/``place_order``
+    is not flagged for the definition (only for a violating call).
+
+    Limitation (documented threat model): the classifier detects **direct** attribute calls such as
+    ``client._authorize_attempt(...)``, ``self._authorize_attempt(...)``,
+    ``client.submit_prepared(...)`` or ``self.submit_prepared(...)``. It exists to prevent
+    accidental/direct architectural bypass. It does NOT claim to defend against deliberately
+    obfuscated Python access such as ``authorize = client._authorize_attempt; authorize(...)`` or
+    ``getattr(client, "_authorize_attempt")(...)`` - that aliasing/reflection is outside the
+    Stage-2 static guard's threat model. The direct-call rules above are never weakened for it.
+    """
+    violations: list[str] = []
+    label = relative_path.as_posix()
+
+    def _visit(node: ast.AST, classes: tuple[ast.ClassDef, ...]) -> None:
+        if isinstance(node, ast.ClassDef):
+            classes = (*classes, node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attribute = node.func.attr
+            if attribute == "place_order":
+                violations.append(f"{label}:{node.lineno} invokes place_order")
+            elif attribute in RUNTIME_ONLY_ATTRIBUTES and relative_path != RUNTIME_FILE:
+                if not _is_exact_phase14_collision(node, classes, relative_path, attribute):
+                    violations.append(f"{label}:{node.lineno} invokes {attribute}")
+        for child in ast.iter_child_nodes(node):
+            _visit(child, classes)
+
+    _visit(tree, ())
+    return violations
+
+
+def test_production_call_sites_are_restricted_to_the_runtime():
+    """AST proof: only the runtime may authorize or send a prepared write; nothing calls place_order."""
+    package = Path(__file__).resolve().parents[1]
+    violations: list[str] = []
+    for path in _production_source_files():
+        relative = path.relative_to(package)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        violations.extend(_classify_restricted_production_calls(tree, relative))
+
+    assert violations == [], violations
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    ["_authorize_attempt", "submit_prepared"],
+)
+def test_negative_control_self_calls_outside_the_runtime_are_rejected(attribute):
+    """A NON-runtime production file must not call these on any receiver, including ``self``."""
+    source = (
+        "class Helper:\n"
+        "    def run(self):\n"
+        f"        return self.{attribute}(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), Path("audit/synthetic_bypass.py")
+    )
+
+    assert violations == [f"audit/synthetic_bypass.py:3 invokes {attribute}"]
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    ["_authorize_attempt", "submit_prepared"],
+)
+def test_positive_control_runtime_calls_are_accepted(attribute):
+    """The same direct calls are accepted when the synthetic path is exactly the runtime file."""
+    source = (
+        "class Runtime:\n"
+        "    def run(self):\n"
+        f"        return self.client.{attribute}(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), RUNTIME_FILE
+    )
+
+    assert violations == []
+
+
+def test_negative_control_client_receiver_outside_the_runtime_is_rejected():
+    source = "def bypass(client):\n    return client.submit_prepared(prepared)\n"
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), Path("audit/synthetic_bypass.py")
+    )
+
+    assert violations == [
+        "audit/synthetic_bypass.py:2 invokes submit_prepared"
+    ]
+
+
+@pytest.mark.parametrize("attribute", ["_authorize_attempt", "submit_prepared"])
+def test_negative_control_adapter_self_calls_are_always_rejected(attribute):
+    """Inside the adapter directory the Phase-14 exemption can never apply."""
+    source = (
+        "class Adapter:\n"
+        f"    def {attribute}(self, value):\n"
+        "        return value\n"
+        "\n"
+        "    def run(self):\n"
+        f"        return self.{attribute}(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), Path(f"execution/binance_testnet/{attribute}_bypass.py")
+    )
+
+    assert violations == [
+        f"execution/binance_testnet/{attribute}_bypass.py:6 invokes {attribute}"
+    ]
+
+
+def test_negative_control_phase14_receiver_mismatch_is_rejected():
+    """A method named submit_prepared in the class must NOT authorize a call on ``client``."""
+    source = (
+        "class ProductionRuntime:\n"
+        "    def submit_prepared(self, value):\n"
+        "        return value\n"
+        "\n"
+        "    def other(self, client):\n"
+        "        return client.submit_prepared(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), PHASE14_RUNTIME_FILE
+    )
+
+    assert violations == ["production/runtime.py:6 invokes submit_prepared"]
+
+
+def test_negative_control_phase14_self_authorize_attempt_is_rejected():
+    """No exemption exists for ``_authorize_attempt`` anywhere, including production/runtime.py."""
+    source = (
+        "class ProductionRuntime:\n"
+        "    def other(self):\n"
+        "        return self._authorize_attempt(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), PHASE14_RUNTIME_FILE
+    )
+
+    assert violations == ["production/runtime.py:3 invokes _authorize_attempt"]
+
+
+def test_negative_control_unrelated_class_self_submit_prepared_is_rejected():
+    """The mandatory control: an unrelated production class may not self-call submit_prepared."""
+    source = (
+        "class SomeOtherProductionClass:\n"
+        "    def submit_prepared(self, value):\n"
+        "        return value\n"
+        "\n"
+        "    def run(self):\n"
+        "        return self.submit_prepared(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), Path("production/other_runtime.py")
+    )
+
+    assert violations == ["production/other_runtime.py:6 invokes submit_prepared"]
+
+
+def test_negative_control_innermost_class_only_authorizes_phase14():
+    """An ancestor/outer ProductionRuntime must not authorize a nested class's self-call."""
+    source = (
+        "class ProductionRuntime:\n"
+        "    class Nested:\n"
+        "        def submit_prepared(self, value):\n"
+        "            return value\n"
+        "\n"
+        "        def run(self):\n"
+        "            return self.submit_prepared(1)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), PHASE14_RUNTIME_FILE
+    )
+
+    assert violations == ["production/runtime.py:7 invokes submit_prepared"]
+
+
+def test_positive_control_real_phase14_call_shape_is_accepted():
+    """The exact verified coordinate set (path/class/self/submit_prepared) is accepted."""
+    source = (
+        "class ProductionRuntime:\n"
+        "    def submit_prepared(self, preparation):\n"
+        "        return preparation\n"
+        "\n"
+        "    def execute_intent(self, preparation):\n"
+        "        return self.submit_prepared(preparation)\n"
+    )
+    violations = _classify_restricted_production_calls(
+        ast.parse(source), PHASE14_RUNTIME_FILE
+    )
+
+    assert violations == []
+
+
+def test_client_place_order_never_calls_the_write_boundary():
+    """The compatibility wrapper must not be an unguarded fresh-write shortcut."""
+    client_path = Path(__file__).resolve().parents[1] / "execution" / "binance_testnet" / "client.py"
+    tree = ast.parse(client_path.read_text(encoding="utf-8"))
+    offenders: list[int] = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"place_order", "submit_prepared", "_authorize_attempt"}
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    ]
+    assert offenders == [], f"client.py self-invokes a write-boundary call at lines {offenders}"
+
+
+# --- migrated audit scenarios (runtime path) --------------------------------------
+
+def test_migrated_audit_scenarios_use_the_runtime_path():
+    from crypto_trader.audit.scenarios import (
+        scenario_cancel_failure,
+        scenario_network_interruption,
+    )
+
+    with tempfile.TemporaryDirectory() as workspace:
+        cancel = scenario_cancel_failure(Path(workspace))
+        network = scenario_network_interruption(Path(workspace))
+
+    assert cancel.status == "pass", cancel.detail
+    assert cancel.evidence["posts"] == 1
+    assert cancel.evidence["attempt_marker"] is True
+    assert network.status == "pass", network.detail
+    assert network.evidence["write_posts"] == 1
+    assert network.evidence["attempt_marker"] is True
+
+
+def test_durable_resubmit_refuses_economic_mismatch_without_another_post(tmp_path):
+    reread = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    reread["side"] = "SELL"
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, reread),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.client.known_orders() == ()
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+def test_durable_resubmit_refuses_changed_known_venue_order_id(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779),
+            fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=780),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        reports = instance.venue_state_source().reports()
+        assert reports[0].venue_order_id == "779"
+        assert instance.client.known_orders()[0].venue_order_id == "779"
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert instance.client.known_orders()[0].venue_order_id == "779"
+        assert instance.local_states()[0].state.value == "submitted"
+
+
+def test_durable_resubmit_malformed_adoption_is_typed_ambiguous_and_pending(tmp_path):
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    bad["side"] = []
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+def test_duplicate_post_malformed_adoption_is_typed_ambiguous_and_pending(tmp_path):
+    bad = dict(fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779).body)
+    bad["side"] = []
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+_MALFORMED_ADOPTION_MUTATORS = [
+    pytest.param(lambda body: {**body, "side": []}, id="side_list"),
+    pytest.param(lambda body: {**body, "side": {}}, id="side_mapping"),
+    pytest.param(lambda body: {**body, "fills": [1]}, id="fills_scalar"),
+    pytest.param(lambda body: {**body, "transactTime": 10**30}, id="timestamp_overflow"),
+    pytest.param(
+        lambda body: {**body, "updateTime": -(10**18), "transactTime": None},
+        id="timestamp_oserror",
+    ),
+]
+
+
+@pytest.mark.parametrize("mutate", _MALFORMED_ADOPTION_MUTATORS)
+def test_durable_resubmit_malformed_payloads_remain_ambiguous_and_pending(tmp_path, mutate):
+    good = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad = mutate(dict(good.body))
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            TransportTimeout("post-send ambiguity"),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+@pytest.mark.parametrize("mutate", _MALFORMED_ADOPTION_MUTATORS)
+def test_duplicate_post_malformed_payloads_remain_ambiguous_and_pending(tmp_path, mutate):
+    good = fx.order_response(CLIENT_ORDER_ID, status="NEW", order_id=779)
+    bad = mutate(dict(good.body))
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            fx.response(200, bad),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+
+
+# --- Review A-1: our own write answer is journaled only after the strict proof ------------------
+
+
+def _fill(quantity, *, price="27000.00", trade_id=901, commission="0", asset="USDT"):
+    return {"price": price, "qty": quantity, "commission": commission, "commissionAsset": asset, "tradeId": trade_id}
+
+
+def _write_answer(*, status, executed="0", quote=None, drop=(), **fields):
+    answer = fx.order_response(
+        CLIENT_ORDER_ID, status=status, order_id=4242, executed_qty=executed, cummulative_quote=quote
+    )
+    for name in drop:
+        answer.body.pop(name)
+    answer.body.update(fields)
+    return answer
+
+
+_MALFORMED_WRITE_ANSWERS = [
+    pytest.param(dict(status="FILLED", drop=("executedQty",)), id="filled_without_executed_quantity"),
+    pytest.param(dict(status="CANCELED", drop=("executedQty",)), id="canceled_without_executed_quantity"),
+    pytest.param(dict(status="EXPIRED", drop=("origQty",)), id="expired_without_original_quantity"),
+    pytest.param(dict(status="FILLED", executed="0.00050000"), id="filled_short_of_its_quantity"),
+    pytest.param(dict(status="NEW", executed="0.00050000"), id="new_with_an_execution"),
+    pytest.param(dict(status="PARTIALLY_FILLED", executed="0.00200000"), id="executed_over_its_quantity"),
+    pytest.param(dict(status="NEW", quote="27.00"), id="quote_without_an_execution"),
+    pytest.param(dict(status="CANCELED", symbol="ETHUSDT"), id="another_symbol"),
+    pytest.param(dict(status="NEW", drop=("side",)), id="without_a_side"),
+    # Review A1-W1-01 (Astra's re-verification of item 22): the fills must agree with the answer.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000")]),
+        id="filled_with_fills_short_of_its_execution",
+    ),
+    pytest.param(
+        dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00100000")]),
+        id="fills_over_its_execution",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", price="28000.00")]),
+        id="fills_contradicting_its_quote",
+    ),
+    pytest.param(dict(status="FILLED", executed="0.00100000", fills=[]), id="an_execution_without_fills"),
+    pytest.param(dict(status="FILLED", executed="0.00100000", fills="0.001"), id="fills_not_a_list"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[{"price": "27000.00"}]), id="a_fill_without_quantity"
+    ),
+    # Review A1-W1-02: an unhashable side is malformed, not a TypeError.
+    pytest.param(dict(status="NEW", side=[]), id="side_a_list"),
+    pytest.param(dict(status="NEW", side={}), id="side_a_mapping"),
+    # Review RV1-RV3 (Astra's re-verification of item 23): every fill is proved, not only the sums.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00050000"), _fill("0.00050000")]),
+        id="a_repeated_trade_id",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[{"price": "27000.00", "qty": "0.00100000"}]),
+        id="a_fill_without_a_trade_id",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", trade_id="")]),
+        id="an_empty_trade_id",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[_fill("-0.00050000", trade_id=901), _fill("0.00150000", trade_id=902)],
+        ),
+        id="a_negative_quantity_offset",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[_fill("0", trade_id=902), _fill("0.00100000", trade_id=901)],
+        ),
+        id="a_zero_quantity_fill",
+    ),
+    pytest.param(
+        dict(
+            status="FILLED",
+            executed="0.00100000",
+            fills=[
+                _fill("0.00050000", price="-1000.00", trade_id=901),
+                _fill("0.00050000", price="55000.00", trade_id=902),
+            ],
+        ),
+        id="a_negative_price_offset",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="NaN")]),
+        id="a_nan_commission",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="-1")]),
+        id="a_negative_commission",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("1e999999", price="1e999999")]),
+        id="an_overflowing_fill",
+    ),
+    # Review RV-F1..RV-F4 (Astra's re-verification of item 24): a value our JSON decoder hands us
+    # that cannot become the journaled events, found only after the identity or state was written.
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", asset="\ud800")]),
+        id="a_commission_asset_that_cannot_be_journaled",
+    ),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", trade_id="\ud800")]),
+        id="a_trade_id_that_cannot_be_journaled",
+    ),
+    pytest.param(dict(status="NEW", drop=("transactTime",)), id="without_a_transaction_time"),
+    pytest.param(dict(status="NEW", transactTime=10**1000), id="an_overflowing_transaction_time"),
+    # Review L1/L2 (Astra's re-verification of item 25): our venue identity and every event time must
+    # fit the journal too, or the order is cached and only then fails to be journaled.
+    pytest.param(dict(status="NEW", orderId=int("9" * 129)), id="a_venue_order_id_too_long_to_journal"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")], orderId=int("9" * 129)),
+        id="a_filled_answer_with_a_venue_order_id_too_long_to_journal",
+    ),
+    pytest.param(dict(status="NEW", transactTime=9223372036855), id="a_transaction_time_past_the_journal"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")], transactTime=9223372036855),
+        id="a_filled_answer_timed_past_the_journal",
+    ),
+    # Review V1-V3 (Astra's re-verification of items 25-26): every number and time of the answer must
+    # lie in the domain our arithmetic and calendar run in, or it fails after it is journaled.
+    pytest.param(
+        dict(status="CANCELED", executed="0", origQty="1e1000000"),
+        id="a_zero_fill_cancel_with_an_unrepresentable_original_quantity",
+    ),
+    pytest.param(dict(status="NEW", origQty="1e1000000"), id="a_new_answer_with_an_unrepresentable_original_quantity"),
+    pytest.param(
+        dict(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000", commission="1e1000000")]),
+        id="a_commission_outside_the_arithmetic_domain",
+    ),
+    pytest.param(dict(status="NEW", transactTime=253402300799000), id="a_transaction_time_at_the_end_of_the_calendar"),
+    pytest.param(dict(status="NEW", transactTime=-9223372036855), id="a_transaction_time_far_before_the_epoch"),
+]
+
+
+@pytest.mark.parametrize("answer", _MALFORMED_WRITE_ANSWERS)
+def test_a_malformed_write_answer_journals_no_state_and_no_identity(tmp_path, answer):
+    # Review A-1 (GPT-6 Astra; adjudicated High and blocking by the GPT-6.1 Sol High adjudication,
+    # as the no-reuse extension of R-9): our own POST answer was parsed only leniently, so a missing
+    # executedQty became 0 and a terminal status with missing or contradictory quantities was
+    # journaled as our order's ended state, with our venue identity. Startup never re-reads an ended
+    # order. The answer is now proved strictly first; a malformed one leaves the outcome unknown.
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(**answer)])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        assert instance.local_states()[0].state.value == "submitted"
+        assert instance.client.known_orders() == ()
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+def test_nothing_is_journaled_when_preparing_our_record_fails(tmp_path, monkeypatch):
+    # Review V1-V3: our identity and every event and observation are built and checked before the
+    # first append, so a failure while preparing them leaves only the durable attempt.
+    from crypto_trader.execution.binance_testnet import runtime as runtime_module
+
+    def refuse(order, **kwargs):
+        raise RuntimeError("preparing the record failed")
+
+    monkeypatch.setattr(runtime_module, "testnet_order_to_phase3_events", refuse)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(status="NEW")])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(RuntimeError):
+            instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert len(attempt_events(journal)) == 1
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+def test_a_journal_failure_inside_our_record_leaves_only_the_attempt(tmp_path, monkeypatch):
+    # Option PB: our identity, state and fills are one transaction, so a failure (or a crash) while
+    # journaling a fill never leaves an ended state without its fills.
+    answer = _write_answer(status="FILLED", executed="0.00100000", fills=[_fill("0.00100000")])
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), answer])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        append, append_batch = journal.append, journal.append_batch
+
+        def failing_append(event):
+            if event.event_type == "execution.fill.recorded":
+                raise JournalSchemaError("journal failure while journaling the fill")
+            return append(event)
+
+        def failing_batch(events):
+            if any(event.event_type == "execution.fill.recorded" for event in events):
+                raise JournalSchemaError("journal failure while journaling the fill")
+            return append_batch(events)
+
+        monkeypatch.setattr(journal, "append", failing_append)
+        monkeypatch.setattr(journal, "append_batch", failing_batch)
+
+        with pytest.raises(JournalSchemaError):
+            instance.submit(execution_request())
+
+        assert len(attempt_events(journal)) == 1
+        journaled = [event.event_type for event in journal.read_range()]
+        assert ORDER_STATE_EVENT_TYPE not in journaled
+        assert "order.venue_identity.recorded" not in journaled
+
+
+def test_our_observation_is_proved_before_the_answer_is_accepted(tmp_path, monkeypatch):
+    # Review V1: the observation our answer is reported as is built in the proof, before the client
+    # caches the order, so a failure to build it is a malformed answer and nothing is journaled.
+    from crypto_trader.execution.binance_testnet.models import TestnetOrder
+
+    def refuse(self, **kwargs):
+        raise ValueError("the observation cannot be built")
+
+    monkeypatch.setattr(TestnetOrder, "to_observation", refuse)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), _write_answer(status="NEW")])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        with pytest.raises(AmbiguousOrderError):
+            instance.submit(execution_request())
+
+        assert instance.client.known_orders() == ()
+        assert len(attempt_events(journal)) == 1
+        assert ORDER_STATE_EVENT_TYPE not in [event.event_type for event in journal.read_range()]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(dict(orderId=int("9" * 128)), id="the_longest_venue_order_id"),
+        pytest.param(dict(transactTime=9223372036854), id="the_latest_journal_time"),
+    ],
+)
+def test_a_write_answer_at_the_journal_limits_is_still_journaled(tmp_path, fields):
+    # Review L1/L2 guard: the limits themselves are journaled as before.
+    written = _write_answer(status="NEW", **fields)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), written])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        instance.submit(execution_request())
+
+        rebuilt, _ = reconstruct_order_states(journal)
+        local = rebuilt.state_for(CLIENT_ORDER_ID)
+        assert (local.state.value, local.venue_order_id) == ("accepted", str(written.body["orderId"]))
+        assert len(instance.client.known_orders()) == 1
+
+
+@pytest.mark.parametrize(
+    ("answer", "state"),
+    [
+        pytest.param(dict(status="NEW"), "accepted", id="new"),
+        pytest.param(
+            dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            "partially_filled",
+            id="partially_filled",
+        ),
+        pytest.param(
+            dict(
+                status="FILLED",
+                executed="0.00100000",
+                fills=[_fill("0.00050000", trade_id=901), _fill("0.00050000", trade_id=902)],
+            ),
+            "filled",
+            id="filled",
+        ),
+        pytest.param(dict(status="CANCELED", executed="0"), "canceled", id="canceled"),
+        pytest.param(
+            dict(status="CANCELED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            "canceled",
+            id="canceled_after_a_partial_fill",
+        ),
+    ],
+)
+def test_a_well_formed_write_answer_is_still_journaled_with_our_identity(tmp_path, answer, state):
+    # Review A-1 guard: a consistent answer is journaled as before, with our venue identity, and
+    # (review RV1) every fill it lists is journaled, so the journaled fills add up to the answer.
+    written = _write_answer(**answer)
+    transport = ScriptedTransport(responses=[*fx.environment_responses(), written])
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        # Scripted venue events occur at fx.SERVER_TIME_MS; the durable attempt precedes them.
+        before_venue = datetime.fromtimestamp((fx.SERVER_TIME_MS - 1000) / 1000, tz=timezone.utc)
+        instance = started(transport, journal, clock=lambda: before_venue)
+
+        instance.submit(execution_request())
+
+        rebuilt, _ = reconstruct_order_states(journal)
+        local = rebuilt.state_for(CLIENT_ORDER_ID)
+        assert (local.state.value, local.venue_order_id) == (state, "4242")
+        fills = [event.payload for event in journal.read_range() if event.event_type == "execution.fill.recorded"]
+        assert sum((fill.quantity for fill in fills), Decimal("0")) == Decimal(written.body["executedQty"])
+        assert sum((fill.quantity * fill.price for fill in fills), Decimal("0")) == Decimal(
+            written.body["cummulativeQuoteQty"]
+        )
+
+
+# --- Review F4: an execution the venue reports is journaled only with fills that prove it ---------
+
+
+def _read_answer(*, status, executed="0", order_id=4242):
+    # A status read (GET /api/v3/order) carries no fills.
+    answer = fx.order_response(CLIENT_ORDER_ID, status=status, order_id=order_id, executed_qty=executed)
+    answer.body.pop("fills")
+    return answer
+
+
+def _states(journal):
+    return [event.payload.state for event in journal.read_range() if event.event_type == ORDER_STATE_EVENT_TYPE]
+
+
+@pytest.mark.parametrize(
+    ("status", "executed"),
+    [
+        pytest.param("FILLED", "0.00100000", id="filled"),
+        pytest.param("CANCELED", "0.00050000", id="canceled_after_a_partial_fill"),
+        pytest.param("PARTIALLY_FILLED", "0.00050000", id="partially_filled"),
+    ],
+)
+def test_an_adopted_execution_without_its_fills_journals_no_state(tmp_path, status, executed):
+    # Review F4 (Saeed's note, widened by the coordinator's proof): after a duplicate POST we adopt the
+    # venue's view by a status read, which lists no fills. Journaling that view as filled (or as ended
+    # after a partial fill) left an execution without its fills; with balances matching that journal a
+    # restart admitted new risk. The state is now left out until fills bound to our order prove it.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            _read_answer(status=status, executed=executed),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+
+        instance.submit(execution_request())
+
+        assert len(posts(transport)) == 1
+        assert _states(journal) == []
+        rebuilt, _ = reconstruct_order_states(journal)
+        assert rebuilt.state_for(CLIENT_ORDER_ID).state.value == "submitted"
+
+
+def test_an_adopted_order_with_nothing_executed_is_journaled_as_before(tmp_path):
+    # Review F4 guard: a cancel with no execution needs no fill, and is journaled as before.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            fx.rejected(code=-2010, msg="Duplicate order sent."),
+            _read_answer(status="CANCELED"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        started(transport, journal).submit(execution_request())
+
+        assert _states(journal) == ["canceled"]
+
+
+def test_a_refreshed_execution_without_its_fills_journals_no_new_state(tmp_path):
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            _write_answer(status="NEW"),
+            _read_answer(status="FILLED", executed="0.00100000"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+
+        instance.refresh(CLIENT_ORDER_ID)
+
+        assert _states(journal) == ["accepted"]
+
+
+@pytest.mark.parametrize(
+    ("executed", "states"),
+    [
+        pytest.param("0.00050000", ["accepted"], id="after_a_partial_fill"),
+        pytest.param("0", ["accepted", "canceled"], id="with_nothing_executed"),
+    ],
+)
+def test_a_cancel_answer_is_journaled_only_when_its_execution_is_proven(tmp_path, executed, states):
+    # A cancel answer lists no fills either: a cancel after a partial fill keeps the order unresolved
+    # until its fills arrive, while a cancel with no execution is journaled as before.
+    cancel = fx.cancel_response(CLIENT_ORDER_ID, order_id=4242)
+    cancel.body.update(
+        executedQty=executed, cummulativeQuoteQty=str(Decimal(executed) * Decimal("27000.00")),
+        transactTime=fx.SERVER_TIME_MS + 1000,
+    )
+    transport = ScriptedTransport(
+        responses=[*fx.environment_responses(), _write_answer(status="NEW"), cancel]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        # Preserve chronology: attempt, accepted response, then cancel response.
+        before_venue = datetime.fromtimestamp((fx.SERVER_TIME_MS - 1000) / 1000, tz=timezone.utc)
+        instance = started(transport, journal, clock=lambda: before_venue)
+        instance.submit(execution_request())
+
+        instance.cancel(CLIENT_ORDER_ID)
+
+        assert _states(journal) == states
+
+
+@pytest.mark.parametrize(
+    ("written", "states"),
+    [
+        pytest.param(
+            dict(status="PARTIALLY_FILLED", executed="0.00050000", fills=[_fill("0.00050000")]),
+            ["partially_filled"],
+            id="the_rest_of_the_execution_unproven",
+        ),
+        pytest.param(
+            dict(
+                status="FILLED",
+                executed="0.00100000",
+                fills=[_fill("0.00050000", trade_id=901), _fill("0.00050000", trade_id=902)],
+            ),
+            ["filled"],
+            id="the_execution_already_proven_by_journaled_fills",
+        ),
+    ],
+)
+def test_a_later_read_counts_the_fills_already_journaled_for_our_order(tmp_path, written, states):
+    # Fills arrive in parts: the proof is the fills already journaled for our order plus the answer's
+    # new ones. A read reporting FILLED adds a state only when they add up to the reported execution.
+    transport = ScriptedTransport(
+        responses=[
+            *fx.environment_responses(),
+            _write_answer(**written),
+            _read_answer(status="FILLED", executed="0.00100000"),
+        ]
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db", venue_writes=True) as journal:
+        instance = started(transport, journal)
+        instance.submit(execution_request())
+
+        instance.refresh(CLIENT_ORDER_ID)
+
+        assert _states(journal) == states
+
+
+@pytest.mark.parametrize(
+    "second_fills",
+    [
+        pytest.param(("2",), id="only_its_new_fill"),
+        pytest.param(("2", "1"), id="its_new_fill_and_the_one_already_journaled"),
+    ],
+)
+def test_fills_arriving_in_parts_prove_each_reported_execution(tmp_path, second_fills):
+    # The fills already journaled for our order count once, plus the answer's new ones, so each partial
+    # execution the venue reports is journaled when its fills arrive in parts or are delivered again.
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from crypto_trader.execution import OrderLifecycleState
+    from crypto_trader.execution.binance_testnet.models import TestnetFill, TestnetOrder
+
+    fills = {trade: TestnetFill(price=Decimal("27000"), quantity=Decimal("1"), trade_id=trade) for trade in ("1", "2")}
+    first = TestnetOrder(
+        symbol="BTCUSDT", client_order_id=CLIENT_ORDER_ID, venue_order_id="4242",
+        state=OrderLifecycleState.PARTIALLY_FILLED, status="PARTIALLY_FILLED", original_quantity=Decimal("3"),
+        executed_quantity=Decimal("1"), price=Decimal("27000"),
+        transact_time=datetime(2026, 1, 1, tzinfo=timezone.utc), fills=(fills["1"],),
+    )
+    second = replace(
+        first, executed_quantity=Decimal("2"), transact_time=first.transact_time + timedelta(seconds=1),
+        fills=tuple(fills[trade] for trade in second_fills),
+    )
+    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
+        instance = started(ScriptedTransport(responses=[*fx.environment_responses()]), journal)
+
+        instance._record(first, correlation_id=uuid4())
+        instance._record(second, correlation_id=uuid4())
+
+        assert _states(journal) == ["partially_filled", "partially_filled"]

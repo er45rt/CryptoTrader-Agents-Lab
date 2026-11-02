@@ -22,12 +22,19 @@ from typing import Any, Dict, List, Literal, Optional, Type
 import requests
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
+from crypto_trader.input_security import require_https_base_url
 
 logger = logging.getLogger("crypto_trader.tools.binance")
 
 # --- Configuration (all overridable, all optional) ---
 
 DEFAULT_BASE_URL = "https://api.binance.com"
+APPROVED_PUBLIC_BASE_URLS = frozenset({"https://api.binance.com", "https://api.binance.us"})
+APPROVED_PUBLIC_ENDPOINTS = frozenset({
+    "/api/v3/klines",
+    "/api/v3/ticker/price",
+    "/api/v3/ticker/24hr",
+})
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_BASE_SECONDS = 1.0
@@ -156,7 +163,9 @@ class BinancePublicTool(BaseTool):
 
         if not self.base_url:
             self.base_url = os.getenv("BINANCE_API_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-        self.base_url = self.base_url.rstrip("/")
+        self.base_url = require_https_base_url(self.base_url)
+        if self.base_url not in APPROVED_PUBLIC_BASE_URLS:
+            raise ValueError("Only approved Binance public API origins are allowed.")
 
         if self.timeout_seconds is None:
             self.timeout_seconds = _env_float("BINANCE_HTTP_TIMEOUT", DEFAULT_TIMEOUT_SECONDS)
@@ -180,16 +189,27 @@ class BinancePublicTool(BaseTool):
 
     def _request_once(self, endpoint_path: str, params: Optional[Dict[str, Any]]) -> Any:
         """Perform a single GET request, returning parsed JSON or raising BinanceRequestError."""
+        # Fields are mutable after construction: re-check both parts at the send boundary.
+        if self.base_url not in APPROVED_PUBLIC_BASE_URLS or endpoint_path not in APPROVED_PUBLIC_ENDPOINTS:
+            raise BinanceRequestError(
+                "invalid_endpoint", "Request destination is not an approved public Binance endpoint.",
+                retryable=False,
+            )
         url = f"{self.base_url}{endpoint_path}"
         query_params = {k: v for k, v in params.items() if v is not None} if params else None
 
         try:
-            response = requests.get(
-                url,
-                headers=self._build_headers(),
-                params=query_params,
-                timeout=self.timeout_seconds,
-            )
+            # Ignore ambient proxy and .netrc credentials; never follow a redirect.
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(
+                    url,
+                    headers=self._build_headers(),
+                    params=query_params,
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                    verify=True,
+                )
         except requests.exceptions.Timeout as exc:
             raise BinanceRequestError(
                 "timeout",
@@ -210,6 +230,13 @@ class BinancePublicTool(BaseTool):
             ) from exc
 
         status_code = response.status_code
+        if 300 <= status_code < 400:
+            raise BinanceRequestError(
+                "redirect_blocked",
+                "Binance public API redirect was blocked without contacting its destination.",
+                status_code=status_code,
+                retryable=False,
+            )
         if status_code >= 400:
             retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
             detail = ""

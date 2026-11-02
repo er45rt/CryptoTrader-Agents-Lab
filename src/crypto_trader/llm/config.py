@@ -19,6 +19,8 @@ import os
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
+from crypto_trader.input_security import require_https_base_url
+
 __all__ = [
     "ACTIVE_PROFILE_NAMES",
     "ANALYST_PROFILE_NAME",
@@ -57,6 +59,8 @@ PROVIDER_DEEPSEEK = "deepseek"
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_DEFAULT_CHAT_MODEL = "deepseek/deepseek-chat"
 DEEPSEEK_DEFAULT_REASONER_MODEL = "deepseek/deepseek-reasoner"
+# No user-supplied environment variable can redirect key lookup to arbitrary secrets.
+_ALLOWED_API_KEY_ENVS = frozenset({"DEEPSEEK_API_KEY"})
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,8 @@ class LLMProfile:
         """
         if not self.api_key_env:
             return ""
+        if self.api_key_env not in _ALLOWED_API_KEY_ENVS:
+            raise LLMConfigError("API key environment variable is not allowlisted.")
         source = os.environ if env is None else env
         value = (source.get(self.api_key_env) or "").strip()
         if not value:
@@ -297,11 +303,16 @@ def load_profile(name: str, env: Mapping[str, str] | None = None) -> LLMProfile:
 
     api_key_env = _first_env_value(source, [f"{prefix}_API_KEY_ENV", f"{provider_prefix}_API_KEY_ENV"])
     if api_key_env:
+        if api_key_env not in _ALLOWED_API_KEY_ENVS:
+            raise LLMConfigError("LLM API_KEY_ENV override is not in the fixed allowlist.")
         overrides["api_key_env"] = api_key_env
 
     base_url = _first_env_value(source, [f"{prefix}_BASE_URL", f"{provider_prefix}_BASE_URL"])
     if base_url:
-        overrides["base_url"] = base_url
+        try:
+            overrides["base_url"] = require_https_base_url(base_url)
+        except ValueError as exc:
+            raise LLMConfigError("LLM BASE_URL must be an HTTPS endpoint.") from exc
 
     temperature_name = _first_matching_name(
         source, [f"{prefix}_TEMPERATURE", f"{provider_prefix}_TEMPERATURE"]

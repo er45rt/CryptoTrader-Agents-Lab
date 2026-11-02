@@ -36,7 +36,13 @@ from crypto_trader.breakglass import (
     parse_operator_command,
 )
 from crypto_trader.breakglass.venue import BinanceSpotTestnetEmergencyControl
-from crypto_trader.execution import ExecutionOrderType, ExecutionRequest, ExecutionSide, InstrumentSpec
+from crypto_trader.execution import (
+    ExecutionOrderType,
+    ExecutionRequest,
+    ExecutionSide,
+    ExecutionTimeInForce,
+    InstrumentSpec,
+)
 from crypto_trader.execution.binance_testnet import (
     BinanceSpotTestnetClient,
     BinanceTestnetError,
@@ -188,7 +194,22 @@ def test_live_halt_blocks_new_risk_and_cancel_open_cancels_through_the_safety_pa
     control, runtime, client, _, _, _ = live_context
     guard = control.normal_writer_guard()
     assert guard.may_create_new_risk() is True
-    order = client.place_order(_resting_limit_request(client))
+    venue_request = _resting_limit_request(client)
+    # Stage 2: the fresh write goes through the production runtime (prepare -> durable attempt
+    # marker -> single send), never through a direct client write.
+    reference = runtime.submit(
+        ExecutionRequest.create(
+            correlation_id=uuid4(),
+            symbol=venue_request.symbol,
+            side=ExecutionSide.BUY,
+            order_type=ExecutionOrderType.LIMIT,
+            quantity=venue_request.quantity,
+            limit_price=venue_request.price,
+            time_in_force=ExecutionTimeInForce.GTC,
+            intent_id=uuid4(),
+        )
+    )
+    order = runtime.refresh(reference)
     assert order.is_terminal is False
 
     halt = control.handle(_command("halt_new_risk", seed="live-1", reason="live validation"))

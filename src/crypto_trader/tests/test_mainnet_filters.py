@@ -75,6 +75,15 @@ def test_a_non_decimal_filter_value_fails_closed():
         parse_symbol_filters(body, "BTCUSDT")
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_filter_values_fail_closed(value):
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"][0]["tickSize"] = value
+
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(body, "BTCUSDT")
+
+
 def test_a_non_positive_tick_or_step_fails_closed():
     with pytest.raises(SymbolFilterError):
         parse_symbol_filters(fx.exchange_info_body(tick="0"), "BTCUSDT")
@@ -89,12 +98,61 @@ def test_an_inconsistent_max_below_min_quantity_fails_closed():
         )
 
 
-def test_a_non_trading_symbol_refuses_an_order():
-    parsed = parse_symbol_filters(fx.exchange_info_body(status="BREAK"), "BTCUSDT")
-
-    assert parsed.is_trading is False
+def test_a_non_trading_symbol_fails_during_rule_parsing():
     with pytest.raises(SymbolFilterError):
-        parsed.validate_order(price=Decimal("27000.00"), quantity=Decimal("0.01"))
+        parse_symbol_filters(fx.exchange_info_body(status="BREAK"), "BTCUSDT")
+
+
+def test_missing_symbol_metadata_fails_closed():
+    for field in ("baseAsset", "quoteAsset"):
+        body = fx.exchange_info_body()
+        body["symbols"][0].pop(field)
+        with pytest.raises(SymbolFilterError):
+            parse_symbol_filters(body, "BTCUSDT")
+
+
+@pytest.mark.parametrize(
+    ("filter_index", "field"),
+    [(0, "tickSize"), (1, "stepSize"), (1, "minQty"), (1, "maxQty"), (2, "minNotional")],
+)
+def test_missing_required_filter_subfields_fail_closed(filter_index, field):
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"][filter_index].pop(field)
+
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(body, "BTCUSDT")
+
+
+def test_zero_max_quantity_fails_closed():
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(fx.exchange_info_body(max_qty="0"), "BTCUSDT")
+
+
+def test_duplicate_filter_type_fails_closed():
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"].append(
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01"}
+    )
+
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(body, "BTCUSDT")
+
+
+def test_notional_and_min_notional_together_fail_closed():
+    body = fx.exchange_info_body()
+    body["symbols"][0]["filters"].append(
+        {"filterType": "MIN_NOTIONAL", "minNotional": "5.00000000"}
+    )
+
+    with pytest.raises(SymbolFilterError):
+        parse_symbol_filters(body, "BTCUSDT")
+
+
+def test_order_validation_enforces_max_quantity():
+    parsed = fx.filters()
+
+    with pytest.raises(SymbolFilterError):
+        parsed.validate_order(price=Decimal("27000.00"), quantity=Decimal("9000.00001"))
 
 
 def test_order_validation_uses_the_live_filters():

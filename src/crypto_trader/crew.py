@@ -6,7 +6,9 @@ from crewai.project import CrewBase, agent, crew, task
 
 # Import existing and new tools
 from .tools.binance_public_tool import BinancePublicTool
-from crewai_tools import SerperDevTool, ScrapeWebsiteTool
+from .tools.binance_futures_public_tool import BinanceFuturesPublicTool
+from crewai_tools import SerperDevTool
+from .tools.safe_scrape_tool import SafeScrapeWebsiteTool
 
 # Centralized LLM layer (Phase 2). Only the canary agent uses it for now; the
 # remaining agents keep their existing YAML-configured model until migrated.
@@ -48,6 +50,12 @@ class ToolManager:
                 raise
         return self._tools['binance']
     
+    def get_futures_tool(self) -> BinanceFuturesPublicTool:
+        """One advisory tool; its request cache/limiter is shared process-wide."""
+        if 'futures_public' not in self._tools:
+            self._tools['futures_public'] = BinanceFuturesPublicTool()
+        return self._tools['futures_public']
+
     def get_serper_tool(self) -> SerperDevTool:
         """Get or create the SerperDev search tool instance"""
         if 'serper' not in self._tools:
@@ -59,15 +67,10 @@ class ToolManager:
                 raise
         return self._tools['serper']
     
-    def get_scrape_tool(self) -> ScrapeWebsiteTool:
-        """Get or create the website scraping tool instance"""
-        if 'scrape' not in self._tools:
-            try:
-                self._tools['scrape'] = ScrapeWebsiteTool()
-                logger.debug("ScrapeWebsiteTool initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize ScrapeWebsiteTool: {e}")
-                raise
+    def get_scrape_tool(self) -> SafeScrapeWebsiteTool:
+        """Provide only the bounded, DNS-pinned, proxy-free HTTPS reader."""
+        if 'scrape' not in self._tools or not isinstance(self._tools['scrape'], SafeScrapeWebsiteTool):
+            self._tools['scrape'] = SafeScrapeWebsiteTool()
         return self._tools['scrape']
 
 @CrewBase
@@ -108,9 +111,7 @@ class CryptoTraderCrew():
         try:
             return Agent(
                 config=self.agents_config['binance_data_analyst'],
-                tools=[self.tool_manager.get_binance_tool()],
-                # Phase 2 (agent 3): provider path only - the Binance tool wiring above is
-                # unchanged, and the LLM now comes from the centralized factory.
+                tools=[self.tool_manager.get_binance_tool(), self.tool_manager.get_futures_tool()],
                 llm=get_llm(MARKET_PROFILE_NAME),
                 verbose=self.verbose
             )
@@ -255,6 +256,12 @@ class CryptoTraderCrew():
             raise
 
     @task
+    def fetch_derivatives_snapshot_task(self) -> Task:
+        """Read-only advisory evidence, with explicit unavailable/suspect handling."""
+        return Task(config=self.tasks_config['fetch_derivatives_snapshot_task'],
+                    agent=self.binance_data_analyst())
+
+    @task
     def research_news_and_sentiment_task(self) -> Task:
         """
         Creates a task for researching recent news and market sentiment.
@@ -294,6 +301,7 @@ class CryptoTraderCrew():
                     self.fetch_binance_klines_task(),
                     self.fetch_binance_price_ticker_task(),
                     self.fetch_binance_24hr_stats_task(),
+                    self.fetch_derivatives_snapshot_task(),
                     self.research_news_and_sentiment_task()
                 ]
             )
@@ -350,6 +358,7 @@ class CryptoTraderCrew():
                     self.fetch_binance_klines_task(),
                     self.fetch_binance_price_ticker_task(),
                     self.fetch_binance_24hr_stats_task(),
+                    self.fetch_derivatives_snapshot_task(),
                     self.research_news_and_sentiment_task(),
                     self.analyze_crypto_data_task(),
                     self.develop_trading_plan_task()

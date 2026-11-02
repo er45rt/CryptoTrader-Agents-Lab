@@ -7,6 +7,7 @@ existing configuration, and that Phase 1 constraints still hold.
 """
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -149,7 +150,25 @@ def test_binance_source_has_no_authenticated_or_trading_endpoints():
     ):
         assert forbidden not in lowered, f"unexpected Binance capability: {forbidden}"
 
-    assert "requests.get" in lowered  # public GET only
+    # Assert the actual public-only transport, not a historical function name.
+    tool = BinancePublicTool()
+    with patch("crypto_trader.tools.binance_public_tool.requests.Session") as factory:
+        session = factory.return_value.__enter__.return_value
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {"symbol": "BTCUSDT", "price": "1.0"}
+        payload = tool._request_once(tool.price_ticker_endpoint_path, {"symbol": "BTCUSDT"})
+
+    assert payload["price"] == "1.0"
+    factory.assert_called_once()
+    session.get.assert_called_once()
+    args, kwargs = session.get.call_args
+    assert args[0] == "https://api.binance.com/api/v3/ticker/price"
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["verify"] is True
+    assert session.trust_env is False
+    assert set(kwargs["headers"]) == {"Accept", "User-Agent"}
+    for method in ("post", "put", "patch", "delete"):
+        getattr(session, method).assert_not_called()
 
 
 def test_no_phase_three_components_were_introduced():

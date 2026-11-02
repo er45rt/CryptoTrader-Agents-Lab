@@ -20,15 +20,18 @@ AUTHORISED_TESTNET_DIRECTORY = TESTNET_DIR
 
 _AUTHORIZED_MODULES = {
     "__init__.py",
+    "backfill.py",
     "client.py",
     "clock.py",
     "credentials.py",
     "endpoints.py",
     "errors.py",
     "models.py",
+    "market_data.py",
     "rate_limit.py",
     "runtime.py",
     "signing.py",
+    "startup.py",
     "transport.py",
     "translate.py",
 }
@@ -152,3 +155,15 @@ def test_testnet_adapter_does_not_leak_into_domain_packages():
             assert not import_pattern.search(file.read_text(encoding="utf-8")), (
                 f"{file.name} depends on the testnet adapter"
             )
+
+
+# Item 5: public ticker safety scope assertion (SENSITIVE, approved)
+def test_public_ticker_source_is_read_only_and_testnet_pinned():
+    """Adding a public market reader grants no authenticated or order capability."""
+    source = (TESTNET_DIR / "market_data.py").read_text(encoding="utf-8").lower()
+    assert "wss://stream.testnet.binance.vision/ws/" in source
+    assert "@ticker" in source
+    assert "wss://stream.binance.com" not in source
+    for forbidden in ("api_key", "api_secret", "/api/v3/order", "newclientorderid",
+                      "socket.send(", "requests.post(", "withdraw/apply"):
+        assert forbidden not in source, f"public market connector includes {forbidden}"

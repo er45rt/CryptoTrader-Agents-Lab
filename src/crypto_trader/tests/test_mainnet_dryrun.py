@@ -313,7 +313,7 @@ def test_a_client_backed_cycle_only_ever_sends_get(journal, state_dir, tmp_path)
 # --- restart / safety semantics ---------------------------------------------
 
 def test_unresolved_reconciliation_blocks_a_restart(journal, state_dir, tmp_path):
-    from crypto_trader.mainnet import SendFault, inject_post_send_ambiguity
+    from crypto_trader.mainnet.faults import SendFault, inject_post_send_ambiguity
     from uuid import UUID
 
     inject_post_send_ambiguity(

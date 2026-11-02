@@ -61,10 +61,18 @@ class _Resolution:
 class ReconciliationEngine:
     """Deterministic reconciliation of local application state against the venue view."""
 
-    def __init__(self, policy: ReconciliationPolicy) -> None:
+    def __init__(
+        self, policy: ReconciliationPolicy, *, require_known_venue_identity: bool = False
+    ) -> None:
+        """``require_known_venue_identity`` (review G-4): an order whose venue order id was never
+        journaled is never resolved from a venue report, which may answer for another order
+        reusing its client order id. Its local state cannot vouch for it either: a cancel by
+        client order id may have journaled another order's answer. Break-glass requires it;
+        startup does not (an accepted residual)."""
         if not isinstance(policy, ReconciliationPolicy):
             raise ReconciliationError("a resolved ReconciliationPolicy is required (fail closed).")
         self._policy = policy
+        self._require_known_venue_identity = bool(require_known_venue_identity)
 
     @property
     def policy(self) -> ReconciliationPolicy:
@@ -213,6 +221,13 @@ class ReconciliationEngine:
                 adjustment,
             )
 
+        if self._require_known_venue_identity and local.is_terminal:
+            # Review SOL-F3: a read or cancel by client order id may have journaled another
+            # order's answer as this order's end, so only a current venue report can prove it.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_unproven",
+            )
         if local.is_terminal:
             # A terminal order whose terminal state came from our own recorded lifecycle/fills
             # needs no venue correction when the venue view simply has nothing to report. The
@@ -234,6 +249,27 @@ class ReconciliationEngine:
         local: LocalOrderState,
         report: VenueOrderReport,
     ) -> _Resolution:
+        if (
+            local.venue_order_id is not None
+            and report.venue_order_id is not None
+            and report.venue_order_id != local.venue_order_id
+        ):
+            # Review G-4: the venue answered for another order that reuses our client order id.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_mismatch",
+            )
+        if self._require_known_venue_identity and local.venue_order_id is None:
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_unknown",
+            )
+        if self._require_known_venue_identity and report.venue_order_id is None:
+            # Review SOL-F4: a report naming no venue order cannot prove ours.
+            return _Resolution(
+                ReconciliationOutcome.AMBIGUOUS_PENDING_RECONCILIATION,
+                "venue_order_identity_unreported",
+            )
         local_ahead = (
             local.state.rank > report.state.rank
             or local.filled_quantity > report.filled_quantity

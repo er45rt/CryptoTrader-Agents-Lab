@@ -68,12 +68,14 @@ from crypto_trader.execution import (  # noqa: E402
     ExecutionOrderType,
     ExecutionSide,
     ExecutionTimeInForce,
+    InstrumentSpec,
 )
 from crypto_trader.execution.binance_testnet import (  # noqa: E402
     RequestsTransport,
     TestnetClock as HttpClock,
 )
 from crypto_trader.mainnet import (  # noqa: E402
+    HardNoSubmitGate,
     MainnetDryRunPipeline,
     MainnetReadOnlyClient,
     SoakRecorder,
@@ -86,10 +88,39 @@ from crypto_trader.persistence import (  # noqa: E402
     rebuild_state,
 )
 from crypto_trader.production import ProductionIntent  # noqa: E402
-from crypto_trader.tests import mainnet_fixtures as fx  # noqa: E402
-from crypto_trader.validity import LiveMarketStateProvider, MarketObservation  # noqa: E402
+from crypto_trader.recovery import load_policy as load_recovery_policy  # noqa: E402
+from crypto_trader.risk import RiskStateSnapshot, load_limits  # noqa: E402
+from crypto_trader.validity import (  # noqa: E402
+    DecisionValidityGate,
+    LiveMarketStateProvider,
+    MarketObservation,
+)
+from crypto_trader.validity import load_policy as load_validity_policy  # noqa: E402
 
-SYMBOL = fx.SYMBOL
+SYMBOL = "BTCUSDT"
+_SYNTHETIC_POLICY_ID = "mainnet-dryrun-test-v1"
+_SYNTHETIC_INSTRUMENT = InstrumentSpec(
+    symbol=SYMBOL,
+    venue="BINANCE_SPOT_MAINNET_READONLY",
+    base_currency="BTC",
+    quote_currency="USDT",
+    price_precision=2,
+    size_precision=5,
+    starting_balance="0 USDT",
+)
+_SYNTHETIC_LIMIT_CONFIG = {
+    "limits_version": "risk-mainnet-dryrun-test-v1",
+    "max_order_notional_quote": "5000",
+    "max_symbol_exposure_quote": "20000",
+    "max_gross_exposure_quote": "50000",
+    "max_net_exposure_quote": "30000",
+    "max_strategy_exposure_quote": "40000",
+    "loss_limit_quote": "1000",
+    "max_drawdown_pct": "10",
+    "concentration_limit_pct": "50",
+    "max_open_orders": 5,
+    "max_open_positions": 3,
+}
 DETERMINISM_CHECK_EVERY = 30
 MAX_CONSECUTIVE_CYCLE_FAILURES = 5
 
@@ -197,19 +228,44 @@ def _build_client() -> MainnetReadOnlyClient:
     return client
 
 
+def _synthetic_risk_state(now: datetime) -> RiskStateSnapshot:
+    return RiskStateSnapshot(
+        equity_quote=Decimal("1000"),
+        peak_equity_quote=Decimal("1000"),
+        realized_pnl_quote=Decimal("0"),
+        gross_exposure_quote=Decimal("0"),
+        net_exposure_quote=Decimal("0"),
+        open_orders=0,
+        open_positions=0,
+        snapshot_ts=now,
+    )
+
+
+def _synthetic_validity_gate() -> DecisionValidityGate:
+    return DecisionValidityGate(
+        load_validity_policy(
+            {
+                "policy_id": _SYNTHETIC_POLICY_ID,
+                "max_age_seconds": 120,
+                "max_market_move_bps": "200",
+            }
+        )
+    )
+
+
 def _build_pipeline(client: MainnetReadOnlyClient, journal, state_dir: Path, recorder: SoakRecorder):
     return MainnetDryRunPipeline(
         journal=journal,
         state_dir=state_dir / "state",
-        instrument=fx.INSTRUMENT,
+        instrument=_SYNTHETIC_INSTRUMENT,
         market_state=_live_market_state(client),
         decision_source=_decision_source(client, client.exchange_info(SYMBOL)),
-        limits=fx.limits(),
-        risk_state_provider=lambda now: fx.risk_state(now=now),
-        validity_gate=fx.validity_gate(),
-        reconciliation_policy=fx.recovery_policy(),
+        limits=load_limits(_SYNTHETIC_LIMIT_CONFIG),
+        risk_state_provider=_synthetic_risk_state,
+        validity_gate=_synthetic_validity_gate(),
+        reconciliation_policy=load_recovery_policy({"policy_id": _SYNTHETIC_POLICY_ID}),
         permission_check=client.verify_read_only_permissions,
-        gate=fx.gate(),
+        gate=HardNoSubmitGate(instrument=_SYNTHETIC_INSTRUMENT),
         client=client,
         soak=recorder,
         clock=_now,

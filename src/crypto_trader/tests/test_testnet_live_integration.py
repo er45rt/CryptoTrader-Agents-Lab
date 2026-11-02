@@ -1,12 +1,13 @@
 """Phase 11: LIVE Binance SPOT TESTNET integration tests (opt-in, never in the offline suite).
 
-These tests are skipped unless BOTH conditions hold:
+These tests are skipped unless ALL THREE conditions hold:
 
-* ``CRYPTO_TRADER_RUN_TESTNET=1`` (explicit opt-in), and
+* ``--allow-live-testnet`` is passed directly on the pytest command line (never via PYTEST_ADDOPTS),
+* ``CRYPTO_TRADER_RUN_TESTNET=1`` (separate environment opt-in), and
 * ``BINANCE_TESTNET_API_KEY`` / ``BINANCE_TESTNET_API_SECRET`` are present in the environment.
 
 They run against the documented Spot Testnet host only, with test funds, and place at most a few
-tiny resting limit orders that are always cancelled. NO mainnet endpoint, no real capital and no
+tiny resting limit orders with verified teardown or explicit failure on uncertain cleanup. NO mainnet endpoint, no real capital and no
 withdrawal capability is ever used. A testnet outage fails these tests - it is never disguised as
 an application PASS, and the offline suite stays green independently.
 
@@ -16,9 +17,10 @@ Credential values are read from the environment by the adapter and are never pri
 from __future__ import annotations
 
 import os
+import sys
 import time
 import uuid
-from decimal import ROUND_CEILING, ROUND_FLOOR
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 
 import pytest
@@ -48,11 +50,17 @@ from crypto_trader.safety import SafetyController
 from crypto_trader.tests import testnet_fixtures as fx
 
 RUN_FLAG = "CRYPTO_TRADER_RUN_TESTNET"
+DIRECT_CLI_FLAG = "--allow-live-testnet"
 INSTRUMENT = InstrumentSpec(symbol="BTCUSDT", base_currency="BTC", starting_balance="100000 USDT")
 
 
 def live_run_enabled() -> bool:
-    """True only when explicitly opted in AND credentials are present (no value inspected)."""
+    """Only a direct CLI opt-in AND env/credentials can enable live order tests.
+
+    Inherited PYTEST_ADDOPTS is deliberately insufficient.
+    """
+    if DIRECT_CLI_FLAG not in sys.argv[1:]:
+        return False
     if os.environ.get(RUN_FLAG) != "1":
         return False
     return bool(os.environ.get("BINANCE_TESTNET_API_KEY")) and bool(
@@ -64,7 +72,7 @@ pytestmark = [
     pytest.mark.testnet,
     pytest.mark.skipif(
         not live_run_enabled(),
-        reason=f"live testnet integration requires {RUN_FLAG}=1 plus testnet credentials",
+        reason=f"live testnet integration requires direct {DIRECT_CLI_FLAG}, {RUN_FLAG}=1, plus testnet credentials",
     ),
 ]
 
@@ -76,13 +84,15 @@ def _new_client():
     its default testnet keys while this adapter provably implements no withdrawal endpoint. The
     observed flag is recorded in the environment record for the readiness matrix.
     """
-    return BinanceSpotTestnetClient(
+    client = BinanceSpotTestnetClient(
         credentials=credentials_from_environment(),
         transport=RequestsTransport(timeout_seconds=15.0),
         clock=SpotClock(time_source=time.time, recv_window_ms=5_000),
         symbol="BTCUSDT",
         withdrawal_policy=WithdrawalPolicy.RECORD_ONLY,
     )
+    client._test_owned_order_ids = set()
+    return client
 
 
 def _resting_limit_request(client, *, side: str = "BUY") -> SpotOrderRequest:
@@ -98,14 +108,16 @@ def _resting_limit_request(client, *, side: str = "BUY") -> SpotOrderRequest:
     tick = rules.price_tick.normalize()
     step = rules.quantity_step.normalize()
 
-    raw_price = (market / 2) if side == "BUY" else (market * 2)
+    # Keep resting prices inside the venue's percent-price band, as in the other live tests.
+    offset = Decimal("0.9") if side == "BUY" else Decimal("1.1")
+    raw_price = market * offset
     price = ((raw_price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick).quantize(tick)
 
     minimum_quantity = max(rules.min_notional / price, rules.min_quantity)
     steps = (minimum_quantity / step).to_integral_value(rounding=ROUND_CEILING)
     quantity = (steps * step).quantize(step)
     assert quantity * price >= rules.min_notional, "sizing must satisfy the notional minimum"
-    return SpotOrderRequest(
+    request = SpotOrderRequest(
         client_order_id=f"ct-live-{uuid.uuid4().hex[:12]}",
         symbol=client.symbol,
         side=side,
@@ -114,6 +126,8 @@ def _resting_limit_request(client, *, side: str = "BUY") -> SpotOrderRequest:
         price=price,
         time_in_force="GTC",
     )
+    client._test_owned_order_ids.add(request.client_order_id)
+    return request
 
 
 def _instrument_for(client) -> InstrumentSpec:
@@ -131,6 +145,8 @@ def _instrument_for(client) -> InstrumentSpec:
 
 def _execution_request(client, intent_id, correlation_id) -> ExecutionRequest:
     resting = _resting_limit_request(client)
+    # Runtime reserves the full UUID as ct2-<intent hex> before its first write.
+    client._test_owned_order_ids.add(f"ct2-{intent_id.hex}")
     return ExecutionRequest.create(
         correlation_id=correlation_id,
         symbol=INSTRUMENT.symbol,
@@ -142,18 +158,83 @@ def _execution_request(client, intent_id, correlation_id) -> ExecutionRequest:
     )
 
 
+def _verify_live_testnet_teardown(client):
+    """Cancel only explicitly reserved test identities, never account-wide orders.
+
+    Unknown venue orders remain untouched and fail closed for operator reconciliation.
+    This cannot guarantee cancellation after process death or venue unavailability.
+    """
+    try:
+        remaining = client.startup_open_orders(client.symbol)
+    except Exception:
+        raise AssertionError(
+            "Testnet teardown unverified: signed openOrders check failed; manual reconciliation required."
+        ) from None
+    owned = getattr(client, "_test_owned_order_ids", None)
+    if (
+        type(remaining) is not tuple
+        or type(owned) is not set
+        or any(type(ref) is not str or not ref for ref in owned)
+    ):
+        raise AssertionError(
+            "Testnet teardown unverified: invalid order evidence or ownership; manual reconciliation required."
+        )
+    if any(
+        type(getattr(order, "client_order_id", None)) is not str
+        or order.client_order_id not in owned for order in remaining
+    ):
+        raise AssertionError(
+            "Testnet teardown unresolved: unowned open orders; manual reconciliation required."
+        )
+    for order in remaining:
+        try:
+            client.cancel_order(client.symbol, order.client_order_id)
+        except Exception:
+            raise AssertionError(
+                "Testnet teardown unverified: targeted cancel failed; manual reconciliation required."
+            ) from None
+    try:
+        after = client.startup_open_orders(client.symbol)
+    except Exception:
+        raise AssertionError(
+            "Testnet teardown unverified: signed openOrders check failed; manual reconciliation required."
+        ) from None
+    if type(after) is not tuple or after:
+        raise AssertionError(
+            "Testnet teardown unresolved: signed openOrders not empty; manual reconciliation required."
+        )
+
+
 @pytest.fixture(scope="module")
 def live_client():
-    """A connected testnet client whose open orders are always cancelled on teardown."""
+    """Refuse existing orders before any live test; verify cleanup afterward."""
     client = _new_client()
     client.verify_environment()
+    # Never mass-cancel a pre-existing or unverifiable Testnet order.
+    # A failed setup must not enter the teardown path that calls cancel-all.
+    try:
+        existing = client.startup_open_orders(client.symbol)
+    except Exception:
+        raise AssertionError(
+            "Testnet preflight unverified: signed openOrders check failed; manual reconciliation required."
+        ) from None
+    if type(existing) is not tuple or existing:
+        raise AssertionError(
+            "Testnet preflight unresolved: open orders not verified empty; manual reconciliation required."
+        )
     try:
         yield client
     finally:
-        try:
-            client.cancel_all_open_orders(client.symbol)
-        except Exception:  # pragma: no cover - cleanup is best effort
-            pass
+        _verify_live_testnet_teardown(client)
+
+
+@pytest.fixture(autouse=True)
+def _verify_after_each_live_test(live_client):
+    """Fail closed before another live test can inherit leftover open orders."""
+    try:
+        yield
+    finally:
+        _verify_live_testnet_teardown(live_client)
 
 
 def test_live_environment_is_spot_testnet_and_least_privilege(live_client):
@@ -200,9 +281,9 @@ def test_live_order_place_and_cancel_lifecycle(tmp_path: Path, live_client):
 
 def test_live_duplicate_client_order_id_is_idempotent(live_client):
     request = _resting_limit_request(live_client)
-    first = live_client.place_order(request)
+    first = fx.place_order(live_client, request)
     try:
-        second = live_client.place_order(request)
+        second = fx.place_order(live_client, request)
     finally:
         live_client.cancel_order(request.symbol, request.client_order_id)
 
@@ -226,25 +307,27 @@ class _InterruptAfterSend:
         return response
 
 
-def test_live_ambiguous_submission_is_reconciled_not_retried(live_client):
+def test_live_ambiguous_submission_is_reconciled_not_retried(tmp_path: Path, live_client):
     intent_id = uuid.uuid4()
     correlation_id = uuid.uuid4()
-    runtime = OrderRuntime(client=live_client, instrument=INSTRUMENT)
-    runtime.start()
-    request = _execution_request(live_client, intent_id, correlation_id)
+    with SQLiteEventJournal(tmp_path / "live-ambiguity.db") as journal:
+        # Stage 2: a venue write requires a durable attempt journal before the POST.
+        runtime = OrderRuntime(client=live_client, instrument=INSTRUMENT, journal=journal)
+        runtime.start()
+        request = _execution_request(live_client, intent_id, correlation_id)
 
-    original = runtime.client.transport
-    runtime.client.transport = _InterruptAfterSend(original)
-    try:
-        with pytest.raises(AmbiguousOrderError):
-            runtime.submit(request)
-    finally:
-        runtime.client.transport = original
+        original = runtime.client.transport
+        runtime.client.transport = _InterruptAfterSend(original)
+        try:
+            with pytest.raises(AmbiguousOrderError):
+                runtime.submit(request)
+        finally:
+            runtime.client.transport = original
 
-    # The restart path adopts the order that really exists instead of re-sending it.
-    restarted = OrderRuntime(client=live_client, instrument=INSTRUMENT)
-    restarted.start()
-    adopted = restarted.recover_order(intent_id, correlation_id=correlation_id)
+        # The restart path adopts the order that really exists instead of re-sending it.
+        restarted = OrderRuntime(client=live_client, instrument=INSTRUMENT, journal=journal)
+        restarted.start()
+        adopted = restarted.recover_order(intent_id, correlation_id=correlation_id)
     assert adopted is not None
     assert adopted.client_order_id == restarted.client_order_id_for(intent_id)
 
@@ -259,19 +342,22 @@ def test_live_ambiguous_submission_is_reconciled_not_retried(live_client):
     live_client.cancel_order(INSTRUMENT.symbol, adopted.client_order_id)
 
 
-def test_live_safety_cancel_all_stops_every_open_order(live_client):
+def test_live_safety_kill_switch_and_owned_order_cancellation(live_client):
     placed = [
-        live_client.place_order(_resting_limit_request(live_client)) for _ in range(2)
+        fx.place_order(live_client, _resting_limit_request(live_client)) for _ in range(2)
     ]
     assert len(placed) == 2
     safety = SafetyController()
     safety.engage_kill_switch(reason_code="live_check", reason="live safety-lane check")
     assert safety.allow_new_risk() is False
 
-    results = live_client.cancel_all_open_orders(live_client.symbol)
-
+    # A live test must never invoke symbol-wide cancellation, even during a safety check.
+    results = [
+        live_client.cancel_order(live_client.symbol, order.client_order_id)
+        for order in placed
+    ]
     assert all(order.state.value == "canceled" for order in results)
-    assert live_client.open_orders(live_client.symbol) == ()
+    assert live_client.startup_open_orders(live_client.symbol) == ()
 
 
 def test_live_reconnect_after_an_idle_period(live_client):

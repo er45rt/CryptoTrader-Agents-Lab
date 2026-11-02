@@ -9,10 +9,12 @@ credentials, endpoints and permission profile stay strictly separate.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from crypto_trader.execution.binance_testnet import (
     API_KEY_HEADER,
@@ -26,6 +28,10 @@ from crypto_trader.execution.binance_testnet import (
 from crypto_trader.execution.binance_testnet.signing import (
     build_query_string,
     signed_query_string,
+)
+from crypto_trader.execution.binance_testnet.transport import (
+    redact_venue_message,
+    safe_transport_error,
 )
 
 from .credentials import MainnetReadOnlyCredentials
@@ -57,12 +63,21 @@ class MainnetReadOnlyClient:
     base_url: str = SPOT_MAINNET_REST_BASE
     symbol: str = "BTCUSDT"
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    sleep: Callable[[float], None] = time.sleep
     _request_log: list[str] = field(default_factory=list, init=False)
+    _bound_base_url: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.base_url = require_mainnet_base_url(self.base_url)
+        self._bound_base_url = self.base_url
         if not isinstance(self.credentials, MainnetReadOnlyCredentials):
             raise MainnetError("the mainnet read-only client requires read-only credentials.")
+
+    def _require_bound_origin(self) -> str:
+        """Never compose signed reads using a mutable, rebound endpoint."""
+        if type(self.base_url) is not str or self.base_url != self._bound_base_url:
+            raise MainnetEndpointError("the mainnet read-only client origin was changed.")
+        return self._bound_base_url
 
     # --- observability -------------------------------------------------------
 
@@ -173,9 +188,19 @@ class MainnetReadOnlyClient:
         weight: int = 1,
     ) -> Any:
         """The ONLY request helper: it always sends GET to an allowlisted read-only path."""
-        require_read_only_path(path)
+        path = require_read_only_path(path)
+        origin = self._require_bound_origin()
+        trusted_url = f"{origin}{path}"
+        parsed = urlsplit(trusted_url)
+        if (
+            f"{parsed.scheme}://{parsed.netloc}" != origin
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path != path or parsed.query or parsed.fragment
+        ):
+            raise MainnetEndpointError("the read-only destination is not a trusted URL.")
         attempt = 0
         while True:
+            origin = self._require_bound_origin()
             attempt += 1
             payload: dict[str, Any] = dict(params)
             if signed:
@@ -185,18 +210,23 @@ class MainnetReadOnlyClient:
                 query = build_query_string(payload)
             request = HttpRequest(
                 method="GET",
-                url=f"{self.base_url}{path}",
+                url=trusted_url,
                 query=query,
                 headers=self._headers(),
                 weight=weight,
                 is_write=False,
             )
+            self._require_bound_origin()
             self._request_log.append(request.safe_repr())
+            failure = None
             try:
                 response = self.transport.send(request)
-            except (TransportTimeout, TransportError):
+            except (TransportTimeout, TransportError) as exc:
+                failure = safe_transport_error(exc)
+            if failure is not None:
                 if attempt >= self.retry.max_attempts:
-                    raise
+                    raise failure from None
+                self.sleep(self.retry.delay_for_attempt(attempt))
                 continue
             if response.status_code == 200:
                 return response.body
@@ -207,10 +237,9 @@ class MainnetReadOnlyClient:
             )
 
     def _safe_message(self, message: str) -> str:
-        for secret in (self.credentials.api_key, self.credentials.with_secret()):
-            if secret and secret in message:
-                return "<redacted venue message>"
-        return message
+        return redact_venue_message(
+            message, (self.credentials.api_key, self.credentials.with_secret())
+        )
 
 
 def _error_of(body: Any) -> tuple[int | None, str]:

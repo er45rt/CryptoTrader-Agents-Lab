@@ -33,6 +33,7 @@ from .modes import (
     require_tested_queue_aware_settings,
     tested_queue_aware_settings,
 )
+from .protection import ImmediateDecision, ProtectedDecision, ProtectionBook, ProtectionPlan, TakeProfitLevel
 from .report import DecisionRecord, FillSummary, OrderSummary, RunReport, report_from_journal
 from .session import TradingSession
 from .simulation import ExecutionSimulator, ScriptedSimulationRunner, SimulationOutcome
@@ -43,6 +44,7 @@ __all__ = [
     "ExecutionSimulator",
     "FillSummary",
     "FrozenMarketDataFeed",
+    "ImmediateDecision",
     "MarketDataFeed",
     "MarketObservation",
     "OrderSummary",
@@ -51,6 +53,9 @@ __all__ = [
     "PaperStateError",
     "PositionLedger",
     "PositionState",
+    "ProtectedDecision",
+    "ProtectionBook",
+    "ProtectionPlan",
     "PublicMarketDataFeed",
     "QUEUE_AWARE_BOOK_TYPE",
     "QueueAwareSettings",
@@ -62,6 +67,7 @@ __all__ = [
     "SimulationError",
     "SimulationOutcome",
     "StrategyDecision",
+    "TakeProfitLevel",
     "TradingMode",
     "TradingSession",
     "load_session_config",

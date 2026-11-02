@@ -83,7 +83,9 @@ class SoakCounters:
         known = cls()
         values: dict[str, int] = {}
         for name in known.to_record():
-            raw = payload.get(name, 0)
+            if name not in payload:
+                raise MainnetError(f"persisted soak counter {name!r} is missing.")
+            raw = payload[name]
             if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
                 raise MainnetError(f"persisted soak counter {name!r} is not a non-negative integer.")
             values[name] = raw
@@ -137,16 +139,21 @@ class SoakState:
         if not isinstance(payload, dict):
             raise MainnetError("the persisted soak state is not a JSON object.")
         try:
+            for name in ("schema_version", "planned_restarts"):
+                if type(payload[name]) is not int:
+                    raise ValueError(f"{name} must be an integer")
+            if not isinstance(payload["journal_deterministic"], bool):
+                raise ValueError("journal_deterministic must be a boolean")
             return cls(
-                schema_version=int(payload["schema_version"]),
+                schema_version=payload["schema_version"],
                 soak_start_time=datetime.fromisoformat(str(payload["soak_start_time"])),
                 last_heartbeat=(
                     None
                     if payload.get("last_heartbeat") is None
                     else datetime.fromisoformat(str(payload["last_heartbeat"]))
                 ),
-                planned_restarts=int(payload.get("planned_restarts", 0)),
-                journal_deterministic=bool(payload.get("journal_deterministic", False)),
+                planned_restarts=payload["planned_restarts"],
+                journal_deterministic=payload["journal_deterministic"],
                 counters=SoakCounters.from_record(payload),
             )
         except (KeyError, TypeError, ValueError) as exc:
