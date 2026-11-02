@@ -6,6 +6,7 @@ replay, rather than inventing the missing engine state.
 """
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -133,3 +134,33 @@ def test_p06_order_causation_links_to_durable_intent_event(tmp_path: Path):
                   if event.event_type == ORDER_STATE_EVENT_TYPE]
         assert len(origins) == 1 and states
         assert all(event.causation_id in origins for event in states)
+
+
+def test_p06_equal_timestamp_fills_replay_identically_in_any_read_order(tmp_path: Path):
+    """Two fills of one order at the same timestamp must not depend on event_id order."""
+    with SQLiteEventJournal(tmp_path / "tie.db") as journal:
+        fx.session(
+            journal, decisions=fx.scripted(fx.buy_decision(quantity="1.5")),
+            data_feed=fx.feed("2700.00"),
+            simulator=ScriptedSimulationRunner(fill_fraction=Decimal("0.4")),
+        ).run()
+        events = list(journal.read_range())
+    fills = [e for e in events if e.event_type == EXECUTION_FILL_EVENT_TYPE]
+    assert len(fills) == 1 and fills[0].payload.remaining_quantity == Decimal("0.9")
+    first = fills[0]
+    second = first.model_copy(update={
+        "event_id": uuid4(),
+        "payload": first.payload.model_copy(update={
+            "quantity": Decimal("0.9"), "remaining_quantity": Decimal("0")}),
+    })
+    base = [e for e in events if e is not first]
+    reports = []
+    for pair in ((first, second), (second, first)):
+        reports.append(report_from_journal(
+            base + list(pair), session_id=fx.SESSION_ID, mode="paper",
+            symbol="ETHUSDT", strategy_id="strategy-paper-1", strict_native_provenance=True,
+        ))
+    assert reports[0] == reports[1]
+    assert reports[0].orders[0].filled_quantity == Decimal("1.5")
+    assert reports[0].orders[0].remaining_quantity == Decimal("0")
+    assert [f.remaining_quantity for f in reports[0].fills] == [Decimal("0.9"), Decimal("0")]

@@ -241,9 +241,15 @@ def report_from_journal(
                 if prior != origin_id:
                     raise PaperStateError("strict native replay found conflicting fill provenance.")
             filled[key] = filled.get(key, Decimal("0")) + event.payload.quantity
-            remaining[key] = event.payload.remaining_quantity or Decimal("0")
+            fill_leaves = event.payload.remaining_quantity or Decimal("0")
+            if strict_native_provenance and key in remaining:
+                # Strict steps are verified below; final leaves are the minimum,
+                # independent of equal-timestamp read order. Legacy keeps last-read.
+                remaining[key] = min(remaining[key], fill_leaves)
+            else:
+                remaining[key] = fill_leaves
             if strict_native_provenance:
-                strict_fill_steps.append((key, filled[key], event.payload.remaining_quantity))
+                strict_fill_steps.append((key, event.payload.quantity, event.payload.remaining_quantity))
             fills.append(
                 (
                     occurred_at,
@@ -255,7 +261,7 @@ def report_from_journal(
                         symbol=event.symbol or symbol,
                         quantity=event.payload.quantity,
                         price=event.payload.price,
-                        remaining_quantity=remaining[key],
+                        remaining_quantity=fill_leaves,
                     ),
                 )
             )
@@ -271,11 +277,20 @@ def report_from_journal(
             raise PaperStateError("strict native replay fill/order intent provenance mismatch.")
         # Every persisted fill must balance against its original durable intent,
         # including intermediate fills that an aggregate-only check would miss.
-        for reference, cumulative_filled, leaves_after_fill in strict_fill_steps:
+        # Fill steps are ordered by their own persisted leaves (non-increasing per
+        # order), never by journal read order, which is undefined at equal timestamps.
+        if any(leaves is None for _, _, leaves in strict_fill_steps):
+            raise PaperStateError(
+                "strict native replay intermediate fill remaining does not reconcile to intent."
+            )
+        cumulative: dict[str, Decimal] = {}
+        for reference, quantity, leaves_after_fill in sorted(
+                strict_fill_steps, key=lambda step: (step[0], -step[2])):
+            cumulative[reference] = cumulative.get(reference, Decimal("0")) + quantity
             origin = fill_origins.get(reference)
             original_quantity = intent_quantities.get(origin)
-            if (leaves_after_fill is None or original_quantity is None
-                    or cumulative_filled + leaves_after_fill != original_quantity):
+            if (original_quantity is None
+                    or cumulative[reference] + leaves_after_fill != original_quantity):
                 raise PaperStateError(
                     "strict native replay intermediate fill remaining does not reconcile to intent."
                 )
@@ -283,7 +298,11 @@ def report_from_journal(
     if not decisions:
         raise PaperStateError(f"no recorded decisions for session {session_id}.")
 
-    ordered_fills = [item[2] for item in sorted(fills, key=lambda item: (item[0], item[1]))]
+    if strict_native_provenance:
+        ordered_fills = [item[2] for item in sorted(
+            fills, key=lambda item: (item[0], item[1], -item[2].remaining_quantity))]
+    else:
+        ordered_fills = [item[2] for item in sorted(fills, key=lambda item: (item[0], item[1]))]
 
     def replay_remaining(reference: str, state: str) -> Decimal:
         seen_filled = filled.get(reference, Decimal("0"))
