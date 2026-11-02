@@ -348,6 +348,37 @@ class TrialRegistry:
             (study_id,),
         ).fetchone()[0])
 
+    def status_counts(self, study_id: str) -> dict[str, int]:
+        """Read-only attempt counts per status from one verified snapshot."""
+        canonical_uuid(study_id)
+        return self._snapshot(lambda: {
+            row["status"]: row["n"] for row in self._db.execute(
+                "SELECT status, COUNT(*) AS n FROM attempts WHERE study_id=? GROUP BY status ORDER BY status",
+                (study_id,),
+            )
+        })
+
+    def trial_record(self, trial_id: str) -> dict:
+        """Read-only status, binding and terminal output hash from one verified snapshot."""
+        canonical_uuid(trial_id)
+        def read():
+            row = self._db.execute(
+                "SELECT study_id, status, binding_hash FROM attempts WHERE trial_id=?", (trial_id,)
+            ).fetchone()
+            if row is None:
+                raise RegistryError("unknown trial")
+            output_hash = None
+            for event in self._db.execute(
+                "SELECT payload FROM events WHERE kind='FINISH' AND study_id=? ORDER BY seq",
+                (row["study_id"],),
+            ):
+                data = parse_json_strict(event["payload"])["data"]
+                if data["trial_id"] == trial_id:
+                    output_hash = data["output_hash"]
+            return {"study_id": row["study_id"], "status": row["status"],
+                    "binding_hash": row["binding_hash"], "output_hash": output_hash}
+        return self._snapshot(read)
+
     def get_status(self, trial_id: str) -> str:
         canonical_uuid(trial_id)
         def read():
