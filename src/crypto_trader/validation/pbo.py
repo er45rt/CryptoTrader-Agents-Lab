@@ -48,7 +48,8 @@ _RANK_CONVENTION = (
     "OOS rank r of the in-sample winner among ALL N candidates, ascending: "
     "r = 1 + #candidates with strictly lower OOS mean return (1 = worst, N = best). "
     "Relative rank w = r/(N+1), logit = ln(w/(1-w)). A partition is overfit iff "
-    "logit <= 0, i.e. 2*rank <= N+1; for odd N the exact OOS median counts as overfit. "
+    "logit < 0 (the IS winner underperforms the OOS median), i.e. 2*rank < N+1; "
+    "for odd N a winner exactly at the OOS median (logit 0) is NOT overfit. "
     "PBO = overfit partitions / C(S, S/2)."
 )
 _ASSUMPTIONS = (
@@ -100,7 +101,7 @@ class PartitionOutcome:
                 or type(self.oos_rank) is not int
                 or not 1 <= self.oos_rank <= self.candidate_count
                 or type(self.overfit) is not bool
-                or self.overfit is not (2 * self.oos_rank <= self.candidate_count + 1)):
+                or self.overfit is not (2 * self.oos_rank < self.candidate_count + 1)):
             raise PBOError("inconsistent partition outcome")
 
 
@@ -320,7 +321,7 @@ def estimate_pbo(
                 rank = 1 + sum(1 for v in oos if v < target)
                 outcomes.append(PartitionOutcome(
                     train, tuple(k for k in range(slice_count) if k not in train),
-                    ids[winner], rank, n, 2 * rank <= n + 1,
+                    ids[winner], rank, n, 2 * rank < n + 1,
                 ))
     except DecimalException as exc:
         raise PBOError("inexact or invalid decimal arithmetic") from exc

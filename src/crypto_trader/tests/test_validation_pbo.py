@@ -53,14 +53,14 @@ def run(candidates, *, slice_count=4, family=None, score=MEAN_RETURN_SCORE, ts=N
 # Manually derived fixture: 3 candidates x 8 rows, S = 4 slices of 2 rows.
 # Slice sums (s0, s1, s2, s3):   A = 3, 3, 3, 3   B = 5.5, 0, 1, 0   C = 0, 4, 0, 1
 #
-# train | IS sums A / B / C   | winner | OOS sums A / B / C | asc rank | 2r <= N+1 = 4?
+# train | IS sums A / B / C   | winner | OOS sums A / B / C | asc rank | 2r < N+1 = 4?
 # {0,1} | 6   / 5.5 / 4       | A      | 6 / 1   / 1        | 3        | no
 # {0,2} | 6   / 6.5 / 0       | B      | 6 / 0   / 5        | 1        | OVERFIT
 # {0,3} | 6   / 5.5 / 1       | A      | 6 / 1   / 4        | 3        | no
 # {1,2} | 6   / 1   / 4       | A      | 6 / 5.5 / 1        | 3        | no
-# {1,3} | 6   / 0   / 5       | A      | 6 / 6.5 / 0        | 2        | OVERFIT (median, N odd)
+# {1,3} | 6   / 0   / 5       | A      | 6 / 6.5 / 0        | 2        | no (AT the median, logit 0)
 # {2,3} | 6   / 1   / 1       | A      | 6 / 5.5 / 4        | 3        | no
-# PBO = 2 / 6.
+# PBO = 1 / 6.
 def known_family():
     return (
         series("A", "1.25", "1.75", "2", "1", "0.5", "2.5", "3", "0"),
@@ -83,23 +83,53 @@ def test_known_answer_fixture_per_partition_winners_ranks_and_pbo():
         (2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1)]
     assert [p.selected_candidate_id for p in report.partitions] == ["A", "B", "A", "A", "A", "A"]
     assert [p.oos_rank for p in report.partitions] == [3, 1, 3, 3, 2, 3]
-    assert [p.overfit for p in report.partitions] == [False, True, False, False, True, False]
+    assert [p.overfit for p in report.partitions] == [False, True, False, False, False, False]
     assert all(p.candidate_count == 3 for p in report.partitions)
     assert report.partition_count == 6
-    assert report.overfit_partition_count == 2
-    assert report.pbo == D(2) / D(6)
-    assert report.pbo == D("0.3333333333333333333333333333")
+    assert report.overfit_partition_count == 1
+    assert report.pbo == D(1) / D(6)
+    assert report.pbo == D("0.1666666666666666666666666667")
 
 
-def test_known_answer_fixture_full_reversal_is_pbo_one():
-    # A = 5,1,-2,0  B = 0,3,1,2  C = 2,-1,4,-3  (hand-derived; IS winner always
-    # lands at or below the OOS median).
+def test_odd_n_winner_exactly_at_oos_median_is_not_overfit():
+    # Train {1,3}: A wins IS and ranks 2 of 3 OOS, w = 2/4 = 1/2, logit = 0.
+    # At the median is not underperforming it: not overfit.
+    outcome = run(known_family()).partitions[4]
+    assert (outcome.train_slices, outcome.oos_rank, outcome.candidate_count) == ((1, 3), 2, 3)
+    assert outcome.overfit is False
+
+
+def test_known_answer_fixture_mostly_reversed_is_four_sixths():
+    # A = 5,1,-2,0  B = 0,3,1,2  C = 2,-1,4,-3  (hand-derived; IS winner lands at
+    # the OOS bottom 4 times and exactly at the OOS median, not below it, twice).
     family = from_slice_sums({"A": (5, 1, -2, 0), "B": (0, 3, 1, 2), "C": (2, -1, 4, -3)})
     report = run(family)
     assert [p.selected_candidate_id for p in report.partitions] == ["A", "C", "A", "B", "B", "B"]
     assert [p.oos_rank for p in report.partitions] == [1, 1, 1, 2, 1, 2]
-    assert report.overfit_partition_count == 6
-    assert report.pbo == D(1)
+    assert [p.overfit for p in report.partitions] == [True, True, True, False, True, False]
+    assert report.overfit_partition_count == 4
+    assert report.pbo == D(4) / D(6)
+
+
+# Even N = 4, S = 4. Slice sums: A = 5,5,2,0  B = 1,1,3,3  C = 2,2,0,4  D = 0,0,1,0.5
+#
+# train | IS A / B / C / D  | winner | OOS A / B / C / D  | asc rank | 2r < N+1 = 5?
+# {0,1} | 10 / 2 / 4 / 0    | A      | 2  / 6 / 4 / 1.5   | 2        | OVERFIT
+# {0,2} | 7  / 4 / 2 / 1    | A      | 5  / 4 / 6 / 0.5   | 3        | no
+# {0,3} | 5  / 4 / 6 / 0.5  | C      | 7  / 4 / 2 / 1     | 2        | OVERFIT
+# {1,2} | 7  / 4 / 2 / 1    | A      | 5  / 4 / 6 / 0.5   | 3        | no
+# {1,3} | 5  / 4 / 6 / 0.5  | C      | 7  / 4 / 2 / 1     | 2        | OVERFIT
+# {2,3} | 2  / 6 / 4 / 1.5  | B      | 10 / 2 / 4 / 0     | 2        | OVERFIT
+# PBO = 4 / 6.
+def test_even_n_rank_two_of_four_is_below_median_and_overfit():
+    family = from_slice_sums({"A": (5, 5, 2, 0), "B": (1, 1, 3, 3),
+                              "C": (2, 2, 0, 4), "D": (0, 0, 1, "0.5")})
+    report = run(family)
+    assert [p.selected_candidate_id for p in report.partitions] == ["A", "A", "C", "A", "C", "B"]
+    assert [p.oos_rank for p in report.partitions] == [2, 3, 2, 3, 2, 2]
+    assert [p.overfit for p in report.partitions] == [True, False, True, False, True, True]
+    assert report.overfit_partition_count == 4
+    assert report.pbo == D(4) / D(6)
 
 
 def test_persistent_dominant_candidate_is_pbo_zero():
@@ -119,7 +149,8 @@ def test_report_is_research_only_and_grants_nothing():
     assert report.permits_trading is False
     assert report.claims_dataset_trust is False
     assert report.accessed_holdout is False
-    assert "ascending" in report.rank_convention and "2*rank <= N+1" in report.rank_convention
+    assert "ascending" in report.rank_convention and "2*rank < N+1" in report.rank_convention
+    assert "<=" not in report.rank_convention
     assert any("not a paper gate" in a.lower() for a in report.assumptions)
     for field in ("permits_trial_allocation", "permits_promotion", "permits_trading",
                   "claims_dataset_trust", "accessed_holdout"):
@@ -143,12 +174,15 @@ def test_report_rejects_tampered_counts_and_pbo():
 
 
 def test_partition_outcome_pins_rank_convention_for_even_and_odd_n():
-    # Overfit iff relative rank r/(N+1) <= 1/2, i.e. logit <= 0, i.e. 2r <= N+1.
-    PartitionOutcome((0, 1), (2, 3), "A", 2, 4, True)
+    # Overfit iff relative rank r/(N+1) < 1/2, i.e. logit < 0, i.e. 2r < N+1.
+    PartitionOutcome((0, 1), (2, 3), "A", 2, 4, True)     # even N: below the median
     PartitionOutcome((0, 1), (2, 3), "A", 3, 4, False)
-    PartitionOutcome((0, 1), (2, 3), "A", 2, 3, True)
+    PartitionOutcome((0, 1), (2, 3), "A", 2, 3, False)    # odd N: exactly at the median
+    PartitionOutcome((0, 1), (2, 3), "A", 1, 3, True)
     PartitionOutcome((0, 1), (2, 3), "A", 3, 3, False)
-    for rank, n, overfit in ((2, 4, False), (3, 4, True), (2, 3, False), (1, 2, False)):
+    PartitionOutcome((0, 1), (2, 3), "A", 1, 2, True)
+    for rank, n, overfit in ((2, 4, False), (3, 4, True), (2, 3, True), (1, 3, False),
+                             (1, 2, False), (2, 2, True)):
         with pytest.raises(PBOError):
             PartitionOutcome((0, 1), (2, 3), "A", rank, n, overfit)
     for rank in (0, 5, True):
@@ -336,7 +370,7 @@ def test_runs_with_network_and_process_launch_denied(monkeypatch):
     monkeypatch.setattr(socket, "socket", denied)
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(subprocess, "Popen", denied)
-    assert run(known_family()).overfit_partition_count == 2
+    assert run(known_family()).overfit_partition_count == 1
 
 
 def test_module_imports_only_pure_stdlib_and_has_no_escape_hatches():
