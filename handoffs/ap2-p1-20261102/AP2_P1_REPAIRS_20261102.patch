@@ -1,0 +1,193 @@
+--- a/src/crypto_trader/paper/session.py
++++ b/src/crypto_trader/paper/session.py
+@@ -487,10 +487,17 @@
+                 return
+             for ts_ns, low, high in simulator.trade_groups(after_ns=protect_cursor, until_ns=until_ns):
+                 protect_cursor = ts_ns
+-                if book.crosses(low, high) or (
+-                        book.needs_every_tick() and ts_ns - last_step_ns >= _STEP_NS):
++                # A working entry may have filled earlier in this subsecond window.
++                # Capture it before examining crosses(); otherwise open=0 hides a
++                # transient stop that recovers before the throttled next capture.
++                active = book.needs_every_tick()
++                if active:
++                    capture(simulator.advance_until(ts_ns), boundary_ns=ts_ns)
++                crossing = book.crosses(low, high)
++                if crossing or (active and ts_ns - last_step_ns >= _STEP_NS):
+                     last_step_ns = ts_ns
+-                    capture(simulator.advance_until(ts_ns), boundary_ns=ts_ns)
++                    if not active:
++                        capture(simulator.advance_until(ts_ns), boundary_ns=ts_ns)
+                     self._protective_step(book, ts_ns, low, high, ledger, requests)
+             protect_cursor = max(protect_cursor, until_ns)
+ 
+--- a/src/crypto_trader/crew_paper_bridge.py
++++ b/src/crypto_trader/crew_paper_bridge.py
+@@ -227,13 +227,20 @@
+         return _hold("quantity_below_step", digest, decided_at)
+     if buying:
+         levels = sorted(plan.take_profit_targets, key=lambda target: target.level)
++        rounded_targets = tuple(
++            (_floor(Decimal(str(target.level)), config.tick_size),
++             Decimal(str(target.allocation_pct)))
++            for target in levels
++        )
++        # Reject invalid quantized prices *before* constructing a validated level.
++        # A model's sub-tick target must yield a durable Hold, not crash the Host.
++        if (not rounded_targets or rounded_targets[0][0] <= price
++                or len({level_price for level_price, _ in rounded_targets}) != len(rounded_targets)):
++            return _hold("target_on_wrong_side", digest, decided_at)
+         targets = tuple(
+-            TakeProfitLevel(_floor(Decimal(str(target.level)), config.tick_size),
+-                            Decimal(str(target.allocation_pct)))
+-            for target in levels
+-        )
+-        if not targets or targets[0].price <= price or len({level.price for level in targets}) != len(targets):
+-            return _hold("target_on_wrong_side", digest, decided_at)
++            TakeProfitLevel(level_price, allocation_pct)
++            for level_price, allocation_pct in rounded_targets
++        )
+         return ProtectedDecision(
+             action="buy", confidence=plan.confidence,
+             rationale=f"crew_plan:{plan.bias}:sha256:{digest}", quantity=quantity,
+--- a/src/crypto_trader/llm/__init__.py
++++ b/src/crypto_trader/llm/__init__.py
+@@ -24,16 +24,19 @@
+     recover_original_error,
+     tolerant_console_writes,
+ )
+-from .factory import (
+-    LLMProviderError,
+-    ProviderRateLimiter,
+-    ResilientLLM,
+-    build_resilient_llm,
+-    get_llm,
+-    get_provider_rate_limiter,
+-    reset_factory_state,
+-    set_default_builder,
+-)
++# Do not import CrewAI/LiteLLM at package initialization. Paper/stub consumers
++# need the schema only; provider infrastructure is loaded only on explicit use.
++_LAZY_FACTORY_NAMES = frozenset({
++    "LLMProviderError", "ProviderRateLimiter", "ResilientLLM", "build_resilient_llm",
++    "get_llm", "get_provider_rate_limiter", "reset_factory_state", "set_default_builder",
++})
++
++
++def __getattr__(name: str):
++    if name in _LAZY_FACTORY_NAMES:
++        from importlib import import_module
++        return getattr(import_module("crypto_trader.llm.factory"), name)
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ from .schemas import (
+     StructuredOutputError,
+     TakeProfitTarget,
+--- a/src/crypto_trader/llm/schemas.py
++++ b/src/crypto_trader/llm/schemas.py
+@@ -22,7 +22,7 @@
+ import re
+ from typing import Any, Iterator, Literal
+ 
+-from crewai.tasks.task_output import TaskOutput
++# The schema parser and guardrail require no CrewAI import during package load.
+ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+ 
+ __all__ = [
+@@ -250,7 +250,7 @@
+     )
+ 
+ 
+-def trading_plan_guardrail(output: TaskOutput) -> tuple[bool, Any]:
++def trading_plan_guardrail(output: Any) -> tuple[bool, Any]:
+     """Task guardrail enforcing the structured plan contract.
+ 
+     Returns ``(True, raw_output)`` when the output validates - the original text is
+--- /dev/null
++++ b/src/crypto_trader/tests/test_ap2_p1_regression.py
+@@ -0,0 +1,86 @@
++"""Independent AP2 P1 regressions. No network or venue access."""
++import os
++import subprocess
++import sys
++from decimal import Decimal
++from dataclasses import replace
++
++import pytest
++from crypto_trader.persistence import SQLiteEventJournal
++from crypto_trader.tests import test_crew_paper_bridge as b
++from crypto_trader.tests import test_paper_protection as p
++from crypto_trader.tests import paper_fixtures as fx
++from crypto_trader.execution.nautilus import NautilusSimulationRunner
++from crypto_trader.execution import MarketTrade
++from crypto_trader.paper.config import SpotCashSettings
++
++
++def test_br1_subtick_target_is_refused_as_hold():
++    raw = b.plan(take_profit_targets=[{"level": 0.001, "allocation_pct": 100}])
++    result = b.to_decision(raw)
++    assert result.action == "hold"
++    assert "target_on_wrong_side" in result.rationale
++
++
++def test_br1_subtick_hold_is_sealed_and_provider_is_not_recalled(tmp_path):
++    store = tmp_path / "decisions"
++    store.mkdir()
++    with SQLiteEventJournal(tmp_path / "journal.db") as journal:
++        plans = b.Plans(b.plan(take_profit_targets=[{"level": 0.001, "allocation_pct": 100}]))
++        source = b.source_for(journal, store, plans)
++        observed = b.observation()
++        first = source.decide(observed)
++        replayed = source.decide(observed)
++        assert first.action == replayed.action == "hold"
++        assert len(plans.contexts) == 1
++        assert len(list(store.glob("crew_*.json"))) == 1
++
++
++@pytest.fixture
++def journal(tmp_path):
++    with SQLiteEventJournal(tmp_path / 'journal.db') as instance:
++        yield instance
++
++
++def test_pr1_subsecond_stop_after_delayed_fill(journal):
++    # Entry can fill and the stop be crossed within a single _STEP_NS interval.
++    base = p.BASE_NS
++    books = []
++    books.extend(p.book(1, 0, "2700.00", "2701.00"))
++    books.extend(p.book(2, 0, "2649.00", "2650.00", previous=("2700.00", "2701.00"), offset=200_000_000))
++    books.extend(p.book(3, 0, "2700.00", "2701.00", previous=("2649.00", "2650.00"), offset=500_000_000))
++    trades = [
++        MarketTrade(price=p.D(price), size=p.D("100"), aggressor=side, ts_ns=base + offset, trade_id=ident)
++        for offset, price, side, ident in (
++            (10_000_000, "2701.00", "BUYER", "pre_fill_tick"),
++            (100_000_000, "2700.00", "SELLER", "entry"),
++            (210_000_000, "2649.00", "SELLER", "stop"),
++            (510_000_000, "2701.00", "BUYER", "rebound"),
++            (1_100_000_000, "2701.00", "BUYER", "horizon"),
++        )
++    ]
++    runner = NautilusSimulationRunner(instrument=p.INSTRUMENT, book_updates=tuple(books), trades=tuple(trades))
++    runner.configure_paper_cash(SpotCashSettings(initial_quote=p.D("100000")))
++    session = fx.session(journal, decisions=fx.scripted(replace(p.protected(limit="2700.00"), immediate=False)), data_feed=fx.feed("2700.00"), simulator=runner)
++    report = session.run()
++    assert report.fills, "test must witness the entry fill"
++    assert report.fills[0].price == p.D("2700.00"), "entry must fill after the initial non-filling tick"
++    assert report.positions["ETHUSDT"] == 0, "a subsecond crossed stop must not stay silently open"
++
++
++def test_hc13_stub_host_import_makes_no_socket_attempts():
++    snippet = (
++        "import socket,json\n"
++        "attempts=[]\n"
++        "def blocked(self, addr):\n"
++        "    attempts.append(str(addr))\n"
++        "    raise OSError('offline denied')\n"
++        "socket.socket.connect=blocked\n"
++        "import crypto_trader.paper_host.host\n"
++        "print('NETWORK_ATTEMPTS='+json.dumps(attempts))\n"
++    )
++    env = dict(os.environ, CREWAI_TRACING_ENABLED="false", CREWAI_DISABLE_TELEMETRY="true",
++               OTEL_SDK_DISABLED="true")
++    result = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True, env=env, timeout=60)
++    assert result.returncode == 0, result.stderr
++    assert "NETWORK_ATTEMPTS=[]" in result.stdout, result.stdout
