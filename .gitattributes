@@ -1,1 +1,2 @@
 src/crypto_trader/execution/binance_testnet/endpoints.py text eol=lf
+src/crypto_trader/tests/fixtures/p05_ethusdt_offline_v1.json text eol=lf
