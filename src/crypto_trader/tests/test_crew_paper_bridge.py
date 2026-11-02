@@ -526,3 +526,17 @@ def test_equal_timestamp_same_side_fills_still_replay():
     require_unambiguous_fill_order([(stamp, "sell"), (stamp, "sell"), (stamp + timedelta(seconds=1), "buy")])
     with pytest.raises(PaperStateError):
         require_unambiguous_fill_order([(stamp, "sell"), (stamp, "buy")])
+
+
+
+def test_rebuilt_average_cost_matches_the_session_fills(journal, store):
+    """Journal rebuild must reproduce average cost, not only quantity, P&L and equity."""
+    report, _ = run_session(journal, store, Plans(*round_trip_plans()))
+    rebuilt = portfolio_snapshot(
+        journal, config=bridge_config(), mark=Decimal("2720.00"), as_of=fx.BASE + timedelta(hours=1),
+    )
+    # The round trip closes flat; the open position is exactly the last buy fill, so its
+    # average cost is that fill's price (fees are realized immediately, not in cost).
+    last = report.fills[-1]
+    assert rebuilt.position_quantity == last.quantity == report.positions["ETHUSDT"]
+    assert rebuilt.average_cost == last.price
