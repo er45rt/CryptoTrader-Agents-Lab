@@ -695,11 +695,32 @@ class SQLiteEventJournal:
         after_event_id: UUID | None = None,
         limit: int | None = None,
     ) -> Iterator[EventEnvelope]:
-        """Yield events in deterministic order, optionally after a snapshot position."""
+        """Yield events in deterministic order, optionally after a snapshot position.
+
+        The continuation filter must use the exact ORDER BY key (occurred_at_ns,
+        COALESCE(sequence_number, 0), event_id). When ``after_event_id`` is a
+        journaled event, its own stored key is the position, so an equal-timestamp
+        event with a higher sequence_number but a smaller event_id is never skipped.
+        """
         clauses, params = [], []
         if after_occurred_at_ns is not None:
-            clauses.append("(occurred_at_ns > ? OR (occurred_at_ns = ? AND event_id > ?))")
-            params.extend([int(after_occurred_at_ns), int(after_occurred_at_ns), str(after_event_id or "")])
+            anchor = None
+            if after_event_id is not None:
+                anchor = self._conn.execute(
+                    "SELECT occurred_at_ns, COALESCE(sequence_number, 0) FROM events WHERE event_id = ?",
+                    (str(after_event_id),),
+                ).fetchone()
+            if anchor is None:
+                clauses.append("(occurred_at_ns > ? OR (occurred_at_ns = ? AND event_id > ?))")
+                params.extend([int(after_occurred_at_ns), int(after_occurred_at_ns), str(after_event_id or "")])
+            else:
+                anchor_ns, anchor_seq = int(anchor[0]), int(anchor[1])
+                clauses.append(
+                    "(occurred_at_ns > ? OR (occurred_at_ns = ? AND "
+                    "(COALESCE(sequence_number, 0) > ? OR "
+                    "(COALESCE(sequence_number, 0) = ? AND event_id > ?))))"
+                )
+                params.extend([anchor_ns, anchor_ns, anchor_seq, anchor_seq, str(after_event_id)])
         sql = "SELECT * FROM events"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)

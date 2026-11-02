@@ -184,3 +184,29 @@ def test_at_least_once_delivery_preserves_state_across_mixed_event_types(journal
 
 def test_unknown_snapshot_name_returns_none(snapshots):
     assert snapshots.latest("never-saved") is None
+
+
+def test_snapshot_tail_keeps_equal_time_event_with_higher_sequence_and_smaller_id(journal, snapshots):
+    """Continuation after a snapshot must follow the replay ORDER BY key exactly."""
+    first = decision(0).model_copy(update={
+        "event_id": UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"), "sequence_number": 1})
+    second = decision(0).model_copy(update={
+        "event_id": UUID("00000000-0000-4000-8000-000000000001"), "sequence_number": 2})
+    journal.append_batch([first, second])
+    assert [e.event_id for e in journal.replay()] == [first.event_id, second.event_id]
+
+    consumer = CountingConsumer()
+    consumer.handle(next(iter(journal.replay())))
+    snapshots.save(
+        "tie",
+        consumer.snapshot_state(),
+        last_event_id=first.event_id,
+        last_occurred_at_ns=int(first.occurred_at.timestamp() * 1_000_000_000),
+        last_sequence_number=1,
+    )
+
+    resumed = CountingConsumer()
+    summary = rebuild_state(journal, resumed, snapshot=snapshots.latest("tie"))
+
+    assert summary.applied_event_ids == [second.event_id], "equal-time tail event was dropped"
+    assert resumed.count_by_type == {"strategy.decision.recorded": 2}
