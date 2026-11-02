@@ -171,3 +171,66 @@ def test_research_path_imports_no_execution_surface():
     for forbidden in ("crypto_trader.execution", "crypto_trader.paper", "crypto_trader.production",
                       "crypto_trader.breakglass", "crypto_trader.mainnet", "binance"):
         assert forbidden not in source
+
+
+
+def test_precheck_cannot_change_the_registered_configuration(tmp_path):
+    """Sol P1: a nested mutation in the precheck must not reach the evaluator."""
+    original = {"params": {"lookback": 5}}
+    with _registry(tmp_path) as reg:
+        def mutate(config):
+            config["params"]["lookback"] = 999
+            return None
+
+        result = run_registered_trial(
+            reg, STUDY, original, MANIFEST,
+            lambda receipt, config: {"evaluated_lookback": config["params"]["lookback"]},
+            precheck=mutate,
+        )
+        assert result.metrics == {"evaluated_lookback": 5}
+        assert original == {"params": {"lookback": 5}}
+        assert admit_result(reg, result, study_id=STUDY) is result
+
+
+def _nested(depth):
+    value = "leaf"
+    for _ in range(depth):
+        value = {"k": value}
+    return value
+
+
+def test_metrics_failing_the_output_hash_still_end_terminal(tmp_path):
+    """Sol P2: metrics valid alone but too deep once wrapped must end FAILED, not STARTED."""
+    from crypto_trader.validation.canonical import CanonicalError, canonical_bytes
+    depth = 1
+    while True:
+        try:
+            canonical_bytes(_nested(depth + 1))
+        except CanonicalError:
+            break
+        depth += 1
+    deepest = _nested(depth)  # the deepest metrics canonical serialization still accepts
+    with _registry(tmp_path) as reg:
+        with pytest.raises(Exception):
+            run_registered_trial(reg, STUDY, CONFIG, MANIFEST, lambda r, c: deepest)
+        assert reg.status_counts(STUDY) == {"FAILED": 1}
+
+
+def test_non_nfc_precheck_reason_still_records_the_rejection(tmp_path):
+    """Sol P2: caller refusal text never blocks the terminal write."""
+    with _registry(tmp_path) as reg:
+        with pytest.raises(TrialRejected):
+            run_registered_trial(reg, STUDY, CONFIG, MANIFEST, _ok,
+                                 precheck=lambda config: "e\u0301 refused")
+        assert reg.status_counts(STUDY) == {"REJECTED_PRECHECK": 1}
+
+
+def test_interrupt_during_precheck_is_aborted_not_failed(tmp_path):
+    """Sol P2: KeyboardInterrupt in the precheck is ABORTED."""
+    with _registry(tmp_path) as reg:
+        def interrupted(config):
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            run_registered_trial(reg, STUDY, CONFIG, MANIFEST, _ok, precheck=interrupted)
+        assert reg.status_counts(STUDY) == {"ABORTED": 1}

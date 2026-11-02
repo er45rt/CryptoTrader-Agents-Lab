@@ -65,32 +65,44 @@ def run_registered_trial(
     """Allocate first, then evaluate; every outcome is recorded. Refusal raises before evaluation."""
     if not isinstance(registry, TrialRegistry) or not callable(evaluate):
         raise RegistryError("approved research path requires a TrialRegistry and an evaluator")
-    receipt = registry.allocate(study_id, config, manifest, parent_trial_id=parent_trial_id)
+    if not isinstance(config, Mapping):
+        raise RegistryError("configuration must be a mapping")
+    # Freeze the configuration once. The registry binds these exact bytes, and the
+    # precheck and evaluator each get an independent deep copy decoded from them,
+    # so nothing can change what is evaluated after registration.
+    frozen = canonical_bytes(dict(config)).decode("utf-8")
+    receipt = registry.allocate(study_id, parse_json_strict(frozen), manifest,
+                                parent_trial_id=parent_trial_id)
 
+    # Terminal reasons are fixed literals: caller text never reaches the registry,
+    # so a reason can never be refused after the attempt was allocated.
     if precheck is not None:
-        # The precheck sees only the configuration: no receipt, seed, data or metrics.
+        # The precheck sees only a configuration copy: no receipt, seed, data or metrics.
         try:
-            refusal = precheck(dict(config))
-        except BaseException:
+            refusal = precheck(parse_json_strict(frozen))
+        except Exception:
             registry.finish(receipt.trial_id, "FAILED", reason="precheck_error")
             raise
+        except BaseException:
+            registry.finish(receipt.trial_id, "ABORTED", reason="precheck_interrupted")
+            raise
         if refusal is not None:
-            registry.finish(receipt.trial_id, "REJECTED_PRECHECK", reason=str(refusal))
+            registry.finish(receipt.trial_id, "REJECTED_PRECHECK", reason="precheck_refused")
             raise TrialRejected("precheck refused the attempt before evaluation")
 
     try:
-        metrics = evaluate(receipt, dict(config))
+        metrics = evaluate(receipt, parse_json_strict(frozen))
         if not isinstance(metrics, Mapping) or not metrics:
             raise RegistryError("evaluator must return nonempty metrics")
         metrics_json = canonical_bytes(dict(metrics)).decode("utf-8")
-    except Exception as exc:
-        registry.finish(receipt.trial_id, "FAILED", reason=f"evaluation_error:{type(exc).__name__}")
+        output_hash = _output_hash(receipt.trial_id, receipt.study_id, receipt.binding_hash, metrics_json)
+    except Exception:
+        registry.finish(receipt.trial_id, "FAILED", reason="evaluation_error")
         raise
     except BaseException:
         registry.finish(receipt.trial_id, "ABORTED", reason="evaluation_interrupted")
         raise
 
-    output_hash = _output_hash(receipt.trial_id, receipt.study_id, receipt.binding_hash, metrics_json)
     registry.finish(receipt.trial_id, "COMPLETED", output_hash=output_hash)
     return AdmissibleResult(receipt.trial_id, receipt.study_id, receipt.binding_hash,
                             metrics_json, output_hash)
