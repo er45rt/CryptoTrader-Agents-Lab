@@ -20,6 +20,25 @@ __all__ = ["PositionLedger", "PositionState"]
 ZERO = Decimal("0")
 
 
+def require_unambiguous_fill_order(fills: Any) -> None:
+    """Refuse equal-timestamp buy and sell fills before average-cost replay.
+
+    ``fills`` yields ``(occurred_at, side)`` pairs. Fills carry no persisted execution
+    order within one timestamp, and the average cost / realized P&L of a buy and a sell
+    depend on which executed first, so such a journal is refused (fail closed) instead
+    of being replayed in an arbitrary event_id order. Same-side fills commute.
+    """
+    sides_at: dict[Any, set[str]] = {}
+    for occurred_at, side in fills:
+        sides = sides_at.setdefault(occurred_at, set())
+        sides.add(side)
+        if len(sides) > 1:
+            raise PaperStateError(
+                "equal-timestamp buy and sell fills have no persisted execution order; "
+                "refusing ambiguous position accounting."
+            )
+
+
 @dataclass(frozen=True)
 class CurrentCashReading:
     """Transient cash observation from the active engine, never a restart token."""

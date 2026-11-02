@@ -15,6 +15,10 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from types import SimpleNamespace
+import crypto_trader.paper.session as paper_session_module
+from crypto_trader.paper import PaperStateError, PositionLedger
+from crypto_trader.paper.accounting import require_unambiguous_fill_order
 import pytest
 from crewai.llms.base_llm import BaseLLM
 
@@ -485,3 +489,40 @@ def test_bridge_module_has_no_venue_or_gateway_dependency():
     forbidden = ("binance", "mainnet", "production", "breakglass", "crew_decision_gateway",
                  "requests", "httpx", "execution")
     assert not [name for name in imported if any(token in name for token in forbidden)]
+
+
+
+class _RetimedJournal:
+    """Read-only view that moves one persisted fill onto another fill's timestamp."""
+
+    def __init__(self, journal, moved, to):
+        self._journal, self._moved, self._to = journal, moved, to
+
+    def read_by_correlation(self, correlation_id):
+        return [event.model_copy(update={"occurred_at": self._to}) if event.event_id == self._moved
+                else event for event in self._journal.read_by_correlation(correlation_id)]
+
+
+def test_equal_timestamp_buy_and_sell_fills_refuse_ambiguous_accounting(journal, store):
+    run_session(journal, store, Plans(*round_trip_plans()))
+    sides = {e.event_id: e.payload.side for e in events_of(journal, "trade.intent.created")}
+    fills = events_of(journal, "execution.fill.recorded")
+    buy = next(f for f in fills if sides[f.causation_id] == "buy")
+    sell = next(f for f in fills if sides[f.causation_id] == "sell")
+    view = _RetimedJournal(journal, sell.event_id, buy.occurred_at)
+    with pytest.raises(PaperStateError, match="equal-timestamp buy and sell"):
+        portfolio_snapshot(view, config=bridge_config(), mark=Decimal("2720.00"),
+                           as_of=fx.BASE + timedelta(hours=1))
+    session_cls = next(c for c in vars(paper_session_module).values()
+                       if isinstance(c, type) and "_recover_prior_fills" in vars(c))
+    stub = SimpleNamespace(journal=view, config=SimpleNamespace(
+        session_id=bridge_config().session_id, symbol="ETHUSDT"))
+    with pytest.raises(PaperStateError, match="equal-timestamp buy and sell"):
+        session_cls._recover_prior_fills(stub, PositionLedger(Decimal("100000")))
+
+
+def test_equal_timestamp_same_side_fills_still_replay():
+    stamp = fx.BASE
+    require_unambiguous_fill_order([(stamp, "sell"), (stamp, "sell"), (stamp + timedelta(seconds=1), "buy")])
+    with pytest.raises(PaperStateError):
+        require_unambiguous_fill_order([(stamp, "sell"), (stamp, "buy")])

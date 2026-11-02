@@ -77,6 +77,7 @@ from .accounting import PositionLedger, SpotCashLedger, CurrentCashReading
 from .config import SessionConfig
 from .decisions import DecisionSource, StrategyDecision, FrozenRunInputs, input_json
 from .errors import PaperStateError
+from .accounting import require_unambiguous_fill_order
 from .feed import MarketDataFeed, MarketObservation
 from .modes import TradingMode
 from .protection import ImmediateDecision, ProtectedDecision, ProtectionBook, ProtectiveTrigger
@@ -909,6 +910,10 @@ class TradingSession:
         events = self.journal.read_by_correlation(self.config.session_id)
         sides = {event.event_id: event.payload.side for event in events
                  if event.event_type == TRADE_INTENT_EVENT_TYPE}
+        require_unambiguous_fill_order(
+            (event.occurred_at, sides.get(event.causation_id)) for event in events
+            if event.event_type == EXECUTION_FILL_EVENT_TYPE
+        )
         for event in events:
             if event.event_type != EXECUTION_FILL_EVENT_TYPE:
                 continue

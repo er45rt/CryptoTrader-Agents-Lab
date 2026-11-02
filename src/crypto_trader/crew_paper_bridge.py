@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 
 from crypto_trader.llm.schemas import StructuredOutputError, parse_trading_plan
 from crypto_trader.paper import MarketObservation, PaperStateError, PositionLedger, StrategyDecision
+from crypto_trader.paper.accounting import require_unambiguous_fill_order
 from crypto_trader.paper.decisions import FrozenRunInputs, input_json
 from crypto_trader.paper.protection import ImmediateDecision, ProtectedDecision, ProtectionPlan, TakeProfitLevel
 from crypto_trader.paper.session import _stable_id
@@ -107,6 +108,10 @@ def portfolio_snapshot(
              if event.event_type == "trade.intent.created"}
     rationales = {event.event_id: event.payload.rationale or "" for event in events
                   if event.event_type == "trade.intent.created"}
+    require_unambiguous_fill_order(
+        (event.occurred_at, sides.get(event.causation_id)) for event in events
+        if event.event_type == "execution.fill.recorded"
+    )
     quote = config.starting_equity_quote
     ledger = PositionLedger(config.starting_equity_quote)
     filled: dict[UUID, Decimal] = {}
