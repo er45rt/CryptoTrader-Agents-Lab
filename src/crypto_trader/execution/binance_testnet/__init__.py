@@ -15,7 +15,14 @@ Scope: authenticated **Spot Testnet** only.
 Testnet success never authorizes mainnet trading.
 """
 
-from .client import BinanceSpotTestnetClient, WithdrawalPolicy
+from .backfill import (
+    BackfillEvent,
+    TradeBackfillPlan,
+    plan_trade_backfill,
+    trade_backfill_plan_fingerprint,
+    trade_backfill_source_revision,
+)
+from .client import BinanceSpotTestnetClient, PreparedTestnetOrder, WithdrawalPolicy
 from .clock import MAX_ABS_CLOCK_OFFSET_MS, MAX_RECV_WINDOW_MS, TestnetClock
 from .credentials import (
     API_KEY_ENV_VAR,
@@ -34,22 +41,33 @@ from .endpoints import (
 )
 from .errors import (
     AmbiguousOrderError,
+    AttemptJournalRequiredError,
     BinanceTestnetError,
     ClockDriftError,
     MainnetForbiddenError,
+    RateLimitAdmissionDeferredError,
     RateLimitBanError,
     RateLimitError,
+    WriteIpBannedOutcomeUnknownError,
+    WriteRateLimitedOutcomeUnknownError,
     TestnetCredentialsRequiredError,
     TestnetEndpointError,
     TestnetRejectedError,
     TestnetSymbolError,
+    TradeBackfillError,
     UnsafeTestnetAccountError,
+    UnsupportedOrderTypeError,
+    VenueProtocolRejectionError,
 )
 from .models import (
     STATUS_TO_STATE,
     TestnetAccountState,
     TestnetEnvironment,
     TestnetFill,
+    VenueTrade,
+    VenueAssetBalance,
+    VenueAccountSnapshot,
+    MarkEvidence,
     TestnetOrder,
     TestnetOrderRequest,
     TestnetSymbolRules,
@@ -58,11 +76,18 @@ from .models import (
 from .rate_limit import RateLimitBudget, RetryPolicy, TokenBucket
 from .runtime import TestnetOrderRuntime, TestnetVenueStateSource
 from .signing import redact_query_string, sign_query_string, signed_query_string
-from .translate import PRODUCER, deterministic_order_uuid, testnet_order_to_phase3_events
+from .translate import (
+    PRODUCER,
+    canonical_fill_event_id,
+    deterministic_order_uuid,
+    testnet_order_to_phase3_events,
+    venue_trade_event_id,
+)
 from .transport import (
     API_KEY_HEADER,
     HttpRequest,
     HttpResponse,
+    PreSendTransportError,
     RequestsTransport,
     ScriptedTransport,
     Transport,
@@ -75,6 +100,8 @@ __all__ = [
     "API_KEY_HEADER",
     "API_SECRET_ENV_VAR",
     "AmbiguousOrderError",
+    "AttemptJournalRequiredError",
+    "BackfillEvent",
     "BinanceSpotTestnetClient",
     "BinanceTestnetError",
     "ClockDriftError",
@@ -85,9 +112,14 @@ __all__ = [
     "MAX_RECV_WINDOW_MS",
     "MainnetForbiddenError",
     "PRODUCER",
+    "PreSendTransportError",
+    "PreparedTestnetOrder",
+    "RateLimitAdmissionDeferredError",
     "RateLimitBanError",
     "RateLimitBudget",
     "RateLimitError",
+    "WriteIpBannedOutcomeUnknownError",
+    "WriteRateLimitedOutcomeUnknownError",
     "RequestsTransport",
     "RetryPolicy",
     "SPOT_TESTNET_REST_BASE",
@@ -101,6 +133,10 @@ __all__ = [
     "TestnetEndpointError",
     "TestnetEnvironment",
     "TestnetFill",
+    "VenueTrade",
+    "VenueAssetBalance",
+    "VenueAccountSnapshot",
+    "MarkEvidence",
     "TestnetOrder",
     "TestnetOrderRequest",
     "TestnetOrderRuntime",
@@ -108,21 +144,30 @@ __all__ = [
     "TestnetSymbolError",
     "TestnetSymbolRules",
     "TestnetVenueStateSource",
+    "TradeBackfillError",
+    "TradeBackfillPlan",
     "TokenBucket",
     "Transport",
     "TransportError",
     "TransportTimeout",
     "UnsafeTestnetAccountError",
+    "UnsupportedOrderTypeError",
+    "VenueProtocolRejectionError",
     "WithdrawalPolicy",
     "assert_no_mainnet_reference",
     "credentials_from_environment",
+    "canonical_fill_event_id",
     "deterministic_order_uuid",
+    "venue_trade_event_id",
     "format_decimal",
     "is_testnet_host",
     "normalize_credential_value",
+    "plan_trade_backfill",
     "redact_query_string",
     "require_testnet_base_url",
     "sign_query_string",
     "signed_query_string",
     "testnet_order_to_phase3_events",
+    "trade_backfill_plan_fingerprint",
+    "trade_backfill_source_revision",
 ]

@@ -22,7 +22,7 @@ import math
 import re
 from typing import Any, Iterator, Literal
 
-from crewai.tasks.task_output import TaskOutput
+# The schema parser and guardrail require no CrewAI import during package load.
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 __all__ = [
@@ -250,7 +250,7 @@ def parse_trading_plan(text: str) -> TradingPlan:
     )
 
 
-def trading_plan_guardrail(output: TaskOutput) -> tuple[bool, Any]:
+def trading_plan_guardrail(output: Any) -> tuple[bool, Any]:
     """Task guardrail enforcing the structured plan contract.
 
     Returns ``(True, raw_output)`` when the output validates - the original text is

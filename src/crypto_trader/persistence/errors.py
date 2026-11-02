@@ -10,6 +10,7 @@ from uuid import UUID
 __all__ = [
     "EventIdConflictError",
     "JournalError",
+    "JournalRevisionMismatchError",
     "JournalSchemaError",
     "SnapshotError",
 ]
@@ -28,6 +29,10 @@ class EventIdConflictError(JournalError):
             f"event_id {event_id} already exists with different content; refusing to overwrite "
             "an append-only journal entry."
         )
+
+
+class JournalRevisionMismatchError(JournalError):
+    """The journal changed after a caller captured the revision it intended to update."""
 
 
 class JournalSchemaError(JournalError):

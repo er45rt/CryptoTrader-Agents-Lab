@@ -60,6 +60,28 @@ def test_stale_intents_are_evicted_so_they_cannot_wait_indefinitely():
     assert len(queue) == 1
 
 
+
+def test_future_dated_intents_are_evicted_fail_closed():
+    queue = BoundedPendingIntents(max_size=2)
+    future = request(market_offset_s=10.0)
+    queue.offer(future, enqueued_at=BASE)
+
+    evicted = queue.evict_expired(now=BASE, policy=POLICY)
+
+    assert [item.intent_id for item in evicted] == [future.intent_id]
+    assert len(queue) == 0
+
+
+def test_exact_max_age_remains_eligible_until_it_exceeds_policy():
+    queue = BoundedPendingIntents(max_size=2)
+    boundary = request()
+    queue.offer(boundary, enqueued_at=BASE)
+
+    evicted = queue.evict_expired(now=BASE + timedelta(seconds=POLICY.max_age_seconds), policy=POLICY)
+
+    assert evicted == []
+    assert queue.intent_ids() == (boundary.intent_id,)
+
 def test_removal_is_explicit_and_idempotent():
     queue = BoundedPendingIntents(max_size=2)
     item = request()

@@ -8,6 +8,7 @@ imports or types.
 """
 
 from .errors import (
+    NonDurableExecutionError,
     EngineVersionError,
     ExecutionBoundaryError,
     QueueAwareConfigurationError,
@@ -18,6 +19,9 @@ from .errors import (
 from .fake import InMemoryExecutionPort
 from .ports import (
     BookLevel,
+    DurableAttemptJournal,
+    DurableVenueWritePort,
+    ExecutionCapability,
     ExecutionObservation,
     ExecutionOrderType,
     ExecutionPort,
@@ -29,12 +33,16 @@ from .ports import (
     MarketBookUpdate,
     MarketTrade,
     OrderLifecycleState,
+    PreparedVenueWrite,
 )
 
 __all__ = [
     "BookLevel",
+    "DurableAttemptJournal",
+    "DurableVenueWritePort",
     "EngineVersionError",
     "ExecutionBoundaryError",
+    "ExecutionCapability",
     "ExecutionObservation",
     "ExecutionOrderType",
     "ExecutionPort",
@@ -47,7 +55,9 @@ __all__ = [
     "MarketBookUpdate",
     "MarketTrade",
     "OrderLifecycleState",
+    "PreparedVenueWrite",
     "QueueAwareConfigurationError",
+    "NonDurableExecutionError",
     "RuntimeStateError",
     "TranslationError",
     "UnsupportedExecutionRequestError",

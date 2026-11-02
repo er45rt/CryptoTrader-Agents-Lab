@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .errors import RateLimitBanError, RateLimitError
+from .errors import RateLimitAdmissionDeferredError, RateLimitBanError, RateLimitError
 
 __all__ = ["RateLimitBudget", "RetryPolicy", "TokenBucket"]
 
@@ -27,6 +28,9 @@ class TokenBucket:
     sleep: Callable[[float], None] = time.sleep
     _tokens: float = field(init=False, default=0.0)
     _updated_at: float = field(init=False, default=0.0)
+    _lock: threading.Lock = field(
+        init=False, repr=False, compare=False, default_factory=threading.Lock
+    )
 
     def __post_init__(self) -> None:
         if self.capacity <= 0:
@@ -36,42 +40,59 @@ class TokenBucket:
         self._tokens = float(self.capacity)
         self._updated_at = self.monotonic()
 
-    def _replenish(self) -> None:
+    def _replenish_unlocked(self) -> None:
         now = self.monotonic()
         elapsed = max(0.0, now - self._updated_at)
         if elapsed:
             self._tokens = min(float(self.capacity), self._tokens + elapsed * self.refill_per_second)
             self._updated_at = now
 
-    def wait_seconds_for(self, weight: int) -> float:
-        """Seconds to wait before ``weight`` can be consumed (0.0 when it fits now)."""
+    def _wait_seconds_for_unlocked(self, weight: int) -> float:
         if weight <= 0:
             raise ValueError("weight must be positive.")
         if weight > self.capacity:
             raise RateLimitError(
                 f"request weight {weight} exceeds the configured budget {self.capacity}."
             )
-        self._replenish()
+        self._replenish_unlocked()
         if self._tokens >= weight:
             return 0.0
         deficit = weight - self._tokens
         return deficit / self.refill_per_second
 
+    def wait_seconds_for(self, weight: int) -> float:
+        """Seconds to wait before ``weight`` can be consumed (0.0 when it fits now)."""
+        with self._lock:
+            return self._wait_seconds_for_unlocked(weight)
+
+    def acquire_now(self, weight: int = 1) -> float:
+        """Atomically consume tokens only when available; never sleep.
+
+        Returns 0.0 on success, or the delay that would be required without consuming.
+        """
+        with self._lock:
+            waited = self._wait_seconds_for_unlocked(weight)
+            if waited > 0:
+                return waited
+            self._tokens -= weight
+            return 0.0
+
     def acquire(self, weight: int = 1) -> float:
         """Consume ``weight`` tokens, sleeping when necessary. Returns the slept seconds."""
-        waited = self.wait_seconds_for(weight)
+        waited = self.acquire_now(weight)
         if waited > 0:
             self.sleep(waited)
-            self._tokens = 0.0
-            self._updated_at = self.monotonic()
-        else:
-            self._tokens -= weight
+            with self._lock:
+                # Preserve the existing conservative one-wait accounting semantics.
+                self._tokens = 0.0
+                self._updated_at = self.monotonic()
         return waited
 
     @property
     def available(self) -> float:
-        self._replenish()
-        return self._tokens
+        with self._lock:
+            self._replenish_unlocked()
+            return self._tokens
 
 
 @dataclass(frozen=True)
@@ -122,6 +143,42 @@ class RateLimitBudget:
         raise RateLimitBanError(
             "the venue signalled an IP ban (HTTP 418); no further request is attempted in this run."
         )
+
+    def admit_now(self, weight: int = 1) -> None:
+        """Consume request weight only when no wait is required; otherwise fail immediately."""
+        if self.banned:
+            raise RateLimitBanError("this client is banned for the remainder of the run.")
+        now = self.monotonic()
+        if now < self.backoff_until:
+            delay = self.backoff_until - now
+            raise RateLimitAdmissionDeferredError(
+                "venue backoff is active; pre-send admission is deferred.",
+                retry_after_seconds=delay,
+            )
+        bucket_delay = self.bucket.acquire_now(weight)
+        if bucket_delay > 0:
+            raise RateLimitAdmissionDeferredError(
+                "request-weight budget is not immediately available.",
+                retry_after_seconds=bucket_delay,
+            )
+
+    def wait_for_admission(self, weight: int = 1) -> float:
+        """Wait outside critical sections until a request is likely admissible; consume no token."""
+        if self.banned:
+            raise RateLimitBanError("this client is banned for the remainder of the run.")
+        waited = 0.0
+        now = self.monotonic()
+        if now < self.backoff_until:
+            delay = self.backoff_until - now
+            self.sleep(delay)
+            waited += delay
+        if self.banned:
+            raise RateLimitBanError("this client is banned for the remainder of the run.")
+        bucket_delay = self.bucket.wait_seconds_for(weight)
+        if bucket_delay > 0:
+            self.sleep(bucket_delay)
+            waited += bucket_delay
+        return waited
 
     def enforce_backoff(self) -> float:
         """Sleep out any pending backoff window before the next request."""

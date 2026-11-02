@@ -60,9 +60,14 @@ MUTATION_PATH_MARKERS: tuple[str, ...] = (
 
 def require_mainnet_base_url(url: str) -> str:
     """Return the URL when it is a documented mainnet host, else fail closed."""
-    if not isinstance(url, str) or not url.strip():
+    if type(url) is not str or not url.strip():
         raise MainnetEndpointError("a mainnet REST base URL is required.")
-    parsed = urlparse(url.strip())
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise MainnetEndpointError("the mainnet read-only base URL is malformed.")
     if parsed.scheme != "https":
         raise MainnetEndpointError("the mainnet read-only base URL must use https.")
     host = (parsed.hostname or "").lower()
@@ -74,7 +79,27 @@ def require_mainnet_base_url(url: str) -> str:
         raise MainnetEndpointError(
             f"{host!r} is not a documented Binance mainnet host; refusing to use it."
         )
-    return url.strip().rstrip("/")
+    try:
+        port = parsed.port
+    except ValueError:
+        malformed_port = True
+    else:
+        malformed_port = False
+    if malformed_port:
+        raise MainnetEndpointError("mainnet base URL has a malformed port.")
+    if (
+        parsed.username is not None or parsed.password is not None or port is not None
+        or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment
+    ):
+        raise MainnetEndpointError(
+            "the mainnet read-only base URL must be a trusted HTTPS origin only."
+        )
+    # Empty query/fragment delimiters survive urlparse with empty values.
+    # Require the complete supplied URL to be exactly the verified origin.
+    origin = f"https://{host}"
+    if url.strip().lower() not in (origin, origin + "/"):
+        raise MainnetEndpointError("mainnet base URL must contain only a trusted origin.")
+    return origin
 
 
 def refuse_mutation_path(path: str) -> None:
@@ -89,7 +114,7 @@ def refuse_mutation_path(path: str) -> None:
 
 def require_read_only_path(path: str) -> str:
     """Return the path when it is on the read-only allowlist AND not a mutation path."""
-    if not isinstance(path, str) or not path.startswith("/"):
+    if type(path) is not str or not path.startswith("/"):
         raise MainnetEndpointError("a request path must be an absolute path beginning with '/'.")
     refuse_mutation_path(path)
     if path not in READ_ONLY_PATHS:

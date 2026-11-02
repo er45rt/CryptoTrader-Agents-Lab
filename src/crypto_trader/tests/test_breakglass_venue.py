@@ -1,14 +1,23 @@
 """Phase 13: venue-side emergency control (Spot Testnet only, cancel-open only, never retried)."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
-from crypto_trader.breakglass import BreakGlassControl, OwnerKind, parse_operator_command
-from crypto_trader.breakglass.venue import BinanceSpotTestnetEmergencyControl
+from crypto_trader.breakglass import (
+    BreakGlassControl,
+    BreakGlassIncompleteError,
+    OwnerKind,
+    parse_operator_command,
+)
+from crypto_trader.breakglass.venue import (
+    BinanceSpotTestnetEmergencyControl,
+    PolicyOnlyVenueControl,
+)
 from crypto_trader.execution import InstrumentSpec
 from crypto_trader.execution.binance_testnet import (
     MAINNET_HOST_MARKERS,
@@ -23,8 +32,30 @@ from crypto_trader.execution.binance_testnet import (
 from crypto_trader.execution.binance_testnet import (
     TestnetEndpointError as EndpointError,
     TestnetOrderRuntime as OrderRuntime,
+    TestnetRejectedError as RejectedError,
 )
+from crypto_trader.execution.binance_testnet import PRODUCER as VENUE_PRODUCER
+from crypto_trader.execution.binance_testnet import deterministic_order_uuid
+from crypto_trader.events import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
+    OperatorCommandRecordPayload,
+    OperatorCommandRecordPayloadV2,
+    OperatorCommandRecorded,
+    OperatorCommandRecordedV2,
+    OperatorCommandRecordedV3,
+    OrderSubmissionAttemptPayload,
+    OrderSubmissionAttempted,
+    OrderVenueIdentityPayload,
+    OrderVenueIdentityRecorded,
+)
+from crypto_trader.breakglass.epoch import derive_ledger
+from crypto_trader.events.contracts import OperatorCommandRecordPayloadV3
 from crypto_trader.persistence import SQLiteEventJournal
+from crypto_trader.recovery import LocalOrderState, OrderStateName
+from crypto_trader.recovery import load_policy as load_recovery_policy
 from crypto_trader.safety import SafetyController
 from crypto_trader.tests import testnet_fixtures as txf
 
@@ -103,18 +134,44 @@ def test_cancel_open_cancels_through_the_adapter_and_confirms_once(journal):
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-1"),
-            txf.order_response("ct-1", status="CANCELED"),
+            txf.cancel_response("ct-1", order_id=100),
         ],
     )
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     deletes = [request for request in transport.requests if request.method == "DELETE"]
 
     assert outcome.confirmed
     assert outcome.cancelled_order_references == ("ct-1",)
     assert len(deletes) == 1
-    assert outcome.to_record()["preflight"] is None
+    assert outcome.to_record()["preflight"] is not None
     assert client.request_log()
+
+
+def test_a_cancel_answering_for_another_venue_order_is_ambiguous(journal):
+    # Review FZ-10: the strict listing is adopted as the lenient one was, so the cancel still
+    # cross-checks the venue order it listed; an answer for another venue order id is not a
+    # confirmed cancel of the listed one.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1"),
+            txf.cancel_response("ct-1", order_id=999),
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
+
+    assert outcome.disposition == "ambiguous"
+    assert outcome.cancelled_order_references == ()
+    assert outcome.unconfirmed_order_references == ("ct-1",)
 
 
 def test_an_ambiguous_cancel_is_never_retried(journal):
@@ -129,7 +186,9 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
         ],
     )
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     deletes = [request for request in transport.requests if request.method == "DELETE"]
 
     assert outcome.ambiguous
@@ -137,10 +196,47 @@ def test_an_ambiguous_cancel_is_never_retried(journal):
     assert len(deletes) == 1
 
 
+@pytest.mark.parametrize(
+    ("disposition", "second_cancel"),
+    [
+        ("ambiguous", TransportTimeout("lost")),
+        ("rejected", txf.rejected(-2011, "Unknown order sent.")),
+    ],
+)
+def test_a_cancel_all_failing_part_way_journals_only_confirmed_cancels(
+    journal, disposition, second_cancel
+):
+    # Review F-03/N-04: ct-1's cancel was confirmed, ct-2's failed. ct-1 stays on the record;
+    # ct-2 is tracked for venue evidence but never recorded as cancelled.
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            second_cancel,
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
+    deletes = [request for request in transport.requests if request.method == "DELETE"]
+
+    assert outcome.disposition == disposition
+    assert outcome.cancelled_order_references == ("ct-1",)
+    assert "ct-2" in control._order_references
+    assert len(deletes) == 2
+
+
 def test_an_unreachable_venue_is_reported_as_unavailable(journal):
     control, _, _, _ = venue(journal, [TransportError("down")])
 
-    outcome = control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
 
     assert outcome.disposition == "unavailable"
     assert outcome.reason_code == "venue_environment_unverified"
@@ -154,10 +250,12 @@ def test_the_request_log_never_exposes_the_api_key_or_signature(journal):
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-3"),
-            txf.order_response("ct-3", status="CANCELED"),
+            txf.cancel_response("ct-3", order_id=100),
         ],
     )
-    control.cancel_open_orders(correlation_id=uuid4(), occurred_at=BASE)
+    control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=SafetyController(correlation_id=uuid4())
+    )
     log = "\n".join(client.request_log())
 
     assert txf.FAKE_API_KEY not in log
@@ -200,7 +298,7 @@ def test_break_glass_cancel_records_lifecycle_events_for_the_journal(journal, tm
             txf.exchange_info_response(),
             txf.account_response(),
             txf.open_orders_response("ct-4"),
-            txf.order_response("ct-4", status="CANCELED"),
+            txf.cancel_response("ct-4", order_id=100),
         ],
     )
     breakglass = BreakGlassControl(
@@ -232,6 +330,1244 @@ def test_break_glass_cancel_records_lifecycle_events_for_the_journal(journal, tm
     assert breakglass.ownership_store.require_fence().owner_kind is OwnerKind.EMERGENCY
 
 
+def _operator_command(command_type):
+    return parse_operator_command(
+        {
+            "command_type": command_type,
+            "command_id": str(uuid4()),
+            "operator_label": "jamal",
+            "reason": "venue emergency",
+            "source": "operator-cli",
+        },
+        delivered_at=BASE,
+    )
+
+
+def _cancel_in_a_first_process(journal, state_dir, *later_responses):
+    """Process A: cancel ct-4 through the safety path; its venue memory dies with it."""
+    first, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-4"),
+            txf.cancel_response("ct-4", order_id=100),
+            *later_responses,
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=first,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert process.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+    return process
+
+
+def test_cancel_open_journals_the_cancelled_references_in_a_v2_record(journal, tmp_path):
+    process = _cancel_in_a_first_process(journal, tmp_path / "state")
+    records = [event for event in journal.read_range() if event.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+
+    assert [event.schema_version for event in records] == [2]
+    assert records[0].payload.model_dump().get("cancelled_order_references") == ["ct-4"]
+    ledger_record = process.load_ledger().records[0]
+    assert getattr(ledger_record, "cancelled_order_references", None) == ("ct-4",)
+
+
+def _reconcile_after_cancel(root, *, new_process):
+    root.mkdir(parents=True)
+    with SQLiteEventJournal(root / "journal.db") as journal:
+        canceled = txf.order_response("ct-4", status="CANCELED")
+        process = _cancel_in_a_first_process(journal, root / "state", canceled)
+        transport = None
+        if new_process:
+            second, client, _, transport = venue(journal, [canceled])
+            client.clock.synchronize(txf.SERVER_TIME_MS)
+            process = BreakGlassControl(
+                journal=journal,
+                state_dir=root / "state",
+                venue=second,
+                clock=lambda: BASE,
+                reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+            )
+        return process.handle(_operator_command("reconcile")), transport
+
+
+def test_reconcile_in_a_new_process_matches_the_cancelling_process(tmp_path):
+    same, _ = _reconcile_after_cancel(tmp_path / "same", new_process=False)
+    new, transport = _reconcile_after_cancel(tmp_path / "new", new_process=True)
+
+    # ct-4 has no durable submission attempt here, so the venue evidence escalates it as an
+    # unknown external order: both processes must stay pending (never "confirmed by evidence").
+    assert (new.reconciliation_status, new.reason_code, new.reconciliation_result) == (
+        "pending",
+        "UNKNOWN_PENDING_RECONCILIATION",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (same.reconciliation_status, same.reason_code, same.reconciliation_result) == (
+        "pending",
+        "UNKNOWN_PENDING_RECONCILIATION",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert [request.method for request in transport.requests] == ["GET"]
+
+
+class _SilentVenue:
+    """Tracks the journaled references but never returns venue evidence for them."""
+
+    def __init__(self):
+        self.tracked = []
+
+    def cancel_open_orders(self, *, correlation_id, occurred_at, safety):
+        raise AssertionError("reconcile must never cancel")
+
+    def venue_reports(self):
+        return ()
+
+    def track_order_references(self, references):
+        self.tracked.extend(references)
+
+
+def _reconcile_in_a_new_process_with(journal, state_dir, venue_control):
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    return process.handle(_operator_command("reconcile"))
+
+
+def test_reconcile_stays_pending_when_the_venue_cannot_query_journaled_cancels(journal, tmp_path):
+    state_dir = tmp_path / "state"
+    _cancel_in_a_first_process(journal, state_dir)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, PolicyOnlyVenueControl())
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
+
+
+def test_reconcile_stays_pending_when_the_venue_has_no_evidence_for_journaled_cancels(
+    journal, tmp_path
+):
+    state_dir = tmp_path / "state"
+    _cancel_in_a_first_process(journal, state_dir)
+    silent = _SilentVenue()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, silent)
+
+    assert silent.tracked == ["ct-4"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
+
+
+def test_a_part_way_cancel_failure_never_journals_the_failed_cancel(journal, tmp_path):
+    # Review F-03/N-04: the journal is a new process's only memory: the confirmed cancel (ct-1)
+    # must reach it, and the cancel that timed out (ct-2) must never be recorded as cancelled.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            TransportTimeout("lost"),
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+
+    outcome = process.handle(_operator_command("cancel_open"))
+
+    assert outcome.venue_control == "ambiguous"
+    assert process.load_ledger().records[0].cancelled_order_references == ("ct-1",)
+    assert process.load_ledger().records[0].unconfirmed_order_references == ("ct-2",)
+    records = [e for e in journal.read_range() if e.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+    assert [event.schema_version for event in records] == [3]
+
+
+def test_reconcile_in_a_new_process_still_asks_about_an_unconfirmed_cancel(journal, tmp_path):
+    # Review N-05: ct-1's cancel was confirmed and ct-2's was rejected. A new process knows both
+    # only from the journal; it must ask the venue about ct-2 too and stay pending without it.
+    state_dir = tmp_path / "state"
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            txf.rejected(-2011, "Unknown order sent."),
+        ],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+    silent = _SilentVenue()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, silent)
+
+    assert silent.tracked == ["ct-1", "ct-2"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_cancelled_orders",
+    )
+
+
+_NEVER_LEARNED_THE_OPEN_ORDERS = {
+    # Listing the open orders failed, so not a single order reference was ever known.
+    "listing timed out": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+        "rejected",
+    ),
+    "listing rejected": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.rejected(-1003, "Too many requests."),
+        ],
+        "rejected",
+    ),
+    # The venue could not even be verified, so the cancel was never attempted.
+    "venue unreachable": ([TransportError("down")], "unavailable"),
+    # Review FZ-10: a 200 whose body is empty or not JSON reaches the client as None, and a body
+    # that is not a list names no orders either; neither is a listing of zero open orders.
+    "listing body empty or not JSON": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), txf.response(200, None)],
+        "rejected",
+    ),
+    "listing body not a list": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.response(200, {"orders": []}),
+        ],
+        "rejected",
+    ),
+}
+
+
+def _cancel_that_never_learned_the_open_orders(journal, state_dir, case):
+    responses, disposition = _NEVER_LEARNED_THE_OPEN_ORDERS[case]
+    control, _, _, transport = venue(journal, responses)
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control == disposition
+    record = first.load_ledger().records[0]
+    assert (record.cancelled_order_references, record.unconfirmed_order_references) == ((), ())
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+
+
+@pytest.mark.parametrize("case", sorted(_NEVER_LEARNED_THE_OPEN_ORDERS))
+def test_reconcile_never_resolves_a_cancel_that_never_learned_the_open_orders(
+    journal, tmp_path, case
+):
+    # Review F-03 (remainder): with no order reference journaled there was nothing to verify, so a
+    # new process resolved the epoch "confirmed by evidence" while orders could still be open.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, case)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, _SilentVenue())
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_open_orders_listing",
+    )
+
+
+@pytest.mark.parametrize(
+    ("listing", "status", "result"),
+    [
+        ([txf.open_orders_response()], "resolved", "reconciliation_confirmed_by_evidence"),
+        (
+            [txf.open_orders_response("ct-9"), txf.order_response("ct-9")],
+            "pending",
+            "reconciliation_left_orders_unresolved",
+        ),
+        ([TransportTimeout("lost")], "pending", "reconciliation_missing_open_orders_listing"),
+        # Review F03-R1: a listed order the status read reports nothing for is not settled.
+        (
+            [txf.open_orders_response("ct-9"), txf.rejected(-2013, "Order does not exist.")],
+            "pending",
+            "reconciliation_missing_venue_evidence_for_listed_orders",
+        ),
+        # Review SOL-F5: a rejected status read is no proof of absence; the run's evidence fails.
+        (
+            [txf.open_orders_response("ct-9"), txf.rejected(-1003, "Too many requests.")],
+            "pending",
+            "reconciliation_venue_evidence_unavailable",
+        ),
+        # Review FZ-10: an empty, non-JSON or non-list 200 body is no listing at all.
+        ([txf.response(200, None)], "pending", "reconciliation_missing_open_orders_listing"),
+        ([txf.response(200, {"orders": []})], "pending", "reconciliation_missing_open_orders_listing"),
+    ],
+    ids=[
+        "nothing open",
+        "an order still open",
+        "listing fails again",
+        "listed order status -2013",
+        "listed order status -1003",
+        "listing body empty or not JSON",
+        "listing body not a list",
+    ],
+)
+def test_reconcile_lists_the_open_orders_a_failed_cancel_never_learned(
+    journal, tmp_path, listing, status, result
+):
+    # Review F-03 (remainder): only a complete listing taken now can settle what is open. An empty
+    # listing is evidence; every listed order is reconciled like any other; a failed one is not.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    second, client, _, transport = venue(journal, listing)
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, second)
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (status, result)
+    assert transport.requests and "openOrders" in transport.requests[0].url, transport.requests
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+
+
+class _ListsButNeverReports(_SilentVenue):
+    """Lists one open order but never returns venue evidence for it."""
+
+    def track_open_orders(self):
+        self.tracked.append("ct-9")
+        return ("ct-9",)
+
+
+def test_reconcile_never_resolves_a_listed_order_without_venue_evidence(journal, tmp_path):
+    # Review F03-R1: a successful listing only names the open orders; each listed order still
+    # needs its own venue report before the epoch may resolve, like every journaled reference.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    venue_control = _ListsButNeverReports()
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, venue_control)
+
+    assert venue_control.tracked == ["ct-9"]
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_missing_venue_evidence_for_listed_orders",
+    )
+
+
+# --- Review F-03 historical (reduced scope): durable observations, the intake and the ack ------
+
+
+class _Crash(BaseException):
+    """A hard stop (a killed process) that no reconcile code may turn into an outcome."""
+
+
+class _CrashesOnReports(_SilentVenue):
+    """The process dies while it reads the venue evidence, after the run has started."""
+
+    def venue_reports(self):
+        raise _Crash()
+
+
+class _FailsOnReports(_SilentVenue):
+    """The venue evidence read fails the way a transport failure does."""
+
+    def venue_reports(self):
+        raise TransportError("down")
+
+
+def _halted_process(journal, state_dir):
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    return process
+
+
+def test_a_listed_external_order_stays_outstanding_after_it_leaves_the_listing(journal, tmp_path):
+    # Review F-03 (Argon): the listing found ct-9, which the journal does not know; it then filled
+    # or was cancelled and left the listing, and a new process saw an empty listing and resolved the
+    # epoch, dropping the only evidence of ct-9. Its observation is journaled now and stays
+    # outstanding.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    seen, client, _, _ = venue(journal, [txf.open_orders_response("ct-9"), txf.order_response("ct-9")])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    first = _reconcile_in_a_new_process_with(journal, state_dir, seen)
+    gone, client, _, _ = venue(journal, [txf.open_orders_response()])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    second = _reconcile_in_a_new_process_with(journal, state_dir, gone)
+
+    assert first.reconciliation_status == "pending"
+    assert (second.reconciliation_status, second.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+
+
+def test_a_later_reconcile_run_requires_a_fresh_acknowledgement(journal, tmp_path):
+    # Review F-03 (ADV-02/FZ-13): an acknowledgement covers the evidence it saw; any later reconcile
+    # run starts from new evidence, so normal is restored only after a fresh acknowledgement.
+    process = _halted_process(journal, tmp_path / "state")
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+
+    stale = process.handle(_operator_command("restore_normal"))
+
+    assert (stale.accepted, stale.reason_code) == (False, "restore_denied_acknowledgement_missing")
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+
+
+def test_a_clock_stepped_back_never_replays_a_later_run_before_the_acknowledgement(
+    journal, tmp_path
+):
+    # Replay orders by occurred_at first. With the wall clock stepped back after the acknowledgement
+    # (an NTP correction), the later run was journaled before it, so the stale acknowledgement
+    # survived and normal was restored on evidence nobody acknowledged.
+    now = [BASE]
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        clock=lambda: now[0],
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    now[0] = BASE + timedelta(seconds=10)
+    assert process.handle(_operator_command("acknowledge")).accepted
+    now[0] = BASE + timedelta(seconds=5)
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+
+    stale = process.handle(_operator_command("restore_normal"))
+
+    assert (stale.accepted, stale.reason_code) == (False, "restore_denied_acknowledgement_missing")
+    assert stale.delivered_at == BASE + timedelta(seconds=10)
+
+
+def test_a_run_that_died_before_recording_what_it_saw_keeps_the_epoch_unsettled(journal, tmp_path):
+    # Review F-03 (FZ-06/ADV-01): the run journals its intake before the first venue read. A run that
+    # died before journaling its observation may have seen orders nobody recorded, so no later run,
+    # acknowledgement or restore may treat the epoch as settled.
+    state_dir = tmp_path / "state"
+    process = _halted_process(journal, state_dir)
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    crashing = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_CrashesOnReports(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    with pytest.raises(_Crash):
+        crashing.handle(_operator_command("reconcile"))
+
+    later = _reconcile_in_a_new_process_with(journal, state_dir, PolicyOnlyVenueControl())
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (later.reconciliation_status, later.reason_code) == ("pending", "observation_possibly_lost")
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_observation_possibly_lost",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_observation_possibly_lost",
+    )
+
+
+def test_status_names_every_reconcile_run_gate_that_blocks_restore(journal, tmp_path):
+    # Review F-03: after a run died before journaling what it saw, status listed only the missing
+    # acknowledgement, so an operator was sent to acknowledge and then refused for another reason.
+    state_dir = tmp_path / "state"
+    process = _halted_process(journal, state_dir)
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    crashing = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_CrashesOnReports(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    with pytest.raises(_Crash):
+        crashing.handle(_operator_command("reconcile"))
+
+    assert process.status().restore_blockers == (
+        "observation_possibly_lost",
+        "reconciliation_run_incomplete",
+        "operator_acknowledgement_missing",
+    )
+
+
+def test_a_failed_venue_read_inside_a_run_is_recorded_and_the_next_run_settles(journal, tmp_path):
+    # Review F-03: an ordinary venue failure inside a run is journaled with the run's observation
+    # (evidence unavailable, so pending), never left as a lost observation; the next run settles.
+    state_dir = tmp_path / "state"
+    _halted_process(journal, state_dir)
+
+    failed = _reconcile_in_a_new_process_with(journal, state_dir, _FailsOnReports())
+    later = _reconcile_in_a_new_process_with(journal, state_dir, PolicyOnlyVenueControl())
+
+    assert (failed.reconciliation_status, failed.reconciliation_result) == (
+        "pending",
+        "reconciliation_venue_evidence_unavailable",
+    )
+    assert later.reconciliation_status == "resolved"
+
+
+def test_a_run_that_died_after_recording_what_it_saw_is_superseded_by_the_next(
+    journal, tmp_path, monkeypatch
+):
+    # Review F-03: everything such a run saw is journaled, so the next complete run may settle the
+    # epoch; until it does, neither the acknowledgement nor restore treats the epoch as complete.
+    from crypto_trader.breakglass import control as control_module
+
+    process = _halted_process(journal, tmp_path / "state")
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+
+    def crash(self, **kwargs):
+        raise _Crash()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(control_module.RestartRecovery, "run", crash)
+        with pytest.raises(_Crash):
+            process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+    later = process.handle(_operator_command("reconcile"))
+
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_reconciliation_run_incomplete",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_reconciliation_run_incomplete",
+    )
+    assert later.reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+
+
+def test_a_run_journals_each_listed_order_the_journal_does_not_know(journal, tmp_path):
+    # Review F-03: the observation names every listed order the journal does not know, with the
+    # venue order id the strict listing reported; an order the journal knows is never external.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    listing, client, _, _ = venue(
+        journal,
+        [
+            txf.open_orders_response("ct-1", "ct-9"),
+            txf.order_response("ct-1", order_id=100),
+            txf.order_response("ct-9", order_id=101),
+        ],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    known = LocalOrderState(
+        order_id=uuid4(),
+        order_reference="ct-1",
+        intent_id=None,
+        correlation_id=None,
+        symbol=txf.SYMBOL,
+        state=OrderStateName.ACCEPTED,
+        remaining_quantity=Decimal("0.001"),
+        submission_attempted=True,
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=listing,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+        local_state_provider=lambda: (known,),
+    )
+
+    outcome = process.handle(_operator_command("reconcile"))
+    intake, observed = [
+        event
+        for event in journal.read_range()
+        if event.event_type in (RECONCILIATION_INTAKE_EVENT_TYPE, RECONCILIATION_OBSERVED_EVENT_TYPE)
+    ]
+
+    assert (intake.event_type, intake.payload.command_id) == (
+        RECONCILIATION_INTAKE_EVENT_TYPE,
+        outcome.command_id,
+    )
+    assert (observed.causation_id, observed.payload.listing) == (intake.event_id, "complete")
+    assert observed.payload.venue_evidence_complete is True
+    assert [
+        (order.client_order_id, order.venue_order_id) for order in observed.payload.external_orders
+    ] == [("ct-9", "101")]
+    assert outcome.reconciliation_status == "pending"
+
+
+def test_a_run_for_a_synthesised_epoch_keeps_the_ledger_derivable(journal, tmp_path):
+    # Review F-03: a fail-closed safety state with no journaled epoch synthesises one; its run is
+    # journaled too, settles nothing, and never breaks the ledger for the commands after it.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "safety_state.json").write_text("{not json", encoding="utf-8")
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    first = process.handle(_operator_command("reconcile"))
+    second = process.handle(_operator_command("reconcile"))
+
+    assert first.accepted and second.accepted
+    assert process.status().epoch_provenance == "provenance_missing"
+    assert process.load_ledger().epoch is None
+
+
+# --- Review F-03 settlement: an external order the venue proves never executed ---------------
+
+
+def _an_outstanding_external_order(journal, state_dir):
+    """The listing found ct-9 (venue order 100), which the journal does not know: outstanding."""
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    seen, client, _, _ = venue(
+        journal, [txf.open_orders_response("ct-9"), txf.order_response("ct-9", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    first = _reconcile_in_a_new_process_with(journal, state_dir, seen)
+    assert first.reconciliation_status == "pending"
+
+
+def _settled_events(journal):
+    return [e for e in journal.read_range() if e.event_type == RECONCILIATION_SETTLED_EVENT_TYPE]
+
+
+def test_an_external_order_the_venue_shows_cancelled_unexecuted_is_settled(journal, tmp_path):
+    # Review F-03 settlement: the strict status read shows the venue order first observed, a
+    # terminal status and no execution, so the order is journaled as settled and the epoch can
+    # resolve, be acknowledged and return to normal.
+    state_dir = tmp_path / "state"
+    _an_outstanding_external_order(journal, state_dir)
+    later, client, _, transport = venue(
+        journal,
+        [txf.open_orders_response(), txf.order_response("ct-9", status="CANCELED", order_id=100)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+    settled = _settled_events(journal)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "resolved",
+        "reconciliation_confirmed_by_evidence",
+    )
+    assert [
+        (order.client_order_id, order.venue_order_id, order.status, order.executed_quantity)
+        for order in settled[0].payload.settled_orders
+    ] == [("ct-9", "100", "CANCELED", Decimal("0"))]
+    assert not [request for request in transport.requests if request.method == "DELETE"]
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+
+
+def _without(response, field):
+    body = dict(response.body)
+    del body[field]
+    return txf.response(200, body)
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        txf.order_response("ct-9", status="NEW", order_id=100),
+        txf.order_response("ct-9", status="FILLED", order_id=100, executed_qty="0.00100000"),
+        txf.order_response("ct-9", status="CANCELED", order_id=100, executed_qty="0.00050000"),
+        txf.order_response("ct-9", status="EXPIRED_IN_MATCH", order_id=100),
+        txf.order_response("ct-9", status="CANCELED", order_id=101),
+        txf.rejected(-2013, "Order does not exist."),
+        TransportTimeout("lost"),
+        # A lenient read would assume no execution, or accept another order's answer.
+        _without(txf.order_response("ct-9", status="CANCELED", order_id=100), "executedQty"),
+        txf.order_response("ct-8", status="CANCELED", order_id=100),
+    ],
+    ids=[
+        "still open",
+        "filled",
+        "partly executed then cancelled",
+        "outside the approved terminal statuses",
+        "another venue order",
+        "unknown to the venue",
+        "status read timed out",
+        "no executed quantity reported",
+        "answer for another client order id",
+    ],
+)
+def test_an_external_order_stays_outstanding_without_proof_it_never_executed(
+    journal, tmp_path, evidence
+):
+    # Review F-03 settlement: anything short of the exact venue order, an approved terminal status
+    # and zero execution leaves the order outstanding; executed orders need trade history.
+    state_dir = tmp_path / "state"
+    _an_outstanding_external_order(journal, state_dir)
+    later, client, _, _ = venue(journal, [txf.open_orders_response(), evidence])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+    assert _settled_events(journal) == []
+
+
+class _ListsWithIdentities(_SilentVenue):
+    """Lists the given orders with their venue order ids and answers the given status evidence."""
+
+    def __init__(self, listed=(), evidence=()):
+        super().__init__()
+        self.listed = dict(listed)
+        self.evidence = dict(evidence)
+
+    def track_open_orders(self):
+        return tuple(self.listed)
+
+    def listed_venue_order_ids(self):
+        return dict(self.listed)
+
+    def order_settlement_evidence(self, reference):
+        return self.evidence.get(reference)
+
+
+def test_settling_a_reused_client_order_id_settles_only_that_venue_order(journal, tmp_path):
+    # Review F-03 settlement: the venue may reuse a client order id once an order ends. ct-9 was
+    # listed as venue order 100 and later as 205; settling 205 must leave 100 outstanding.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    for listed in ({"ct-9": "100"}, {"ct-9": "205"}):
+        _reconcile_in_a_new_process_with(journal, state_dir, _ListsWithIdentities(listed=listed))
+    settles = _ListsWithIdentities(evidence={"ct-9": ("205", "CANCELED", Decimal("0"))})
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, settles)
+    settled = _settled_events(journal)[0].payload.settled_orders
+    ledger = BreakGlassControl(journal=journal, state_dir=state_dir).load_ledger()
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_external_orders_outstanding",
+    )
+    assert [order.venue_order_id for order in settled] == ["205"]
+    assert ledger.observations.external_orders == (("ct-9", "100"),)
+
+
+def test_a_listing_naming_a_client_order_id_twice_keeps_the_epoch_unsettled(journal, tmp_path):
+    # Review SOL-F1: the strict listing named ct-9 as venue orders 100 and 101 and only 101 was
+    # journaled, so settling 101 resolved the epoch and restore_normal passed while 100 had no
+    # proof it ended unexecuted. Such a listing is contradictory: nothing records what it showed,
+    # and the epoch stays unsettled.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    seen, client, _, _ = venue(
+        journal,
+        [txf.open_orders_response("ct-9", "ct-9"), txf.order_response("ct-9", order_id=101)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    try:
+        _reconcile_in_a_new_process_with(journal, state_dir, seen)
+    except BreakGlassIncompleteError as exc:
+        refused = str(exc)
+    else:
+        refused = None
+    later, client, _, _ = venue(
+        journal,
+        [txf.open_orders_response(), txf.order_response("ct-9", status="CANCELED", order_id=101)],
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    outcome = _reconcile_in_a_new_process_with(journal, state_dir, later)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "observation_possibly_lost",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_observation_possibly_lost",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_observation_possibly_lost",
+    )
+    assert refused is not None and "ct-9" in refused
+    assert _settled_events(journal) == []
+
+
+@pytest.mark.parametrize(
+    "ended",
+    [OrderStateName.CANCELED, OrderStateName.FILLED, OrderStateName.REJECTED, OrderStateName.EXPIRED],
+)
+def test_a_listed_order_reusing_an_ended_local_id_stays_outstanding_until_settled(
+    journal, tmp_path, ended
+):
+    # Review SOL-F2: the listing named ct-8 as venue order 100, but the journal knew ct-8 only as an
+    # order of ours that had ended, so the observation dropped it as local. Once that external order
+    # left the listing, a later run resolved and restore_normal passed with no proof it ended
+    # unexecuted. Only a locally open order is ours to reconcile: this one is journaled as external
+    # and settles only on the exact venue order's evidence.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    ours = LocalOrderState(
+        order_id=uuid4(),
+        order_reference="ct-8",
+        intent_id=None,
+        correlation_id=None,
+        symbol=txf.SYMBOL,
+        state=ended,
+        submission_attempted=True,
+    )
+
+    def process(responses):
+        venue_control, client, _, _ = venue(journal, responses)
+        client.clock.synchronize(txf.SERVER_TIME_MS)
+        return BreakGlassControl(
+            journal=journal,
+            state_dir=state_dir,
+            venue=venue_control,
+            clock=lambda: BASE,
+            reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+            local_state_provider=lambda: (ours,),
+        )
+
+    seen = process(
+        [txf.open_orders_response("ct-8"), txf.order_response("ct-8", order_id=100)]
+    ).handle(_operator_command("reconcile"))
+    executed = txf.order_response(
+        "ct-8", status="FILLED", order_id=100, executed_qty="0.00100000"
+    )
+    gone = process([txf.open_orders_response(), executed])
+    later = gone.handle(_operator_command("reconcile"))
+    acknowledge = gone.handle(_operator_command("acknowledge"))
+    restore = gone.handle(_operator_command("restore_normal"))
+
+    # Review SOL-F3: our ended ct-8, whose venue order id was never journaled, cannot be proven
+    # once the venue shows ct-8 as another order, so it keeps the epoch pending as well.
+    assert (later.reconciliation_status, later.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert seen.reconciliation_status == "pending"
+    assert gone.load_ledger().observations.external_orders == (("ct-8", "100"),)
+
+    proven = process(
+        [txf.open_orders_response(), txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    )
+    settled = proven.handle(_operator_command("reconcile"))
+
+    # The external order settles on its exact evidence; our unproven order still blocks restore.
+    assert [
+        (order.client_order_id, order.venue_order_id)
+        for order in _settled_events(journal)[0].payload.settled_orders
+    ] == [("ct-8", "100")]
+    assert proven.load_ledger().observations.external_orders == ()
+    assert (settled.reconciliation_status, settled.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert not proven.handle(_operator_command("acknowledge")).accepted
+    assert not proven.handle(_operator_command("restore_normal")).accepted
+
+
+# --- Review G-4: our open order is ours only under our journaled venue order id ---------------
+
+
+def _our_open_order():
+    """Our open ct-8, which the journal knows as venue order 100."""
+    return LocalOrderState(
+        order_id=uuid4(),
+        order_reference="ct-8",
+        intent_id=None,
+        correlation_id=None,
+        symbol=txf.SYMBOL,
+        state=OrderStateName.ACCEPTED,
+        remaining_quantity=Decimal("0.001"),
+        submission_attempted=True,
+        venue_order_id="100",
+    )
+
+
+def _process_for(journal, state_dir, venue_control, ours):
+    return BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+        local_state_provider=lambda: (ours,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("listed_id", "status", "result", "external", "restored"),
+    [
+        (777, "pending", "reconciliation_left_orders_unresolved", (("ct-8", "777"),), False),
+        (100, "resolved", "reconciliation_confirmed_by_evidence", (), True),
+    ],
+    ids=["another venue order under our id", "our own venue order"],
+)
+def test_a_listing_under_our_open_id_is_ours_only_with_our_venue_id(
+    journal, tmp_path, listed_id, status, result, external, restored
+):
+    # Review G-4: matched by client order id alone, a listing of ct-8 as venue order 777 passed as
+    # our order 100, so 777 was never journaled and the run resolved. Our journaled venue id tells
+    # them apart: 777 is external, and our order stays unresolved while the venue reports only 777.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    listing = txf.open_orders_response("ct-8")
+    listing.body[0]["orderId"] = listed_id
+    venue_control, client, _, _ = venue(
+        journal, [listing, txf.order_response("ct-8", order_id=listed_id)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = _process_for(journal, state_dir, venue_control, _our_open_order())
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (status, result)
+    assert process.load_ledger().observations.external_orders == external
+    assert (acknowledge.accepted, restore.accepted) == (restored, restored)
+
+
+def test_a_confirmed_cancel_answered_for_another_venue_order_never_restores(journal, tmp_path):
+    # Review G-4: cancelling ct-8 by client order id cancelled venue order 777, not our order 100,
+    # and the venue then reported 777 cancelled. Matched by client order id alone, our order
+    # resolved as cancelled and restore_normal passed while it may still be open or filled.
+    state_dir = tmp_path / "state"
+    ours = _our_open_order()
+    listing = txf.open_orders_response("ct-8")
+    listing.body[0]["orderId"] = 777
+    first, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            listing,
+            txf.cancel_response("ct-8", order_id=777),
+        ],
+    )
+    cancelling = _process_for(journal, state_dir, first, ours)
+    cancelling.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+    later, client, _, _ = venue(
+        journal, [txf.order_response("ct-8", status="CANCELED", order_id=777)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = _process_for(journal, state_dir, later, ours)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+# --- Review ADV-04: a listing run journaled before reconcile runs recorded anything ------------
+
+
+def _as_code_before_run_events(patch):
+    """Behave as the code before review F-03: no intake, observation or settlement, no run gate."""
+    from crypto_trader.breakglass import control as control_module
+
+    patch.setattr(
+        control_module.BreakGlassControl, "_append_run_event", lambda self, *a, **k: uuid4()
+    )
+    patch.setattr(control_module.BreakGlassControl, "_reconcile_run_blocker", lambda self: None)
+
+
+def test_a_listing_run_by_older_code_keeps_the_epoch_unsettled(journal, tmp_path, monkeypatch):
+    # Review ADV-04: older code listed the open orders a failed cancel never learned, found ct-9,
+    # failed to read its status and journaled nothing about it. ct-9 then left the listing, and the
+    # new code resolved the epoch on an empty listing: the only evidence of ct-9 was gone.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    older, client, _, _ = venue(
+        journal, [txf.open_orders_response("ct-9"), txf.rejected(-1003, "Too many requests.")]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        legacy = _reconcile_in_a_new_process_with(journal, state_dir, older)
+    gone, client, _, _ = venue(journal, [txf.open_orders_response()])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    later = _reconcile_in_a_new_process_with(journal, state_dir, gone)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert legacy.reconciliation_result == "reconciliation_venue_evidence_unavailable"
+    assert (later.reconciliation_status, later.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_legacy_external_evidence_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_legacy_external_evidence_unverifiable",
+    )
+    assert process.status().restore_blockers[0] == "legacy_external_evidence_unverifiable"
+
+
+def test_a_run_by_older_code_before_the_open_orders_were_unknown_never_listed(
+    journal, tmp_path, monkeypatch
+):
+    # Review ADV-04: the older run came before any cancel left the open orders unknown, so it never
+    # listed them and hid nothing; the epoch settles as usual.
+    state_dir = tmp_path / "state"
+    control, _, _, _ = venue(
+        journal,
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("halt_new_risk")).accepted
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        assert first.handle(_operator_command("reconcile")).accepted
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+    listing, client, _, _ = venue(journal, [txf.open_orders_response()])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+
+    later = _reconcile_in_a_new_process_with(journal, state_dir, listing)
+
+    assert (later.reconciliation_status, later.reconciliation_result) == (
+        "resolved",
+        "reconciliation_confirmed_by_evidence",
+    )
+
+
+def test_a_listing_run_by_older_code_in_a_closed_epoch_never_blocks_a_later_one(
+    journal, tmp_path, monkeypatch
+):
+    # Review ADV-04: an epoch the older code already closed keeps its history; only the open
+    # epoch is judged, so a new epoch settles as usual.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_ListsWithIdentities(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    with monkeypatch.context() as patch:
+        _as_code_before_run_events(patch)
+        assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+        assert process.handle(_operator_command("acknowledge")).accepted
+        assert process.handle(_operator_command("restore_normal")).accepted
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+
+
+def _journal_a_v3_cancel(journal, tmp_path):
+    # ct-1's cancel is confirmed and ct-2's times out, so the command is journaled as V3.
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-1", "ct-2"),
+            txf.cancel_response("ct-1", order_id=100),
+            TransportTimeout("lost"),
+        ],
+    )
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    process.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert process.handle(_operator_command("cancel_open")).venue_control == "ambiguous"
+    return process
+
+
+def test_the_audit_record_of_a_v3_command_shows_both_reference_lists(journal, tmp_path):
+    # Review N-06: the audit record rebuilt from the journal shows the cancel the venue never
+    # confirmed (ct-2) apart from the confirmed one (ct-1).
+    process = _journal_a_v3_cancel(journal, tmp_path)
+
+    record = process.load_ledger().records[0].to_record()
+
+    assert record["cancelled_order_references"] == ["ct-1"]
+    assert record["unconfirmed_order_references"] == ["ct-2"]
+
+
+def test_the_v3_contract_refuses_a_reference_both_cancelled_and_unconfirmed(journal, tmp_path):
+    # Review N-07: the writer keeps the two lists apart; the contract must refuse an overlap too,
+    # for any V3 payload it validates on read or replay.
+    _journal_a_v3_cancel(journal, tmp_path)
+    (event,) = [e for e in journal.read_range() if e.event_type == OPERATOR_COMMAND_EVENT_TYPE]
+    data = event.payload.model_dump()
+    valid = OperatorCommandRecordPayloadV3.model_validate(data)
+    assert (valid.cancelled_order_references, valid.unconfirmed_order_references) == (
+        ["ct-1"],
+        ["ct-2"],
+    )
+    overlap = {**data, "cancelled_order_references": ["ct-1", "ct-2"]}
+
+    with pytest.raises(ValidationError, match="both cancelled and unconfirmed"):
+        OperatorCommandRecordPayloadV3.model_validate(overlap)
+
+
+def test_a_legacy_v1_command_record_replays_with_no_cancelled_references(journal, tmp_path):
+    legacy = _operator_command("cancel_open")
+    journal.append(
+        OperatorCommandRecorded(
+            event_id=uuid4(),
+            occurred_at=BASE,
+            correlation_id=legacy.command_id,
+            causation_id=legacy.causation_id,
+            producer="application.breakglass",
+            sequence_number=100,
+            payload=OperatorCommandRecordPayload(
+                command_id=legacy.command_id,
+                command_type="cancel_open",
+                requested_at=legacy.requested_at,
+                operator_label=legacy.operator_label,
+                operator_identity=legacy.operator_identity,
+                reason=legacy.reason,
+                source=legacy.source,
+                previous_safety_state="normal",
+                resulting_safety_state="reduce_only",
+                disposition="accepted",
+                reason_code="break_glass_engaged_cancel_open",
+                command_digest=legacy.digest,
+                mode_path=("normal", "reduce_only"),
+                venue_control="confirmed",
+                reconciliation_status="pending",
+                epoch_opened=True,
+                epoch_closed=False,
+                fence_term=2,
+            ),
+        )
+    )
+    control = BreakGlassControl(journal=journal, state_dir=tmp_path / "state", clock=lambda: BASE)
+
+    assert type(list(journal.read_range())[0]) is OperatorCommandRecorded
+    record = control.load_ledger().records[0]
+    assert getattr(record, "cancelled_order_references", None) == ()
+
+
 def test_venue_reports_expose_only_reference_backed_evidence(journal):
     control, client, _, _ = venue(
         journal,
@@ -245,3 +1581,1020 @@ def test_venue_reports_expose_only_reference_backed_evidence(journal):
     assert reports[0].order_reference == "ct-5"
     assert reports[0].state.value == "canceled"
     assert reports[0].remaining_quantity == Decimal("0.00100000")
+
+
+def test_cancel_preflight_is_current_and_attached_to_outcome(journal):
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-red-1"),
+            txf.cancel_response("ct-red-1", order_id=100),
+        ],
+    )
+    safety = SafetyController(correlation_id=uuid4())
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+
+    assert outcome.confirmed
+    assert outcome.preflight is not None
+    assert outcome.preflight.safety_mode == safety.mode.value
+    assert len([r for r in transport.requests if r.method == "DELETE"]) == 1
+
+
+def test_cancel_preflight_refuses_non_trading_account_before_delete(journal):
+    control, _, _, transport = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(can_trade=False),
+        ],
+    )
+
+    outcome = control.cancel_open_orders(
+        correlation_id=uuid4(),
+        occurred_at=BASE,
+        safety=SafetyController(correlation_id=uuid4()),
+    )
+
+    assert outcome.disposition == "unavailable"
+    assert outcome.reason_code == "venue_environment_unverified"
+    assert [request for request in transport.requests if request.method == "DELETE"] == []
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+
+def test_testnet_acceptance_rejects_undocumented_binance_vision_hosts():
+    for undocumented in (
+        "https://binance.vision",
+        "https://other.binance.vision",
+        "https://child.testnet.binance.vision",
+    ):
+        with pytest.raises(EndpointError):
+            require_testnet_base_url(undocumented)
+
+
+def test_preflight_forces_symbol_rule_refresh_even_when_cache_is_warm(journal):
+    control, client, _, transport = venue(
+        journal,
+        [
+            txf.exchange_info_response(),
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+        ],
+    )
+    client.symbol_rules()
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 1
+
+    preflight = control.preflight(safety=SafetyController(correlation_id=uuid4()))
+
+    assert preflight.passed
+    assert txf.request_paths(transport).count("/api/v3/exchangeInfo") == 2
+
+
+def test_failed_second_cancel_never_reuses_stale_preflight_evidence(journal):
+    control, _, _, _ = venue(
+        journal,
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response(),
+            TransportError("second preflight unavailable"),
+        ],
+    )
+    safety = SafetyController(correlation_id=uuid4())
+
+    first = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+    second = control.cancel_open_orders(
+        correlation_id=uuid4(), occurred_at=BASE, safety=safety
+    )
+
+    assert first.preflight is not None
+    assert second.disposition == "unavailable"
+    assert second.preflight is None
+
+
+# --- Review G-4 item 13: a crash before our venue identity was journaled --------------------
+
+
+def _our_attempt_only(journal):
+    """The venue accepted our ct-8, and we crashed before journaling its identity or state."""
+    journal.append(
+        OrderSubmissionAttempted(
+            occurred_at=BASE,
+            correlation_id=uuid4(),
+            producer="application.production",
+            order_id=deterministic_order_uuid("ct-8"),
+            symbol=txf.SYMBOL,
+            payload=OrderSubmissionAttemptPayload(
+                venue_reference="ct-8",
+                intent_id=uuid4(),
+                side="buy",
+                order_type="limit",
+                quantity=Decimal("0.001"),
+                limit_price=Decimal("27000"),
+                time_in_force="gtc",
+                venue_producer=VENUE_PRODUCER,
+            ),
+        )
+    )
+
+
+def _journal_process(journal, state_dir, responses):
+    venue_control, client, _, _ = venue(journal, responses)
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    return BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_an_order_whose_venue_identity_was_never_journaled_never_restores(journal, tmp_path, path):
+    # Review G-4: without our journaled venue order id, a venue report for ct-8 may be another
+    # order that reuses it, so break-glass never resolves our order from it (P-L and P-C).
+    state_dir = tmp_path / "state"
+    _our_attempt_only(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        reports = [txf.open_orders_response("ct-8"), txf.order_response("ct-8", order_id=100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                txf.open_orders_response("ct-8"),
+                txf.cancel_response("ct-8", order_id=100),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        reports = [txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    process = _journal_process(journal, state_dir, reports)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reconciliation_result) == (
+        "pending",
+        "reconciliation_left_orders_unresolved",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+# --- Review SOL-F4: a report without a venue order id never proves our order -----------------
+
+
+def _listing_of_ct8(venue_order_id):
+    response = txf.open_orders_response("ct-8")
+    response.body[0]["orderId"] = venue_order_id
+    return response
+
+
+def _our_attempt_and_identity(journal):
+    """Our ct-8 as the venue's answer to our write named it: venue order 100."""
+    _our_attempt_only(journal)
+    attempt = next(
+        event for event in journal.read_range() if event.event_type == "order.submission.attempted"
+    )
+    journal.append(
+        OrderVenueIdentityRecorded(
+            occurred_at=BASE,
+            correlation_id=attempt.correlation_id,
+            producer=VENUE_PRODUCER,
+            order_id=attempt.order_id,
+            symbol=attempt.symbol,
+            payload=OrderVenueIdentityPayload(
+                venue_reference="ct-8", intent_id=attempt.payload.intent_id, venue_order_id="100"
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("status", ["NEW", "CANCELED"])
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_a_report_without_a_venue_order_id_never_restores_our_known_order(
+    journal, tmp_path, path, status
+):
+    # Review SOL-F4 (GPT-6.1 Sol High on 5375d9d): our ct-8 is journaled as venue order 100, but a
+    # status answer for ct-8 carried no orderId, so it may be another order reusing ct-8. Its
+    # missing id passed the identity comparison and the epoch returned to normal.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        before = [_listing_of_ct8(100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                _listing_of_ct8(777),
+                txf.cancel_response("ct-8", order_id=777),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        before = []
+    answer = txf.order_response("ct-8", status=status, order_id=777)
+    del answer.body["orderId"]
+    process = _journal_process(journal, state_dir, [*before, answer])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+# --- Review SOL-F3: our order's local state alone never vouches for it ----------------------
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["identity known", "identity unknown"])
+@pytest.mark.parametrize("read", ["refresh", "cancel"])
+def test_a_state_journaled_from_another_order_never_restores_by_silence(
+    journal, tmp_path, read, known
+):
+    # Review SOL-F3 (GPT-6.1 Sol High on 5375d9d): a refresh or cancel of ct-8 by client order id
+    # answered for venue order 777, and the runtime journaled 777's CANCELED as our state. A later
+    # epoch with nothing to read trusted that ended state, and the epoch returned to normal.
+    if known:
+        _our_attempt_and_identity(journal)
+    else:
+        _our_attempt_only(journal)
+    answer = (
+        txf.order_response("ct-8", status="CANCELED", order_id=777)
+        if read == "refresh"
+        else txf.cancel_response("ct-8", order_id=777)
+    )
+    _, client, runtime, _ = venue(journal, [answer])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    getattr(runtime, read)("ct-8")
+    strict_read = txf.order_response("ct-8", status="CANCELED", order_id=777)
+    process = _journal_process(journal, tmp_path / "state", [strict_read] if known else [])
+
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+@pytest.mark.parametrize("symbol", [txf.SYMBOL, "ETHUSDT"], ids=["our order", "another symbol"])
+def test_our_ended_order_is_proven_by_a_strict_read_of_our_venue_order(journal, tmp_path, symbol):
+    # Review SOL-F3: with nothing else to read, break-glass reads our ended order strictly, and
+    # only the venue showing our own venue order 100 ended lets the epoch resolve. The strict
+    # reader refuses an answer for another symbol.
+    _our_attempt_and_identity(journal)
+    _, client, runtime, _ = venue(
+        journal, [txf.order_response("ct-8", status="CANCELED", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    runtime.refresh("ct-8")
+    answer = txf.order_response("ct-8", status="CANCELED", order_id=100)
+    answer.body["symbol"] = symbol
+    venue_control, client, _, transport = venue(journal, [answer])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=tmp_path / "state",
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    proven = symbol == txf.SYMBOL
+    assert outcome.reconciliation_status == ("resolved" if proven else "pending")
+    assert [request.method for request in transport.requests] == ["GET"]
+    assert (acknowledge.accepted, restore.accepted) == (proven, proven)
+
+
+def test_an_order_the_venue_already_reported_is_not_read_again(journal, tmp_path):
+    # Review SOL-F3: the strict read is only for our orders the run has no report for.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    venue_control, client, _, transport = venue(
+        journal, [_listing_of_ct8(100), txf.order_response("ct-8", order_id=100)]
+    )
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=venue_control,
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+
+    outcome = process.handle(_operator_command("reconcile"))
+
+    assert outcome.reconciliation_status == "resolved"
+    assert [request.method for request in transport.requests] == ["GET", "GET"]
+
+
+# --- Review SOL-F5: our tracked orders are read only through the strict reader ---------------
+
+
+@pytest.mark.parametrize(
+    "case", ["wrong symbol", "missing executedQty", "missing origQty", "inconsistent quote"]
+)
+@pytest.mark.parametrize("path", ["listing", "confirmed cancel"])
+def test_a_tracked_order_report_must_prove_its_symbol_and_quantities(
+    journal, tmp_path, path, case
+):
+    # Review SOL-F5 (GPT-6.1 Sol High on 71aec66): venue_reports() read our tracked ct-8 through
+    # the lenient reader, so an answer for another symbol, or with missing or contradictory
+    # quantities, became a report, the strict read of item 15 never ran, and the epoch returned
+    # to normal.
+    state_dir = tmp_path / "state"
+    _our_attempt_and_identity(journal)
+    if path == "listing":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        before = [_listing_of_ct8(100)]
+    else:
+        cancelling = _journal_process(
+            journal,
+            state_dir,
+            [
+                txf.time_response(),
+                txf.exchange_info_response(),
+                txf.account_response(),
+                _listing_of_ct8(100),
+                txf.cancel_response("ct-8", order_id=100),
+            ],
+        )
+        cancelling.ownership_store.takeover(
+            owner_id="normal:runtime",
+            owner_kind=OwnerKind.NORMAL,
+            acquired_at=BASE,
+            reason_code="runtime_started",
+        )
+        assert cancelling.handle(_operator_command("cancel_open")).venue_control == "confirmed"
+        before = []
+    answer = txf.order_response("ct-8", status="CANCELED", order_id=100)
+    if case == "wrong symbol":
+        answer.body["symbol"] = "ETHUSDT"
+    elif case == "inconsistent quote":
+        answer.body["cummulativeQuoteQty"] = "1"
+    else:
+        del answer.body[case.removeprefix("missing ")]
+    process = _journal_process(journal, state_dir, [*before, answer])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert process.status().new_risk_permitted is False
+
+
+@pytest.mark.parametrize("code", [-2013, -1100], ids=["order absent", "another rejection"])
+def test_only_a_confirmed_absence_drops_a_tracked_order_from_the_venue_reports(journal, code):
+    # Review SOL-F5: only the venue confirming that the order does not exist (-2013) leaves it
+    # without a report; any other rejection fails the read, so the run's venue evidence is
+    # incomplete instead of silently missing an order.
+    control, client, _, _ = venue(journal, [txf.rejected(code, "refused")])
+    client.clock.synchronize(txf.SERVER_TIME_MS)
+    control.track_order_references(["ct-5"])
+
+    if code == -2013:
+        assert control.venue_reports() == ()
+    else:
+        with pytest.raises(RejectedError):
+            control.venue_reports()
+
+
+# --- Review P5-F1: an older run is judged by when it was written, not by its journaled time ------
+
+
+def _journal_an_older_code_listing_run(journal, occurred_at, sequence_number):
+    """The record the code before review F-03 journaled for an accepted reconcile run: no intake,
+    the raw wall clock as its time, and the open epoch's session as its correlation."""
+    ledger = derive_ledger(journal)
+    last = ledger.records[-1]
+    command = _operator_command("reconcile")
+    journal.append(
+        OperatorCommandRecordedV2(
+            event_id=uuid4(),
+            occurred_at=occurred_at,
+            correlation_id=ledger.open_epoch.session_id,
+            causation_id=command.causation_id,
+            producer="application.breakglass",
+            sequence_number=sequence_number,
+            payload=OperatorCommandRecordPayloadV2(
+                command_id=command.command_id,
+                command_type="reconcile",
+                requested_at=BASE,
+                operator_label=command.operator_label,
+                operator_identity=command.operator_identity,
+                reason=command.reason,
+                source=command.source,
+                previous_safety_state=last.resulting_safety_state,
+                resulting_safety_state=last.resulting_safety_state,
+                disposition="accepted",
+                reason_code="UNKNOWN_PENDING_RECONCILIATION",
+                command_digest=command.digest,
+                mode_path=[last.resulting_safety_state],
+                venue_control="not_requested",
+                reconciliation_status="pending",
+                epoch_opened=False,
+                epoch_closed=False,
+                fence_term=last.fence_term,
+                cancelled_order_references=[],
+            ),
+        )
+    )
+
+
+def _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir):
+    """An epoch opened by a halt at BASE; ten seconds later a cancel never learned the open orders."""
+    now = [BASE]
+    control, _, _, _ = venue(
+        journal,
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+    )
+    first = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=control,
+        clock=lambda: now[0],
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("halt_new_risk")).accepted
+    now[0] = BASE + timedelta(seconds=10)
+    assert first.handle(_operator_command("cancel_open")).venue_control == "rejected"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "replays before the cancel that opened the epoch",
+        "replays between the epoch opening and the cancel",
+        "replays between the epoch opening and the cancel, no sequence number",
+        "replays after the cancel, numbered before it",
+    ],
+)
+def test_an_older_run_journaled_with_an_earlier_time_still_keeps_the_epoch_unsettled(
+    journal, tmp_path, case
+):
+    # Review P5-F1 (DeepSeek "Saeed" on 6ad0558, confirmed by GPT-6.1 Sol High adjudication): the
+    # code before review F-03 took the raw wall clock, so its reconcile record, written after a
+    # cancel that never learned the open orders, can carry an earlier time. ADV-04 judged the older
+    # run by replay order, missed it, and the epoch returned to normal on an empty listing.
+    state_dir = tmp_path / "state"
+    if case == "replays before the cancel that opened the epoch":
+        _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+        _journal_an_older_code_listing_run(journal, BASE - timedelta(seconds=5), 201)
+    elif case == "replays after the cancel, numbered before it":
+        # Replay order and sequence disagree, so neither proves the run came first.
+        _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir)
+        _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=15), 101)
+    else:
+        _halt_then_a_cancel_that_never_learned_the_open_orders(journal, state_dir)
+        sequence = None if case.endswith("no sequence number") else 301
+        _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=5), sequence)
+    process = _journal_process(journal, state_dir, [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_legacy_external_evidence_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_legacy_external_evidence_unverifiable",
+    )
+
+
+# --- Review F-1: a record of the open epoch counts wherever its journaled time replays it --------
+
+
+def _journal_an_older_code_record(
+    journal,
+    command_type,
+    *,
+    occurred_at,
+    sequence_number,
+    correlation_id,
+    epoch_opened=False,
+    venue_control="not_requested",
+    cancelled=(),
+    unconfirmed=(),
+):
+    """A record as the code before the logical clock wrote it: raw wall clock, its own sequence."""
+    records = derive_ledger(journal).records
+    previous = records[-1].resulting_safety_state if records else "normal"
+    resulting = "halt_new_risk" if command_type == "halt_new_risk" else previous
+    command = _operator_command(command_type)
+    fields = dict(
+        command_id=command.command_id,
+        command_type=command_type,
+        requested_at=BASE,
+        operator_label=command.operator_label,
+        operator_identity=command.operator_identity,
+        reason=command.reason,
+        source=command.source,
+        previous_safety_state=previous,
+        resulting_safety_state=resulting,
+        disposition="accepted",
+        reason_code="UNKNOWN_PENDING_RECONCILIATION",
+        command_digest=command.digest,
+        mode_path=[previous, resulting],
+        venue_control=venue_control,
+        reconciliation_status="pending",
+        epoch_opened=epoch_opened,
+        epoch_closed=False,
+        fence_term=2,
+        cancelled_order_references=list(cancelled),
+    )
+    envelope = dict(
+        event_id=uuid4(),
+        occurred_at=occurred_at,
+        correlation_id=correlation_id,
+        causation_id=command.causation_id,
+        producer="application.breakglass",
+        sequence_number=sequence_number,
+    )
+    if unconfirmed:
+        event = OperatorCommandRecordedV3(
+            **envelope,
+            payload=OperatorCommandRecordPayloadV3(
+                **fields, unconfirmed_order_references=list(unconfirmed)
+            ),
+        )
+    else:
+        event = OperatorCommandRecordedV2(**envelope, payload=OperatorCommandRecordPayloadV2(**fields))
+    journal.append(event)
+
+
+def _an_older_epoch_opened_by_a_halt(journal, session):
+    _journal_an_older_code_record(
+        journal,
+        "halt_new_risk",
+        occurred_at=BASE,
+        sequence_number=200,
+        correlation_id=session,
+        epoch_opened=True,
+    )
+
+
+_REPLAYS_BEFORE_THE_OPENING = {
+    # Only the epoch's session places it (its sequence is lower than the opening's).
+    "session correlation": lambda session: (session, 100),
+    # An operator-supplied correlation id; only its later sequence places it.
+    "operator correlation, later sequence": lambda session: (uuid4(), 300),
+    # An operator-supplied correlation id and no sequence: it cannot be placed, so it counts.
+    "operator correlation, no sequence": lambda session: (uuid4(), None),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_REPLAYS_BEFORE_THE_OPENING))
+def test_a_failed_cancel_replaying_before_the_epoch_opening_still_needs_a_listing(
+    journal, tmp_path, case
+):
+    # Review F-1 (DeepSeek "Saeed" re-verifying item 17): a failed cancel written after the halt
+    # that opened the epoch, but with a stepped-back raw clock, replayed before that opening record.
+    # The open-orders gate only looked after the opening, so no listing was taken and the epoch
+    # returned to normal while the venue still listed an open order (ct-9).
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    correlation, sequence = _REPLAYS_BEFORE_THE_OPENING[case](session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=sequence,
+        correlation_id=correlation,
+        venue_control="rejected",
+    )
+    assert derive_ledger(journal).open_epoch_open_orders_unknown()
+    process = _journal_process(journal, tmp_path / "state", [txf.open_orders_response("ct-9")])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "pending"
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+    assert process.load_ledger().observations.external_orders == (("ct-9", "100"),)
+
+
+@pytest.mark.parametrize("kind", ["cancelled", "unconfirmed"])
+def test_a_cancel_replaying_before_the_epoch_opening_keeps_its_order_references(journal, kind):
+    # Review F-1: the order references of such a cancel are still read for Phase 8.
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=300,
+        correlation_id=uuid4(),
+        venue_control="confirmed" if kind == "cancelled" else "ambiguous",
+        cancelled=("ct-8",) if kind == "cancelled" else (),
+        unconfirmed=("ct-8",) if kind == "unconfirmed" else (),
+    )
+    ledger = derive_ledger(journal)
+
+    references = (
+        ledger.open_epoch_order_references()
+        if kind == "cancelled"
+        else ledger.open_epoch_unconfirmed_references()
+    )
+    assert references == ("ct-8",)
+
+
+def test_an_older_run_after_an_operator_correlated_failed_cancel_keeps_the_epoch_unsettled(
+    journal, tmp_path
+):
+    # Review F-1 (owner's option B): the legacy-run check of item 17 places the epoch's records by
+    # the same rule, so an operator-correlated failed cancel replaying before the opening still
+    # marks a later intake-less run as a listing run.
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=300,
+        correlation_id=uuid4(),
+        venue_control="rejected",
+    )
+    _journal_an_older_code_listing_run(journal, BASE + timedelta(seconds=5), 401)
+    process = _journal_process(journal, tmp_path / "state", [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "legacy_external_evidence_unverifiable",
+    )
+    assert (acknowledge.accepted, restore.accepted) == (False, False)
+
+
+def test_a_closed_earlier_epoch_never_marks_a_new_one(journal, tmp_path, monkeypatch):
+    # Review F-1: records of an earlier epoch (other session, lower sequence) stay out of the open
+    # one, so its failed cancel neither forces a listing nor adds references.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_ListsWithIdentities(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+    assert process.handle(_operator_command("restore_normal")).accepted
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    ledger = derive_ledger(journal)
+    assert ledger.open_epoch is not None
+    assert not ledger.open_epoch_open_orders_unknown()
+    assert not ledger.open_epoch_legacy_listing_run()
+    assert ledger.open_epoch_order_references() == ()
+    assert ledger.open_epoch_unconfirmed_references() == ()
+
+
+# --- Review N-1: a cancel after the latest reconciliation voids it for restore -----------------
+
+
+def _reconciled_and_acknowledged(journal, state_dir):
+    """halt -> reconcile resolved -> acknowledge, with a venue that has nothing to report."""
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_SilentVenue(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+    assert process.handle(_operator_command("reconcile")).reconciliation_status == "resolved"
+    assert process.handle(_operator_command("acknowledge")).accepted
+
+
+_LATER_CANCELS = {
+    # The venue could not list the open orders: the cancel learned no reference.
+    "failed": (
+        [txf.time_response(), txf.exchange_info_response(), txf.account_response(), TransportTimeout("lost")],
+        "rejected",
+    ),
+    # The venue confirmed a cancel of ct-8, which no reconciliation has read.
+    "confirmed": (
+        [
+            txf.time_response(),
+            txf.exchange_info_response(),
+            txf.account_response(),
+            txf.open_orders_response("ct-8"),
+            txf.cancel_response("ct-8", order_id=100),
+        ],
+        "confirmed",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_LATER_CANCELS))
+def test_a_cancel_after_the_acknowledged_reconciliation_refuses_restore(journal, tmp_path, kind):
+    # Review N-1 (DeepSeek "Saeed" while re-verifying item 18): after halt, a resolved reconcile and
+    # an acknowledgement, a cancel reached the venue; restore_normal was still accepted on the
+    # earlier reconciliation, so normal returned while the open orders were unknown (or a cancelled
+    # order was never read), and the epoch closed with no way to reconcile again.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses, disposition = _LATER_CANCELS[kind]
+    cancelling = _journal_process(journal, state_dir, responses)
+    assert cancelling.handle(_operator_command("cancel_open")).venue_control == disposition
+
+    acknowledge = cancelling.handle(_operator_command("acknowledge"))
+    restore = cancelling.handle(_operator_command("restore_normal"))
+
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_reconciliation_superseded_by_venue_action",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_reconciliation_superseded_by_venue_action",
+    )
+    assert "reconciliation_superseded_by_venue_action" in cancelling.status().restore_blockers
+    assert cancelling.status().epoch_open
+
+
+def test_a_new_reconciliation_after_the_cancel_lets_normal_return(journal, tmp_path):
+    # Review N-1: the way back is a new reconciliation (it lists the open orders the failed cancel
+    # never learned) and a fresh acknowledgement.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses, _ = _LATER_CANCELS["failed"]
+    assert _journal_process(journal, state_dir, responses).handle(
+        _operator_command("cancel_open")
+    ).venue_control == "rejected"
+    process = _journal_process(journal, state_dir, [txf.open_orders_response()])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert outcome.reconciliation_status == "resolved"
+    assert (acknowledge.accepted, restore.accepted) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("venue_control", "superseded"),
+    [("rejected", True), ("not_requested", False)],
+    ids=["cancel reached the venue", "cancel never reached the venue"],
+)
+def test_an_older_cancel_numbered_after_the_reconciliation_still_supersedes_it(
+    journal, tmp_path, venue_control, superseded
+):
+    # Review N-1: a cancel journaled by code before the logical clock can replay before the
+    # reconciliation it followed; only replay order and sequence together prove it came first.
+    # A cancel refused before any venue call never supersedes a reconciliation.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE - timedelta(seconds=5),
+        sequence_number=401,
+        correlation_id=derive_ledger(journal).open_epoch.session_id,
+        venue_control=venue_control,
+    )
+    process = _journal_process(journal, state_dir, [])
+
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert restore.accepted is not superseded
+    blockers = BreakGlassControl(
+        journal=journal, state_dir=state_dir, clock=lambda: BASE
+    ).status().restore_blockers
+    assert ("reconciliation_superseded_by_venue_action" in blockers) is superseded
+
+
+# --- Review H-1: a cancel that failed part-way cannot prove which listed orders it never reached --
+
+
+def _listing_of(*pairs):
+    response = txf.open_orders_response(*[reference for reference, _ in pairs])
+    for body, (_, order_id) in zip(response.body, pairs):
+        body["orderId"] = order_id
+    return response
+
+
+def _a_cancel_failing_part_way(journal, state_dir, listed, confirmed_before):
+    """Our ct-8 (venue order 100) is journaled; the strict listing names ``listed`` in order, the
+    cancels in ``confirmed_before`` succeed and the next one fails, so the rest is never reached."""
+    _our_attempt_and_identity(journal)
+    responses = [txf.time_response(), txf.exchange_info_response(), txf.account_response(), _listing_of(*listed)]
+    responses += [
+        txf.cancel_response(reference, order_id=order_id)
+        for reference, order_id in listed
+        if reference in confirmed_before
+    ]
+    responses.append(txf.rejected(-2011, "Unknown order sent."))
+    first = _journal_process(journal, state_dir, responses)
+    first.ownership_store.takeover(
+        owner_id="normal:runtime",
+        owner_kind=OwnerKind.NORMAL,
+        acquired_at=BASE,
+        reason_code="runtime_started",
+    )
+    assert first.handle(_operator_command("cancel_open")).venue_control in ("rejected", "ambiguous")
+
+
+_PART_WAY = {
+    "first cancel fails": ([("ct-8", 100), ("ct-2", 101)], ()),
+    "middle cancel fails": ([("ct-1", 99), ("ct-8", 100), ("ct-2", 101)], ("ct-1",)),
+}
+
+
+@pytest.mark.parametrize("tail", ["still open", "gone"])
+@pytest.mark.parametrize("case", sorted(_PART_WAY))
+def test_a_cancel_failing_part_way_keeps_the_epoch_unsettled(journal, tmp_path, case, tail):
+    # Review H-1 (DeepSeek "Saeed" hypothesis, promoted with a replay by the GPT-6.1 Sol High
+    # adjudication): the cancel failed on ct-8, so ct-2 after it in the listing was neither cancelled
+    # nor journaled. A later reconcile read only the journaled references, resolved, and restore
+    # succeeded while ct-2 could still be open, or could have filled and left the listing.
+    state_dir = tmp_path / "state"
+    listed, confirmed_before = _PART_WAY[case]
+    _a_cancel_failing_part_way(journal, state_dir, listed, confirmed_before)
+    answers = [
+        txf.order_response(reference, status="CANCELED", order_id=order_id)
+        for reference, order_id in listed
+        if reference in confirmed_before or reference == "ct-8"
+    ]
+    if derive_ledger(journal).open_epoch_open_orders_unknown():
+        answers.insert(0, _listing_of(("ct-2", 101)) if tail == "still open" else txf.open_orders_response())
+    process = _journal_process(journal, state_dir, answers)
+
+    outcome = process.handle(_operator_command("reconcile"))
+    acknowledge = process.handle(_operator_command("acknowledge"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == (
+        "pending",
+        "cancel_listing_unverifiable",
+    )
+    assert (acknowledge.accepted, acknowledge.reason_code) == (
+        False,
+        "acknowledgement_denied_cancel_listing_unverifiable",
+    )
+    assert (restore.accepted, restore.reason_code) == (
+        False,
+        "restore_denied_cancel_listing_unverifiable",
+    )
+    assert "cancel_listing_unverifiable" in process.status().restore_blockers
+
+
+def test_a_cancel_failing_part_way_after_the_acknowledgement_still_refuses_restore(journal, tmp_path):
+    # Review H-1 with review N-1 (item 19): reconciled and acknowledged first, then the part-way
+    # cancel; a new reconcile cannot settle what the cancel never reached.
+    state_dir = tmp_path / "state"
+    _reconciled_and_acknowledged(journal, state_dir)
+    responses = [
+        txf.time_response(),
+        txf.exchange_info_response(),
+        txf.account_response(),
+        _listing_of(("ct-5", 100), ("ct-2", 101)),
+        txf.rejected(-2011, "Unknown order sent."),
+    ]
+    assert _journal_process(journal, state_dir, responses).handle(
+        _operator_command("cancel_open")
+    ).venue_control in ("rejected", "ambiguous")
+    process = _journal_process(journal, state_dir, [txf.order_response("ct-5", status="CANCELED", order_id=100)])
+
+    outcome = process.handle(_operator_command("reconcile"))
+    restore = process.handle(_operator_command("restore_normal"))
+
+    assert (outcome.reconciliation_status, outcome.reason_code) == ("pending", "cancel_listing_unverifiable")
+    assert (restore.accepted, restore.reason_code) == (False, "restore_denied_cancel_listing_unverifiable")
+
+
+def test_a_cancel_that_never_reached_a_listed_order_is_not_quarantined(journal, tmp_path):
+    # Review H-1: only a failed cancel that recorded references is quarantined. A cancel whose
+    # listing failed recorded none; it leaves the open orders unknown (review F-03) instead.
+    state_dir = tmp_path / "state"
+    _cancel_that_never_learned_the_open_orders(journal, state_dir, "listing timed out")
+    process = _journal_process(journal, state_dir, [])
+
+    assert derive_ledger(journal).open_epoch_open_orders_unknown()
+    assert "cancel_listing_unverifiable" not in process.status().restore_blockers
+
+
+def _journal_an_older_code_restore(journal, session, sequence_number):
+    """A restore_normal record closing the epoch, as code before review H-1 could write it."""
+    command = _operator_command("restore_normal")
+    journal.append(
+        OperatorCommandRecordedV2(
+            event_id=uuid4(),
+            occurred_at=BASE,
+            correlation_id=session,
+            causation_id=command.causation_id,
+            producer="application.breakglass",
+            sequence_number=sequence_number,
+            payload=OperatorCommandRecordPayloadV2(
+                command_id=command.command_id,
+                command_type="restore_normal",
+                requested_at=BASE,
+                operator_label=command.operator_label,
+                operator_identity=command.operator_identity,
+                reason=command.reason,
+                source=command.source,
+                previous_safety_state="halt_new_risk",
+                resulting_safety_state="normal",
+                disposition="accepted",
+                reason_code="normal_restored_by_operator",
+                command_digest=command.digest,
+                mode_path=["halt_new_risk", "normal"],
+                venue_control="not_requested",
+                reconciliation_status="resolved",
+                epoch_opened=False,
+                epoch_closed=True,
+                fence_term=2,
+                cancelled_order_references=[],
+            ),
+        )
+    )
+
+
+def test_a_part_way_cancel_of_a_closed_earlier_epoch_never_quarantines_a_new_one(journal, tmp_path):
+    # Review H-1: the gate judges the open epoch's records only. Code before the gate could close an
+    # epoch after such a cancel; a later epoch is judged on its own records.
+    state_dir = tmp_path / "state"
+    session = uuid4()
+    _an_older_epoch_opened_by_a_halt(journal, session)
+    _journal_an_older_code_record(
+        journal,
+        "cancel_open",
+        occurred_at=BASE,
+        sequence_number=300,
+        correlation_id=session,
+        venue_control="ambiguous",
+        unconfirmed=("ct-8",),
+    )
+    _journal_an_older_code_restore(journal, session, 400)
+    assert derive_ledger(journal).open_epoch is None
+    process = BreakGlassControl(
+        journal=journal,
+        state_dir=state_dir,
+        venue=_SilentVenue(),
+        clock=lambda: BASE,
+        reconciliation_policy=load_recovery_policy({"policy_id": "test"}),
+    )
+    assert process.handle(_operator_command("halt_new_risk")).accepted
+
+    assert derive_ledger(journal).open_epoch is not None
+    assert "cancel_listing_unverifiable" not in process.status().restore_blockers

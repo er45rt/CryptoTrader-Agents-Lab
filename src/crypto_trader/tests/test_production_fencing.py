@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -14,10 +17,16 @@ from crypto_trader.breakglass import (
     PolicyOnlyVenueControl,
     StaleWriterFenceError,
 )
+from crypto_trader.execution import ExecutionSide
 from crypto_trader.persistence import SQLiteEventJournal
-from crypto_trader.production import ProductionStartupError, ProductionStateError
+from crypto_trader.production import (
+    ProductionSafetyBlockedError,
+    ProductionStartupError,
+    ProductionStateError,
+)
 from crypto_trader.safety import SafetyMode
 from crypto_trader.tests.production_fixtures import (
+    BASE,
     INSTRUMENT,
     RecordingExecutionPort,
     build_runtime,
@@ -26,6 +35,7 @@ from crypto_trader.tests.production_fixtures import (
     limits,
     operator_command,
     persist_safety_state,
+    risk_state,
 )
 
 
@@ -84,7 +94,55 @@ def test_a_second_normal_writer_cannot_be_authoritative_at_the_same_time(journal
     with pytest.raises(StaleWriterFenceError):
         runtime.submit_prepared(preparation)
     assert port.submit_count == 0
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
     assert control.ownership_store.require_fence().owner_id == "normal:second-runtime"
+
+
+def test_submit_prepared_rejects_forged_object_but_keeps_real_issued_preparation(
+    journal, state_dir
+):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("forged-preparation"))
+    forged = replace(preparation)
+
+    with pytest.raises(ProductionStateError, match="exact unused preparation"):
+        runtime.submit_prepared(forged)
+
+    assert port.submit_count == 0
+    assert len(runtime._pending) == 1
+    result = runtime.submit_prepared(preparation)
+    assert result.intent_id == preparation.intent_id
+    assert port.submit_count == 1
+    assert len(runtime._pending) == 0
+
+
+def test_submit_prepared_is_one_time_only(journal, state_dir):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("one-time-preparation"))
+
+    runtime.submit_prepared(preparation)
+
+    with pytest.raises(ProductionStateError, match="exact unused preparation"):
+        runtime.submit_prepared(preparation)
+    assert port.submit_count == 1
+    assert len(runtime._pending) == 0
+
+
+def test_expired_preparation_is_refused_and_releases_reservation(journal, state_dir):
+    _control, port, runtime = _started_runtime(journal, state_dir)
+    runtime.start()
+    preparation = runtime.prepare_intent(intent("expired-preparation"))
+    runtime._clock = lambda: BASE + timedelta(seconds=61)
+
+    with pytest.raises(ProductionStateError, match="expired before submission"):
+        runtime.submit_prepared(preparation)
+
+    assert port.submit_count == 0
+    assert len(runtime._pending) == 0
+    assert runtime._issued_preparations == {}
 
 
 def test_an_absent_writer_lease_refuses_writes_and_new_risk(journal, state_dir):
@@ -145,7 +203,114 @@ def test_a_non_normal_halt_posture_also_refuses_startup(journal, state_dir):
     assert port.submit_count == 0
 
 
+@pytest.mark.parametrize("kill_switch_engaged", [False, True])
+def test_final_fence_distinguishes_normal_mode_kill_switch_state(
+    journal, state_dir, kill_switch_engaged
+):
+    control, port, runtime = _started_runtime(journal, state_dir)
+    report = runtime.start()
+    preparation = runtime.prepare_intent(intent(f"normal-kill-switch-{kill_switch_engaged}"))
+
+    assert preparation.approved is True
+    assert port.submit_count == 0
+
+    persist_safety_state(
+        state_dir,
+        mode="normal",
+        kill_switch_engaged=kill_switch_engaged,
+        sequence=2,
+    )
+    load = control.load_safety_state()
+    assert load.source == "state_file"
+    assert load.forced_fail_closed is False
+    assert load.controller.mode is SafetyMode.NORMAL
+    assert load.controller.kill_switch_engaged is kill_switch_engaged
+    ownership = control.ownership_store.require_fence()
+    assert ownership.owner_kind is OwnerKind.NORMAL
+    assert ownership.owner_id == report.owner_id
+    assert ownership.term == report.fence_term
+
+    if kill_switch_engaged:
+        with pytest.raises(ProductionSafetyBlockedError, match=r"^kill_switch_engaged:"):
+            runtime.submit_prepared(preparation)
+        assert port.submit_count == 0
+    else:
+        result = runtime.submit_prepared(preparation)
+        assert result.fence.kill_switch_engaged is False
+        assert result.fence.safety_mode == "normal"
+        assert port.submit_count == 1
+
+
+def test_normal_preparation_is_rejected_after_same_term_transition_to_reduce_only(
+    journal, state_dir
+):
+    control, port, runtime = _started_runtime(journal, state_dir)
+    report = runtime.start()
+    preparation = runtime.prepare_intent(intent("normal-to-reduce-only"))
+    assert preparation.approved is True
+    assert preparation.safety_mode == "normal"
+
+    outcome = control.handle(
+        operator_command("reduce_only", seed="normal-to-reduce-only-transition")
+    )
+    ownership = control.ownership_store.require_fence()
+
+    assert outcome.accepted
+    assert outcome.resulting_safety_state == "reduce_only"
+    assert ownership.owner_kind is OwnerKind.NORMAL
+    assert ownership.term == report.fence_term
+
+    with pytest.raises(ProductionSafetyBlockedError):
+        runtime.submit_prepared(preparation)
+
+    assert port.submit_count == 0
+
+
 # --- 6/7/8: takeover invalidates a running writer --------------------------------
+
+def test_reduce_only_preparation_is_rejected_after_same_term_restore_to_normal(
+    journal, state_dir
+):
+    def provider(now):
+        return replace(
+            risk_state(now=now),
+            position_quantity={INSTRUMENT.symbol: Decimal("1")},
+        )
+
+    control, port, runtime = _started_runtime(
+        journal,
+        state_dir,
+        risk_state_source=provider,
+    )
+    report = runtime.start()
+    assert control.handle(
+        operator_command("reduce_only", seed="reduce-only-before-prepare")
+    ).accepted
+
+    preparation = runtime.prepare_intent(
+        intent(
+            "reduce-only-then-normal",
+            side=ExecutionSide.SELL,
+            quantity=Decimal("0.01000"),
+        )
+    )
+    assert preparation.approved is True
+    assert preparation.safety_mode == "reduce_only"
+
+    restored = control.handle(
+        operator_command("restore_normal", seed="restore-after-reduce-only-prepare")
+    )
+    ownership = control.ownership_store.require_fence()
+
+    assert restored.accepted
+    assert ownership.owner_kind is OwnerKind.NORMAL
+    assert ownership.term == report.fence_term
+
+    with pytest.raises(ProductionSafetyBlockedError):
+        runtime.submit_prepared(preparation)
+
+    assert port.submit_count == 0
+
 
 def test_break_glass_takeover_invalidates_an_already_running_normal_writer(journal, state_dir):
     control, port, runtime = _started_runtime(journal, state_dir)

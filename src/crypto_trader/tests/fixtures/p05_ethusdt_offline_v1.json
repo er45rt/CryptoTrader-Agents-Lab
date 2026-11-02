@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "fixture_id": "P05-ETHUSDT-L2-MBP-OFFLINE-v1",
+  "symbol": "ETHUSDT",
+  "starting_equity_quote": "100000",
+  "engine_version": "1.231.0",
+  "book_type": "L2_MBP",
+  "observations": [
+    {
+      "market_reference": "public.kline.1m#0",
+      "observed_at": "2026-01-01T12:00:00+00:00",
+      "mark": "2700.00",
+      "volume": "10",
+      "decision": "buy",
+      "quantity": "1.00000000"
+    },
+    {
+      "market_reference": "public.kline.1m#1",
+      "observed_at": "2026-01-01T12:00:01+00:00",
+      "mark": "2701.00",
+      "volume": "10",
+      "decision": "hold"
+    }
+  ],
+  "l2_book": {
+    "bid_price": "2700.00",
+    "bid_size": "100.00000000",
+    "ask_price": "2701.00",
+    "ask_size": "100.00000000"
+  },
+  "trades": [
+    {"offset_ms": 10, "trade_id": "P05-TRIGGER", "price": "2700.00", "size": "100.00000000", "aggressor": "SELLER"},
+    {"offset_ms": 20, "trade_id": "P05-CLEAR", "price": "2700.00", "size": "100.00000000", "aggressor": "SELLER"},
+    {"offset_ms": 30, "trade_id": "P05-FILL", "price": "2700.00", "size": "1.00000000", "aggressor": "SELLER"}
+  ]
+}

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .errors import RuntimeStateError, UnsupportedExecutionRequestError
 from .ports import (
+    ExecutionCapability,
     ExecutionObservation,
     ExecutionRequest,
     ExecutionRuntimeState,
@@ -24,6 +25,9 @@ __all__ = ["InMemoryExecutionPort"]
 
 class InMemoryExecutionPort:
     """Records requests and emits scripted lifecycle observations."""
+
+    #: Explicit Stage-3 capability: this double never writes to an external venue.
+    capability = ExecutionCapability.NON_WRITING
 
     def __init__(self, instrument: InstrumentSpec, *, fill_fully: bool = True) -> None:
         self._instrument = instrument

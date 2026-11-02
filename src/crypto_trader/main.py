@@ -1,12 +1,17 @@
 # src/crypto_trader/main.py
+import sys
 import os
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from dotenv import load_dotenv
 from crypto_trader.crew import CryptoTraderCrew
+from crypto_trader.input_security import require_https_base_url, valid_market_symbol
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from crypto_trader.crew_decision_gateway import CrewAdvisoryReceipt, CrewDecisionGateway
 
 # Configure logging
 logging.basicConfig(
@@ -48,13 +53,12 @@ def setup_environment() -> bool:
     # The market-data layer uses the official Binance public REST API and needs
     # no API key. We only sanity-check an operator-supplied base URL override.
     binance_base_url = (os.getenv("BINANCE_API_BASE_URL") or "").strip()
-    if binance_base_url and not binance_base_url.startswith(("https://", "http://")):
-        logger.error(
-            "BINANCE_API_BASE_URL must start with http:// or https:// (got %r). "
-            "Unset it to use the default official endpoint.",
-            binance_base_url,
-        )
-        return False
+    if binance_base_url:
+        try:
+            require_https_base_url(binance_base_url)
+        except ValueError:
+            logger.error("BINANCE_API_BASE_URL must be a valid HTTPS endpoint (no credentials).")
+            return False
 
     if not os.getenv("SERPER_API_KEY"):
         logger.warning("SERPER_API_KEY not found. The NewsAndSentimentResearcherAgent might not function correctly.")
@@ -71,9 +75,9 @@ def validate_inputs(config: Dict[str, Any]) -> bool:
     Returns:
         bool: True if inputs are valid, False otherwise
     """
-    # Validate symbol format (basic check)
-    if not isinstance(config['target_symbol'], str) or len(config['target_symbol']) < 5:
-        logger.error(f"Invalid cryptocurrency symbol: {config['target_symbol']}")
+    # Exact uppercase ASCII symbol; reject control chars, path characters and Unicode lookalikes.
+    if not valid_market_symbol(config.get('target_symbol')):
+        logger.error("Invalid cryptocurrency symbol: must match ^[A-Z0-9]{5,20}$")
         return False
     
     # Validate kline interval format
@@ -105,7 +109,7 @@ def prepare_output_directory(config: Dict[str, Any]) -> Path:
     logger.info(f"Output directory for trading plan: {output_dir}")
     return output_dir
 
-def save_trading_plan(content: Any, output_dir: Path, filename: str) -> Path:
+def save_trading_plan(content: Any, output_dir: Path, filename: str, *, exclusive: bool = False) -> Path:
     """
     Save the trading plan to a file.
     
@@ -118,12 +122,21 @@ def save_trading_plan(content: Any, output_dir: Path, filename: str) -> Path:
         Path: Path to the saved file
     """
     file_path = output_dir / filename
-    with open(file_path, 'w', encoding='utf-8') as f:
-        # Handle CrewOutput object by converting to string
-        if hasattr(content, '__str__'):
-            f.write(str(content))
-        else:
-            f.write(content)
+    if exclusive:
+        # Binary write preserves the exact SHA256-referenced UTF-8 bytes on
+        # Windows as well (text mode would silently translate LF to CRLF).
+        if not isinstance(content, str):
+            raise TypeError("Durable Crew delivery artifact must be plain text.")
+        with open(file_path, 'xb') as f:
+            f.write(content.encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+    else:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            if hasattr(content, '__str__'):
+                f.write(str(content))
+            else:
+                f.write(content)
     return file_path
 
 def create_inputs(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -149,7 +162,11 @@ def create_inputs(config: Dict[str, Any]) -> Dict[str, Any]:
         'filename_datetime': filename_datetime_str
     }
 
-def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
+def run_crew(
+    inputs: Dict[str, Any], output_dir: Path,
+    *, advisory_gateway: "CrewDecisionGateway | None" = None,
+    return_origin_receipt: bool = False,
+) -> Any:
     """
     Initialize and run the CryptoTraderCrew with the given inputs.
     
@@ -158,8 +175,23 @@ def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
         output_dir: Directory to save output files
         
     Returns:
-        Optional[str]: Result of the crew execution or None if an error occurred
+        Legacy Crew output by default; an inert typed receipt only on explicit
+        trusted host request, or None on an execution error.
     """
+    if type(return_origin_receipt) is not bool:
+        from crypto_trader.production.errors import ProductionStateError
+        raise ProductionStateError("return_origin_receipt must be an explicit boolean.")
+    if return_origin_receipt:
+        from crypto_trader.production.errors import ProductionStateError
+        from crypto_trader.crew_decision_gateway import CrewDecisionGateway
+        if type(advisory_gateway) is not CrewDecisionGateway:
+            raise ProductionStateError(
+                "origin receipt requires an explicit trusted CrewDecisionGateway."
+            )
+    # The optional gateway is research-only and cannot submit an order. A host
+    # delivery identity is durably reserved BEFORE the actual CrewAI kickoff.
+    attempt = (None if advisory_gateway is None else
+               advisory_gateway.delivery_ledger.begin(output_dir, symbol=inputs['target_symbol']))
     crypto_crew_instance = CryptoTraderCrew().crew()
     
     logger.info(f"🚀 Kicking off the CryptoTraderCrew for target symbol: {inputs['target_symbol']}...")
@@ -167,10 +199,26 @@ def run_crew(inputs: Dict[str, Any], output_dir: Path) -> Optional[str]:
         result = crypto_crew_instance.kickoff(inputs=inputs)
         
         logger.info("\n\n✅ Crew execution finished!")
-        output_filename = f"trading_plan_{inputs['target_symbol']}_{inputs['filename_datetime']}.md"
-        file_path = save_trading_plan(result, output_dir, output_filename)
+        if attempt is None:
+            output_filename = f"trading_plan_{inputs['target_symbol']}_{inputs['filename_datetime']}.md"
+            file_path = save_trading_plan(result, output_dir, output_filename)
+        else:
+            output_filename = f"trading_plan_{attempt.symbol}_{attempt.delivery_id}.md"
+            raw_plan = str(result)
+            file_path = save_trading_plan(raw_plan, output_dir, output_filename, exclusive=True)
+            advisory_gateway.delivery_ledger.complete(attempt, raw_plan, file_path)
+            # Advisory origin events only; NEVER prepare, admit, submit, or trade.
+            issued_intent = advisory_gateway.issue(
+                raw_plan, source_delivery_id=attempt.delivery_id,
+            )
         logger.info(f"📝 Trading Plan saved to: {file_path}")
-        
+
+        if return_origin_receipt:
+            from crypto_trader.crew_decision_gateway import CrewAdvisoryReceipt
+            return CrewAdvisoryReceipt(
+                raw_plan=raw_plan, intent=issued_intent,
+                source_delivery_id=attempt.delivery_id,
+            )
         return result
     except Exception as e:
         logger.error(f"An error occurred during crew execution: {e}", exc_info=True)
@@ -196,10 +244,18 @@ def parse_arguments():
     
     return parser.parse_args()
 
-def run():
-    """
-    Main function to run the CryptoTraderCrew.
-    """
+def run(
+    *, advisory_gateway: "CrewDecisionGateway | None" = None,
+    return_origin_receipt: bool = False,
+):
+    """Run the CLI; only a trusted host can explicitly request an inert origin receipt."""
+    if type(return_origin_receipt) is not bool or (
+        return_origin_receipt and advisory_gateway is None
+    ):
+        from crypto_trader.production.errors import ProductionStateError
+        raise ProductionStateError(
+            "origin receipt requires an explicit trusted advisory gateway and boolean flag."
+        )
     # Parse command line arguments
     args = parse_arguments()
     
@@ -218,11 +274,11 @@ def run():
     
     # Setup environment
     if not setup_environment():
-        return
+        sys.exit(1)
     
     # Validate inputs
     if not validate_inputs(config):
-        return
+        sys.exit(1)
     
     # Prepare output directory
     output_dir = prepare_output_directory(config)
@@ -230,15 +286,27 @@ def run():
     # Create inputs for the crew
     inputs = create_inputs(config)
     
-    # Run the crew
-    result = run_crew(inputs, output_dir)
+    # Preserve the legacy call contract; return a typed receipt only on explicit host opt-in.
+    if return_origin_receipt:
+        result = run_crew(
+            inputs, output_dir, advisory_gateway=advisory_gateway,
+            return_origin_receipt=True,
+        )
+    elif advisory_gateway is None:
+        result = run_crew(inputs, output_dir)
+    else:
+        # Only the trusted host may supply a provenance gateway; never submit here.
+        result = run_crew(inputs, output_dir, advisory_gateway=advisory_gateway)
     
     # Display summary of results
-    if result:
-        logger.info("Trading plan generation completed successfully.")
-        # Optional: Add a summary of the trading plan here if needed
-    else:
+    if result is None:
         logger.error("Failed to generate trading plan.")
+        sys.exit(1)
+
+    logger.info("Trading plan generation completed successfully.")
+    if return_origin_receipt:
+        return result  # Inert, typed origin receipt; never an admission or submission.
+    # Optional: Add a summary of the trading plan here if needed
 
 if __name__ == "__main__":
     run()

@@ -233,3 +233,196 @@ def test_translation_refuses_to_guess_a_missing_timestamp():
 
     with pytest.raises(TranslationError):
         outbound.to_phase3_order_state_event(observation)
+
+
+def test_explicit_nautilus_fill_identity_is_stable_and_distinguishes_partials():
+    """Native-trade-backed IDs pass unchanged into the Phase 3 fill contract."""
+    from uuid import UUID
+    from decimal import Decimal
+    from crypto_trader.execution.ports import ExecutionObservation, OrderLifecycleState
+    from crypto_trader.execution.nautilus import outbound
+
+    observation = ExecutionObservation(
+        order_reference="SIM-SAME-ORDER",
+        intent_id=UUID(int=99),
+        correlation_id=UUID(int=100),
+        symbol="ETHUSDT",
+        state=OrderLifecycleState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.25"),
+        remaining_quantity=Decimal("0.75"),
+        last_fill_quantity=Decimal("0.25"),
+        last_fill_price=Decimal("2700"),
+        ts_ns=1_767_225_600_020_000_000,
+    )
+    first = outbound.to_phase3_fill_event(observation, event_id=UUID(int=700))
+    replay = outbound.to_phase3_fill_event(observation, event_id=UUID(int=700))
+    distinct_trade = outbound.to_phase3_fill_event(observation, event_id=UUID(int=701))
+    assert first.event_id == replay.event_id
+    assert first.event_id != distinct_trade.event_id
+    assert first.order_id == distinct_trade.order_id
+
+
+# --- Terminal-event audit provenance: explicit native reasons, never invented ---
+
+@pytest.mark.parametrize(
+    ("state", "native_reason"),
+    [
+        (OrderLifecycleState.REJECTED, "INSUFFICIENT_BALANCE"),
+        (OrderLifecycleState.CANCELED, "source_event=OrderCanceled; venue_reason=not supplied"),
+        (OrderLifecycleState.EXPIRED, "source_event=OrderExpired; venue_reason=not supplied"),
+    ],
+)
+def test_terminal_phase3_translation_preserves_explicit_auditable_reason(
+    state, native_reason
+):
+    """Terminal Phase3 events require a source-backed reason without contract changes."""
+    observation = ExecutionObservation(
+        order_reference="SIM-TERMINAL", intent_id=UUID(int=811),
+        correlation_id=UUID(int=812), symbol="ETHUSDT", state=state,
+        filled_quantity=Decimal("0"), remaining_quantity=Decimal("1"),
+        ts_ns=TS_NS,
+    )
+    event = outbound.to_phase3_order_state_event(
+        observation, reason=native_reason, event_id=UUID(int=813)
+    )
+    assert event.payload.state == state.value
+    assert event.payload.reason == native_reason
+    assert event.event_id == UUID(int=813)
+
+
+def test_terminal_translator_rejects_missing_reason_and_blank_rejection():
+    for state in (OrderLifecycleState.REJECTED, OrderLifecycleState.CANCELED, OrderLifecycleState.EXPIRED):
+        observation = ExecutionObservation(
+            order_reference="SIM-TERMINAL", intent_id=UUID(int=821),
+            correlation_id=UUID(int=822), symbol="ETHUSDT", state=state,
+            filled_quantity=Decimal("0"), remaining_quantity=Decimal("1"),
+            ts_ns=TS_NS,
+        )
+        with pytest.raises(TranslationError, match="reason"):
+            outbound.to_phase3_order_state_event(observation)
+        with pytest.raises(TranslationError, match="reason"):
+            outbound.to_phase3_order_state_event(observation, reason="   ")
+
+
+def test_terminal_runtime_captures_native_reject_reason_and_source_limited_fallback():
+    """Native event reason reaches Phase3 without extending the shared observation port."""
+    from types import SimpleNamespace
+    from crypto_trader.execution.nautilus.runtime import NautilusExecutionRuntime
+
+    cases = (
+        (OrderLifecycleState.REJECTED, "order_rejected", "RISK_LIMIT", "RISK_LIMIT"),
+        (OrderLifecycleState.CANCELED, "order_canceled", None,
+         "source_event=OrderCanceled; venue_reason=not supplied"),
+        (OrderLifecycleState.EXPIRED, "order_expired", None,
+         "source_event=OrderExpired; venue_reason=not supplied"),
+    )
+    for state, label, reason, expected in cases:
+        runtime = NautilusExecutionRuntime(INSTRUMENT)
+        request = make_request(
+            intent_id=UUID(int=841),
+            correlation_id=UUID(int=842),
+            quantity=Decimal("1.00000000"),
+        )
+        reference = "SIM-TEST-TERMINAL"
+        runtime._pending[reference] = request
+        order = SimpleNamespace(
+            client_order_id=reference,
+            status=SimpleNamespace(name=state.name),
+            filled_qty=Decimal("0"),
+            leaves_qty=Decimal("1"),
+            ts_last=TS_NS,
+        )
+        strategy = SimpleNamespace(
+            cache=SimpleNamespace(order=lambda _: order),
+        )
+        event = SimpleNamespace(
+            client_order_id=reference,
+            ts_event=TS_NS,
+            reason=reason,
+        )
+        runtime._record_order_event(strategy, label, event)
+        assert len(runtime.phase3_events()) == 1
+        assert runtime.phase3_events()[0].payload.reason == expected
+        assert runtime.observations()[0].state is state
+
+
+def test_rejected_native_event_without_actual_reason_fails_closed():
+    from types import SimpleNamespace
+    from crypto_trader.execution.nautilus.runtime import NautilusExecutionRuntime
+
+    runtime = NautilusExecutionRuntime(INSTRUMENT)
+    request = make_request(
+        intent_id=UUID(int=861), correlation_id=UUID(int=862),
+        quantity=Decimal("1.00000000"),
+    )
+    reference = "SIM-REJECTION-WITHOUT-REASON"
+    runtime._pending[reference] = request
+    order = SimpleNamespace(
+        client_order_id=reference, status=SimpleNamespace(name="REJECTED"),
+        filled_qty=Decimal("0"), leaves_qty=Decimal("1"), ts_last=TS_NS,
+    )
+    strategy = SimpleNamespace(cache=SimpleNamespace(order=lambda _: order))
+    event = SimpleNamespace(client_order_id=reference, ts_event=TS_NS, reason=" ")
+    with pytest.raises(TranslationError, match="reason"):
+        runtime._record_order_event(strategy, "order_rejected", event)
+    assert runtime.observations() == ()
+    assert runtime.phase3_events() == ()
+
+
+def test_real_offline_ioc_cancel_preserves_reason_and_reservation(tmp_path):
+    """Native Nautilus IOC cancellation passes temporal validation and journal audit."""
+    from crypto_trader.execution import ExecutionTimeInForce
+    from crypto_trader.tests.test_paper_nautilus import runner, TS_BASE_NS, MS
+    from crypto_trader.tests import paper_fixtures as fx
+    from crypto_trader.paper import ScriptedSimulationRunner
+    from crypto_trader.risk import PendingIntent, Side
+    from crypto_trader.persistence import SQLiteEventJournal
+
+    request = make_request(
+        intent_id=UUID(int=11881),
+        correlation_id=fx.SESSION_ID,
+        quantity=Decimal("1.00000000"),
+        limit_price=Decimal("2699.00"),  # never marketable against this frozen tape
+        time_in_force=ExecutionTimeInForce.IOC,
+    )
+    outcome = runner().simulate([request])
+    native_states = [obs.state.value for obs in outcome.observations]
+    assert native_states == ["submitted", "accepted", "canceled"]
+    marker = "source_event=OrderCanceled; venue_reason=not supplied"
+    terminal_events = [
+        evt for evt in outcome.phase3_events
+        if evt.event_type == "order.state.changed" and evt.payload.state == "canceled"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].payload.reason == marker
+
+    with SQLiteEventJournal(tmp_path / "ioc-terminal-audit.sqlite") as journal:
+        paper = fx.session(
+            journal, decisions=fx.scripted(fx.hold_decision()),
+            data_feed=fx.feed("2700"), simulator=ScriptedSimulationRunner(),
+        )
+        paper._reservations[request.intent_id] = (
+            Side.BUY, Decimal("1"), Decimal("2699"),
+        )
+        paper._pending.register(PendingIntent(
+            intent_id=request.intent_id, symbol="ETHUSDT",
+            strategy_id=paper.config.strategy_id, side=Side.BUY,
+            quantity=Decimal("1"), notional=Decimal("2699"),
+        ))
+        paper._temporal_decided_ns[request.intent_id] = TS_BASE_NS - 1
+        terminal, ids = paper._validate_temporal_delta(
+            outcome, [request], boundary_ns=TS_BASE_NS + 20 * MS,
+        )
+        paper._journal_simulation(outcome)
+        paper._reconcile_temporal_reservations(outcome)
+        paper._temporal_terminal_intents = terminal
+        paper._temporal_seen_event_ids.update(ids)
+        assert request.intent_id in terminal
+        assert request.intent_id not in paper._reservations
+        assert all(item.intent_id != request.intent_id for item in paper._pending.items())
+        persisted = [
+            evt for evt in journal.read_range()
+            if evt.event_type == "order.state.changed" and evt.payload.state == "canceled"
+        ]
+        assert len(persisted) == 1
+        assert persisted[0].payload.reason == marker

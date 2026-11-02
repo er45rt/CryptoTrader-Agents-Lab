@@ -145,27 +145,38 @@ def _occurred_at(ts_ns: int) -> datetime:
 
 
 def to_phase3_order_state_event(
-    observation: ExecutionObservation, *, sequence_number: int | None = None
+    observation: ExecutionObservation, *, sequence_number: int | None = None,
+    event_id: UUID | None = None, reason: str | None = None,
 ) -> OrderStateChanged:
-    """Translate an observation into the Phase 3 ``order.state.changed`` contract."""
+    """Translate native lifecycle state with an auditable terminal-event reason."""
     if observation.state is None:
         raise TranslationError("observation has no lifecycle state to publish.")
+    if observation.state in {
+        OrderLifecycleState.REJECTED,
+        OrderLifecycleState.CANCELED,
+        OrderLifecycleState.EXPIRED,
+    } and (not isinstance(reason, str) or not reason.strip()):
+        raise TranslationError("terminal order event requires a source-backed reason.")
     return OrderStateChanged(
+        **({"event_id": event_id} if event_id is not None else {}),
         occurred_at=_occurred_at(observation.ts_ns),
         correlation_id=observation.correlation_id,
         producer=observation.producer,
         order_id=deterministic_order_uuid(observation.order_reference),
         symbol=observation.symbol,
         sequence_number=sequence_number,
-        payload=OrderStateChangePayload(state=observation.state.value),
+        payload=OrderStateChangePayload(state=observation.state.value, reason=reason),
     )
 
 
-def to_phase3_fill_event(observation: ExecutionObservation) -> ExecutionFillRecorded:
+def to_phase3_fill_event(
+    observation: ExecutionObservation, *, event_id: UUID | None = None,
+) -> ExecutionFillRecorded:
     """Translate a fill observation into the Phase 3 ``execution.fill.recorded`` contract."""
     if observation.last_fill_quantity is None or observation.last_fill_price is None:
         raise TranslationError("observation is not a fill; cannot publish a fill event.")
     return ExecutionFillRecorded(
+        **({"event_id": event_id} if event_id is not None else {}),
         occurred_at=_occurred_at(observation.ts_ns),
         correlation_id=observation.correlation_id,
         producer=observation.producer,

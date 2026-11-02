@@ -189,7 +189,11 @@ class DecisionValidityGate:
         if deadlines and now_utc > min(deadlines):
             return decision(Disposition.EXPIRED, "valid_until_exceeded")
 
-        # 2. STALE: age measured from the ORIGINAL market observation.
+        # 2. STALE: age measured from the ORIGINAL market observation. A negative age means the
+        # market event is timestamped after "now" (clock skew, a bad producer, or malformed data)
+        # and must fail closed exactly like an over-age observation, never be treated as fresh.
+        if age_seconds < 0:
+            return decision(Disposition.STALE, "market_event_ts_in_future")
         if age_seconds > self._policy.max_age_seconds:
             return decision(Disposition.STALE, "max_age_exceeded")
 

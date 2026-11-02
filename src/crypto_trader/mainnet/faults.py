@@ -1,4 +1,11 @@
-"""Fault injection for the mainnet read-only dry-run (Phase 15).
+"""Synthetic fault injection for the mainnet read-only dry-run (Phase 15) - TEST/FAULT-ONLY.
+
+Stage 3 status (OPTION B): this module is RETAINED ONLY AS TEST / SYNTHETIC FAULT-INJECTION
+MACHINERY. It is deliberately NOT part of the production durability path: production durability
+comes exclusively from the approved ``order.submission.attempted`` attempt -> authorization -> send
+boundary in the Binance testnet adapter (Stage 1 + Stage 2), and nothing here is evidence of that
+durability. It is no longer re-exported from ``crypto_trader.mainnet``; the remaining consumers are
+the dedicated offline fault tests, which import this module explicitly.
 
 Two classes of fault MUST NOT be conflated:
 

@@ -27,15 +27,29 @@ selected explicitly and refused while disabled.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import threading
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from crypto_trader.breakglass import BreakGlassControl, BreakGlassError, WriterGuard
+from crypto_trader.events import (
+    ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+    EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
+    RISK_EVALUATION_EVENT_TYPE, VALIDITY_EVENT_TYPE, TRADE_INTENT_EVENT_TYPE,
+    OrderSubmissionAttempted,
+    StrategyDecisionRecorded, TradeIntentCreated,
+)
 from crypto_trader.execution import (
+    DurableVenueWritePort,
+    ExecutionCapability,
     ExecutionOrderType,
     ExecutionPort,
     ExecutionRequest,
@@ -43,10 +57,18 @@ from crypto_trader.execution import (
     ExecutionSide,
     ExecutionTimeInForce,
     InstrumentSpec,
+    NonDurableExecutionError,
 )
 from crypto_trader.execution.binance_testnet import AmbiguousOrderError
+from crypto_trader.execution.binance_testnet.transport import RequestsTransport
+from crypto_trader.execution.ports import CanonicalWriterLease, CanonicalWriterScope, CanonicalWriterScopeError
+from crypto_trader.execution.binance_testnet.startup import (
+    BinanceStartupCollector, StartupEvidenceError,
+)
 from crypto_trader.persistence import EventJournal
+from crypto_trader.recovery.journaling import reconciliation_events
 from crypto_trader.recovery import (
+    OrderStateReconstructor,
     ReconciliationEngine,
     ReconciliationPolicy,
     RestartRecovery,
@@ -67,6 +89,7 @@ from crypto_trader.validity import (
     DecisionValidityGate,
     Disposition,
     MarketStateProvider,
+    ValidityPolicy,
     ValidityRequest,
 )
 
@@ -78,16 +101,22 @@ from .errors import (
     ProductionStateError,
 )
 from .fence import FenceCheck, ProductionFence
+from .risk_state import ProductionRiskStateSource
+
+_STRATEGY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 
 __all__ = [
     "PRODUCTION_PRODUCER",
+    "CrewOriginAuthority",
     "IntentPreparation",
     "ProductionExecutionOutcome",
     "ProductionIntent",
     "ProductionRuntime",
     "ProductionStartupReport",
     "ProductionSubmitResult",
+    "intent_deadline",
     "production_control",
+    "validity_request_for",
 ]
 
 PRODUCTION_PRODUCER = "application.production"
@@ -98,6 +127,105 @@ _SIDE_TO_RISK = {
     ExecutionSide.BUY: RiskSide.BUY,
     ExecutionSide.SELL: RiskSide.SELL,
 }
+
+
+def canonical_event(event) -> str:
+    # Concrete models preserve payload fields, envelope identity and explicit nulls.
+    return json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class JournalView:
+    contents: tuple[tuple[UUID, str], ...]
+    required_references: tuple[str, ...]
+    state_references: tuple[str, ...]
+    unproven_terminal_references: tuple[str, ...]
+    unproven_legacy_references: tuple[str, ...]
+    fingerprint: str
+
+    @classmethod
+    def capture(cls, journal, symbol: str) -> JournalView:
+        events = journal.read_range()
+        rebuilt = OrderStateReconstructor()
+        for event in events:
+            if event.event_type in {
+                ORDER_STATE_EVENT_TYPE, ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+                EXECUTION_FILL_EVENT_TYPE, VENUE_TRADE_EVENT_TYPE, ACCOUNT_EQUITY_EVENT_TYPE,
+            } and event.symbol != symbol:
+                raise StartupEvidenceError("writing startup requires a dedicated single-symbol journal.")
+            rebuilt.handle(event)
+        states = rebuilt.states()
+        if any(state.symbol != symbol for state in states) or any(
+            anchor.symbol != symbol for anchor in rebuilt.attempt_anchor_map().values()
+        ):
+            raise StartupEvidenceError("reconstructed journal scope does not match the instrument.")
+        contents = tuple((event.event_id, canonical_event(event)) for event in events)
+        if len({identity for identity, _ in contents}) != len(contents):
+            raise StartupEvidenceError("journal identities are not unique.")
+        return cls(
+            contents=contents,
+            required_references=tuple(sorted(
+                state.order_reference for state in states
+                if state.submission_attempted
+                and (not state.is_terminal or (
+                    state.state.value in {"canceled", "expired", "rejected"}
+                    and state.venue_order_id is None
+                ))
+            )),
+            state_references=tuple(sorted(state.order_reference for state in states)),
+            # Preserve the established recovery-conflict path. It must report
+            # existing lifecycle/anchor conflicts before this new identity gate.
+            unproven_terminal_references=(tuple(sorted(
+                state.order_reference for state in states
+                if state.submission_attempted
+                and state.state.value in {"canceled", "expired", "rejected"}
+                and state.venue_order_id is None
+            )) if not rebuilt.conflicts() else ()),
+            # A legacy 20-hex client reference does not uniquely encode the intent UUID.
+            # Without a journaled venue order id, a reused reference cannot prove origin.
+            unproven_legacy_references=(tuple(sorted(
+                state.order_reference for state in states
+                if state.submission_attempted and not state.is_terminal
+                and state.venue_order_id is None
+                and state.order_reference.startswith("ct-")
+            )) if not rebuilt.conflicts() else ()),
+            fingerprint=hashlib.sha256(json.dumps(
+                [value for _, value in contents], separators=(",", ":"),
+            ).encode()).hexdigest(),
+        )
+
+    def require_stable(self, journal, *, symbol, run=None, now=None, producer=None, correlation=None):
+        current = JournalView.capture(journal, symbol)
+        allowed = ()
+        if run is not None:
+            ids = tuple(run.journaled_event_ids)
+            baseline_ids = {identity for identity, _ in self.contents}
+            if len(ids) != 3 or len(set(ids)) != 3 or baseline_ids.intersection(ids):
+                raise StartupEvidenceError("recovery event identities are invalid.")
+            expected = reconciliation_events(
+                run.report, occurred_at=now, producer=producer,
+                correlation_id=correlation, event_ids=ids,
+            )
+            allowed = tuple((event.event_id, canonical_event(event)) for event in expected)
+            actual = dict(current.contents)
+            if any(actual.get(identity) != value for identity, value in allowed):
+                raise StartupEvidenceError("recovery pass additions do not match this run.")
+        allowed_ids = {identity for identity, _ in allowed}
+        if tuple(item for item in current.contents if item[0] not in allowed_ids) != self.contents:
+            raise StartupEvidenceError("journal changed during startup evidence collection/recovery.")
+        if (
+            current.required_references != self.required_references
+            or current.state_references != self.state_references
+            or current.unproven_terminal_references != self.unproven_terminal_references
+            or current.unproven_legacy_references != self.unproven_legacy_references
+        ):
+            raise StartupEvidenceError("journal-derived query coverage changed during startup.")
+        if run is not None and tuple(sorted(
+            state.order_reference for state in run.rebuilt_states
+        )) != self.state_references:
+            raise StartupEvidenceError("recovery reconstructed a different journal view.")
+        if run is not None and any(state.symbol != symbol for state in run.rebuilt_states):
+            raise StartupEvidenceError("recovery rebuilt another symbol.")
 
 
 @dataclass(frozen=True)
@@ -124,10 +252,15 @@ class ProductionIntent:
     time_in_force: ExecutionTimeInForce = ExecutionTimeInForce.GTC
     valid_until: datetime | None = None
     decision_scope: str = "default"
+    # Stable IDs of journaled, causally linked producer evidence; not a trade approval.
+    origin_decision_event_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.correlation_id, UUID) or not isinstance(self.intent_id, UUID):
             raise ProductionStateError("an intent requires correlation_id and intent_id UUIDs.")
+        if (self.origin_decision_event_id is not None
+                and not isinstance(self.origin_decision_event_id, UUID)):
+            raise ProductionStateError("origin_decision_event_id must be a UUID if supplied.")
         if not isinstance(self.side, ExecutionSide):
             raise ProductionStateError("an intent requires an ExecutionSide.")
         if not isinstance(self.order_type, ExecutionOrderType):
@@ -156,11 +289,113 @@ class ProductionIntent:
                 raise ProductionStateError(f"{name} must be timezone-aware.")
         if not self.symbol or not self.strategy_id or not self.market_reference:
             raise ProductionStateError("symbol, strategy_id and market_reference are required.")
+        if not isinstance(self.strategy_id, str) or not _STRATEGY_ID_PATTERN.fullmatch(
+            self.strategy_id
+        ):
+            raise ProductionStateError(
+                "strategy_id must be 1-128 characters of letters, digits, '_', '-' or '.'."
+            )
 
     @property
     def risk_price(self) -> Decimal:
         """The deterministic price Hard Risk evaluates against (never a guessed market price)."""
         return self.limit_price if self.limit_price is not None else self.reference_price
+
+
+class CrewOriginAuthority:
+    """Session-only in-process origin receipts; independent of any LLM or broker.
+
+    A journal append or matching producer string does not grant a receipt.
+    The trusted owner-process gateway is the only registered issuer. This
+    guards against journal-only spoofing, not hostile code within the process.
+    """
+
+    def __init__(self, *, audit=None) -> None:
+        from .origin_audit import CrewOriginAudit
+        if audit is not None and type(audit) is not CrewOriginAudit:
+            raise ProductionStateError("origin authority requires an explicit host-keyed audit.")
+        self._audit = audit
+        self._gateway: object | None = None
+        self._tickets: dict[UUID, tuple[ProductionIntent, str, str, UUID, str]] = {}
+
+    def _bind(self, gateway: object) -> None:
+        if self._gateway is not None:
+            raise ProductionStateError("origin authority is already bound to a gateway.")
+        self._gateway = gateway
+
+    def _seal(self, gateway: object, intent: ProductionIntent,
+              decision: StrategyDecisionRecorded, created: TradeIntentCreated,
+              *, source_delivery_id: UUID, raw_plan: str) -> None:
+        if (self._gateway is not gateway or intent.intent_id in self._tickets
+                or not isinstance(source_delivery_id, UUID)
+                or not isinstance(raw_plan, str)):
+            raise ProductionStateError("origin authority cannot issue an unbound or repeated attestation.")
+        gateway.delivery_ledger.verify(source_delivery_id, raw_plan)
+        if self._audit is not None:
+            self._audit.seal_origin(
+                gateway._journal, source_delivery_id, raw_plan, decision, created,
+            )
+        self._tickets[intent.intent_id] = (
+            intent, canonical_event(decision), canonical_event(created),
+            source_delivery_id, raw_plan,
+        )
+
+    def _reverify_delivery(self, intent_id: UUID) -> None:
+        """Re-read the original host-owned source evidence, not a producer label."""
+        receipt = self._tickets.get(intent_id)
+        if self._gateway is None or receipt is None:
+            raise ProductionStateError("origin authority lacks a bound source delivery receipt.")
+        self._gateway.delivery_ledger.verify(receipt[3], receipt[4])
+        if self._audit is not None:
+            self._audit.audit(self._gateway._journal)
+
+    def verified(self, intent: ProductionIntent,
+                 decision: StrategyDecisionRecorded, created: TradeIntentCreated) -> bool:
+        receipt = self._tickets.get(intent.intent_id)
+        if receipt is None or receipt[:3] != (
+            intent, canonical_event(decision), canonical_event(created),
+        ):
+            return False
+        self._reverify_delivery(intent.intent_id)
+        return True
+
+
+def validity_request_for(intent: ProductionIntent) -> ValidityRequest:
+    """Build the one canonical validity request for a production intent."""
+    if not isinstance(intent, ProductionIntent):
+        raise ProductionStateError("validity_request_for expects a ProductionIntent.")
+    return ValidityRequest(
+        correlation_id=intent.correlation_id,
+        symbol=intent.symbol,
+        decision_started_at=intent.decision_started_at,
+        decision_completed_at=intent.decision_completed_at,
+        market_event_ts=intent.market_event_ts,
+        reference_price=intent.reference_price,
+        market_reference=intent.market_reference,
+        intent_id=intent.intent_id,
+        decision_scope=intent.decision_scope,
+        valid_until=intent.valid_until,
+    )
+
+
+def intent_deadline(intent: ProductionIntent, policy: ValidityPolicy) -> datetime:
+    """Return the earliest deterministic deadline after which an intent is invalid."""
+    if not isinstance(intent, ProductionIntent):
+        raise ProductionStateError("intent_deadline expects a ProductionIntent.")
+    if not isinstance(policy, ValidityPolicy):
+        raise ProductionStateError("intent_deadline requires a resolved ValidityPolicy.")
+    deadlines = [
+        intent.market_event_ts.astimezone(timezone.utc)
+        + timedelta(seconds=policy.max_age_seconds)
+    ]
+    if intent.valid_until is not None:
+        deadlines.append(intent.valid_until.astimezone(timezone.utc))
+    if policy.valid_until_seconds is not None:
+        deadlines.append(
+            intent.decision_completed_at.astimezone(timezone.utc)
+            + timedelta(seconds=policy.valid_until_seconds)
+        )
+    return min(deadlines)
 
 
 @dataclass(frozen=True)
@@ -175,11 +410,19 @@ class IntentPreparation:
     quantity: Decimal
     limit_price: Decimal | None
     time_in_force: ExecutionTimeInForce
+    strategy_id: str
     approved: bool
     stages: tuple[str, ...]
     blocked_reason_code: str | None
     safety_mode: str
     prepared_at: datetime
+    # Authenticated references are bound to this immutable issued preparation.
+    # Only the opt-in strict venue path uses these fields at the last write gate.
+    reference_price: Decimal | None = None
+    market_event_ts: datetime | None = None
+    market_reference: str | None = None
+    risk_mark_price: Decimal | None = None
+    risk_mark_event_ts: datetime | None = None
 
     def to_record(self) -> dict[str, object]:
         """A JSON-able, secret-free record of the decision path so far."""
@@ -191,6 +434,7 @@ class IntentPreparation:
             "order_type": self.order_type.value,
             "quantity": str(self.quantity),
             "limit_price": None if self.limit_price is None else str(self.limit_price),
+            "strategy_id": self.strategy_id,
             "approved": self.approved,
             "stages": list(self.stages),
             "blocked_reason_code": self.blocked_reason_code,
@@ -258,6 +502,7 @@ class ProductionStartupReport:
     started_at: datetime
     journaled_event_ids: tuple[UUID, ...] = ()
     notes: tuple[str, ...] = ()
+    venue_evidence: dict[str, object] | None = None
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -272,6 +517,7 @@ class ProductionStartupReport:
             "started_at": self.started_at.astimezone(timezone.utc).isoformat(),
             "journaled_event_ids": [str(event_id) for event_id in self.journaled_event_ids],
             "notes": list(self.notes),
+            "venue_evidence": self.venue_evidence,
         }
 
 
@@ -306,7 +552,7 @@ class ProductionRuntime:
         validity_gate: DecisionValidityGate,
         market_state: MarketStateProvider,
         limits: RiskLimits,
-        risk_state_provider: Callable[[datetime], RiskStateSnapshot],
+        risk_state_provider: Callable[[datetime], RiskStateSnapshot] | ProductionRiskStateSource,
         reconciliation_policy: ReconciliationPolicy,
         environment: str | TradingEnvironment | None = None,
         mainnet_authorized: bool = False,
@@ -317,6 +563,11 @@ class ProductionRuntime:
         clock: Callable[[], datetime] | None = None,
         pending: PendingIntentRegistry | None = None,
         producer: str = PRODUCTION_PRODUCER,
+        require_origin_binding: bool = False,
+        trusted_origin_producer: str | None = None,
+        origin_authority: object | None = None,
+        require_authenticated_origin_audit: bool = False,
+        require_rollback_checkpoint: bool = False,
     ) -> None:
         if journal is None:
             raise ProductionStateError("the production runtime requires the event journal.")
@@ -335,7 +586,44 @@ class ProductionRuntime:
             raise ProductionStateError("the production runtime requires a risk-state provider.")
         if not isinstance(owner_id, str) or not owner_id.strip():
             raise ProductionStateError("the production runtime requires a non-empty owner id.")
+        if type(require_origin_binding) is not bool:
+            raise ProductionStateError("require_origin_binding must be an explicit boolean.")
+        if require_origin_binding and (
+            not isinstance(trusted_origin_producer, str) or not trusted_origin_producer.strip()
+        ):
+            raise ProductionStateError("strict origin binding needs a configured decision producer.")
+        if origin_authority is not None:
+            if type(origin_authority) is not CrewOriginAuthority or not require_origin_binding:
+                raise ProductionStateError("authenticated origin authority requires strict binding.")
+        if type(require_authenticated_origin_audit) is not bool:
+            raise ProductionStateError(
+                "require_authenticated_origin_audit must be an explicit boolean."
+            )
+        if require_authenticated_origin_audit:
+            from .origin_audit import CrewOriginAudit
+            audit = None if origin_authority is None else origin_authority._audit
+            journal_identity = getattr(journal, "journal_id", None)
+            if (not require_origin_binding or type(audit) is not CrewOriginAudit
+                    or not callable(journal_identity)
+                    or journal_identity() != audit._journal_id):
+                raise ProductionStateError(
+                    "authenticated origin audit must be bound to the exact durable journal."
+                )
+        if type(require_rollback_checkpoint) is not bool:
+            raise ProductionStateError("require_rollback_checkpoint must be an explicit boolean.")
+        if require_rollback_checkpoint:
+            audit = None if origin_authority is None else origin_authority._audit
+            if (not require_authenticated_origin_audit or audit is None
+                    or not callable(audit._checkpoint_reader)):
+                raise ProductionStateError(
+                    "origin checkpoint requires an authenticated audit with an external reader."
+                )
+        self._require_rollback_checkpoint = require_rollback_checkpoint
+        self._require_authenticated_origin_audit = require_authenticated_origin_audit
 
+        # SQLiteEventJournal is thread-affine. The production runtime must be constructed
+        # and subsequently used on that same owner thread; producer threads use admission only.
+        self._owner_thread_id = threading.get_ident()
         self._journal = journal
         self._state_dir = Path(state_dir)
         self._instrument = instrument
@@ -350,8 +638,37 @@ class ProductionRuntime:
         self._mainnet_base_url = mainnet_base_url
         self._owner_id = owner_id.strip()
         self._venue_sources = tuple(venue_sources)
+        # Stage 3 capability gate; mutable wiring is checked again at submission.
+        capability = self._resolve_execution_capability(execution)
+        self._capability = capability
+        self._durable_venue_writes = False
+        if capability.writes_to_venue:
+            if not isinstance(execution, DurableVenueWritePort):
+                raise NonDurableExecutionError(
+                    "the injected execution port declares venue writing but does not inherit the "
+                    "approved durable submission contract; refusing to construct a production "
+                    "runtime that could create venue risk without a durable attempt boundary."
+                )
+            attempt_journal = execution.durable_attempt_journal()
+            if attempt_journal is None or attempt_journal is not journal:
+                raise NonDurableExecutionError(
+                    "the injected venue-writing execution port is not wired to this runtime's own "
+                    "durable journal, so a submission-attempt marker could not be committed before "
+                    "the first send; refusing to construct the production runtime."
+                )
+            self._durable_venue_writes = True
         self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         self._pending = pending if pending is not None else PendingIntentRegistry()
+        self._issued_preparations: dict[UUID, tuple[IntentPreparation, datetime]] = {}
+        self._prepared_revisions = {}
+        self._prior_session_intents: frozenset[UUID] = frozenset()
+        self._prior_session_trade_intents: dict[UUID, str] = {}
+        self._prior_session_origin_ids: frozenset[UUID] = frozenset()
+        self._require_origin_binding = require_origin_binding
+        self._trusted_origin_producer = trusted_origin_producer
+        self._origin_authority = origin_authority
+        self._session_evidence: tuple[tuple[UUID, str], ...] = ()
+        self._admission_token: object | None = None
         self._producer = producer
         self._control = (
             control
@@ -363,6 +680,19 @@ class ProductionRuntime:
                 clock=self._clock,
             )
         )
+        self._real_https_writer = (
+            self._durable_venue_writes
+            and type(getattr(getattr(self._execution, "client", None), "transport", None))
+            is RequestsTransport
+        )
+        if self._durable_venue_writes:
+            self._require_canonical_risk_binding()
+            self._require_host_local_writer_authority()
+        if self._real_https_writer and not self._require_rollback_checkpoint:
+            # Owner decision on E1: a same-identity journal rollback is invisible without this pin.
+            raise ProductionStateError(
+                "a real HTTPS venue writer requires the external rollback checkpoint."
+            )
         self._state = ExecutionRuntimeState.STOPPED
         self._environment: EnvironmentDecision | None = None
         self._fence: ProductionFence | None = None
@@ -397,8 +727,14 @@ class ProductionRuntime:
     def startup_report(self) -> ProductionStartupReport | None:
         return self._startup
 
+    @property
+    def validity_policy(self) -> ValidityPolicy:
+        """The immutable validity policy shared with production admission."""
+        return self._validity_gate.policy
+
     def status(self) -> dict[str, object]:
         """Read-only runtime posture (never writes, never repairs, never caches an approval)."""
+        self._require_owner_thread()
         posture = self._control.status()
         return {
             "runtime_state": self._state.value,
@@ -419,97 +755,264 @@ class ProductionRuntime:
     # --- lifecycle -----------------------------------------------------------
 
     def start(self, *, correlation_id: UUID | None = None) -> ProductionStartupReport:
-        """Fail-closed startup: environment, posture, recovery, then claim the normal lease."""
+        """Writing startup claims first, then proves current signed venue/recovery evidence."""
+        self._require_owner_thread()
+        self._require_checkpoint_configuration()
         if self._state is ExecutionRuntimeState.RUNNING:
             raise ProductionStateError("the production runtime is already running.")
-        now = self._now()
-        run_id = correlation_id or uuid4()
-
-        # 1. Environment first: a disabled production environment is refused before anything else.
-        decision = resolve_environment(
-            self._requested_environment,
-            mainnet_authorized=self._mainnet_authorized,
-            mainnet_base_url=self._mainnet_base_url,
-        )
-
-        # 2. Persisted safety state: a normal trading writer requires a normal posture.
-        load = self._control.load_safety_state()
-        self._require_startup_posture(load.controller)
-
-        # 3. Journal/recovery state: unresolved orders block new risk.
-        reconstructed, _rebuild = reconstruct_order_states(self._journal)
-        local_states = reconstructed.states()
-        recovery = RestartRecovery(
-            engine=ReconciliationEngine(self._reconciliation_policy),
-            journal=self._journal,
-            venue_sources=list(self._venue_sources)
-            or [StaticVenueStateSource(entries=(), name="production.no-venue-evidence")],
-            producer=self._producer,
-        )
-        run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
-        if not run.report.is_fully_resolved:
-            self._last_refusal = "recovery_required"
-            raise ProductionRecoveryRequiredError(
-                "startup refused: order state is not fully reconciled (unresolved: "
-                f"{sorted(run.report.unresolved_orders)}); new risk stays blocked until evidence "
-                "resolves it through Phase 8 reconciliation."
-            )
-
-        # 4. Claim the single authoritative normal writer lease (a fresh fencing term).
+        self._startup = None
+        self._environment = self._guard = self._fence = self._last_fence = None
+        self._last_outcome = self._last_refusal = None
+        execution_started = False
+        phase = "admission_binding"
         try:
-            guard = self._control.claim_normal_writer(
-                owner_id=self._owner_id, reason_code="production_runtime_started"
+            if self._durable_venue_writes and self._admission_token is None:
+                self._last_refusal = "admission_unbound"
+                raise ProductionStateError(
+                    "venue-writing production runtime requires a bound "
+                    "ProductionAdmissionController before startup."
+                )
+            phase = "authenticated_origin_audit"
+            if self._origin_authority is not None and self._origin_authority._audit is not None:
+                self._origin_authority._audit.audit(self._journal)
+                if self._require_rollback_checkpoint:
+                    phase = "external_rollback_checkpoint"
+                    self._origin_authority._audit.verify_external_checkpoint(self._journal)
+            phase = "canonical_writer_authority"
+            if self._durable_venue_writes:
+                self._require_host_local_writer_authority()
+                if self._real_https_writer:
+                    # A previous runtime session's in-memory binding cannot authorize restart.
+                    self._risk_state_provider._client.canonical_scope = None
+                    self._risk_state_provider._client._canonical_writer_lease = None
+            phase = "startup_safety_anchor"
+            startup_safety_anchor = self._safety_transition_anchor()
+            phase = "environment"
+            now = self._now()
+            run_id = correlation_id or uuid4()
+            nonce = uuid4()  # Caller correlation identity never supplies freshness.
+            decision = resolve_environment(
+                self._requested_environment, mainnet_authorized=self._mainnet_authorized,
+                mainnet_base_url=self._mainnet_base_url,
             )
-        except BreakGlassError as exc:
-            self._last_refusal = "writer_lease_unavailable"
-            raise ProductionStateError(
-                "startup refused: the normal writer lease could not be claimed "
-                f"({type(exc).__name__}): {exc}"
-            ) from exc
+            phase = "startup_posture"
+            load = self._control.load_safety_state()
+            self._require_startup_posture(load.controller)
+            self._require_startup_safety_anchor(startup_safety_anchor)
+            startup_safety_mode = load.controller.mode.value
+            phase = "execution_context"
+            capability = self._resolve_execution_capability(self._execution)
+            if capability is not self._capability:
+                raise NonDurableExecutionError("execution capability changed before startup.")
+            writing = capability.writes_to_venue
+            collector = None
+            if writing:
+                if self._journal_identity_unverified():
+                    # Review F-02 (legacy): before the writer claim and before any venue request.
+                    self._last_refusal = "journal_identity_unverified"
+                    raise ProductionStateError(
+                        "startup refused: journal_identity_unverified: the journal records no "
+                        "journal_id, so it cannot be proven to be the journal its lease was bound "
+                        "to; re-establish on a new state dir with a newly founded journal."
+                    )
+                if self._execution.durable_attempt_journal() is not self._journal:
+                    raise NonDurableExecutionError("execution startup journal wiring changed.")
+                if self._venue_sources:
+                    raise StartupEvidenceError("writing startup refuses caller-supplied venue sources.")
+                collector = BinanceStartupCollector(
+                    self._execution, journal=self._journal,
+                    instrument=self._instrument, endpoint=decision.base_url,
+                    max_status_queries=256,  # Bounded; overflow refuses startup before signed status reads.
+                )
 
-        # 5. Bind the fence to the held token and prove it is current before serving traffic.
-        fence = ProductionFence(
-            control=self._control,
-            guard=guard,
-            owner_id=self._owner_id,
-            environment=decision.environment,
-        )
-        check = fence.authorize_new_risk(now=now, correlation_id=run_id)
+            def claim():
+                try:
+                    return self._control.claim_normal_writer(
+                        owner_id=self._owner_id, reason_code="production_runtime_started",
+                    )
+                except BreakGlassError as exc:
+                    self._last_refusal = "writer_lease_unavailable"
+                    raise ProductionStateError("startup refused: normal writer lease unavailable.") from exc
 
-        # 6. Start the execution boundary. For the Spot Testnet adapter this verifies the endpoint,
-        #    the clock and the account's least-privilege permissions (trading enabled, withdrawals
-        #    unavailable) BEFORE any order can be attempted; a failure here leaves the runtime
-        #    stopped with no traffic.
-        try:
+            guard = fence = view = batch = None
+
+            def authorize_startup_fence_locked(active_fence: ProductionFence) -> FenceCheck:
+                self._require_startup_safety_anchor(startup_safety_anchor)
+                return active_fence.authorize_new_risk(
+                    now=self._now(),
+                    correlation_id=run_id,
+                    prepared_safety_mode=startup_safety_mode,
+                )
+
+            def authorize_startup_fence(active_fence: ProductionFence) -> FenceCheck:
+                with self._control.ownership_store.exclusive(purpose="startup_fence"):
+                    return authorize_startup_fence_locked(active_fence)
+
+            if writing:
+                phase = "writer_claim"
+                guard = claim()
+                fence = ProductionFence(
+                    control=self._control, guard=guard, owner_id=self._owner_id,
+                    environment=decision.environment,
+                )
+                authorize_startup_fence(fence)
+                phase = "venue_evidence"
+                view = JournalView.capture(self._journal, self._instrument.symbol)
+                explicit_identity_types = {
+                    ORDER_SUBMISSION_ATTEMPTED_EVENT_TYPE,
+                    RISK_EVALUATION_EVENT_TYPE, VALIDITY_EVENT_TYPE,
+                }
+                prior_events = tuple((identity, contents, json.loads(contents))
+                                     for identity, contents in view.contents)
+                prior_intents = frozenset(
+                    UUID(event["payload"]["intent_id"]) for _, _, event in prior_events
+                    if event["event_type"] in explicit_identity_types
+                )
+                prior_trade_intents = {identity: contents for identity, contents, event in prior_events
+                                       if event["event_type"] == TRADE_INTENT_EVENT_TYPE}
+                prior_origin_ids = frozenset(
+                    identity for identity, _, event in prior_events
+                    if event["event_type"] == "strategy.decision.recorded"
+                ) | frozenset(
+                    UUID(event["causation_id"]) for _, _, event in prior_events
+                    if event["event_type"] == TRADE_INTENT_EVENT_TYPE
+                    and event["causation_id"] is not None
+                )
+                prior_identity_evidence = tuple(
+                    (identity, contents) for identity, contents, event in prior_events
+                    if event["event_type"] in explicit_identity_types | {TRADE_INTENT_EVENT_TYPE,
+                                                                           "strategy.decision.recorded"}
+                )
+                batch = collector.collect(
+                    nonce=nonce, fence_term=fence.fence_term, view=view, clock=self._now,
+                )
+                # The ownership lock is deliberately not held during network I/O.
+                authorize_startup_fence(fence)
+                source = collector.validate(batch, nonce=nonce, fence_term=fence.fence_term, view=view)
+                view.require_stable(self._journal, symbol=self._instrument.symbol)
+                if view.unproven_terminal_references:
+                    # Signed status by clientOrderId is insufficient to prove a
+                    # terminal order's venue identity after a crash or replay.
+                    # Refuse before recovery side effects or execution.start().
+                    self._last_refusal = "recovery_required"
+                    raise ProductionRecoveryRequiredError(
+                        "startup refused: unresolved order state: "
+                        "terminal venue order identity unproven; manual reconciliation required."
+                    )
+                if view.unproven_legacy_references:
+                    # The old truncated reference may have been reused after a terminal fill.
+                    # A signed client-reference lookup alone cannot distinguish generations.
+                    self._last_refusal = "recovery_required"
+                    raise ProductionRecoveryRequiredError(
+                        "startup refused: unresolved legacy order identity; "
+                        "venue order id unproven; manual reconciliation required."
+                    )
+                sources = [source]
+                local_states = None  # Preserve conflicts and immutable durable attempt anchors.
+            else:
+                # Explicit NON_WRITING ports keep their offline evidence, but like every writer they
+                # journal recovery only after claiming the lease, under its fence.
+                phase = "writer_claim"
+                guard = claim()
+                fence = ProductionFence(
+                    control=self._control, guard=guard, owner_id=self._owner_id,
+                    environment=decision.environment,
+                )
+                phase = "execution_context"
+                reconstructed, _ = reconstruct_order_states(self._journal)
+                local_states = reconstructed.states()
+                sources = list(self._venue_sources) or [
+                    StaticVenueStateSource(entries=(), name="production.no-venue-evidence")
+                ]
+            phase = "recovery"
+            recovery = RestartRecovery(
+                engine=ReconciliationEngine(self._reconciliation_policy), journal=self._journal,
+                venue_sources=sources, producer=self._producer,
+            )
+            # Journal recovery only as the still-fenced owner: no takeover window before it.
+            with self._control.ownership_store.exclusive(purpose="startup_fence"):
+                authorize_startup_fence_locked(fence)
+                run = recovery.run(now=now, local_states=local_states, correlation_id=run_id)
+            if not run.report.is_fully_resolved or run.requires_halt_new_risk or not run.may_resume_trading:
+                self._last_refusal = "recovery_required"
+                raise ProductionRecoveryRequiredError(
+                    "startup refused: unresolved order state requires recovery: "
+                    f"{sorted(run.report.unresolved_orders)}"
+                )
+            def verify_evidence():
+                if self._origin_authority is not None and self._origin_authority._audit is not None:
+                    self._origin_authority._audit.audit(self._journal)
+                if writing:
+                    if (self._execution is not collector.execution or self._venue_sources
+                        or self._instrument != collector.instrument):
+                        raise StartupEvidenceError("production execution/source wiring changed during startup.")
+                    if self._resolve_execution_capability(self._execution) is not capability:
+                        raise StartupEvidenceError("execution capability changed during startup.")
+                    collector.validate(batch, nonce=nonce, fence_term=fence.fence_term, view=view)
+                    view.require_stable(
+                        self._journal, symbol=self._instrument.symbol, run=run, now=now,
+                        producer=self._producer, correlation=run_id,
+                    )
+
+            phase = "post_recovery_evidence"
+            verify_evidence()
+            check = authorize_startup_fence(fence)
+            phase = "execution_boundary_start_failed"
+            execution_started = True
             self._execution.start()
-        except Exception as exc:  # noqa: BLE001 - the typed error is re-raised unchanged
-            self._last_refusal = f"execution_boundary_start_failed:{type(exc).__name__}"
+            phase = "final_startup_evidence"
+            # Serialize final publication with takeover, without locking the venue reads.
+            with self._control.ownership_store.exclusive(purpose="submission"):
+                verify_evidence()
+                check = authorize_startup_fence_locked(fence)
+                if self._execution.state() is not ExecutionRuntimeState.RUNNING:
+                    raise ProductionStartupError("execution boundary did not become running.")
+                self._environment, self._guard, self._fence = decision, guard, fence
+                self._last_fence = check
+                self._startup = ProductionStartupReport(
+                    environment=decision.environment.value, base_url=decision.base_url,
+                    owner_id=self._owner_id, fence_term=check.fence_term,
+                    safety_mode=check.safety_mode, safety_state_source=check.safety_state_source,
+                    recovered_orders=len(run.rebuilt_states), reconciliation_state=run.recovery_state,
+                    started_at=check.checked_at, journaled_event_ids=tuple(run.journaled_event_ids),
+                    notes=decision.notes, venue_evidence=None if batch is None else batch.summary(),
+                )
+                # A successful fully-resolved startup supersedes any in-memory reservation from
+                # the previous run; durable journal/venue state is authoritative after recovery.
+                if writing:
+                    # A resolved order-status report alone is not complete economic evidence.
+                    # Keep attempted reservations until canonical risk refresh proves coverage.
+                    for item in self._pending.items():
+                        if not self._attempt_may_exist(item.intent_id):
+                            self._pending.remove(item.intent_id)
+                    self._prior_session_intents = prior_intents
+                    self._prior_session_trade_intents = prior_trade_intents
+                    self._prior_session_origin_ids = prior_origin_ids
+                    self._session_evidence = prior_identity_evidence + tuple(
+                        (identity, canonical_event(self._journal.read_by_id(identity)))
+                        for identity in run.journaled_event_ids
+                    )
+                else:
+                    self._pending.clear()
+                self._issued_preparations.clear()
+                self._prepared_revisions.clear()
+                self._state = ExecutionRuntimeState.RUNNING
+            return self._startup
+        except Exception as exc:
+            self._state = ExecutionRuntimeState.STOPPED
+            self._startup = None
+            if self._last_refusal is None:
+                self._last_refusal = f"{phase}:{type(exc).__name__}"
+            if execution_started:
+                try:
+                    self._execution.stop()
+                except Exception:
+                    pass  # Best effort only; never undo another writer's lease.
             raise
-
-        self._environment = decision
-        self._guard = guard
-        self._fence = fence
-        self._last_fence = check
-        self._last_outcome = None
-        self._last_refusal = None
-        self._state = ExecutionRuntimeState.RUNNING
-        self._startup = ProductionStartupReport(
-            environment=decision.environment.value,
-            base_url=decision.base_url,
-            owner_id=self._owner_id,
-            fence_term=check.fence_term,
-            safety_mode=check.safety_mode,
-            safety_state_source=check.safety_state_source,
-            recovered_orders=len(local_states),
-            reconciliation_state=run.recovery_state,
-            started_at=now,
-            journaled_event_ids=tuple(run.journaled_event_ids),
-            notes=decision.notes,
-        )
-        return self._startup
 
     def stop(self) -> None:
         """Stop serving. The held lease record stays on disk; a restart takes a fresh term."""
+        self._require_owner_thread()
         self._execution.stop()
         self._state = ExecutionRuntimeState.STOPPED
 
@@ -521,29 +1024,40 @@ class ProductionRuntime:
         *,
         capacity_available: bool = True,
         latest_scope_intent_id: UUID | None = None,
+        _admission_token: object | None = None,
     ) -> IntentPreparation:
-        """Run validity then Hard Risk. Contacts no venue and grants no trading authority."""
+        """Run validity then canonical Hard Risk; writing mode refreshes read-only venue evidence."""
+        self._require_owner_thread()
+        self._require_admission_token(_admission_token)
         self._require_running()
         if not isinstance(intent, ProductionIntent):
             raise ProductionStateError("prepare_intent expects a ProductionIntent.")
         now = self._now()
+        self._expire_preparations(now)
         controller = self._control.load_safety_state().controller
         stages: list[str] = []
+        if self._durable_venue_writes:
+            self._require_session_evidence()
+            if self._intent_predates_session(intent):
+                return self._blocked(intent, ["session:abandoned"], "prior_session_intent", controller, now)
+            if self._require_origin_binding:
+                self._verify_durable_origin(intent)
+        if (
+            controller.kill_switch_engaged
+            or controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}
+        ):
+            stages.append("safety:blocked")
+            return self._blocked(
+                intent,
+                stages,
+                "trading_halted",
+                controller,
+                now,
+            )
 
         # Stage 1: deterministic decision validity / staleness.
         validity = self._validity_gate.evaluate(
-            ValidityRequest(
-                correlation_id=intent.correlation_id,
-                symbol=intent.symbol,
-                decision_started_at=intent.decision_started_at,
-                decision_completed_at=intent.decision_completed_at,
-                market_event_ts=intent.market_event_ts,
-                reference_price=intent.reference_price,
-                market_reference=intent.market_reference,
-                intent_id=intent.intent_id,
-                decision_scope=intent.decision_scope,
-                valid_until=intent.valid_until,
-            ),
+            validity_request_for(intent),
             market_state=self._market_state,
             now=now,
             latest_scope_intent_id=latest_scope_intent_id,
@@ -555,8 +1069,40 @@ class ProductionRuntime:
 
         # Stage 2: deterministic Hard Risk, under the CURRENT persisted safety mode.
         engine = HardRiskEngine(
-            risk_limits_for_safety(controller, self._limits), pending=self._pending
+            risk_limits_for_safety(controller, self._limits),
+            pending=self._pending,
+            include_pending_reservations=self._durable_venue_writes,
+            enforce_attributed_inventory=self._durable_venue_writes,
         )
+        if isinstance(self._risk_state_provider, ProductionRiskStateSource):
+            if self._guard is None:
+                raise ProductionStateError(
+                    "canonical risk state requires the active runtime writer guard."
+                )
+            reference_kwargs = {}
+            if self._risk_state_provider._continuity_max_move_bps is not None:
+                from .risk_state import RiskDecisionMark
+                reference_kwargs["decision_mark"] = RiskDecisionMark(
+                    symbol=intent.symbol, reference_price=intent.reference_price,
+                    event_ts=intent.market_event_ts, reference_id=intent.market_reference,
+                )
+            risk_state, risk_now = self._risk_state_provider(
+                now,
+                guard=self._guard,
+                correlation_id=intent.correlation_id,
+                **reference_kwargs,
+            )
+            if self._durable_venue_writes:
+                # Signed venue account evidence and canonical risk have now both passed.
+                self._bind_host_local_writer_after_risk()
+                # The canonical source validated journal fills, balances and venue open orders.
+                # Transfer only prior attempted reservations into that proven exposure snapshot.
+                for item in self._pending.items():
+                    if item.intent_id not in self._issued_preparations and self._attempt_may_exist(item.intent_id):
+                        self._pending.remove(item.intent_id)
+        else:
+            risk_state = self._risk_state_provider(now)
+            risk_now = now
         decision = engine.evaluate(
             RiskRequest(
                 correlation_id=intent.correlation_id,
@@ -568,8 +1114,8 @@ class ProductionRuntime:
                 intent_id=intent.intent_id,
                 order_type=intent.order_type.value,
             ),
-            self._risk_state_provider(now),
-            now=now,
+            risk_state,
+            now=risk_now,
         )
         stages.append("risk:allowed" if decision.allowed else "risk:blocked")
         if not decision.allowed:
@@ -577,7 +1123,7 @@ class ProductionRuntime:
 
         # Stage 3 is the fence, and it happens in submit_prepared immediately before the venue call.
         stages.append("safety:fence_deferred_to_submit")
-        return IntentPreparation(
+        preparation = IntentPreparation(
             intent_id=intent.intent_id,
             correlation_id=intent.correlation_id,
             symbol=intent.symbol,
@@ -586,15 +1132,79 @@ class ProductionRuntime:
             quantity=intent.quantity,
             limit_price=intent.limit_price,
             time_in_force=intent.time_in_force,
+            strategy_id=intent.strategy_id,
             approved=True,
             stages=tuple(stages),
             blocked_reason_code=None,
             safety_mode=controller.mode.value,
             prepared_at=now,
+            reference_price=intent.reference_price,
+            market_event_ts=intent.market_event_ts,
+            market_reference=intent.market_reference,
+            risk_mark_price=(
+                self._risk_state_provider._last_accepted_mark.price
+                if isinstance(self._risk_state_provider, ProductionRiskStateSource)
+                and self._risk_state_provider._continuity_max_move_bps is not None
+                and self._risk_state_provider._last_accepted_mark is not None
+                else None
+            ),
+            risk_mark_event_ts=(
+                self._risk_state_provider._last_accepted_mark.observed_at
+                if isinstance(self._risk_state_provider, ProductionRiskStateSource)
+                and self._risk_state_provider._continuity_max_move_bps is not None
+                and self._risk_state_provider._last_accepted_mark is not None
+                else None
+            ),
         )
+        self._issued_preparations[intent.intent_id] = (
+            preparation,
+            intent_deadline(intent, self._validity_gate.policy),
+        )
+        if self._durable_venue_writes:
+            self._prepared_revisions[intent.intent_id] = self._journal.revision()
+        return preparation
 
-    def submit_prepared(self, preparation: IntentPreparation) -> ProductionSubmitResult:
-        """The final fence check, immediately followed by the venue submission."""
+    def submit_prepared(
+        self,
+        preparation: IntentPreparation,
+        *,
+        _admission_token: object | None = None,
+    ) -> ProductionSubmitResult:
+        """Wait on venue admission outside the lock, then atomically authorize and submit."""
+        self._require_owner_thread()
+        self._require_admission_token(_admission_token)
+        fresh_submit_mark = None
+        if self._durable_venue_writes:
+            try:
+                self._validate_submission_preparation(preparation, release_on_failure=False)
+                self._execution.await_write_admission()
+                # Bounded public market read OUTSIDE the ownership lock. The evidence
+                # is revalidated inside the lock immediately before the writer fence.
+                fresh_submit_mark = self._capture_strict_submit_market(preparation)
+            except Exception as admission_exc:
+                # Admission failed before this call can create a marker or POST. Cleanup must
+                # serialize with a concurrent submit of the SAME preparation: if another thread
+                # crossed the durable boundary while we waited, its ambiguity reservation wins.
+                try:
+                    with self._control.ownership_store.exclusive(purpose="submission"):
+                        issued = self._issued_preparations.get(preparation.intent_id)
+                        if issued is not None and issued[0] is preparation:
+                            self._release_preparation(preparation.intent_id)
+                except Exception as cleanup_exc:
+                    # Failure to prove safe cleanup is fail-closed: keep the reservation and
+                    # preserve the original admission failure as the public cause.
+                    raise admission_exc from cleanup_exc
+                raise
+        with self._control.ownership_store.exclusive(purpose="submission"):
+            return self._submit_prepared_locked(preparation, fresh_submit_mark=fresh_submit_mark)
+
+    def _validate_submission_preparation(
+        self,
+        preparation: IntentPreparation,
+        *,
+        release_on_failure: bool = True,
+    ) -> datetime:
+        """Validate local submission prerequisites; callers re-run this after taking the lock."""
         self._require_running()
         if not isinstance(preparation, IntentPreparation):
             raise ProductionStateError("submit_prepared expects an IntentPreparation.")
@@ -603,20 +1213,151 @@ class ProductionRuntime:
                 "the intent was not approved "
                 f"({preparation.blocked_reason_code}); nothing is submitted."
             )
+        issued = self._issued_preparations.get(preparation.intent_id)
+        if issued is None or issued[0] is not preparation:
+            raise ProductionStateError(
+                "submit_prepared requires the exact unused preparation issued by this runtime."
+            )
+        now = self._now()
+        if now > issued[1]:
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
+            raise ProductionStateError("the issued preparation expired before submission.")
         if self._fence is None:
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
             raise ProductionStateError("the runtime holds no writer fence; refusing to submit.")
 
-        now = self._now()
+        try:
+            capability = self._resolve_execution_capability(self._execution)
+            if capability is not self._capability:
+                raise NonDurableExecutionError("execution capability changed after construction")
+            if (
+                self._durable_venue_writes
+                and self._execution.durable_attempt_journal() is not self._journal
+            ):
+                raise NonDurableExecutionError("execution journal changed after construction")
+            if self._durable_venue_writes:
+                self._require_canonical_risk_binding()
+                canonical = self._require_host_local_writer_authority()
+                if (canonical is not None
+                        and self._risk_state_provider._client.canonical_scope != canonical):
+                    raise ProductionStateError("canonical writer account binding is missing or changed.")
+                self._require_session_evidence()
+        except Exception:
+            if release_on_failure:
+                self._release_preparation(preparation.intent_id)
+            raise
+        return now
+
+    def _capture_strict_submit_market(self, preparation: IntentPreparation):
+        source = self._risk_state_provider
+        if not isinstance(source, ProductionRiskStateSource) or source._continuity_max_move_bps is None:
+            return None
+        from crypto_trader.execution.binance_testnet.market_data import BinanceTestnetTickerQuoteSource
+        try:
+            reader = source._mark_source_factory()
+            if type(reader) is not BinanceTestnetTickerQuoteSource or reader.symbol != preparation.symbol:
+                raise ProductionStateError("strict submit market source identity mismatch.")
+            return reader.read_once_risk_mark()
+        except Exception as exc:
+            raise ProductionStateError("strict submit market refresh failed; refusing venue write.") from exc
+
+    def _recheck_strict_market_before_submit(self, preparation: IntentPreparation, fresh_mark) -> None:
+        """Fail closed on an independently refreshed price before the final writer fence.
+
+        No venue order is sent by this check. A failed/stale/disconnected read
+        consumes the preparation; it MUST NOT be retried automatically.
+        """
+        source = self._risk_state_provider
+        if not isinstance(source, ProductionRiskStateSource):
+            return
+        cap = source._continuity_max_move_bps
+        if cap is None:
+            return  # Legacy behavior is not silently widened by this opt-in path.
+        if (
+            not isinstance(preparation.reference_price, Decimal)
+            or not preparation.reference_price.is_finite()
+            or preparation.reference_price <= 0
+            or not isinstance(preparation.risk_mark_price, Decimal)
+            or not preparation.risk_mark_price.is_finite()
+            or preparation.risk_mark_price <= 0
+            or not isinstance(preparation.market_event_ts, datetime)
+            or preparation.market_event_ts.tzinfo is None
+            or not isinstance(preparation.risk_mark_event_ts, datetime)
+            or preparation.risk_mark_event_ts.tzinfo is None
+            or not preparation.market_reference
+        ):
+            raise ProductionStateError("strict submit market evidence lacks authenticated preparation facts.")
+        from crypto_trader.execution.binance_testnet import MarkEvidence
+        mark = fresh_mark
+        checked_at = self._now()
+        if (
+            type(mark) is not MarkEvidence
+            or mark.symbol != preparation.symbol
+            or mark.observed_at < preparation.market_event_ts
+            or mark.observed_at < preparation.risk_mark_event_ts
+            or mark.observed_at > checked_at
+            or (checked_at - mark.observed_at).total_seconds() > source._max_mark_age_seconds
+        ):
+            raise ProductionStateError("strict submit price event order or freshness invalid.")
+        move_original = abs(mark.price - preparation.reference_price) * Decimal("10000") / preparation.reference_price
+        move_risk = abs(mark.price - preparation.risk_mark_price) * Decimal("10000") / preparation.risk_mark_price
+        if move_original > cap or move_risk > cap:
+            raise ProductionStateError("strict submit price moved beyond approved risk limit.")
+        latest_state = self._market_state.latest(preparation.symbol)
+        if (latest_state is None or latest_state.symbol != preparation.symbol
+                or latest_state.market_event_ts < preparation.market_event_ts
+                or latest_state.market_event_ts > checked_at):
+            raise ProductionStateError("strict submit market-state continuity unavailable.")
+        if latest_state.market_event_ts > mark.observed_at:
+            raise ProductionStateError(
+                "strict submit live market-state event is newer than verified venue mark."
+            )
+        move_state = abs(latest_state.price - preparation.reference_price) * Decimal("10000") / preparation.reference_price
+        if move_state > cap:
+            raise ProductionStateError("strict submit live market-state moved beyond approved risk limit.")
+        # Independently compare the two authenticated feeds. Checking that each
+        # is near the initial decision is insufficient: opposing movements can
+        # make their pairwise divergence almost twice the approved tolerance.
+        crossfeed_bps = abs(mark.price - latest_state.price) * Decimal("10000") / latest_state.price
+        if crossfeed_bps > cap:
+            raise ProductionStateError("strict submit venue/local market feeds diverged beyond risk limit.")
+
+    def _submit_prepared_locked(self, preparation: IntentPreparation, *, fresh_submit_mark=None) -> ProductionSubmitResult:
+        now = self._validate_submission_preparation(preparation)
+        try:
+            self._recheck_strict_market_before_submit(preparation, fresh_submit_mark)
+            now = self._validate_submission_preparation(preparation)
+        except Exception:
+            self._release_preparation(preparation.intent_id)
+            raise
         try:
             # The last thing that happens before the venue call. Never cached, never skipped.
             check = self._fence.authorize_new_risk(
-                now=now, correlation_id=preparation.correlation_id
+                now=now,
+                correlation_id=preparation.correlation_id,
+                prepared_safety_mode=preparation.safety_mode,
             )
-        except ProductionSafetyBlockedError as exc:
-            self._last_refusal = str(exc)
+        except Exception as exc:
+            if isinstance(exc, ProductionSafetyBlockedError):
+                self._last_refusal = str(exc)
+            self._release_preparation(preparation.intent_id)
             raise
 
         self._last_fence = check
+        if self._durable_venue_writes and self._journal.revision() != self._prepared_revisions.get(preparation.intent_id):
+            self._release_preparation(preparation.intent_id)
+            raise ProductionStateError("journal changed after Hard Risk preparation; new decision required.")
+        if (self._durable_venue_writes and self._require_origin_binding
+                and self._origin_authority is not None):
+            try:
+                # A policy-approved, journaled Crew source must still match its
+                # session-issued host receipt immediately before the durable write.
+                self._origin_authority._reverify_delivery(preparation.intent_id)
+            except Exception:
+                self._release_preparation(preparation.intent_id)
+                raise
         request = ExecutionRequest(
             intent_id=preparation.intent_id,
             correlation_id=preparation.correlation_id,
@@ -626,13 +1367,55 @@ class ProductionRuntime:
             quantity=preparation.quantity,
             limit_price=preparation.limit_price,
             time_in_force=preparation.time_in_force,
+            strategy_id=preparation.strategy_id,
         )
         try:
-            reference = self._execution.submit(request)
-        except AmbiguousOrderError:
-            # UNKNOWN_PENDING_RECONCILIATION: preserved exactly, never retried, never masked.
-            self._last_outcome = "unknown_pending_reconciliation"
+            # Venue-writing execution goes through the approved durable submission sequence
+            # (marker -> authorization -> one send). Non-writing execution keeps its own port.
+            if self._durable_venue_writes:
+                audit = None if self._origin_authority is None else self._origin_authority._audit
+                options = {} if audit is None else {"origin_audit": audit}
+                # Issue proof only for this final, risk-approved request, under
+                # the already-held submission lock. Never cache blanket port authority.
+                client = None
+                if self._real_https_writer:
+                    scope = self._require_host_local_writer_authority()
+                    client = self._risk_state_provider._client
+                    client._canonical_writer_lease = CanonicalWriterLease(
+                        scope=scope, journal=self._journal,
+                        store=self._control.ownership_store, guard=self._guard,
+                        request=request,
+                    )
+                try:
+                    # Keep one canonical durable-submit call with an optional audit.
+                    reference = DurableVenueWritePort.submit_durably(self._execution, request, **options)
+                finally:
+                    if client is not None:
+                        client._canonical_writer_lease = None
+            else:
+                reference = self._execution.submit(request)
+        except AmbiguousOrderError as exc:
+            # UNKNOWN_PENDING_RECONCILIATION: never retry this preparation. Retire the one-shot
+            # issued object but KEEP its economic pending reservation until recovery/startup
+            # establishes authoritative outcome.
+            self._issued_preparations.pop(preparation.intent_id, None)
+            self._prepared_revisions.pop(preparation.intent_id, None)
+            reason_code = getattr(exc, "reason_code", None)
+            self._last_outcome = (
+                "unknown_pending_reconciliation"
+                if not reason_code
+                else f"unknown_pending_reconciliation:{reason_code}"
+            )
             raise
+        except Exception:
+            if self._durable_venue_writes and self._attempt_may_exist(preparation.intent_id):
+                self._issued_preparations.pop(preparation.intent_id, None)
+                self._prepared_revisions.pop(preparation.intent_id, None)
+                self._last_outcome = "unknown_pending_reconciliation"
+            else:
+                self._release_preparation(preparation.intent_id)
+            raise
+        self._release_preparation(preparation.intent_id, submitted=True)
         self._last_outcome = "submitted"
         self._last_refusal = None
         return ProductionSubmitResult(
@@ -652,12 +1435,19 @@ class ProductionRuntime:
         *,
         capacity_available: bool = True,
         latest_scope_intent_id: UUID | None = None,
+        _admission_token: object | None = None,
     ) -> ProductionExecutionOutcome:
-        """Convenience path: prepare then submit. A blocked decision never reaches the venue."""
+        """Prepare then submit; an admission-bound runtime requires its controller capability.
+
+        Durable venue-writing paths deduplicate an exact intent_id across restart via the
+        deterministic client order id and journal. A new intent_id for the same decision is not
+        equivalent durable identity and must be handled before Mainnet promotion.
+        """
         preparation = self.prepare_intent(
             intent,
             capacity_available=capacity_available,
             latest_scope_intent_id=latest_scope_intent_id,
+            _admission_token=_admission_token,
         )
         if not preparation.approved:
             return ProductionExecutionOutcome(
@@ -666,7 +1456,10 @@ class ProductionRuntime:
                 submission=None,
                 blocked_reason_code=preparation.blocked_reason_code,
             )
-        submission = self.submit_prepared(preparation)
+        submission = self.submit_prepared(
+            preparation,
+            _admission_token=_admission_token,
+        )
         return ProductionExecutionOutcome(
             submitted=True,
             preparation=preparation,
@@ -675,6 +1468,281 @@ class ProductionRuntime:
         )
 
     # --- internals -----------------------------------------------------------
+
+    def _bind_admission(self) -> object:
+        """Bind exactly one serialized admission controller to this runtime."""
+        self._require_owner_thread()
+        if self._admission_token is not None:
+            raise ProductionStateError(
+                "production runtime already has an admission controller bound."
+            )
+        if self._issued_preparations or len(self._pending) != 0:
+            raise ProductionStateError(
+                "production runtime cannot bind admission with outstanding preparations "
+                "or pending economic reservations."
+            )
+        token = object()
+        self._admission_token = token
+        return token
+
+    def _require_admission_token(self, token: object | None) -> None:
+        if self._durable_venue_writes and self._admission_token is None:
+            raise ProductionStateError(
+                "venue-writing production runtime requires a bound "
+                "ProductionAdmissionController; direct decision-path calls are refused."
+            )
+        if self._admission_token is not None and token is not self._admission_token:
+            raise ProductionStateError(
+                "production runtime is admission-bound; direct decision-path calls are refused."
+            )
+
+    def _require_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise ProductionStateError(
+                "production runtime is thread-affine: construct and use it on the journal owner "
+                "thread; producer threads must use the admission controller."
+            )
+
+    def _release_preparation(self, intent_id: UUID, *, submitted: bool = False) -> None:
+        self._issued_preparations.pop(intent_id, None)
+        self._prepared_revisions.pop(intent_id, None)
+        if submitted or not self._durable_venue_writes or not self._attempt_may_exist(intent_id):
+            self._pending.remove(intent_id)
+
+    def _expire_preparations(self, now: datetime) -> None:
+        expired = [
+            intent_id
+            for intent_id, (_preparation, expires_at) in self._issued_preparations.items()
+            if now > expires_at
+        ]
+        for intent_id in expired:
+            if self._durable_venue_writes and self._attempt_may_exist(intent_id):
+                self._issued_preparations.pop(intent_id, None)
+                self._prepared_revisions.pop(intent_id, None)
+            else:
+                self._release_preparation(intent_id)
+
+    def _attempt_may_exist(self, intent_id: UUID) -> bool:
+        try:
+            return any(isinstance(event, OrderSubmissionAttempted) and event.payload.intent_id == intent_id
+                       for event in self._journal.read_range())
+        except Exception:
+            return True  # Failure to prove absence never releases economic risk.
+
+    def _verify_durable_origin(self, intent: ProductionIntent) -> None:
+        """Strict opt-in decision lineage for a durable writer; no authority from an ID alone.
+
+        This proves journal consistency, not source authentication. A trusted origin
+        producer/adapter must separately prevent fabricated fresh root decisions.
+        """
+        if not self._durable_venue_writes or not self._require_origin_binding:
+            return
+        if self._startup is None or intent.origin_decision_event_id is None:
+            raise ProductionStateError("strict origin binding requires a running session and origin ID.")
+        if intent.origin_decision_event_id in self._prior_session_origin_ids:
+            raise ProductionStateError("strict origin binding refuses a prior-session decision.")
+        decision = self._journal.read_by_id(intent.origin_decision_event_id)
+        created = self._journal.read_by_id(intent.intent_id)
+        if not isinstance(decision, StrategyDecisionRecorded) or not isinstance(created, TradeIntentCreated):
+            raise ProductionStateError("strict origin binding requires persisted decision and intent events.")
+        if (
+            decision.producer != self._trusted_origin_producer
+            or created.producer != self._trusted_origin_producer
+            or decision.event_id != created.causation_id
+            or decision.correlation_id != intent.correlation_id
+            or created.correlation_id != intent.correlation_id
+            or decision.symbol != intent.symbol or created.symbol != intent.symbol
+            or decision.strategy_id != intent.strategy_id
+            or created.strategy_id != intent.strategy_id
+            or decision.payload.action != intent.side.value
+            or created.payload.side != intent.side.value
+            or created.payload.quantity != intent.quantity
+            or created.payload.order_type != intent.order_type.value
+            or created.payload.limit_price != intent.limit_price
+            or decision.occurred_at < self._startup.started_at
+            or created.occurred_at < self._startup.started_at
+            or decision.occurred_at > self._now()
+            or created.occurred_at > self._now()
+        ):
+            raise ProductionStateError("strict origin binding has conflicting producer, economics or causation.")
+        if self._origin_authority is not None and not self._origin_authority.verified(
+            intent, decision, created,
+        ):
+            raise ProductionStateError("strict origin requires an issued session authority attestation.")
+        if any(
+            isinstance(event, TradeIntentCreated)
+            and event.causation_id == decision.event_id
+            and event.event_id != intent.intent_id
+            for event in self._journal.read_range()
+        ):
+            raise ProductionStateError("strict origin binding found competing intents for one decision.")
+
+    def _intent_predates_session(self, intent: ProductionIntent) -> bool:
+        """Previously consumed origin and intent identities cannot be reissued."""
+        if not self._durable_venue_writes or self._startup is None:
+            return False
+        boundary = self._startup.started_at
+        if self._require_origin_binding and (
+            intent.origin_decision_event_id is None
+            or intent.origin_decision_event_id in self._prior_session_origin_ids
+        ):
+            return True
+        if (intent.intent_id in self._prior_session_intents
+                or intent.decision_completed_at < boundary or intent.market_event_ts < boundary):
+            return True
+        if self._prior_session_trade_intents:
+            # Paper _stable_id: preserve its namespace and "|" separator without importing
+            # the Paper execution substrate. UUID5 is not producer authentication.
+            derived_event_id = uuid5(UUID("7d4f2b91-3c6a-4e58-9b2f-1a9d5c8e7f30"),
+                                     f"{intent.intent_id}|intent-event")
+            contents = self._prior_session_trade_intents.get(derived_event_id)
+            if contents is not None:
+                event = json.loads(contents)
+                payload = event["payload"]
+                if (event["event_type"], event["symbol"], event["strategy_id"], event["correlation_id"],
+                    payload["side"], payload["order_type"], Decimal(payload["quantity"]),
+                    None if payload["limit_price"] is None else Decimal(payload["limit_price"])) != (
+                    TRADE_INTENT_EVENT_TYPE, intent.symbol, intent.strategy_id, str(intent.correlation_id),
+                    intent.side.value, intent.order_type.value, intent.quantity, intent.limit_price,
+                ):
+                    raise ProductionStateError("derived historical intent identity has mismatched economics.")
+                return True
+        return False
+
+    def _require_session_evidence(self) -> None:
+        if not self._session_evidence or any(
+            (event := self._journal.read_by_id(identity)) is None or canonical_event(event) != contents
+            for identity, contents in self._session_evidence
+        ):
+            raise ProductionStateError("persisted startup session boundary is missing or changed.")
+
+    def _require_checkpoint_configuration(self) -> None:
+        """Construction is not authority for a later start on mutable wiring."""
+        from .origin_audit import CrewOriginAudit
+        real = self._real_https_writer or type(
+            getattr(getattr(self._execution, "client", None), "transport", None)
+        ) is RequestsTransport
+        if not real and not self._require_rollback_checkpoint:
+            return
+        authority = self._origin_authority
+        audit = getattr(authority, "_audit", None)
+        if (self._require_rollback_checkpoint is not True
+                or self._require_authenticated_origin_audit is not True
+                or self._require_origin_binding is not True
+                or type(authority) is not CrewOriginAuthority
+                or type(audit) is not CrewOriginAudit
+                or not callable(audit._checkpoint_reader)
+                or audit._journal_id != self._journal.journal_id()):
+            raise ProductionStateError("origin checkpoint configuration is broken; startup refused.")
+
+    def _require_host_local_writer_authority(self) -> CanonicalWriterScope | None:
+        """Pin the real HTTPS writer to ONE Windows account journal and owner lease.
+
+        Configured account identity selects a candidate path; it does not authorize
+        sending. Only a later strict signed snapshot plus canonical risk proof may
+        bind the client to this scope.
+        """
+        if not self._durable_venue_writes:
+            return None
+        source = self._require_canonical_risk_binding()
+        client = source._client
+        if (type(client.transport) is RequestsTransport) is not self._real_https_writer:
+            raise ProductionStateError(
+                "canonical writer transport changed since production construction."
+            )
+        if not self._real_https_writer:
+            return None
+        try:
+            scope = CanonicalWriterScope(
+                venue=client.venue_label,
+                environment=source._environment,
+                account_id=source._venue_account_id,
+            )
+            scope.require_journal(self._journal)
+            if (
+                self._state_dir.resolve(strict=False) != scope.state_dir().resolve(strict=False)
+                or self._control.ownership_store.path.resolve(strict=False)
+                != scope.ownership_path().resolve(strict=False)
+            ):
+                raise CanonicalWriterScopeError("ownership lease location is not canonical.")
+        except (CanonicalWriterScopeError, OSError, ValueError):
+            raise ProductionStateError(
+                "canonical writer requires the same verified FULL journal and owner lease "
+                "in the configured account's host-local authority directory."
+            ) from None
+        return scope
+
+    def _bind_host_local_writer_after_risk(self) -> None:
+        """Publish the canonical scope only after strict signed account-risk validation."""
+        scope = self._require_host_local_writer_authority()
+        if scope is None:
+            return
+        client = self._risk_state_provider._client
+        if client._authenticated_venue_account_id != scope.account_id:
+            raise ProductionStateError(
+                "canonical writer cannot bind: signed risk account identity mismatches "
+                "the configured authority."
+            )
+        client.canonical_scope = scope
+
+    def _require_canonical_risk_binding(self) -> ProductionRiskStateSource:
+        """Fail closed unless venue writes and canonical risk evidence share one authority path."""
+        source = self._risk_state_provider
+        if type(source) is not ProductionRiskStateSource:
+            raise ProductionStateError(
+                "venue-writing production requires the canonical ProductionRiskStateSource."
+            )
+        execution_client = getattr(self._execution, "client", None)
+        if (
+            execution_client is None
+            or source._client is not execution_client
+            or source._journal is not self._journal
+            or source._control is not self._control
+            or source._instrument != self._instrument
+            or source._environment != source._client.venue_label
+        ):
+            raise ProductionStateError(
+                "canonical risk source is not bound to this runtime's execution client, journal, "
+                "control, instrument and environment."
+            )
+        return source
+
+    @staticmethod
+    def _resolve_execution_capability(execution: object) -> ExecutionCapability:
+        """Resolve the explicit execution capability, failing closed on anything unknown.
+
+        UNKNOWN CAPABILITY IS NEVER SAFE CAPABILITY: a missing, malformed, contradictory or
+        unsupported declaration is refused before the runtime can create venue risk. There is
+        deliberately no ``getattr(..., False)``-style permissive fallback.
+        """
+        declaration = getattr(execution, "capability", None)
+        if declaration is None:
+            legacy = getattr(execution, "writes_to_venue", None)
+            detail = "" if legacy is None else f" (legacy writes_to_venue={legacy!r})"
+            raise NonDurableExecutionError(
+                "the injected execution port has no explicit ExecutionCapability declaration"
+                + detail
+                + "; unknown capability is never treated as safe."
+            )
+        if not isinstance(declaration, ExecutionCapability):
+            raise NonDurableExecutionError(
+                f"the injected execution port declares a malformed capability {declaration!r}; "
+                "refusing to guess its venue-write semantics."
+            )
+        if isinstance(execution, DurableVenueWritePort):
+            if declaration is not ExecutionCapability.DURABLE_VENUE_WRITING:
+                raise NonDurableExecutionError(
+                    "the injected execution port inherits the approved durable submission "
+                    f"contract but declares capability {declaration.value!r}; refusing the "
+                    "contradictory declaration."
+                )
+            return declaration
+        if declaration is ExecutionCapability.VENUE_WRITING_UNPROVEN:
+            raise NonDurableExecutionError(
+                "the injected execution port declares venue writing without the approved durable "
+                "submission boundary; it can never be used for production execution."
+            )
+        return declaration
 
     def _blocked(
         self,
@@ -693,6 +1761,7 @@ class ProductionRuntime:
             quantity=intent.quantity,
             limit_price=intent.limit_price,
             time_in_force=intent.time_in_force,
+            strategy_id=intent.strategy_id,
             approved=False,
             stages=tuple(stages),
             blocked_reason_code=reason_code,
@@ -700,25 +1769,60 @@ class ProductionRuntime:
             prepared_at=now,
         )
 
+    def _journal_identity_unverified(self) -> bool:
+        """Whether this FULL-founded journal records no journal_id (founded before identities, F-02).
+
+        Venue writes require a FULL-founded journal, so that is the only kind a writer could trade
+        on with an unproven pairing; a journal that was never FULL-founded never carries one.
+        """
+        path = getattr(self._journal, "path", None)
+        if not isinstance(path, str) or not path or path == ":memory:":
+            return False
+        founded = getattr(self._journal, "has_full_foundation", None)
+        if founded is None or not founded():
+            return False
+        read = getattr(self._journal, "journal_id", None)
+        return read is None or read() is None
+
     def _require_startup_posture(self, controller: SafetyController) -> None:
         if controller.kill_switch_engaged:
             self._last_refusal = "kill_switch_engaged"
             raise ProductionStartupError(
                 "startup refused: the persisted safety state has the kill switch engaged."
             )
-        if controller.mode is not SafetyMode.NORMAL:
+        if controller.mode not in {SafetyMode.NORMAL, SafetyMode.REDUCE_ONLY}:
             self._last_refusal = f"safety_mode_{controller.mode.value}"
             raise ProductionStartupError(
                 "startup refused: the persisted safety posture is "
-                f"{controller.mode.value!r}, which does not permit a normal trading writer. "
-                "Reconcile, acknowledge and restore normal through the operator break-glass channel "
-                "first."
+                f"{controller.mode.value!r}, which does not permit the production writer. "
+                "Reconcile, acknowledge and restore an allowed posture through the operator "
+                "break-glass channel first."
             )
         epoch = self._control.load_epoch()
         if epoch is not None and epoch.is_open:
             self._last_refusal = "break_glass_epoch_open"
             raise ProductionStartupError(
                 f"startup refused: break-glass epoch {epoch.session_id} is open."
+            )
+
+    def _safety_transition_anchor(self) -> tuple[int, UUID | None]:
+        """Return the append-only identity of accepted operator safety transitions."""
+        transitions = tuple(
+            record
+            for record in self._control.load_ledger().records
+            if record.accepted
+            and record.previous_safety_state != record.resulting_safety_state
+        )
+        return (
+            len(transitions),
+            None if not transitions else transitions[-1].event_id,
+        )
+
+    def _require_startup_safety_anchor(self, expected: tuple[int, UUID | None]) -> None:
+        if self._safety_transition_anchor() != expected:
+            self._last_refusal = "safety_state_changed_during_startup"
+            raise ProductionStartupError(
+                "startup refused: the safety state changed during startup."
             )
 
     def _require_running(self) -> None:

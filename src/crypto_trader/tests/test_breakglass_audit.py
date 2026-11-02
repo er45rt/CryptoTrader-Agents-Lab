@@ -15,6 +15,7 @@ from crypto_trader.breakglass.audit import (
     run_break_glass_audit,
 )
 from crypto_trader.breakglass.audit import matrix as audit_matrix
+from crypto_trader.breakglass.audit import checks as audit_checks
 
 
 @pytest.fixture(scope="module")
@@ -94,6 +95,81 @@ def test_limitations_are_recorded_as_informational_not_as_passes(report):
     assert all(item.status == "informational" for item in informational)
     assert report.limitations == tuple(item.detail for item in informational)
     assert any("testnet" in item.item_id for item in informational)
+
+
+
+@pytest.mark.parametrize(
+    ("head", "config"),
+    (
+        (
+            "ref: refs/heads/main",
+            '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n',
+        ),
+        ("ref: refs/heads/feature/test", ""),
+        ("ref: refs/heads/main", "not-a-valid-git-config"),
+        ("0123456789abcdef", None),
+        (None, None),
+    ),
+)
+def test_repository_metadata_never_blocks_breakglass_readiness(
+    monkeypatch, tmp_path: Path, head: str | None, config: str | None
+):
+    root = tmp_path / "repo"
+    git_dir = root / ".git"
+    if head is not None:
+        git_dir.mkdir(parents=True)
+        (git_dir / "HEAD").write_text(head, encoding="utf-8")
+        if config is not None:
+            (git_dir / "config").write_text(config, encoding="utf-8")
+
+    monkeypatch.setattr(audit_checks, "PROJECT_ROOT", root)
+    item = audit_checks._git_policy_item()
+
+    assert item.item_id == "repository_metadata"
+    assert item.area == "Repository policy"
+    assert item.required is False
+    assert item.status == "informational"
+    assert item.is_blocking_failure is False
+
+
+def test_repository_metadata_never_reads_git_config(monkeypatch, tmp_path: Path):
+    root = tmp_path / "repo"
+    git_dir = root / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git_dir / "config").write_text(
+        '[remote "origin"]\n\turl = https://credential@example.invalid/repo.git\n',
+        encoding="utf-8",
+    )
+
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        assert self.name != "config", "repository_metadata must never read .git/config"
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    monkeypatch.setattr(audit_checks, "PROJECT_ROOT", root)
+
+    item = audit_checks._git_policy_item()
+
+    assert item.status == "informational"
+    assert item.evidence["current_branch"] == "main"
+    assert item.is_blocking_failure is False
+
+
+def test_repository_metadata_tolerates_gitdir_file(monkeypatch, tmp_path: Path):
+    root = tmp_path / "worktree"
+    root.mkdir()
+    (root / ".git").write_text("gitdir: ../actual-git-dir\n", encoding="utf-8")
+
+    monkeypatch.setattr(audit_checks, "PROJECT_ROOT", root)
+    item = audit_checks._git_policy_item()
+
+    assert item.required is False
+    assert item.status == "informational"
+    assert item.evidence["git_layout"] == "gitdir_file"
+    assert item.is_blocking_failure is False
 
 
 def test_the_report_is_json_serializable_and_secret_free(report):

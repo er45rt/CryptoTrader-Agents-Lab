@@ -1,7 +1,7 @@
-"""Tests for the Binance official public market data tool (Phase 1 migration).
+"""Offline tests for the allowlisted Binance spot public-market-data GET tool.
 
-All tests are network-free: they patch requests.get on the tool module, so no
-request ever leaves the test process.
+All successful request paths patch Session.get; an autouse guard rejects any
+real Session.send regardless of whether a test accidentally misses a mock.
 """
 
 import json
@@ -37,6 +37,15 @@ def make_response(status_code=200, payload=None, headers=None, text=""):
     if status_code >= 400:
         response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=response)
     return response
+
+
+@pytest.fixture(autouse=True)
+def forbid_real_network(monkeypatch):
+    """Fail hard if any test reaches the requests transport, even through _run."""
+    def deny_send(self, request, **kwargs):
+        pytest.fail(f"Unexpected real HTTP transport: {request.method}")
+
+    monkeypatch.setattr(requests.sessions.Session, "send", deny_send)
 
 
 @pytest.fixture
@@ -76,7 +85,7 @@ def test_endpoints_use_official_api_v3_paths(tool):
 
 # --- Success paths ---
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_get_kline_data_success(mock_get, tool):
     mock_get.return_value = make_response(payload=[KLINE_ROW])
 
@@ -99,7 +108,7 @@ def test_get_kline_data_success(mock_get, tool):
     assert "x-rapidapi-key" not in {k.lower() for k in call.kwargs["headers"]}
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_get_symbol_price_ticker_success(mock_get, tool):
     mock_get.return_value = make_response(payload={"symbol": "BTCUSDT", "price": "40000.00000000"})
 
@@ -114,7 +123,7 @@ def test_get_symbol_price_ticker_success(mock_get, tool):
     assert mock_get.call_args.args[0] == f"{DEFAULT_BASE_URL}/api/v3/ticker/price"
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_get_24hr_ticker_success(mock_get, tool):
     mock_get.return_value = make_response(payload={
         "symbol": "ETHUSDT",
@@ -141,7 +150,7 @@ def test_get_24hr_ticker_success(mock_get, tool):
     (404, "http_error"),
     (418, "ip_banned"),
 ])
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_non_retryable_http_errors_are_structured(mock_get, status_code, expected_type, tool):
     mock_get.return_value = make_response(status_code=status_code, payload={"code": -1121, "msg": "Invalid symbol."})
 
@@ -155,7 +164,7 @@ def test_non_retryable_http_errors_are_structured(mock_get, status_code, expecte
     assert mock_get.call_count == 1  # no retry for non-transient failures
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_timeout_returns_structured_error_after_bounded_retries(mock_get, tool):
     mock_get.side_effect = requests.exceptions.Timeout("timed out")
 
@@ -170,7 +179,7 @@ def test_timeout_returns_structured_error_after_bounded_retries(mock_get, tool):
     assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0, 2.0]  # bounded exponential backoff
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_connection_error_returns_structured_error(mock_get, tool):
     mock_get.side_effect = requests.exceptions.ConnectionError("dns failure")
 
@@ -184,7 +193,7 @@ def test_connection_error_returns_structured_error(mock_get, tool):
 
 # --- Retry behavior ---
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_transient_server_error_is_retried_then_succeeds(mock_get, tool):
     mock_get.side_effect = [
         make_response(status_code=503, payload={"msg": "unavailable"}),
@@ -199,7 +208,7 @@ def test_transient_server_error_is_retried_then_succeeds(mock_get, tool):
     assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_rate_limit_honors_retry_after_then_succeeds(mock_get, tool):
     mock_get.side_effect = [
         make_response(status_code=429, payload={"msg": "too many requests"}, headers={"Retry-After": "3"}),
@@ -214,7 +223,7 @@ def test_rate_limit_honors_retry_after_then_succeeds(mock_get, tool):
     assert [call.args[0] for call in mock_sleep.call_args_list] == [3.0]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_rate_limit_returns_structured_error_after_retry_budget(mock_get, tool):
     mock_get.return_value = make_response(status_code=429, payload={"msg": "too many requests"})
 
@@ -229,7 +238,7 @@ def test_rate_limit_returns_structured_error_after_retry_budget(mock_get, tool):
 
 # --- Response validation ---
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_empty_kline_response_is_rejected(mock_get, tool):
     mock_get.return_value = make_response(payload=[])
 
@@ -243,7 +252,7 @@ def test_empty_kline_response_is_rejected(mock_get, tool):
     assert "empty candle list" in result["message"]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_malformed_kline_row_is_rejected(mock_get, tool):
     mock_get.return_value = make_response(payload=[[1672531200000, "not-a-number"]])
 
@@ -256,7 +265,7 @@ def test_malformed_kline_row_is_rejected(mock_get, tool):
     assert result["error_type"] == "invalid_response"
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_out_of_order_kline_timestamps_are_rejected(mock_get, tool):
     row_later = [row for row in KLINE_ROW]
     row_earlier = [row for row in KLINE_ROW]
@@ -272,7 +281,7 @@ def test_out_of_order_kline_timestamps_are_rejected(mock_get, tool):
     assert "ascending order" in result["message"]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_missing_price_field_is_rejected(mock_get, tool):
     mock_get.return_value = make_response(payload={"symbol": "BTCUSDT"})
 
@@ -283,7 +292,7 @@ def test_missing_price_field_is_rejected(mock_get, tool):
     assert "price" in result["message"]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_incomplete_24hr_payload_is_rejected(mock_get, tool):
     mock_get.return_value = make_response(payload={"symbol": "ETHUSDT", "lastPrice": "2450.00"})
 
@@ -294,7 +303,7 @@ def test_incomplete_24hr_payload_is_rejected(mock_get, tool):
     assert "openPrice" in result["message"]
 
 
-@patch(f"{MODULE}.requests.get")
+@patch(f"{MODULE}.requests.Session.get")
 def test_non_json_response_is_rejected(mock_get, tool):
     mock_get.return_value = make_response(status_code=200, payload=None, text="<html>blocked</html>")
 
@@ -320,3 +329,152 @@ def test_missing_parameters_return_structured_error(tool):
     assert result["status"] == "error"
     assert result["error_type"] == "invalid_response"
     assert "symbol" in result["message"]
+
+
+# --- Public transport boundary (fail closed; no live network) ---
+
+@pytest.mark.parametrize("unsafe_base", [
+    "https://example.com",
+    "https://api.binance.com.evil.example",
+    "https://api.binance.com:443",
+    "https://api.binance.com/api/v3",
+    "https://api.binance.com?redirect=1",
+    "https://api.binance.com#fragment",
+    "https://user:secret@api.binance.com",
+    "http://api.binance.com",
+    "https://127.0.0.1",
+    "https://localhost",
+    "https://testnet.binance.vision",
+])
+def test_unapproved_base_url_rejected_before_transport(unsafe_base):
+    with patch(f"{MODULE}.requests.Session.get") as mock_get:
+        with pytest.raises(ValueError):
+            BinancePublicTool(base_url=unsafe_base)
+        mock_get.assert_not_called()
+
+
+@pytest.mark.parametrize("field,unsafe_value", [
+    ("base_url", "https://example.com"),
+    ("base_url", "https://api.binance.com.evil.example"),
+    ("base_url", "https://api.binance.com:443"),
+    ("price_ticker_endpoint_path", "/api/v3/order"),
+    ("price_ticker_endpoint_path", "//evil.example/order"),
+    ("price_ticker_endpoint_path", "/api/v3/ticker/price?x=1"),
+    ("price_ticker_endpoint_path", "/api/v3/ticker/price/../order"),
+])
+def test_mutated_destination_is_rejected_before_send(tool, field, unsafe_value):
+    setattr(tool, field, unsafe_value)
+    with patch(f"{MODULE}.requests.Session.get") as mock_get:
+        result = json.loads(tool._run(
+            action="get_symbol_price_ticker", parameters={"symbol": "BTCUSDT"}
+        ))
+    assert result["status"] == "error"
+    assert result["error_type"] == "invalid_endpoint"
+    assert result["attempts"] == 1
+    assert result["data"] is None
+    mock_get.assert_not_called()
+
+
+def test_public_session_ignores_ambient_credentials_and_proxy(monkeypatch, tool):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:18181")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:18181")
+    monkeypatch.setenv("NETRC", "C:/path/to/untrusted.netrc")
+    with patch(f"{MODULE}.requests.Session") as factory:
+        session = factory.return_value.__enter__.return_value
+        session.get.return_value = make_response(
+            payload={"symbol": "BTCUSDT", "price": "40000.00"}
+        )
+        result = json.loads(tool._run(
+            action="get_symbol_price_ticker", parameters={"symbol": "BTCUSDT"}
+        ))
+    assert result["status"] == "ok"
+    assert session.trust_env is False
+    session.get.assert_called_once()
+    kwargs = session.get.call_args.kwargs
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["verify"] is True
+    assert kwargs["timeout"] == 7.0
+    assert "auth" not in kwargs and "proxies" not in kwargs
+    assert set(kwargs["headers"]) == {"Accept", "User-Agent"}
+    assert "Authorization" not in kwargs["headers"]
+    factory.return_value.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("status_code", [300, 301, 302, 303, 304, 307, 308, 399])
+@patch(f"{MODULE}.requests.Session.get")
+def test_every_redirect_is_nonretryable_error_without_followup(mock_get, status_code, tool):
+    response = make_response(
+        status_code=status_code,
+        payload={"symbol": "BTCUSDT", "price": "40000.00"},
+        headers={"Location": "https://evil.example/api/v3/order"},
+    )
+    mock_get.return_value = response
+    with patch(f"{MODULE}.time.sleep") as sleep:
+        result = json.loads(tool._run(
+            action="get_symbol_price_ticker", parameters={"symbol": "BTCUSDT"}
+        ))
+    assert result["status"] == "error"
+    assert result["error_type"] == "redirect_blocked"
+    assert result["http_status"] == status_code
+    assert result["attempts"] == 1
+    assert result["data"] is None
+    mock_get.assert_called_once()
+    response.json.assert_not_called()
+    sleep.assert_not_called()
+
+
+@patch(f"{MODULE}.requests.Session.get")
+def test_us_public_api_can_be_called_without_auth(mock_get):
+    mock_get.return_value = make_response(
+        payload={"symbol": "BTCUSDT", "price": "40000.00"}
+    )
+    tool = BinancePublicTool(base_url="https://api.binance.us/", max_attempts=1)
+    result = json.loads(tool._run(
+        action="get_symbol_price_ticker", parameters={"symbol": "BTCUSDT"}
+    ))
+    assert result["status"] == "ok"
+    assert mock_get.call_args.args[0] == "https://api.binance.us/api/v3/ticker/price"
+
+
+def test_unapproved_environment_override_rejected_without_transport(monkeypatch):
+    monkeypatch.setenv("BINANCE_API_BASE_URL", "https://api.binance.com.evil.example")
+    with patch(f"{MODULE}.requests.Session.get") as mock_get:
+        with pytest.raises(ValueError):
+            BinancePublicTool()
+        mock_get.assert_not_called()
+
+
+def test_real_requests_preparation_disables_ambient_proxy_and_netrc(monkeypatch, tool):
+    """Exercise the real Requests preparation logic, intercepting send before sockets."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:18181")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:18181")
+    monkeypatch.setenv("NETRC", "C:/nonexistent/attacker.netrc")
+
+    def fail_ambient(*args, **kwargs):
+        pytest.fail("Requests tried to read environment or netrc settings")
+
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", fail_ambient)
+    monkeypatch.setattr(requests.sessions, "get_environ_proxies", fail_ambient)
+    calls = []
+
+    def capture_send(self, prepared, **kwargs):
+        calls.append((prepared, kwargs, self.trust_env))
+        return make_response(payload={"symbol": "BTCUSDT", "price": "40000.00"})
+
+    # Overrides the file-wide deny guard with a controlled, still socket-free send.
+    monkeypatch.setattr(requests.sessions.Session, "send", capture_send)
+    result = json.loads(tool._run(
+        action="get_symbol_price_ticker",
+        parameters={"symbol": "BTCUSDT"},
+    ))
+    assert result["status"] == "ok"
+    assert len(calls) == 1
+    prepared, kwargs, trust_env = calls[0]
+    assert trust_env is False
+    assert prepared.method == "GET"
+    assert prepared.url == "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    assert "Authorization" not in prepared.headers
+    assert "Cookie" not in prepared.headers
+    assert kwargs.get("proxies") == {}
+    assert kwargs["verify"] is True
+    assert kwargs["allow_redirects"] is False

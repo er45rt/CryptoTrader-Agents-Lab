@@ -20,7 +20,10 @@ __all__ = [
     "FIXTURES",
     "FIXTURE_CAUSAL_TRADE_INTENT",
     "FIXTURE_ORDER_STATE_CHANGED",
+    "FIXTURE_ORDER_SUBMISSION_ATTEMPTED",
     "FIXTURE_PARTIAL_FILL",
+    "FIXTURE_VENUE_TRADE_RECORDED",
+    "FIXTURE_ACCOUNT_EQUITY_RECORDED",
     "FIXTURE_RECOVERY_STATE_CHANGED",
     "FIXTURE_RISK_DECISION",
     "FIXTURE_ROOT_STRATEGY_DECISION",
@@ -140,6 +143,68 @@ FIXTURE_PARTIAL_FILL: dict[str, Any] = {
     },
 }
 
+# 5b. Venue trade metadata linked to the existing partial fill.
+FIXTURE_VENUE_TRADE_RECORDED: dict[str, Any] = {
+    "event_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "event_type": "venue.trade.recorded",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:15Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": "77777777-7777-4777-8777-777777777777",
+    "producer": "infrastructure.synthetic_venue",
+    "strategy_id": "strat-synthetic-1",
+    "order_id": ORDER_ID,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "venue_reference": "ct-44444444444444444444",
+        "venue_order_id": "42",
+        "venue_trade_id": "7001",
+        "fill_event_id": "77777777-7777-4777-8777-777777777777",
+        "price": "100.25000000",
+        "quantity": "0.40000000",
+        "quote_quantity": "40.10000000",
+        "commission": "0.00400000",
+        "commission_asset": "SYNTH",
+        "trade_time": "2026-01-01T12:00:15Z",
+        "is_buyer": True,
+        "is_maker": False,
+    },
+}
+
+# 5c. Durable production account-equity baseline root.
+FIXTURE_ACCOUNT_EQUITY_RECORDED: dict[str, Any] = {
+    "event_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    "event_type": "account.equity.recorded",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:02Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": None,
+    "producer": "application.production.equity",
+    "strategy_id": None,
+    "order_id": None,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "kind": "baseline",
+        "environment": "binance-spot-testnet",
+        "venue_account_id": "123456789",
+        "base_asset": "SYNTH",
+        "quote_asset": "USDT",
+        "base_balance": "10.00000000",
+        "quote_balance": "1000.00000000",
+        "mark_price": "100.25000000",
+        "mark_reference": "market:SYNTHUSDT:fixture",
+        "mark_event_ts": "2026-01-01T12:00:02Z",
+        "equity_quote": "2002.50000000",
+        "peak_equity_quote": "2002.50000000",
+        "baseline_event_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "previous_event_id": None,
+        "fence_term": 1,
+        "reason": "Synthetic production equity baseline fixture.",
+    },
+}
+
 # 6. Recovery/reconciliation state change.
 FIXTURE_RECOVERY_STATE_CHANGED: dict[str, Any] = {
     "event_id": "88888888-8888-4888-8888-888888888888",
@@ -160,12 +225,40 @@ FIXTURE_RECOVERY_STATE_CHANGED: dict[str, Any] = {
     },
 }
 
+# 7. Durable pre-send submission attempt (Phase 15 durability, additive contract).
+FIXTURE_ORDER_SUBMISSION_ATTEMPTED: dict[str, Any] = {
+    "event_id": "99999999-9999-4999-8999-999999999999",
+    "event_type": "order.submission.attempted",
+    "schema_version": 1,
+    "occurred_at": "2026-01-01T12:00:01Z",
+    "correlation_id": CORRELATION_ID,
+    "causation_id": None,
+    "producer": "application.production",
+    "strategy_id": "strat-synthetic-1",
+    "order_id": ORDER_ID,
+    "symbol": "SYNTHUSDT",
+    "sequence_number": None,
+    "payload": {
+        "venue_reference": "ct-44444444444444444444",
+        "intent_id": "55555555-5555-4555-8555-555555555555",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "1.00000000",
+        "limit_price": "100.25000000",
+        "time_in_force": "gtc",
+        "venue_producer": "infrastructure.binance_testnet",
+    },
+}
+
 FIXTURES: dict[str, dict[str, Any]] = {
     "root_strategy_decision": FIXTURE_ROOT_STRATEGY_DECISION,
     "causal_trade_intent": FIXTURE_CAUSAL_TRADE_INTENT,
     "risk_decision": FIXTURE_RISK_DECISION,
+    "order_submission_attempted": FIXTURE_ORDER_SUBMISSION_ATTEMPTED,
     "order_state_changed": FIXTURE_ORDER_STATE_CHANGED,
     "partial_fill": FIXTURE_PARTIAL_FILL,
+    "venue_trade_recorded": FIXTURE_VENUE_TRADE_RECORDED,
+    "account_equity_recorded": FIXTURE_ACCOUNT_EQUITY_RECORDED,
     "recovery_state_changed": FIXTURE_RECOVERY_STATE_CHANGED,
 }
 

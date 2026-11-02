@@ -25,7 +25,12 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from crypto_trader.events import OPERATOR_COMMAND_EVENT_TYPE
+from crypto_trader.events import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
+)
 from crypto_trader.persistence import EventJournal
 from crypto_trader.safety import SafetyMode
 
@@ -35,12 +40,20 @@ __all__ = [
     "EPOCH_SCHEMA_VERSION",
     "BreakGlassEpoch",
     "BreakGlassLedger",
+    "EpochObservations",
     "OperatorAcknowledgement",
     "RecordedOperatorCommand",
     "derive_ledger",
 ]
 
 EPOCH_SCHEMA_VERSION = 1
+
+#: The journaled events of one break-glass reconcile run (review F-03).
+_RUN_EVENT_TYPES = (
+    RECONCILIATION_INTAKE_EVENT_TYPE,
+    RECONCILIATION_OBSERVED_EVENT_TYPE,
+    RECONCILIATION_SETTLED_EVENT_TYPE,
+)
 
 #: Reconciliation states an epoch can be in.
 ReconciliationStatus = Literal["not_required", "pending", "resolved", "failed"]
@@ -260,6 +273,10 @@ class RecordedOperatorCommand:
     event_id: UUID
     correlation_id: UUID
     causation_id: UUID | None
+    cancelled_order_references: tuple[str, ...] = ()
+    unconfirmed_order_references: tuple[str, ...] = ()
+    #: The writer's envelope sequence number, None when the event carries none (review P5-F1).
+    sequence_number: int | None = None
 
     @property
     def accepted(self) -> bool:
@@ -286,10 +303,29 @@ class RecordedOperatorCommand:
             "epoch_opened": self.epoch_opened,
             "epoch_closed": self.epoch_closed,
             "fence_term": self.fence_term,
+            "cancelled_order_references": list(self.cancelled_order_references),
+            "unconfirmed_order_references": list(self.unconfirmed_order_references),
             "correlation_id": str(self.correlation_id),
             "causation_id": None if self.causation_id is None else str(self.causation_id),
             "event_id": str(self.event_id),
         }
+
+
+@dataclass(frozen=True)
+class EpochObservations:
+    """What the journaled reconcile runs recorded (review F-03); a closed epoch leaves none behind.
+
+    ``external_orders`` are the (client order id, venue order id) of every open venue order a run
+    listed that the journal does not know; one leaves only when a run settles that exact venue
+    order as terminal without any execution, otherwise it stays outstanding for the epoch.
+    ``unobserved_intakes`` are runs that started but never journaled what they saw: they may have
+    seen orders nobody recorded. ``run_incomplete`` means the latest run started after the last
+    completed one, so no recorded reconciliation result covers the latest venue reads.
+    """
+
+    external_orders: tuple[tuple[str, str | None], ...] = ()
+    unobserved_intakes: tuple[UUID, ...] = ()
+    run_incomplete: bool = False
 
 
 @dataclass(frozen=True)
@@ -298,25 +334,199 @@ class BreakGlassLedger:
 
     epoch: BreakGlassEpoch | None = None
     commands: dict[UUID, RecordedOperatorCommand] = field(default_factory=dict)
+    observations: EpochObservations = field(default_factory=EpochObservations)
+    latest_occurred_at: datetime | None = None
+    #: The command_id of every reconcile run that journaled an intake (review F-03).
+    reconcile_run_commands: frozenset[UUID] = frozenset()
 
     def command(self, command_id: UUID) -> RecordedOperatorCommand | None:
         return self.commands.get(command_id)
 
     @property
     def records(self) -> list[RecordedOperatorCommand]:
-        """Every recorded command in authoritative journal (arrival) order."""
+        """Every recorded command in journal replay order (by journaled time, then sequence)."""
         return list(self.commands.values())
 
     @property
     def open_epoch(self) -> BreakGlassEpoch | None:
         return self.epoch if self.epoch is not None and self.epoch.is_open else None
 
+    def _open_epoch_records(self) -> list[tuple[int, RecordedOperatorCommand]]:
+        """The open epoch's records with their replay index (reviews P5-F1 and F-1).
+
+        Replay orders records by journaled time, which code before the logical clock took from the
+        raw wall clock, so a record of the open epoch can replay before the record that opened it.
+        A record belongs to the open epoch when it replays at or after the opening record, carries
+        the epoch's session as its correlation, or has a sequence number above the opening
+        record's (written after it). A record that replays earlier and cannot be placed because a
+        sequence number is missing counts as well (fail-closed).
+        """
+        epoch = self.open_epoch
+        if epoch is None:
+            return []
+        records = self.records
+        opened = max((index for index, record in enumerate(records) if record.epoch_opened), default=0)
+        anchor = records[opened].sequence_number
+        return [
+            (index, record)
+            for index, record in enumerate(records)
+            if index >= opened
+            or record.correlation_id == epoch.session_id
+            or anchor is None
+            or record.sequence_number is None
+            or record.sequence_number > anchor
+        ]
+
+    def open_epoch_order_references(self) -> tuple[str, ...]:
+        """Order references cancelled in the open epoch, in journal order."""
+        references: list[str] = []
+        for _, record in self._open_epoch_records():
+            for reference in record.cancelled_order_references:
+                if reference not in references:
+                    references.append(reference)
+        return tuple(references)
+
+    def open_epoch_unconfirmed_references(self) -> tuple[str, ...]:
+        """Order references whose cancel stayed unconfirmed in the open epoch."""
+        references: list[str] = []
+        for _, record in self._open_epoch_records():
+            for reference in record.unconfirmed_order_references:
+                if reference not in references:
+                    references.append(reference)
+        return tuple(references)
+
+    def open_epoch_open_orders_unknown(self) -> bool:
+        """Whether a cancel since the open epoch was opened never learned the venue's open orders.
+
+        A cancel_open the venue did not confirm that recorded no reference at all (listing the
+        open orders failed, or the cancel could not be attempted) leaves them unknown: only a
+        complete venue listing can settle what is open (review F-03).
+        """
+        return any(_leaves_open_orders_unknown(record) for _, record in self._open_epoch_records())
+
+    def open_epoch_legacy_listing_run(self) -> bool:
+        """Whether a reconcile run journaled before intakes existed listed the open orders.
+
+        Review ADV-04: such a run listed the open orders a failed cancel never learned and
+        journaled nothing it saw, so no later run can tell which venue orders it may have found.
+
+        Review P5-F1: that older code took the raw wall clock, so its record can replay before the
+        cancel it followed, even before the record that opened the epoch. The epoch's records are
+        placed as ``_open_epoch_records`` does (review F-1), and an older run counts as earlier
+        than such a cancel only when replay order and the writer's sequence numbers both say so;
+        otherwise it is taken as a listing run.
+        """
+        members = self._open_epoch_records()
+        cancels = [(index, record) for index, record in members if _leaves_open_orders_unknown(record)]
+        runs = [
+            (index, record)
+            for index, record in members
+            if record.accepted
+            and record.command_type == "reconcile"
+            and record.command_id not in self.reconcile_run_commands
+        ]
+        return any(not _written_before(run, cancel) for run in runs for cancel in cancels)
+
+    def open_epoch_cancel_listing_unverifiable(self) -> bool:
+        """Whether a cancel of the open epoch failed part-way through its listing (review H-1).
+
+        A cancel the venue did not confirm (rejected, ambiguous or unavailable) that recorded
+        references stopped somewhere in its strict listing. The orders listed after that point were
+        neither cancelled nor journaled, and the journal cannot tell whether there were any, so no
+        reconciliation can prove what became of them: only re-establishment clears it.
+        """
+        return any(
+            record.command_type == "cancel_open"
+            and record.venue_control in ("rejected", "ambiguous", "unavailable")
+            and bool(record.cancelled_order_references or record.unconfirmed_order_references)
+            for _, record in self._open_epoch_records()
+        )
+
+    def open_epoch_reconciliation_superseded(self) -> bool:
+        """Whether a cancel reached the venue after the open epoch's latest reconciliation (N-1).
+
+        A reconciliation, and the acknowledgement of it, cover the venue as it was then. A cancel
+        that reached the venue later may have changed it, so neither may restore normal until a new
+        reconciliation runs. A cancel counts as earlier only when replay order and the writer's
+        sequence numbers both say so; otherwise it supersedes (fail-closed).
+        """
+        members = self._open_epoch_records()
+        runs = [
+            (index, record)
+            for index, record in members
+            if record.accepted and record.command_type == "reconcile"
+        ]
+        if not runs:
+            return False
+        latest = runs[-1]
+        return any(
+            not _written_before((index, record), latest)
+            for index, record in members
+            if record.command_type == "cancel_open" and record.venue_control != "not_requested"
+        )
+
+
+def _written_before(
+    first: tuple[int, RecordedOperatorCommand], second: tuple[int, RecordedOperatorCommand]
+) -> bool:
+    """Whether a record was written before another: replay order and sequence agree (P5-F1)."""
+    (first_index, first_record), (second_index, second_record) = first, second
+    return (
+        first_index < second_index
+        and first_record.sequence_number is not None
+        and second_record.sequence_number is not None
+        and first_record.sequence_number < second_record.sequence_number
+    )
+
+
+def _leaves_open_orders_unknown(record: RecordedOperatorCommand) -> bool:
+    """A cancel_open the venue did not confirm that recorded no reference at all."""
+    return (
+        record.command_type == "cancel_open"
+        and record.venue_control in ("rejected", "ambiguous", "unavailable")
+        and not record.cancelled_order_references
+        and not record.unconfirmed_order_references
+    )
+
 
 def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
     """Rebuild the ledger from the authoritative journal (no cache, no guessing)."""
     commands: dict[UUID, RecordedOperatorCommand] = {}
     epoch: BreakGlassEpoch | None = None
-    for event in journal.replay():
+    # Every reconcile run, in replay order (review F-03): their intakes, the intakes observed, every
+    # external order observed, and the replay index of the latest intake and completed run. No
+    # epoch is restored while any of them blocks it, so a closed epoch leaves none behind.
+    intakes: list[UUID] = []
+    observed: set[UUID] = set()
+    external: list[tuple[str, str | None]] = []
+    run_commands: set[UUID] = set()
+    last_intake = last_completed = -1
+    latest_occurred_at: datetime | None = None
+    for index, event in enumerate(journal.replay()):
+        latest_occurred_at = event.occurred_at  # replay is ordered by occurred_at
+        if event.event_type in _RUN_EVENT_TYPES:
+            # A run for a synthesised epoch (no journaled one) settles nothing.
+            if epoch is None:
+                continue
+            if event.event_type == RECONCILIATION_INTAKE_EVENT_TYPE:
+                intakes.append(event.event_id)
+                run_commands.add(event.payload.command_id)
+                last_intake = index
+                # An acknowledgement covers the evidence it saw; a new run reads new evidence.
+                epoch = epoch.with_updates(acknowledgement=None)
+            elif event.event_type == RECONCILIATION_OBSERVED_EVENT_TYPE:
+                observed.add(event.payload.intake_id)
+                for order in event.payload.external_orders:
+                    identity = (order.client_order_id, order.venue_order_id)
+                    if identity not in external:
+                        external.append(identity)
+            else:
+                # Only the exact venue order first observed leaves; any other stays outstanding.
+                for order in event.payload.settled_orders:
+                    identity = (order.client_order_id, order.venue_order_id)
+                    if identity in external:
+                        external.remove(identity)
+            continue
         if event.event_type != OPERATOR_COMMAND_EVENT_TYPE:
             continue
         payload = event.payload
@@ -345,6 +555,17 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
                 event_id=event.event_id,
                 correlation_id=event.correlation_id,
                 causation_id=event.causation_id,
+                # V1 records carry no references; V2 records journal the venue-confirmed ones.
+                cancelled_order_references=tuple(
+                    str(reference)
+                    for reference in getattr(payload, "cancelled_order_references", ())
+                ),
+                # V3 records also journal the cancels the venue never confirmed (review N-05).
+                unconfirmed_order_references=tuple(
+                    str(reference)
+                    for reference in getattr(payload, "unconfirmed_order_references", ())
+                ),
+                sequence_number=event.sequence_number,
             )
         except (AttributeError, TypeError, ValueError) as exc:
             raise BreakGlassStateError(
@@ -358,7 +579,20 @@ def derive_ledger(journal: EventJournal) -> BreakGlassLedger:
             )
         commands.setdefault(record.command_id, record)
         epoch = _reduce_epoch(epoch, record)
-    return BreakGlassLedger(epoch=epoch, commands=commands)
+        if record.accepted and record.command_type == "reconcile":
+            last_completed = index
+    observations = EpochObservations(
+        external_orders=tuple(external),
+        unobserved_intakes=tuple(intake for intake in intakes if intake not in observed),
+        run_incomplete=last_intake > last_completed,
+    )
+    return BreakGlassLedger(
+        epoch=epoch,
+        commands=commands,
+        observations=observations,
+        latest_occurred_at=latest_occurred_at,
+        reconcile_run_commands=frozenset(run_commands),
+    )
 
 
 def _reduce_epoch(
