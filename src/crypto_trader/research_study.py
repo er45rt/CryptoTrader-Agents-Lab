@@ -24,8 +24,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from crypto_trader.research_gate import StrategyGateReport, evaluate_strategy_gate
-from crypto_trader.validation.canonical import content_hash
+from crypto_trader.research_gate import StrategyGateReport, evaluate_strategy_gate, report_payload
+from crypto_trader.validation.canonical import canonical_bytes, content_hash, parse_json_strict
 from crypto_trader.validation.contracts import RegistryError, StudySpec
 from crypto_trader.validation.holdout import (
     HoldoutLedger, evaluate_holdout, grant, holdout_rows_sha256, request_access,
@@ -278,15 +278,58 @@ def reverify_study(outcome: StudyOutcome, *, preregistration=None, results=None)
     return StudyCheck(selection_ok, () if selection_ok else ("selection_not_per_rule",), report)
 
 
+# The only paths a re-run may legitimately change: identities generated during the run, and the
+# hashes or heads computed over them (registry/ledger heads include event times). Every other
+# field, including deterministic digests of inputs and data, is compared.
+#   walk-forward metrics: nothing excluded (they carry no run identity or time);
+#   holdout metrics: candidate trial_id and output_hash (output_hash covers the trial_id);
+#   gate payload: selected_trial_id, both register heads, the trial:<id>:<output> list and the
+#     holdout evidence hashes (over metrics that contain the trial_id);
+#   outcome evidence: the same run-dependent hashes and heads.
+_RUN_GENERATED_PATHS = {
+    "walk_forward_metrics": (),
+    "holdout_metrics": (("candidate", "trial_id"), ("candidate", "output_hash")),
+    "gate": (("selected_trial_id",), ("evidence", "registry_head"), ("evidence", "ledger_head"),
+             ("evidence", "trial_outputs"), ("evidence", "holdout_evidence")),
+    "evidence": (("selected_output",), ("holdout_result",), ("gate_report_sha256",),
+                 ("registry_head",), ("ledger_head",)),
+}
+
+
+def _without(document, paths):
+    """A canonical deep copy with exactly the listed paths removed; a missing path is an error."""
+    view = parse_json_strict(canonical_bytes(document).decode("utf-8"))
+    for path in paths:
+        node = view
+        try:
+            for key in path[:-1]:
+                node = node[key]
+            del node[path[-1]]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise StudyError("comparable_path_missing") from exc
+    return view
+
+
 def comparable(outcome: StudyOutcome) -> dict:
-    """Results and decisions only: no trial or event identities, times or hashes depending on them."""
-    gate = outcome.gate_report
-    held = outcome.holdout_report.metrics
+    """Every computed result and decision; only run-generated identities and dependent hashes out."""
+    family = list(outcome.preregistration["family"])
+    def order(result):
+        name = result.metrics["config"]["strategy"]["name"]
+        return (family.index(name) if name in family else len(family), name)
+    walk_forward = [
+        {"name": result.metrics["config"]["strategy"]["name"],
+         "metrics": _without(result.metrics, _RUN_GENERATED_PATHS["walk_forward_metrics"])}
+        for result in sorted(outcome.results, key=order)
+    ]
     return {
-        "scenario": outcome.scenario, "decision": gate.decision, "reasons": list(gate.reasons),
-        "measures": dict(gate.measures), "checks": [dict(c) for c in gate.checks], "policy": gate.policy,
+        "scenario": outcome.scenario, "label": outcome.label,
+        "preregistration": _without(outcome.preregistration, ()),
+        "walk_forward": walk_forward,
+        "ranking": [{"name": r["name"], "sharpe": r["sharpe"]} for r in outcome.ranking],
         "selected_name": outcome.selected_name,
-        "ranking": [(r["name"], r["sharpe"]) for r in outcome.ranking],
-        "holdout": {"net_sharpe": held["sharpe"], "compounded": held["compounded_net_excess_return"],
-                    "positions": list(held["positions"])},
+        "holdout_metrics": _without(outcome.holdout_report.metrics, _RUN_GENERATED_PATHS["holdout_metrics"]),
+        "ledger_kinds": [kind for kind, _ in outcome.ledger_events],
+        "gate": _without(report_payload(outcome.gate_report), _RUN_GENERATED_PATHS["gate"]),
+        "evidence": _without(outcome.evidence, _RUN_GENERATED_PATHS["evidence"]),
+        "trials_verified_before_holdout": outcome.trials_verified_before_holdout,
     }

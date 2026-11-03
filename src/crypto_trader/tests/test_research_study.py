@@ -1,6 +1,8 @@
 """P5-01: synthetic end-to-end research dry run over the closed P4 pipeline (research only)."""
 from __future__ import annotations
 
+import copy
+import json
 import socket
 import subprocess
 from dataclasses import replace
@@ -10,7 +12,7 @@ import pytest
 
 from crypto_trader import research_gate as gate
 from crypto_trader import research_study as study
-from crypto_trader.validation.research_path import run_registered_trial
+from crypto_trader.validation.research_path import AdmissibleResult, run_registered_trial
 from crypto_trader.validation.walk_forward import WalkForward
 
 
@@ -90,7 +92,97 @@ def test_comparable_view_excludes_ids_times_and_dependent_hashes(signal):
     text = repr(view)
     assert signal.selected_trial_id not in text and signal.evidence["registry_head"] not in text
     assert signal.gate_report.report_sha256 not in text
-    assert view["decision"] == signal.gate_report.decision and view["selected_name"] == signal.selected_name
+    assert view["gate"]["decision"] == signal.gate_report.decision
+    assert view["selected_name"] == signal.selected_name
+
+
+def _with_holdout(outcome, edit):
+    metrics = copy.deepcopy(outcome.holdout_report.metrics)
+    edit(metrics)
+    return replace(outcome, holdout_report=replace(outcome.holdout_report, metrics=metrics))
+
+
+def _with_walk_forward(outcome, index, edit):
+    result = outcome.results[index]
+    metrics = json.loads(result.metrics_json)
+    edit(metrics)
+    forged = AdmissibleResult(result.trial_id, result.study_id, result.binding_hash,
+                              json.dumps(metrics), result.output_hash)
+    return replace(outcome, results=outcome.results[:index] + (forged,) + outcome.results[index + 1:])
+
+
+def _set(path, value):
+    def edit(metrics):
+        node = metrics
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    return edit
+
+
+@pytest.mark.parametrize("label, make", [
+    # Astra's six single edits
+    ("wf position", lambda o: _with_walk_forward(o, 0, _set(("folds", 0, "positions", 0), "0.5"))),
+    ("holdout costs[0]", lambda o: _with_holdout(o, _set(("costs", 0), "9"))),
+    ("holdout net[0]", lambda o: _with_holdout(o, _set(("net_excess_returns", 0), "9"))),
+    ("holdout gross[0]", lambda o: _with_holdout(o, _set(("gross_excess_returns", 0), "9"))),
+    ("holdout turnover", lambda o: _with_holdout(o, _set(("turnover",), "9"))),
+    ("holdout total_cost", lambda o: _with_holdout(o, _set(("total_cost",), "9"))),
+    # fold and aggregate statistics, windows, settings
+    ("wf fold mean", lambda o: _with_walk_forward(o, 1, _set(("folds", 2, "mean"), "9"))),
+    ("wf fold sharpe", lambda o: _with_walk_forward(o, 2, _set(("folds", 1, "sharpe"), "9"))),
+    ("wf fold compounded", lambda o: _with_walk_forward(o, 3, _set(("folds", 0, "compounded_net_excess_return"), "9"))),
+    ("wf fold costs", lambda o: _with_walk_forward(o, 1, _set(("folds", 1, "costs", 5), "9"))),
+    ("wf fold gross", lambda o: _with_walk_forward(o, 1, _set(("folds", 1, "gross_excess_returns", 5), "9"))),
+    ("wf fold net", lambda o: _with_walk_forward(o, 1, _set(("folds", 1, "net_excess_returns", 5), "9"))),
+    ("wf fold turnover", lambda o: _with_walk_forward(o, 1, _set(("folds", 1, "turnover"), "9"))),
+    ("wf fold total_cost", lambda o: _with_walk_forward(o, 1, _set(("folds", 1, "total_cost"), "9"))),
+    ("wf fold window", lambda o: _with_walk_forward(o, 0, _set(("folds", 0, "oos_start_utc_ns"), "1"))),
+    ("wf fold cutoff", lambda o: _with_walk_forward(o, 0, _set(("folds", 0, "train_cutoff_utc_ns"), "1"))),
+    ("wf aggregate sharpe", lambda o: _with_walk_forward(o, 0, _set(("aggregate", "sharpe"), "9"))),
+    ("wf aggregate total_cost", lambda o: _with_walk_forward(o, 0, _set(("aggregate", "total_cost"), "9"))),
+    ("wf frozen fee", lambda o: _with_walk_forward(o, 0, _set(("config", "walk_forward", "fee_bps"), "0"))),
+    ("wf strategy config", lambda o: _with_walk_forward(o, 0, _set(("config", "strategy", "name"), "x"))),
+    ("wf used rows", lambda o: _with_walk_forward(o, 0, _set(("data", "used_rows_sha256"), "0" * 64))),
+    ("holdout positions", lambda o: _with_holdout(o, _set(("positions", 3), "0.5"))),
+    ("holdout mean", lambda o: _with_holdout(o, _set(("mean",), "9"))),
+    ("holdout sharpe", lambda o: _with_holdout(o, _set(("sharpe",), "9"))),
+    ("holdout compounded", lambda o: _with_holdout(o, _set(("compounded_net_excess_return",), "9"))),
+    ("holdout cost rate", lambda o: _with_holdout(o, _set(("cost_rate",), "0"))),
+    ("holdout window", lambda o: _with_holdout(o, _set(("holdout", "start_utc_ns"), "1"))),
+    ("holdout cutoff", lambda o: _with_holdout(o, _set(("train_cutoff_utc_ns",), "1"))),
+    ("holdout rows digest", lambda o: _with_holdout(o, _set(("data", "holdout_rows_sha256"), "0" * 64))),
+    ("holdout frozen config", lambda o: _with_holdout(o, _set(("candidate", "config_sha256"), "0" * 64))),
+])
+def test_comparable_detects_every_single_computational_change(signal, label, make):
+    assert study.comparable(make(signal)) != study.comparable(signal), label
+
+
+@pytest.mark.parametrize("make", [
+    lambda o: _with_holdout(o, _set(("candidate", "trial_id"), "00000000-0000-4000-8000-000000000000")),
+    lambda o: _with_holdout(o, _set(("candidate", "output_hash"), "0" * 64)),
+    lambda o: replace(o, selected_trial_id="00000000-0000-4000-8000-000000000000"),
+    lambda o: replace(o, evidence={**o.evidence, "registry_head": "0" * 64, "ledger_head": "0" * 64,
+                                   "gate_report_sha256": "0" * 64, "holdout_result": "x",
+                                   "selected_output": "x"}),
+], ids=["holdout trial_id", "holdout output_hash", "selected trial_id", "run evidence"])
+def test_only_run_generated_identities_and_dependent_hashes_are_excluded(signal, make):
+    assert study.comparable(make(signal)) == study.comparable(signal)
+
+
+def test_comparable_keeps_the_full_results_in_family_order(signal):
+    view = study.comparable(signal)
+    assert [c["name"] for c in view["walk_forward"]] == list(study.FAMILY)
+    assert all(len(c["metrics"]["folds"]) == 3 for c in view["walk_forward"])
+    assert view["holdout_metrics"]["positions"] == signal.holdout_report.metrics["positions"]
+    assert view["gate"]["checks"] == [dict(c) for c in signal.gate_report.checks]
+    assert view["preregistration"] == signal.preregistration
+
+
+def test_a_missing_projection_path_fails_loudly(signal):
+    broken = _with_holdout(signal, lambda m: m["candidate"].pop("trial_id"))
+    with pytest.raises(study.StudyError, match="comparable_path_missing"):
+        study.comparable(broken)
 
 
 # ---------------------------------------------------------------- noise control (control 3)
