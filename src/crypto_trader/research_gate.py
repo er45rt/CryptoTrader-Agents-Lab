@@ -14,8 +14,9 @@ Missing, unverifiable or non-VALID evidence gives INSUFFICIENT_EVIDENCE; complet
 then judged against the registered approval_policy, which must be at least as strict as the
 project floor: RESEARCH_APPROVED or RESEARCH_REJECTED. The PBO slice count is never adjusted.
 FAILED attempts have no return series, so they would be silently missing from the PBO family:
-their presence gives INSUFFICIENT_EVIDENCE. The registry and holdout ledger heads must not change
-during the gate. The report is deterministic and carries its own SHA256 for the evidence file.
+their presence gives INSUFFICIENT_EVIDENCE. The registry and holdout ledger are re-verified as the
+last step, after the decision and the report are built; a head that moved since the first read
+gives INSUFFICIENT_EVIDENCE. The report is deterministic and carries its own SHA256.
 """
 from __future__ import annotations
 
@@ -65,6 +66,9 @@ LIMITATIONS = (
     "PBO treats slices as exchangeable; serial dependence is not corrected",
     "DSR uses the counted attempts M; N_eff is not estimated",
     "costs are research assumptions, not observed execution prices",
+    "the registry and holdout ledger are checked unchanged from the first read to a final check "
+    "after the decision; writes after that check, or after return, are not prevented, and the "
+    "two SQLite files are not locked together atomically",
 )
 
 
@@ -263,11 +267,6 @@ def evaluate_strategy_gate(registry: TrialRegistry, ledger: HoldoutLedger, *, st
                 except PBOError as exc:
                     reasons.append(f"pbo_not_computable:{exc}")
 
-    if registry.verify().head_hash != registry_head:
-        reasons.append("registry_changed_during_read")
-    if ledger.head() != ledger_head:
-        reasons.append("ledger_changed_during_read")
-
     evidence = {
         "registry_head": registry_head, "ledger_head": ledger_head,
         "policy_sha256": content_hash(REPORT_DOMAIN + "-policy", _raw_policy(preregistration)),
@@ -277,18 +276,32 @@ def evaluate_strategy_gate(registry: TrialRegistry, ledger: HoldoutLedger, *, st
     }
     raw_policy = _raw_policy(preregistration) if policy is not None else None
     if reasons:
-        return _report(INSUFFICIENT, reasons, study_id, selected_trial_id, (), raw_policy, measures, evidence)
+        outcome = _report(INSUFFICIENT, reasons, study_id, selected_trial_id, (), raw_policy,
+                          measures, evidence)
+    else:
+        holdout_metrics = holdout_verified.metrics
+        sharpe = holdout_metrics["sharpe"]
+        measures.update(
+            dsr=str(dsr_report.dsr), pbo=str(pbo_report.pbo),
+            holdout_net_sharpe=sharpe,
+            holdout_compounded_net_excess_return=holdout_metrics["compounded_net_excess_return"],
+        )
+        checks = judge(policy, dsr=dsr_report.dsr, pbo=pbo_report.pbo,
+                       holdout_sharpe=None if sharpe is None else Decimal(sharpe),
+                       holdout_compounded=Decimal(holdout_metrics["compounded_net_excess_return"]))
+        failed = [f"criterion_failed:{c['criterion']}" for c in checks if not c["passed"]]
+        outcome = _report(REJECTED if failed else APPROVED, failed, study_id, selected_trial_id,
+                          checks, raw_policy, measures, evidence)
 
-    holdout_metrics = holdout_verified.metrics
-    sharpe = holdout_metrics["sharpe"]
-    measures.update(
-        dsr=str(dsr_report.dsr), pbo=str(pbo_report.pbo),
-        holdout_net_sharpe=sharpe,
-        holdout_compounded_net_excess_return=holdout_metrics["compounded_net_excess_return"],
-    )
-    checks = judge(policy, dsr=dsr_report.dsr, pbo=pbo_report.pbo,
-                   holdout_sharpe=None if sharpe is None else Decimal(sharpe),
-                   holdout_compounded=Decimal(holdout_metrics["compounded_net_excess_return"]))
-    failed = [f"criterion_failed:{c['criterion']}" for c in checks if not c["passed"]]
-    return _report(REJECTED if failed else APPROVED, failed, study_id, selected_trial_id, checks,
-                   raw_policy, measures, evidence)
+    # Last step before returning: every decision-affecting computation and the report are done.
+    # Both registers are re-read through their full chain verification; any change since the
+    # first read refuses. This covers the moment of this check, not any write after it.
+    moved = []
+    if registry.verify().head_hash != registry_head:
+        moved.append("registry_changed_during_read")
+    if ledger.head() != ledger_head:
+        moved.append("ledger_changed_during_read")
+    if moved:
+        return _report(INSUFFICIENT, list(reasons) + moved, study_id, selected_trial_id, (),
+                       raw_policy, measures, evidence)
+    return outcome

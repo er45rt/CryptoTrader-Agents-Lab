@@ -366,6 +366,57 @@ def test_ledger_change_during_the_gate_is_insufficient(study, monkeypatch):
     assert "ledger_changed_during_read" in report.reasons
 
 
+def _late_write(study, which):
+    """A registry allocation or a logged holdout-ledger refusal: either moves that head."""
+    if which == "registry":
+        study.registry.allocate(STUDY, {"late": which}, MANIFEST)
+    else:
+        with pytest.raises(ho.HoldoutError):
+            ho.request_access(study.ledger, study.registry, study_id=STUDY, candidate=study.selected,
+                              preregistration=study.doc, manifest=MANIFEST, history=study.history)
+
+
+@pytest.mark.parametrize("stage", ["judge", "_report", "deflated_sharpe", "estimate_pbo"])
+@pytest.mark.parametrize("which", ["registry", "ledger"])
+def test_a_write_at_any_decision_stage_is_never_approved(study, monkeypatch, stage, which):
+    """Sol P4-06 G8: writes during judge or report building (and, unchanged, DSR/PBO)."""
+    original = getattr(gate, stage)
+    def write_after(*args, **kwargs):
+        out = original(*args, **kwargs)
+        _late_write(study, which)
+        return out
+    monkeypatch.setattr(gate, stage, write_after)
+    report = study.gate()
+    assert report.decision == "INSUFFICIENT_EVIDENCE"
+    assert f"{which}_changed_during_read" in report.reasons
+    assert report.operational_authorization == "NONE"
+    assert report.permits_promotion is False and report.permits_paper_or_trading is False
+
+
+def test_unchanged_registers_still_give_the_correct_approval(study):
+    before = (study.registry.verify().head_hash, study.ledger.head())
+    report = study.gate()
+    assert report.decision == "RESEARCH_APPROVED", report.reasons
+    assert (study.registry.verify().head_hash, study.ledger.head()) == before
+    assert (report.evidence["registry_head"], report.evidence["ledger_head"]) == before
+
+
+def test_final_check_verifies_the_registry_chain_not_only_its_head(study, monkeypatch):
+    original = gate.judge
+    calls = []
+    real_verify = study.registry.verify
+    def counting_verify():
+        calls.append("verify")
+        return real_verify()
+    monkeypatch.setattr(study.registry, "verify", counting_verify)
+    def mark(*args, **kwargs):
+        calls.append("judge")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(gate, "judge", mark)
+    study.gate()
+    assert calls.index("judge") < len(calls) - 1 - calls[::-1].index("verify")   # a full verify after judge
+
+
 def test_same_inputs_give_the_same_report_hash(study):
     a, b = study.gate(), study.gate()
     assert a.report_sha256 == b.report_sha256 and a == b
