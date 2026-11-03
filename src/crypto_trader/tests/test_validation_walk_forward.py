@@ -231,6 +231,26 @@ def test_decide_sees_only_features_available_at_its_decision(tmp_path):
     assert [n for *_, n in calls] == [d // DAY - BASE // DAY + 1 for d in oos]
 
 
+def test_row_first_seen_later_is_hidden_until_its_decision(tmp_path):
+    """Sol P4-04 R1/R5: features declared available on day 0, but the row (decision and
+    revision) is first seen on day 150. Nothing of it may reach fit or decide earlier."""
+    rows = PANEL[:150] + (replace(PANEL[150], feature_available_utc_ns=day(0),
+                                  features=(("signal", "FUTURE_REVISION"),)),) + PANEL[151:]
+    cutoffs = iter((day(99), day(129), day(159)))   # oos_start - purge per fold
+    leaks, seen = [], []
+    def fit(features, labels, cfg):
+        cutoff = next(cutoffs)
+        leaks.extend(("fit", f.row_id) for f in features if f.decision_utc_ns > cutoff)
+        return {}
+    def decide(state, now_utc_ns, features, cfg):
+        leaks.extend(("decide", f.row_id) for f in features if f.decision_utc_ns > now_utc_ns)
+        seen.extend(now_utc_ns for f in features if dict(f.features)["signal"] == "FUTURE_REVISION")
+        return "0"
+    run(tmp_path, panel=rows, fit=fit, decide=decide)
+    assert leaks == []
+    assert min(seen) == day(150)                     # first visible exactly at its decision
+
+
 def test_interfaces_carry_no_realized_return_for_decisions():
     assert {f.name for f in dataclasses.fields(FeatureRow)} == {
         "row_id", "decision_utc_ns", "feature_available_utc_ns", "features"}
@@ -501,6 +521,36 @@ def test_registry_change_during_verification_is_refused(tmp_path, monkeypatch):
         report = verify(reg, result)
         assert report.status == "INSUFFICIENT_EVIDENCE"
         assert "registry_changed_during_read" in report.reasons and report.metrics is None
+
+
+def test_registry_change_during_rederivation_is_refused(tmp_path, monkeypatch):
+    """Sol P4-04 R4: a write after the proof read but during re-derivation must refuse."""
+    reg, result = run(tmp_path)
+    with reg:
+        original = wf_module._metrics
+        def rebuild_then_allocate(*args, **kwargs):
+            rebuilt = original(*args, **kwargs)
+            reg.allocate(STUDY, {"racing": 2}, MANIFEST)
+            return rebuilt
+        monkeypatch.setattr(wf_module, "_metrics", rebuild_then_allocate)
+        report = verify(reg, result)
+        assert report.status == "INSUFFICIENT_EVIDENCE"
+        assert "registry_changed_during_read" in report.reasons and report.metrics is None
+
+
+def test_verification_trusts_recorded_decisions_and_state_hashes_documented_limit(tmp_path):
+    """Sol P4-04 R7: a well-formed substitute fit-state hash recorded at evaluation is accepted;
+    verification re-derives metrics GIVEN the recorded decisions and state hashes only."""
+    honest = runner()
+    def substitute(receipt, cfg):
+        metrics = honest.evaluate(receipt, cfg)
+        metrics["folds"][0]["fit_state_sha256"] = "d" * 64
+        return metrics
+    reg = registry(tmp_path)
+    with reg:
+        result = run_registered_trial(reg, STUDY, config(), MANIFEST, substitute)
+        assert verify(reg, result).status == "VALID_RESEARCH_RESULT"
+    assert any("does not re-run fit or decide" in item for item in wf_module.LIMITATIONS)
 
 
 # ---------------------------------------------------------------- evidence and DSR compatibility

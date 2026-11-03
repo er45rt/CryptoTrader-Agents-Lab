@@ -3,8 +3,9 @@ approval (that is P4-06), promotion, Paper or trading permission.
 
 Run path: the caller builds ``WalkForward(panel, ...)`` and passes ``.evaluate`` to the P4-02
 ``run_registered_trial``; this module does not import the research path. One walk-forward run
-is ONE registered attempt; its windows are not attempts. ``verify_walk_forward`` re-derives
-everything except the recorded decisions from the registry, the panel and the preregistration.
+is ONE registered attempt; its windows are not attempts. ``verify_walk_forward`` proves the
+registration, binds the inputs and recomputes the layout and metrics GIVEN the recorded
+positions and fit-state hashes; it does not re-run fit or decide.
 
 Layout (UTC nanoseconds, half-open intervals). The plan is ``config["walk_forward"]``, frozen
 and bound by P4-02: warmup_start <= anchor_start; OOS boundaries b_0 < ... < b_K with
@@ -13,12 +14,14 @@ K >= MIN_FOLDS folds [b_(k-1), b_k); purge_ns >= 0; period; fee_bps; slippage_bp
 * Every row: feature_available <= decision, revision_first_seen <= decision < exposure_end.
 * Every used row with decision in [b_0, b_K) is one OOS step of exactly one fold, at least
   MIN_OOS_PER_FOLD per fold; its exposure ends by the next step's decision and its fold's end.
+* A row's values are the version first seen at revision_first_seen <= decision, so nothing
+  of a row is visible before its decision, whatever feature_available declares.
 * Fold k refits at cutoff c_k = b_(k-1) - purge_ns. fit sees the features of used rows with
-  feature_available <= c_k and the realized excess returns of rows with decision >=
-  anchor_start and exposure_end <= c_k (matured; the purge drops the rest). Warm-up rows
-  (before anchor_start) give features only.
+  decision <= c_k and the realized excess returns of rows with decision >= anchor_start and
+  exposure_end <= c_k (matured; the purge drops the rest). Warm-up rows (before
+  anchor_start) give features only.
 * Step t: decide sees the frozen fit state, a fresh config copy and the features of used rows
-  with feature_available <= decision_t. It never receives a realized return or exposure end.
+  with decision <= decision_t. It never receives a realized return or exposure end.
   The framework then applies the position to the step's realized excess return.
 
 Accounting (single asset, Decimal): position p_t in [-1, 1] (fraction of capital); gross
@@ -90,6 +93,8 @@ LIMITATIONS = (
     "market data is not admitted (anchor_missing); its SHA256 is recorded evidence, not trust",
     "the holdout declaration is bound in the local UNANCHORED registry; blindness and "
     "independence are not shown (P4-05)",
+    "verification recomputes metrics given the recorded positions and fit-state hashes; it "
+    "does not re-run fit or decide, so those records are the evaluator's registered output",
     "a research result grants no strategy approval, promotion, Paper, Testnet or Live permission",
 )
 
@@ -150,7 +155,7 @@ class _Fold:
 @dataclass(frozen=True)
 class _Layout:
     folds: tuple[_Fold, ...]
-    by_availability: tuple[FeatureRow, ...]
+    by_decision: tuple[FeatureRow, ...]
     used_rows: int
     used_rows_sha256: str
     oos_index_sha256: str
@@ -318,8 +323,7 @@ def _layout(panel: tuple[PanelRow, ...], plan: _Plan, holdout_start: int, holdou
         span_start = min(r.feature_available_utc_ns, r.revision_first_seen_utc_ns)
         if _overlaps(span_start, r.exposure_end_utc_ns, holdout_start, holdout_end):
             raise WalkForwardError("holdout_overlap")
-    ordered = sorted(used, key=lambda r: (r.feature_available_utc_ns, r.decision_utc_ns))
-    by_availability = tuple(_feature_row(r) for r in ordered)
+    by_decision = tuple(_feature_row(r) for r in used)   # panel is strictly decision-sorted
     folds = []
     for start, end in zip(plan.bounds, plan.bounds[1:]):
         cutoff = start - plan.purge
@@ -337,7 +341,7 @@ def _layout(panel: tuple[PanelRow, ...], plan: _Plan, holdout_start: int, holdou
         )
         if not labels:
             raise WalkForwardError("empty_training")
-        features = tuple(f for f in by_availability if f.feature_available_utc_ns <= cutoff)
+        features = tuple(f for f in by_decision if f.decision_utc_ns <= cutoff)
         folds.append(_Fold(start, end, cutoff, features, labels, steps))
     used_hash = content_hash(_ROWS_DOMAIN, [{
         "row_id": r.row_id, "decision_utc_ns": str(r.decision_utc_ns),
@@ -347,15 +351,15 @@ def _layout(panel: tuple[PanelRow, ...], plan: _Plan, holdout_start: int, holdou
         "excess_return": r.excess_return, "features": [list(p) for p in r.features],
     } for r in used])
     index = content_hash(_INDEX_DOMAIN, [str(r.decision_utc_ns) for f in folds for r in f.steps])
-    return _Layout(tuple(folds), by_availability, len(used), used_hash, index)
+    return _Layout(tuple(folds), by_decision, len(used), used_hash, index)
 
 
 def _visible(layout: _Layout, fold: _Fold):
-    """Yield (step, features available at the step's decision); never a later feature."""
-    rows = layout.by_availability
+    """Yield (step, features of rows decided by the step's decision); never a later row."""
+    rows = layout.by_decision
     i = 0
     for step in fold.steps:
-        while i < len(rows) and rows[i].feature_available_utc_ns <= step.decision_utc_ns:
+        while i < len(rows) and rows[i].decision_utc_ns <= step.decision_utc_ns:
             i += 1
         yield step, rows[:i]
 
@@ -539,6 +543,9 @@ def verify_walk_forward(registry: TrialRegistry, result, *, study_id: str, panel
             reasons.append(str(exc).split(":")[0])
         except (CanonicalError, KeyError, TypeError):
             reasons.append("invalid_metrics")
+    # Re-check after re-derivation too: success requires one unchanged head for every read.
+    if registry.verify().head_hash != head:
+        reasons.append("registry_changed_during_read")
     if reasons:
         return WalkForwardReport(INSUFFICIENT, tuple(dict.fromkeys(reasons)), study_id, trial_id,
                                  evidence)
