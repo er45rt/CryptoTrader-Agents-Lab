@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -107,10 +108,10 @@ class Setup:
                                 source_sha256="c" * 64, fit=fit_mean, decide=decide_sign)
         return run_registered_trial(self.registry, STUDY, config(name), MANIFEST, runner.evaluate)
 
-    def request(self, candidate=None, ledger=None):
+    def request(self, candidate=None, ledger=None, history=HISTORY):
         return ho.request_access(ledger or self.ledger, self.registry, study_id=STUDY,
                                  candidate=candidate or self.candidate,
-                                 preregistration=self.doc, manifest=MANIFEST)
+                                 preregistration=self.doc, manifest=MANIFEST, history=history)
 
     def granted(self):
         rid = self.request()
@@ -400,7 +401,7 @@ def test_preregistration_other_than_the_studys_is_refused(setup):
     other["study"] = "edited after registration"
     with pytest.raises(ho.HoldoutError, match="binding_or_preregistration_mismatch"):
         ho.request_access(setup.ledger, setup.registry, study_id=STUDY, candidate=setup.candidate,
-                          preregistration=other, manifest=MANIFEST)
+                          preregistration=other, manifest=MANIFEST, history=HISTORY)
 
 
 # ---------------------------------------------------------------- data commitment and causality (E)
@@ -415,10 +416,124 @@ def test_holdout_rows_must_match_the_commitment(setup):
 
 
 def test_history_reaching_into_the_holdout_is_refused(setup):
-    rid = setup.granted()
     leaky = HISTORY[:-1] + (replace(HISTORY[-1], exposure_end_utc_ns=day(HOLD[0]) + 1),)
     with pytest.raises(ho.HoldoutError, match="history_overlaps_holdout"):
-        setup.evaluate(rid, history=leaky)
+        setup.request(history=leaky)                      # refused at the request
+    rid = setup.granted()
+    with pytest.raises(ho.HoldoutError, match="history_changed"):
+        setup.evaluate(rid, history=leaky)                # and never accepted later
+    assert setup.ledger.study_state(STUDY) == "GRANTED"
+
+
+# ---------------------------------------------------------------- R8: frozen training history
+def test_history_swapped_after_the_request_gives_no_new_result(setup):
+    """Sol P4-05 R8: history returns 0.02 and features signal 1 after the grant."""
+    rid = setup.granted()
+    swapped = tuple(replace(r, excess_return="0.02", features=(("signal", "1"),)) for r in HISTORY)
+    with pytest.raises(ho.HoldoutError, match="history_changed"):
+        setup.evaluate(rid, history=swapped)
+    assert setup.ledger.study_state(STUDY) == "GRANTED"            # nothing disclosed
+    report = setup.evaluate(rid)
+    assert "history_changed" in setup.verify(report, history=swapped).reasons
+    assert report.metrics["data"]["history_commitment"] == setup.ledger.events(STUDY)[0][1]["history"]
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda h: h[:50] + (replace(h[50], row_id="x00050"),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], feature_available_utc_ns=day(50) - 1),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], revision_first_seen_utc_ns=day(50) - 1),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], exposure_end_utc_ns=day(51) - 1),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], excess_return="0.0001"),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], features=(("signal", "9"),)),) + h[51:],
+    lambda h: h[:50] + (replace(h[50], features=h[50].features + (("z", "1"),)),) + h[51:],
+    lambda h: h[1:],
+    lambda h: h + (),
+], ids=["row_id", "feature_available", "revision", "exposure_end", "return", "feature_value",
+        "extra_feature", "dropped_row", "identical"])
+def test_history_commitment_covers_order_and_every_field(setup, mutate):
+    rid = setup.granted()
+    changed = mutate(HISTORY)
+    if changed == HISTORY:
+        assert setup.evaluate(rid, history=changed).status == "VALID_RESEARCH_RESULT"
+        return
+    with pytest.raises(ho.HoldoutError, match="history_changed"):
+        setup.evaluate(rid, history=changed)
+    assert setup.ledger.study_state(STUDY) == "GRANTED"
+
+
+def test_history_order_is_committed():
+    swapped = HISTORY[:10] + (HISTORY[11], HISTORY[10]) + HISTORY[12:]
+    assert ho._history_commitment(swapped) != ho._history_commitment(HISTORY)
+    assert ho._history_commitment(HISTORY) == {"rows_sha256": ho._history_commitment(HISTORY)["rows_sha256"],
+                                               "row_count": len(HISTORY)}
+
+
+# ---------------------------------------------------------------- R9: nothing undisclosed before DISCLOSED
+def test_sol_probe_sequence_reveals_nothing_about_the_holdout(setup):
+    """Sol P4-05 R9: history=() then original / modified / original holdout under one grant."""
+    rid = setup.granted()
+    modified = HOLDOUT[:5] + (replace(HOLDOUT[5], excess_return="0.05"),) + HOLDOUT[6:]
+    reasons = []
+    for hold in (HOLDOUT, modified, HOLDOUT):
+        with pytest.raises(ho.HoldoutError) as info:
+            setup.evaluate(rid, history=(), holdout=hold)
+        reasons.append(str(info.value))
+    assert reasons == ["history_changed"] * 3                # independent of the holdout input
+    assert setup.ledger.study_state(STUDY) == "GRANTED"
+
+
+@pytest.mark.parametrize("supplied", [
+    HOLDOUT[:5] + (replace(HOLDOUT[5], excess_return="0.05"),) + HOLDOUT[6:],
+    HOLDOUT[:-1],
+    HOLDOUT[1:] + HOLDOUT[:1],                                          # unsorted
+    HOLDOUT[:5] + (replace(HOLDOUT[5], feature_available_utc_ns=day(200)),) + HOLDOUT[6:],
+    HOLDOUT[:5] + (replace(HOLDOUT[5], decision_utc_ns=day(300)),) + HOLDOUT[6:],   # outside window
+    (),
+    list(HOLDOUT),
+    "not rows",
+], ids=["return", "short", "unsorted", "point_in_time", "outside_window", "empty", "list", "text"])
+def test_any_non_matching_holdout_input_gives_one_reason_before_disclosure(setup, supplied):
+    rid = setup.granted()
+    with pytest.raises(ho.HoldoutError) as info:
+        setup.evaluate(rid, holdout=supplied)
+    assert str(info.value) == "holdout_data_mismatch"
+    assert setup.ledger.study_state(STUDY) == "GRANTED"
+
+
+def test_committed_holdout_content_is_checked_only_after_disclosure(tmp_path):
+    """A committed holdout whose content is invalid is detected after DISCLOSED; it is consumed."""
+    broken = HOLDOUT[:10] + (replace(HOLDOUT[10], exposure_end_utc_ns=day(172)),) + HOLDOUT[11:]
+    s = Setup(tmp_path, doc=make_doc(holdout_rows=broken))
+    try:
+        rid = s.granted()
+        with pytest.raises(ho.HoldoutError, match="overlapping_or_overrunning_exposure"):
+            s.evaluate(rid, holdout=broken)
+        events = s.ledger.events(STUDY)
+        assert [k for k, _ in events] == ["ACCESS_REQUESTED", "GRANTED", "DISCLOSED", "RETIRED"]
+        assert events[-1][1]["outcome"] == "FAILED"
+        with pytest.raises(ho.HoldoutError, match="not_granted_or_already_disclosed"):
+            s.evaluate(rid, holdout=broken)
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------- R7: single use is per ledger file
+def test_single_use_is_scoped_to_one_ledger_file_documented_limit(setup):
+    """Copying the file at GRANTED, or a fresh ledger, permits another evaluation: not prevented."""
+    rid = setup.granted()
+    setup.ledger.close()
+    copy_path = setup.path / "copy.sqlite"
+    copy_path.write_bytes((setup.path / "holdout.sqlite").read_bytes())
+    setup.ledger = ho.HoldoutLedger(setup.path / "holdout.sqlite")
+    assert setup.evaluate(rid).status == "VALID_RESEARCH_RESULT"
+    with ho.HoldoutLedger(copy_path) as copy:
+        assert setup.evaluate(rid, ledger=copy).status == "VALID_RESEARCH_RESULT"
+    with ho.HoldoutLedger(setup.path / "fresh.sqlite") as fresh:
+        again = setup.request(ledger=fresh)
+        ho.grant(fresh, again, owner_confirms=True)
+        assert setup.evaluate(again, ledger=fresh).status == "VALID_RESEARCH_RESULT"
+    assert any("within this ledger file only" in item for item in ho.LIMITATIONS)
+    assert not re.search(r"\bever\b", ho.__doc__) and "cannot be repeated" not in ho.__doc__
 
 
 def test_too_few_holdout_observations_are_refused(tmp_path):
@@ -511,9 +626,20 @@ def test_tampered_reports_or_panels_are_refused(setup):
     tampered = HOLDOUT[:5] + (replace(HOLDOUT[5], excess_return="0.05"),) + HOLDOUT[6:]
     assert "holdout_data_mismatch" in setup.verify(report, holdout=tampered).reasons
     assert "invalid_report" in setup.verify(object()).reasons
-    # history is not in the commitment: only re-derivation can expose an altered history
     history = HISTORY[:100] + (replace(HISTORY[100], excess_return="0.05"),) + HISTORY[101:]
-    assert "metrics_not_reproducible" in setup.verify(report, history=history).reasons
+    assert "history_changed" in setup.verify(report, history=history).reasons
+
+
+def test_rederivation_that_differs_from_the_record_is_refused(setup, monkeypatch):
+    """Every input is now bound, so re-derivation is the check against a changed computation."""
+    report = setup.evaluate(setup.granted())
+    original = ho._metrics
+    def drifted(*args, **kwargs):
+        rebuilt = original(*args, **kwargs)
+        rebuilt["turnover"] = "0"
+        return rebuilt
+    monkeypatch.setattr(ho, "_metrics", drifted)
+    assert "metrics_not_reproducible" in setup.verify(report).reasons
 
 
 def test_registry_or_ledger_change_during_verification_is_refused(setup, monkeypatch):
@@ -558,7 +684,8 @@ def test_limitations_state_the_evidence_boundaries(setup):
     text = " ".join(ho.LIMITATIONS)
     for phrase in ("local SQLite", "not anchored", "owner_confirms", "not authentication",
                    "match the commitment", "not that nobody saw", "outside the interface",
-                   "synthetic", "not re-run fit or decide"):
+                   "synthetic", "not re-run fit or decide", "within this ledger file only",
+                   "unchanged since the request", "only holdout signal"):
         assert phrase in text, phrase
     assert report.limitations == ho.LIMITATIONS and report.metrics["limitations"] == list(ho.LIMITATIONS)
     m = report.metrics

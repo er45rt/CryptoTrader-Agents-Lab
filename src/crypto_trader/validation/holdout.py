@@ -9,14 +9,24 @@ ACCESS_REQUESTED -> GRANTED -> DISCLOSED -> RETIRED, with DENIED logging every r
   the registered study's by recomputing the registry binding of the candidate.
 * Candidate freeze: one request names one registered COMPLETED walk-forward result; its trial_id,
   binding_hash, output_hash and frozen configuration hash are recorded and must be identical at
-  evaluation. One study has at most one pending request and at most one GRANTED, ever.
+  evaluation.
+* History freeze: the request also records a canonical digest and count of every supplied
+  history row (order and all fields). Evaluation and verification refuse any other history.
+  This shows the history is unchanged since the request, not that it is authentic or the data
+  the earlier research used. History structure (overlap with the declared holdout window,
+  matured training rows) is checked at the request, on the frozen rows and declared plan.
+* Single use holds within ONE ledger file: there a study has at most one pending request and at
+  most one GRANTED, decided inside BEGIN IMMEDIATE transactions that replay and verify the whole
+  chain. Copying, restoring or replacing the file, or opening another ledger, is not prevented.
 * Grant: requires ``owner_confirms=True``, a caller declaration, not owner authentication.
-* Consume before exposure: every check that needs no callback runs first (a failure logs DENIED
-  and consumes nothing); then DISCLOSED is committed durably BEFORE fit or decide receive any
-  holdout data. Success, failure or interruption ends RETIRED; a crash after DISCLOSED leaves the
-  study DISCLOSED, which refuses any further evaluation. Single use is decided inside
-  BEGIN IMMEDIATE transactions that replay and verify the whole ledger.
-* The final evaluation is not a registry attempt (DSR M is unchanged) and cannot be repeated.
+* Before disclosure only identity, registration, candidate, frozen-history and plan checks run,
+  plus one comparison of the supplied holdout rows with the PUBLISHED commitment digest; every
+  mismatch gives the same reason, so nothing beyond that public equality is learned, and a
+  refusal logs DENIED and consumes nothing. Then DISCLOSED is committed durably BEFORE fit or
+  decide receive any holdout data; checks of the holdout rows' content run only after it, and
+  their failure consumes the holdout. Success, failure or interruption ends RETIRED; a crash
+  after DISCLOSED leaves the study DISCLOSED, which refuses any further evaluation.
+* The final evaluation is not a registry attempt (DSR M is unchanged).
 
 Evaluation (same causal interface and accounting as P4-04, re-implemented here because the
 validation sandbox forbids importing walk_forward): one fit at cutoff c = holdout_start - purge
@@ -58,6 +68,7 @@ VALID = "VALID_RESEARCH_RESULT"
 INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
 
 _ROWS_DOMAIN = "holdout-rows-v1"
+_HISTORY_DOMAIN = "holdout-history-v1"
 _RESULT_HASH_DOMAIN = "holdout-result-v1"
 _EVENT_DOMAIN = "holdout-ledger-event-v1"
 _CONFIG_DOMAIN = "holdout-candidate-config-v1"
@@ -90,7 +101,14 @@ ASSUMPTIONS = (
 LIMITATIONS = (
     "the holdout ledger is local SQLite and not anchored externally; an administrator can "
     "rewrite it and its hash chain",
+    "single use holds within this ledger file only; copying, restoring or replacing the file, "
+    "or opening another ledger, permits another evaluation",
     "owner_confirms=True is a caller declaration, not authentication of the owner",
+    "the history digest shows the history is unchanged since the request, not that it is "
+    "authentic or the data used by the earlier research",
+    "before disclosure the supplied holdout rows are compared with the published commitment "
+    "digest; that equality, which anyone holding the digest can test, is the only holdout "
+    "signal",
     "hashes show the supplied rows match the commitment, not that nobody saw the holdout data",
     "no guarantee against disclosure or ledger edits outside the interface of this module; "
     "callbacks reading closures or global state are not contained",
@@ -187,6 +205,7 @@ class _Layout:
     history_rows: int
     history_sha256: str
     holdout_sha256: str
+    history_commitment: dict
 
 
 def _ctx() -> Context:
@@ -340,7 +359,8 @@ def _apply(study: dict, kind: HoldoutAuditType, data: dict) -> None:
             raise HoldoutError("integrity: request while pending or consumed")
         requests[rid] = {"status": _REQUESTED, "candidate": data["candidate"],
                          "preregistration_sha256": data["preregistration_sha256"],
-                         "commitment": data["commitment"], "outcome": None, "result_sha256": None}
+                         "commitment": data["commitment"], "history": data["history"],
+                         "outcome": None, "result_sha256": None}
     elif kind is HoldoutAuditType.GRANTED:
         if rid not in requests or requests[rid]["status"] != _REQUESTED or study["granted"] is not None:
             raise HoldoutError("integrity: invalid grant")
@@ -433,15 +453,34 @@ def _validated_rows(rows, what: str) -> tuple[PanelRow, ...]:
     return rows
 
 
+def _digest(domain: str, rows) -> str | None:
+    """Canonical digest of rows in their order with every field; None if they cannot be encoded.
+    Encoding only: no content check, so a digest comparison reveals nothing but equality."""
+    try:
+        if type(rows) is not tuple or any(type(r) is not PanelRow for r in rows):
+            return None
+        return content_hash(domain, [{
+            "row_id": r.row_id, "decision_utc_ns": str(r.decision_utc_ns),
+            "feature_available_utc_ns": str(r.feature_available_utc_ns),
+            "revision_first_seen_utc_ns": str(r.revision_first_seen_utc_ns),
+            "exposure_end_utc_ns": str(r.exposure_end_utc_ns),
+            "excess_return": r.excess_return, "features": [list(p) for p in r.features],
+        } for r in rows])
+    except (CanonicalError, TypeError, ValueError):
+        return None
+
+
 def holdout_rows_sha256(rows) -> str:
     """Commitment digest of holdout rows (to be placed in the preregistration document)."""
-    return content_hash(_ROWS_DOMAIN, [{
-        "row_id": r.row_id, "decision_utc_ns": str(r.decision_utc_ns),
-        "feature_available_utc_ns": str(r.feature_available_utc_ns),
-        "revision_first_seen_utc_ns": str(r.revision_first_seen_utc_ns),
-        "exposure_end_utc_ns": str(r.exposure_end_utc_ns),
-        "excess_return": r.excess_return, "features": [list(p) for p in r.features],
-    } for r in _validated_rows(rows, "holdout")])
+    digest = _digest(_ROWS_DOMAIN, rows)
+    if digest is None:
+        raise HoldoutError("invalid_panel:holdout")
+    return digest
+
+
+def _history_commitment(history) -> dict | None:
+    digest = _digest(_HISTORY_DOMAIN, history)
+    return None if digest is None else {"rows_sha256": digest, "row_count": len(history)}
 
 
 def _preregistration(document):
@@ -537,37 +576,17 @@ def _plan(config) -> _Plan:
     return _Plan(warmup, anchor, purge, period, rate)
 
 
-def _rows_hash(rows) -> str:
-    return content_hash(_ROWS_DOMAIN, [{
-        "row_id": r.row_id, "decision_utc_ns": str(r.decision_utc_ns),
-        "feature_available_utc_ns": str(r.feature_available_utc_ns),
-        "revision_first_seen_utc_ns": str(r.revision_first_seen_utc_ns),
-        "exposure_end_utc_ns": str(r.exposure_end_utc_ns),
-        "excess_return": r.excess_return, "features": [list(p) for p in r.features],
-    } for r in rows])
-
-
 def _feature_row(row: PanelRow) -> FeatureRow:
     return FeatureRow(row.row_id, row.decision_utc_ns, row.feature_available_utc_ns, row.features)
 
 
-def _layout(history, holdout_rows, plan: _Plan, holdout: tuple[int, int], commitment: dict) -> _Layout:
-    start, end = holdout
+def _history_part(history, plan: _Plan, holdout: tuple[int, int]):
+    """Checks needing only the frozen history and the declared plan and window: no holdout data."""
+    start = holdout[0]
     past = _validated_rows(history, "history")
-    rows = _validated_rows(holdout_rows, "holdout")
     for r in past:
         if r.decision_utc_ns >= start or r.exposure_end_utc_ns > start:
             raise HoldoutError("history_overlaps_holdout")
-    if _rows_hash(rows) != commitment["rows_sha256"] or len(rows) != commitment["row_count"]:
-        raise HoldoutError("holdout_data_mismatch")
-    if any(not start <= r.decision_utc_ns < end for r in rows):
-        raise HoldoutError("holdout_row_outside_window")
-    if len(rows) < MIN_HOLDOUT_OBSERVATIONS:
-        raise HoldoutError("insufficient_holdout_observations")
-    for i, r in enumerate(rows):
-        limit = rows[i + 1].decision_utc_ns if i + 1 < len(rows) else end
-        if r.exposure_end_utc_ns > limit:
-            raise HoldoutError("overlapping_or_overrunning_exposure")
     cutoff = start - plan.purge
     if not plan.anchor_start < cutoff:
         raise HoldoutError("invalid_plan")
@@ -577,10 +596,34 @@ def _layout(history, holdout_rows, plan: _Plan, holdout: tuple[int, int], commit
                    if r.decision_utc_ns >= plan.anchor_start and r.exposure_end_utc_ns <= cutoff)
     if not labels:
         raise HoldoutError("empty_training")
+    return cutoff, used, labels
+
+
+def _matches_commitment(holdout_rows, commitment: dict) -> bool:
+    """The only pre-disclosure use of holdout rows: equality with the published digest."""
+    return (_digest(_ROWS_DOMAIN, holdout_rows) == commitment["rows_sha256"]
+            and len(holdout_rows) == commitment["row_count"])
+
+
+def _layout(history, holdout_rows, plan: _Plan, holdout: tuple[int, int], commitment: dict) -> _Layout:
+    """Full layout. Its holdout-content checks run only after DISCLOSED, or in verification."""
+    start, end = holdout
+    cutoff, used, labels = _history_part(history, plan, holdout)
+    if not _matches_commitment(holdout_rows, commitment):
+        raise HoldoutError("holdout_data_mismatch")
+    rows = _validated_rows(holdout_rows, "holdout")
+    if any(not start <= r.decision_utc_ns < end for r in rows):
+        raise HoldoutError("holdout_row_outside_window")
+    if len(rows) < MIN_HOLDOUT_OBSERVATIONS:
+        raise HoldoutError("insufficient_holdout_observations")
+    for i, r in enumerate(rows):
+        limit = rows[i + 1].decision_utc_ns if i + 1 < len(rows) else end
+        if r.exposure_end_utc_ns > limit:
+            raise HoldoutError("overlapping_or_overrunning_exposure")
     by_decision = tuple(_feature_row(r) for r in used + rows)   # decision-sorted across the boundary
     features = tuple(f for f in by_decision if f.decision_utc_ns <= cutoff)
-    return _Layout(cutoff, features, labels, rows, by_decision, len(used), _rows_hash(used),
-                   commitment["rows_sha256"])
+    return _Layout(cutoff, features, labels, rows, by_decision, len(used),
+                   _digest(_ROWS_DOMAIN, used), commitment["rows_sha256"], _history_commitment(history))
 
 
 def _stats(xs: list[Decimal]) -> dict:
@@ -625,6 +668,7 @@ def _metrics(study_id: str, facts: _Candidate, plan: _Plan, layout: _Layout, pos
         "commitment": dict(facts.commitment),
         "data": {"holdout_rows_sha256": layout.holdout_sha256, "holdout_rows": len(layout.steps),
                  "history_rows_sha256": layout.history_sha256, "history_rows": layout.history_rows,
+                 "history_commitment": dict(layout.history_commitment),
                  "source_status": "UNANCHORED_COMMITTED_NOT_ADMITTED"},
         "period": plan.period, "cost_rate": str(plan.cost_rate),
         "train_cutoff_utc_ns": str(layout.cutoff), "train_label_rows": len(layout.labels),
@@ -640,14 +684,16 @@ def _metrics(study_id: str, facts: _Candidate, plan: _Plan, layout: _Layout, pos
 
 # ---------------------------------------------------------------- lifecycle
 def request_access(ledger: HoldoutLedger, registry: TrialRegistry, *, study_id: str, candidate,
-                   preregistration, manifest, parent_trial_id=None) -> str:
-    """Freeze one registered COMPLETED walk-forward candidate; return the request id."""
+                   preregistration, manifest, history, parent_trial_id=None) -> str:
+    """Freeze one registered COMPLETED walk-forward candidate and its training history."""
     try:
         canonical_uuid(study_id)
     except CanonicalError as exc:
         raise HoldoutError("invalid_study") from exc
     try:
         facts = _candidate(registry, study_id, candidate, preregistration, manifest, parent_trial_id)
+        _history_part(history, _plan(facts.config), facts.holdout)
+        frozen_history = _history_commitment(history)
     except HoldoutError as exc:
         ledger._deny(study_id, None, str(exc).split(":")[0])
         raise
@@ -664,7 +710,8 @@ def request_access(ledger: HoldoutLedger, registry: TrialRegistry, *, study_id: 
         ledger._append(HoldoutAuditType.ACCESS_REQUESTED, study_id, {
             "study_id": study_id, "request_id": request_id, "candidate": facts.frozen(),
             "preregistration_sha256": facts.preregistration_sha256,
-            "commitment": dict(facts.commitment), "registry_head": facts.registry_head,
+            "commitment": dict(facts.commitment), "history": frozen_history,
+            "registry_head": facts.registry_head,
         })
         return request_id, None
     return ledger._run(apply)
@@ -729,13 +776,19 @@ def evaluate_holdout(ledger: HoldoutLedger, registry: TrialRegistry, request_id:
                 or facts.preregistration_sha256 != request["preregistration_sha256"]
                 or dict(facts.commitment) != request["commitment"]):
             raise HoldoutError("candidate_changed")
+        if _history_commitment(history) != request["history"]:
+            raise HoldoutError("history_changed")
         plan = _plan(facts.config)
-        layout = _layout(history, holdout_rows, plan, facts.holdout, facts.commitment)
+        _history_part(history, plan, facts.holdout)            # frozen rows: same outcome as at request
+        # The only pre-disclosure use of holdout rows: every mismatch gives this one reason.
+        if not _matches_commitment(holdout_rows, facts.commitment):
+            raise HoldoutError("holdout_data_mismatch")
     except HoldoutError as exc:
         ledger._deny(study_id, request_id, str(exc).split(":")[0])
         raise
 
-    # Consume before exposure: DISCLOSED is committed before any callback sees holdout data.
+    # Consume before exposure: DISCLOSED is committed before any callback sees holdout data,
+    # and before any check of the holdout rows' content.
     def disclose(studies):
         if studies[study_id]["requests"][request_id]["status"] != _GRANTED:
             reason = "not_granted_or_already_disclosed"
@@ -744,12 +797,13 @@ def evaluate_holdout(ledger: HoldoutLedger, registry: TrialRegistry, request_id:
             return None, reason
         ledger._append(HoldoutAuditType.DISCLOSED, study_id, {
             "study_id": study_id, "request_id": request_id, "registry_head": facts.registry_head,
-            "holdout_rows_sha256": layout.holdout_sha256, "history_rows_sha256": layout.history_sha256,
+            "holdout_rows_sha256": facts.commitment["rows_sha256"], "history": request["history"],
         })
         return None, None
     ledger._run(disclose)
 
     try:
+        layout = _layout(history, holdout_rows, plan, facts.holdout, facts.commitment)
         frozen = canonical_bytes(facts.config).decode("utf-8")
         state = fit(layout.features, layout.labels, parse_json_strict(frozen))
         try:
@@ -796,6 +850,8 @@ def verify_holdout(ledger: HoldoutLedger, registry: TrialRegistry, report, *, ca
             facts = _candidate(registry, study_id, candidate, preregistration, manifest, parent_trial_id)
             if facts.frozen() != request["candidate"] or dict(facts.commitment) != request["commitment"]:
                 reasons.append("candidate_changed")
+            elif _history_commitment(history) != request["history"]:
+                reasons.append("history_changed")
             else:
                 plan = _plan(facts.config)
                 layout = _layout(history, holdout_rows, plan, facts.holdout, facts.commitment)
