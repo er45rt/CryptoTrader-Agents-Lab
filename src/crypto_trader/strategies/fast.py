@@ -65,7 +65,8 @@ def run_fast_backtest(strategy: Strategy, bars: Sequence[Bar], *, market: Market
     open_trade: dict[str, Any] | None = None
     fees_total = Decimal(0)
     in_mkt = 0
-    for i, (bar, obs) in enumerate(zip(bars, observations)):
+    for i, bar in enumerate(bars):
+        obs = observations[i] if i < len(observations) else None   # last bar: no later book to fill it
         if pending is not None:                     # fill at this bar's open book
             side, q = pending
             price = asks[i] if side == "buy" else bids[i]
@@ -98,9 +99,10 @@ def run_fast_backtest(strategy: Strategy, bars: Sequence[Bar], *, market: Market
             fills.append({"time": bar.open_time.isoformat(), "side": side, "quantity": str(q), "price": str(price),
                           "fee": str(fee)})
             pending = None
-        decision = source.decide(obs)
-        if decision.action in {"buy", "sell"}:
-            pending = (decision.action, decision.quantity)
+        if obs is not None:
+            decision = source.decide(obs)
+            if decision.action in {"buy", "sell"}:
+                pending = (decision.action, decision.quantity)
         if state["qty"] > 0:
             in_mkt += 1
         equity.append((bar.close_time.isoformat(), float(state["cash"] + state["qty"] * bar.close)))

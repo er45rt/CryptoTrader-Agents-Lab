@@ -103,6 +103,29 @@ def load_bars(path: str | Path, timeframe: str, *, start: datetime | None = None
     return bars
 
 
+def fetch_forming_open(symbol: str, timeframe: str, *, now: datetime | None = None,
+                       cafile: str | None = None, timeout: float = 20.0) -> tuple[datetime, Decimal] | None:
+    """(open_time, open) of the candle forming at `now` - its open price is final once it starts."""
+    import ssl
+    import urllib.parse
+    import urllib.request
+
+    now = now or datetime.now(timezone.utc)
+    step = TIMEFRAMES[timeframe]
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    start = epoch + ((now - epoch) // step) * step
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+    query = urllib.parse.urlencode({"symbol": symbol, "interval": timeframe,
+                                    "startTime": int(start.timestamp() * 1000), "limit": 1})
+    req = urllib.request.Request(f"{KLINES_URL}?{query}", method="GET", headers={"User-Agent": "ct-strategy-ohlcv/1"})
+    with opener.open(req, timeout=timeout) as resp:
+        page = json.loads(resp.read())
+    if not page or int(page[0][0]) != int(start.timestamp() * 1000):
+        return None
+    return start, Decimal(str(page[0][1]))
+
+
 def fetch_public_klines(symbol: str, timeframe: str, *, start: datetime, end: datetime | None = None,
                         now: datetime | None = None, cafile: str | None = None,
                         not_after: datetime | None = None, timeout: float = 20.0) -> list[Bar]:

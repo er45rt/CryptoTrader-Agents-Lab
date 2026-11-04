@@ -200,8 +200,9 @@ def test_engine_and_fast_preview_agree_exactly(tmp_path):
         assert engine.metrics["fees_quote"] == pytest.approx(fast.metrics["fees_quote"], abs=1e-6)
         for (ta, a), (tb, b) in zip(engine.equity_curve, fast.equity_curve):
             assert ta == tb and a == pytest.approx(b, abs=1e-6)
-        assert Decimal(engine.metrics["engine_equity_quote"]) == pytest.approx(
-            Decimal(str(engine.metrics["final_equity_quote"])), abs=Decimal("0.000001"))
+        # the engine marks equity at its last observation = the second-to-last bar (the last bar's
+        # decision has no later book to execute against, so it is not observed)
+        assert float(engine.metrics["engine_equity_quote"]) == pytest.approx(engine.equity_curve[-2][1], abs=1e-6)
         assert (tmp_path / strat.name / "backtest_result.json").exists()
         assert engine.metrics["risk_counts"].get("allowed", 0) == engine.metrics["fills"]
 

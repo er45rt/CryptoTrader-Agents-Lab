@@ -96,21 +96,32 @@ def _q(value: Decimal, step: Decimal) -> Decimal:
 
 
 def build_tape(bars: Sequence[Bar], market: MarketSpec, slippage_bps: Decimal,
-               depth_quote: Decimal = Decimal("100000000")) -> tuple[tuple[MarketObservation, ...], tuple[MarketBookUpdate, ...]]:
-    """Observations at each bar close; one book per bar placed 1 ms after the previous bar closed."""
+               depth_quote: Decimal = Decimal("100000000"),
+               next_open: tuple[datetime, Decimal] | None = None,
+               ) -> tuple[tuple[MarketObservation, ...], tuple[MarketBookUpdate, ...]]:
+    """Observations at each bar close; one book per bar placed 1 ms after the previous bar closed.
+
+    The engine only accepts a decision that a LATER market event can execute, so the last bar's
+    observation is kept only when `next_open` (the open of the bar now forming) is known.
+    """
     s = slippage_bps / Decimal(10000)
     observations = tuple(MarketObservation(
         symbol=market.symbol, price=b.close, observed_at=b.close_time, market_reference=_ref(i, b),
         volume=b.volume) for i, b in enumerate(bars))
+    if next_open is None:
+        observations = observations[:-1]
+    elif next_open[0] != bars[-1].close_time:
+        raise StrategyError("next_open must be the open of the bar that follows the last closed bar.")
     books: list[MarketBookUpdate] = []
     seq = 1
     prev: tuple[Decimal, Decimal] | None = None
-    for b in bars:
-        bid = (b.open * (1 - s)).quantize(market.tick_size, rounding=ROUND_DOWN)
-        ask = (b.open * (1 + s)).quantize(market.tick_size, rounding=ROUND_DOWN) + (
+    opens = [(b.open_time, b.open) for b in bars] + ([next_open] if next_open is not None else [])
+    for open_time, open_price in opens:
+        bid = (open_price * (1 - s)).quantize(market.tick_size, rounding=ROUND_DOWN)
+        ask = (open_price * (1 + s)).quantize(market.tick_size, rounding=ROUND_DOWN) + (
             market.tick_size if s > 0 else Decimal(0))
-        size = _q(depth_quote / b.open, market.quantity_step)
-        ts = _ns(b.open_time) + 1_000_000  # just after the previous bar's close = this bar's open
+        size = _q(depth_quote / open_price, market.quantity_step)
+        ts = _ns(open_time) + 1_000_000  # just after the previous bar's close = this bar's open
         if prev is not None:
             books.append(MarketBookUpdate(levels=[BookLevel("BUY", prev[0], size, 1),
                                                   BookLevel("SELL", prev[1], size, 2)],
@@ -127,7 +138,9 @@ class StrategyDecisionSource:
     """paper.DecisionSource adapter: closed bars -> Strategy.on_bar -> StrategyDecision."""
 
     def __init__(self, strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec,
-                 settings: RunSettings, position: Callable[[MarketObservation], Any]) -> None:
+                 settings: RunSettings, position: Callable[[MarketObservation], Any],
+                 trade_from_index: int = 0) -> None:
+        self.trade_from_index = trade_from_index   # bars before this index only warm the strategy up
         self.strategy = strategy
         self.bars = tuple(bars)
         self.market = market
@@ -167,6 +180,8 @@ class StrategyDecisionSource:
         signal = self.strategy.on_bar(history)
         if signal is not None and not isinstance(signal, Signal):
             raise StrategyError(f"{type(self.strategy).__name__}.on_bar must return Signal or None.")
+        if i < self.trade_from_index:
+            return StrategyDecision(action="hold", confidence="low", rationale="pre-session-history", decided_at=at)
         snap = self._snapshot(observation)
         held = snap.position_quantity - snap.open_sell_quantity
         self.signals.append({"index": i, "at": at.isoformat(), "target": None if signal is None else str(signal.target),
@@ -281,13 +296,15 @@ class _IncrementalReader:
 
 
 def run_session(strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec, settings: RunSettings,
-                journal_path: Path, session_id: UUID, strategy_id: str) -> tuple[Any, StrategyDecisionSource, Any]:
+                journal_path: Path, session_id: UUID, strategy_id: str,
+                trade_from_index: int = 0,
+                next_open: tuple[datetime, Decimal] | None = None) -> tuple[Any, StrategyDecisionSource, Any]:
     """One deterministic pass of the engine over `bars` (used by backtest and by paper replay)."""
-    if not bars:
-        raise StrategyError("no bars to run.")
+    if len(bars) < 2 and next_open is None:
+        raise StrategyError("need at least 2 bars (or the next bar's open) to run.")
     if bars[0].timeframe != strategy.timeframe:
         raise StrategyError(f"strategy timeframe {strategy.timeframe} != data timeframe {bars[0].timeframe}.")
-    observations, books = build_tape(bars, market, settings.slippage_bps)
+    observations, books = build_tape(bars, market, settings.slippage_bps, next_open=next_open)
     runner = NautilusSimulationRunner(
         instrument=InstrumentSpec(symbol=market.symbol, base_currency=market.base_currency,
                                   quote_currency=market.quote_currency, price_precision=market.price_precision,
@@ -308,7 +325,8 @@ def run_session(strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec, 
     def position(observation: MarketObservation) -> Any:
         return portfolio_snapshot(reader, config=bridge_cfg, mark=observation.price, as_of=observation.observed_at)
 
-    source = StrategyDecisionSource(strategy, bars, market=market, settings=settings, position=position)
+    source = StrategyDecisionSource(strategy, bars, market=market, settings=settings, position=position,
+                                    trade_from_index=trade_from_index)
     session = TradingSession(
         config=load_session_config({"mode": TradingMode.PAPER.value, "symbol": market.symbol,
                                     "strategy_id": strategy_id, "session_id": session_id,
