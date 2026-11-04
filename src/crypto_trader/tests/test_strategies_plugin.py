@@ -119,22 +119,76 @@ def test_shared_view_matches_plain_history_and_refuses_unclosed_bars():
         for name, args in (("sma", (5,)), ("rsi", (7,)), ("macd_signal", ())):
             for a, b in zip(view.indicator(name, *args), plain.indicator(name, *args), strict=True):
                 assert (math.isnan(a) and math.isnan(b)) or a == pytest.approx(b, rel=1e-12)
+        shared.learn(view)                                   # later views get these as prefixes
+        again = BarHistory._view(shared, cut, bars[cut - 1].close_time)
+        assert again.indicator("sma", 5) == view.indicator("sma", 5)
     with pytest.raises(StrategyError):
         BarHistory._view(shared, 30, bars[29].close_time - timedelta(seconds=1))
-    with pytest.raises(StrategyError):
-        _SharedSeries([bars[1], bars[0]])
+
+
+def test_sol_d30_1_an_earlier_unclosed_bar_is_refused():
+    """Sol D30 r1 #1: a 1d bar followed by 1h bars; at 02:00 the 1d bar (closing next day) is still open."""
+    from crypto_trader.strategies.api import _SharedSeries
+
+    def bar(t, tf):
+        return Bar(open_time=T0 + t, open=Decimal(100), high=Decimal(101), low=Decimal(99), close=Decimal(100),
+                   volume=Decimal(1), timeframe=tf)
+
+    mixed = [bar(timedelta(0), "1d"), bar(timedelta(hours=1), "1h"), bar(timedelta(hours=2), "1h")]
+    shared = _SharedSeries(mixed)
+    for n in (2, 3):
+        with pytest.raises(StrategyError):
+            BarHistory._view(shared, n, mixed[n - 1].close_time)
+        with pytest.raises(StrategyError):
+            BarHistory(mixed[:n], mixed[n - 1].close_time)          # same answer as the plain constructor
+
+    class Daily(Strategy):
+        name = "daily"
+        timeframe = "1d"
+        warmup_bars = 2
+        seen: list = []
+
+        def on_bar(self, bars):
+            Daily.seen.append(bars.bars)
+            return Signal.flat()
+
+    with pytest.raises(StrategyError):          # Sol's end-to-end reproduction: refused, nothing delivered
+        run_fast_backtest(Daily(), mixed)
+    assert Daily.seen == []
+
+
+def test_sol_d30_2_the_view_given_to_a_strategy_holds_nothing_from_later_bars():
+    """Sol D30 r1 #2: no attribute of the view may reach the full-run series."""
+    from crypto_trader.strategies.api import _SharedSeries
+
+    bars = synthetic_bars(50)
+    shared = _SharedSeries(bars)
+    warm = BarHistory._view(shared, 50, bars[-1].close_time)
+    warm.indicator("sma", 5)
+    assert warm.close
+    shared.learn(warm)                                       # full-run arrays now exist engine-side
+    view = BarHistory._view(shared, 2, bars[1].close_time)
+    assert set(vars(view)) == {"_bars", "as_of", "_cache"}
+    assert len(view._bars) == 2 and all(len(v) == 2 for v in view._cache.values())
+    assert not any(isinstance(v, _SharedSeries) for v in vars(view).values())
 
 
 def test_shared_view_never_slices_a_non_builtin_indicator(monkeypatch):
     from crypto_trader.strategies.api import _SharedSeries
 
     bars = synthetic_bars(40)
-    peek = lambda b: tuple(b.close[-1] for _ in b.close)   # deliberately non-causal  # noqa: E731
+    peek = lambda b, *a: tuple(b.close[-1] for _ in b.close)   # deliberately non-causal  # noqa: E731
     monkeypatch.setitem(indicators.REGISTRY, "peek", peek)
-    view = BarHistory._view(_SharedSeries(bars), 10, bars[9].close_time)
+    shared = _SharedSeries(bars)
+    view = BarHistory._view(shared, 10, bars[9].close_time)
     assert view.indicator("peek")[0] == view.close[-1]      # computed on the 10 visible bars only
-    monkeypatch.setitem(indicators.REGISTRY, "sma", peek)   # replaced built-in: not shared either
-    assert view.indicator("sma")[0] == view.close[-1]
+    view.indicator("sma", 3)
+    shared.learn(view)
+    later = BarHistory._view(shared, 10, bars[9].close_time)
+    assert ("peek", (), ()) not in later._cache             # never computed over the whole run
+    monkeypatch.setitem(indicators.REGISTRY, "sma", peek)   # built-in replaced after it was learned
+    later = BarHistory._view(shared, 10, bars[9].close_time)
+    assert later.indicator("sma", 3)[0] == later.close[-1]  # not served from the full-run cache
 
 
 # --- data integrity --------------------------------------------------------------------------------

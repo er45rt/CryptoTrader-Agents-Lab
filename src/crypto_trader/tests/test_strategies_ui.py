@@ -159,3 +159,89 @@ def test_paper_names_are_confined(ws):
             ws._paper_dir(bad)
     with pytest.raises(StrategyError):
         ws.paper_start("missing")
+
+
+# --- Sol D30 round-1 regressions ------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from crypto_trader.strategies import analysis  # noqa: E402
+
+
+def _equity(steps):
+    eq, v = [], 1000.0
+    eq.append(("2024-01-01T00:00", v))
+    for i, r in enumerate(steps, 1):
+        v *= 1 + r
+        eq.append((f"2024-{1 + i // 28:02d}-{1 + i % 28:02d}T00:00", v))
+    return eq
+
+
+def _result(eq, sharpe=2.0, hold=1.0):
+    return SimpleNamespace(metrics={"sharpe": sharpe, "net_return": eq[-1][1] / eq[0][1] - 1},
+                           benchmark={"sharpe": hold}, equity_curve=eq, settings={"taker_fee": "0.001"})
+
+
+GOOD_FEES = lambda fee: SimpleNamespace(metrics={"net_return": 0.05})  # noqa: E731
+
+
+def test_sol_d30_3_concurrent_backtests_never_share_a_trial_number(ws, monkeypatch):
+    ws.upload_strategy("up.py", GOOD)
+    spec = next(s["spec"] for s in ws.strategies()["strategies"] if s["name"] == "up")
+    seen, gate = [], threading.Barrier(2, timeout=5)
+    real = store.robustness_verdict
+
+    def slow_verdict(result, *, rerun_with_fees, n_trials):
+        seen.append(n_trials)
+        try:
+            gate.wait(timeout=0.5)        # the two runs meet here only if the count is not serialized
+        except threading.BrokenBarrierError:
+            pass
+        return real(result, rerun_with_fees=rerun_with_fees, n_trials=n_trials)
+
+    monkeypatch.setattr(store, "robustness_verdict", slow_verdict)
+    threads = [threading.Thread(target=ws.backtest, args=({"spec": spec, "data": _data(ws)},)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(seen) == [1, 2]
+    assert len((ws.root / "runs" / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_sol_d30_4_dsr_uses_central_moment_normalization():
+    mu = 1.6445 * .01 * (30 ** 0.5) / 29
+    p = analysis.dsr_probability([mu + .01, mu - .01] * 15, 1)
+    assert p is not None and p < 0.95                       # Sol: 0.949963518 (the old code gave 0.950093)
+    assert p == pytest.approx(0.949963518, abs=1e-6)
+
+
+def test_sol_d30_5_a_missing_fee_check_is_never_promising():
+    eq = _equity([0.0132, -0.0068] * 15)
+    v = analysis.robustness_verdict(_result(eq), rerun_with_fees=None, n_trials=1)
+    assert v["verdict"] == "unproven"
+    assert {c["key"]: c["ok"] for c in v["checks"]}["fees_x2"] is None
+    assert analysis.robustness_verdict(_result(eq), rerun_with_fees=GOOD_FEES, n_trials=1)["verdict"] == "promising"
+
+
+def test_sol_d30_6_equal_sharpe_does_not_beat_hold():
+    eq = _equity([0.0132, -0.0068] * 15)
+    v = analysis.robustness_verdict(_result(eq, sharpe=1.0, hold=1.0), rerun_with_fees=GOOD_FEES, n_trials=1)
+    assert {c["key"]: c["ok"] for c in v["checks"]}["beats_hold"] is False
+    assert v["verdict"] == "unproven"
+
+
+def test_sol_d30_7_start_is_refused_while_a_stopped_loop_is_still_alive(ws, monkeypatch):
+    folder = ws.root / "paper" / "s1"
+    folder.mkdir()
+    (folder / "session.json").write_text("{}")
+    (folder / "pid.json").write_text(json.dumps({"pid": 4242}))
+    (folder / "STOP").write_text("x")
+    monkeypatch.setattr(store, "_pid_alive", lambda pid: True)
+    spawned = []
+    monkeypatch.setattr(store.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    with pytest.raises(StrategyError):
+        ws.paper_start("s1")
+    assert (folder / "STOP").exists() and spawned == []     # STOP kept, no second loop
+    (folder / "STOP").unlink()
+    assert ws.paper_start("s1") == {"ok": True, "already_running": True} and spawned == []

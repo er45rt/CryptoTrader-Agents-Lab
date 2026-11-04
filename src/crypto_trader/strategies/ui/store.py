@@ -211,8 +211,13 @@ class Workspace:
             s2 = RunSettings(**{**asdict(settings), "taker_fee": fee, "maker_fee": fee})
             return run_fast_backtest(loaded.instantiate(**params), bars, settings=s2)
 
-        n_trials = len(self.runs()["runs"]) + 1
-        verdict = robustness_verdict(result, rerun_with_fees=rerun, n_trials=n_trials)
+        with self._lock:   # count, judge and append as one step: concurrent runs never share a trial number
+            n_trials = len(self.runs()["runs"]) + 1
+            verdict = robustness_verdict(result, rerun_with_fees=rerun, n_trials=n_trials)
+            return self._record(rid, run_dir, engine, body, loaded, params, bars, result, verdict)
+
+    def _record(self, rid: str, run_dir: Path, engine: bool, body: dict[str, Any], loaded: Any, params: dict[str, Any],
+                bars: Any, result: Any, verdict: dict[str, Any]) -> dict[str, Any]:
         step = max(1, len(result.equity_curve) // 1500)
         payload = {
             "id": rid, "at": _now(), "mode": "engine" if engine else "fast", "strategy": result.strategy,
@@ -230,7 +235,7 @@ class Workspace:
         summary |= {"net_return": result.metrics["net_return"], "sharpe": result.metrics.get("sharpe"),
                     "max_drawdown": result.metrics["max_drawdown"], "verdict": verdict["verdict"],
                     "hold_return": result.benchmark["net_return"]}
-        with self._lock, (self.root / "runs" / "runs.jsonl").open("a", encoding="utf-8") as fh:
+        with (self.root / "runs" / "runs.jsonl").open("a", encoding="utf-8") as fh:   # caller holds self._lock
             fh.write(json.dumps(summary, ensure_ascii=False, default=str) + "\n")   # append-only experiment log
         self._event("backtest.done", id=rid, strategy=result.strategy, mode=payload["mode"])
         return payload
@@ -252,8 +257,9 @@ class Workspace:
         return self.root / "paper" / name
 
     def _running(self, folder: Path) -> bool:
+        """True while the session's loop process is alive, whether or not a STOP has been requested."""
         pid_file = folder / "pid.json"
-        if not pid_file.exists() or (folder / "STOP").exists():
+        if not pid_file.exists():
             return False
         return _pid_alive(int(json.loads(pid_file.read_text())["pid"]))
 
@@ -266,7 +272,7 @@ class Workspace:
             st = json.loads((folder / "status.json").read_text(encoding="utf-8")) if (folder / "status.json").exists() else {}
             out.append({"name": folder.name, "strategy": doc["strategy_name"], "symbol": doc["market"]["symbol"],
                         "timeframe": doc["timeframe"], "capital": doc["settings"]["capital_quote"],
-                        "running": self._running(folder), "equity": st.get("equity_quote"), "net_return": st.get("net_return"),
+                        "running": self._running(folder), "stopping": (folder / "STOP").exists(), "equity": st.get("equity_quote"), "net_return": st.get("net_return"),
                         "position": st.get("position"), "fills": st.get("fills"), "last_cycle": st.get("cycle_at"),
                         "missed_bars": st.get("missed_bars"), "error": (json.loads((folder / "last_error.json").read_text())
                                                                      if (folder / "last_error.json").exists() else None)})
@@ -286,7 +292,14 @@ class Workspace:
         folder = self._paper_dir(name)
         if not (folder / "session.json").exists():
             raise StrategyError("no such session.")
+        with self._lock:
+            return self._start_locked(name, folder)
+
+    def _start_locked(self, name: str, folder: Path) -> dict[str, Any]:
         if self._running(folder):
+            if (folder / "STOP").exists():
+                # the old loop has not reached its STOP check yet; removing STOP now would leave two loops
+                raise StrategyError("the previous loop is still stopping; try again after one poll interval.")
             return {"ok": True, "already_running": True}
         (folder / "STOP").unlink(missing_ok=True)
         env = dict(os.environ, PYTHONPATH=str(REPO / "src"), PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")

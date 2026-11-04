@@ -48,24 +48,27 @@ def _daily_like_returns(equity: Sequence[tuple[str, float]]) -> list[float]:
 
 
 def dsr_probability(returns: Sequence[float], n_trials: int) -> float | None:
-    """Bailey & Lopez de Prado DSR on per-bar returns; None if undefined."""
+    """DSR on per-bar returns, with the formulas documented in validation.dsr; None if undefined.
+
+    SR = mean / s (s: T-1 sample deviation); g3 = m3 / m2^1.5, g4 = m4 / m2^2 from central moments;
+    v = (1 - g3*SR + (g4-1)/4*SR^2) / (T-1); SR0 = sqrt(v) * A(N). Only one trial's returns are kept, so
+    the cross-trial variance is unavailable and the project's variance floor v is used alone.
+    """
     n = len(returns)
     if n < 30 or n_trials < 1:
         return None
     mean = sum(returns) / n
-    var = sum((r - mean) ** 2 for r in returns) / (n - 1)
-    if var <= 0:
+    m2 = sum((r - mean) ** 2 for r in returns) / n
+    if m2 <= 0:
         return None
-    sd = math.sqrt(var)
-    sr = mean / sd
-    m3 = sum((r - mean) ** 3 for r in returns) / n / sd ** 3
-    m4 = sum((r - mean) ** 4 for r in returns) / n / sd ** 4
-    # expected max of n_trials standard normals scales the benchmark Sharpe by the per-bar Sharpe spread
-    emax, _ = expected_max_normal(max(1, n_trials))
-    sr0 = float(emax) * math.sqrt(1.0 / (n - 1)) if n_trials > 1 else 0.0
-    denom = 1 - m3 * sr + (m4 - 1) / 4 * sr ** 2
+    sr = mean / math.sqrt(m2 * n / (n - 1))
+    g3 = sum((r - mean) ** 3 for r in returns) / n / m2 ** 1.5
+    g4 = sum((r - mean) ** 4 for r in returns) / n / m2 ** 2
+    denom = 1 - g3 * sr + (g4 - 1) / 4 * sr ** 2
     if denom <= 0:
         return None
+    emax, _ = expected_max_normal(max(1, n_trials))
+    sr0 = math.sqrt(denom / (n - 1)) * float(emax) if n_trials > 1 else 0.0
     z = (sr - sr0) * math.sqrt(n - 1) / math.sqrt(denom)
     return float(normal_cdf(Decimal(str(z))))
 
@@ -79,7 +82,7 @@ def robustness_verdict(result: Any, *, rerun_with_fees: Callable[[Decimal], Any]
         checks.append({"key": key, "label": label, "ok": ok, "detail": detail})
 
     s, bs = m.get("sharpe"), b.get("sharpe")
-    add("beats_hold", "يتفوق على الاحتفاظ (Sharpe)", None if s is None or bs is None else s >= bs,
+    add("beats_hold", "يتفوق على الاحتفاظ (Sharpe)", None if s is None or bs is None else s > bs,
         f"{(s or 0):.2f} مقابل {(bs or 0):.2f}")
     half = len(eq) // 2
     if half >= 2:
@@ -92,6 +95,8 @@ def robustness_verdict(result: Any, *, rerun_with_fees: Callable[[Decimal], Any]
         doubled = rerun_with_fees(Decimal(str(result.settings.get("taker_fee", "0.001"))) * 2)
         add("fees_x2", "يصمد لو تضاعفت الرسوم", doubled.metrics["net_return"] > 0,
             f"العائد برسوم مضاعفة {doubled.metrics['net_return']:.1%}")
+    else:                                         # never silently dropped: an unrun check blocks "promising"
+        add("fees_x2", "يصمد لو تضاعفت الرسوم", None, "لم يُشغَّل")
     cut = int(len(eq) * 0.7)
     if 2 <= cut < len(eq) - 2:
         ins = eq[cut - 1][1] / eq[0][1] - 1
@@ -102,8 +107,9 @@ def robustness_verdict(result: Any, *, rerun_with_fees: Callable[[Decimal], Any]
     p = dsr_probability(_daily_like_returns(eq), n_trials)
     add("dsr", f"DSR ≥ 0.95 بعد {n_trials} تجربة", None if p is None else p >= 0.95,
         "غير معرّف" if p is None else f"{p:.2f}")
-    decided = [c for c in checks if c["ok"] is not None]
-    verdict = "promising" if decided and len(decided) == len(checks) and all(c["ok"] for c in checks) else "unproven"
+    required = {"beats_hold", "both_halves", "fees_x2", "out_of_sample", "dsr"}
+    passed = {c["key"] for c in checks if c["ok"] is True}
+    verdict = "promising" if passed == required and len(checks) == len(required) else "unproven"
     return {"verdict": verdict, "label": "واعدة" if verdict == "promising" else "غير مثبتة", "checks": checks,
             "note": "حكم على الماضي فقط، وليس وعدًا بالربح."}
 

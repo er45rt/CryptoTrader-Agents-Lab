@@ -144,7 +144,7 @@ class StrategyDecisionSource:
         self.tradable = tuple(tradable) if tradable is not None else None   # False = bar arrived too late
         self.strategy = strategy
         self.bars = tuple(bars)
-        self._shared = _SharedSeries(self.bars)   # also checks the bars are strictly increasing
+        self._shared = _SharedSeries(self.bars)   # engine-side only; strategies get prefix views
         self.market = market
         self.settings = settings
         self.position = position
@@ -180,6 +180,7 @@ class StrategyDecisionSource:
             return StrategyDecision(action="hold", confidence="low", rationale="warmup", decided_at=at)
         history = BarHistory._view(self._shared, i + 1, as_of=at)
         signal = self.strategy.on_bar(history)
+        self._shared.learn(history)
         if signal is not None and not isinstance(signal, Signal):
             raise StrategyError(f"{type(self.strategy).__name__}.on_bar must return Signal or None.")
         if i < self.trade_from_index:

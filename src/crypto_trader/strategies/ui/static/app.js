@@ -111,7 +111,7 @@ function sessionTable(ss) {
   if (!ss.length) return `<p class="muted">ما فيه جلسات. أنشئ وحدة من صفحة التداول الورقي.</p>`;
   return `<table><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>المركز</th><th>صفقات</th><th>فائتة</th></tr>
   ${ss.map((s) => `<tr><td><a href="#" data-session="${esc(s.name)}">${esc(s.name)}</a></td><td>${esc(s.strategy)} · ${esc(s.timeframe)}</td>
-  <td>${s.running ? '<span class="pill good">تعمل</span>' : '<span class="pill warn">متوقفة</span>'}${s.error ? ' <span class="pill bad" title="' + esc(s.error.error) + '">خطأ</span>' : ""}</td>
+  <td>${s.running && s.stopping ? '<span class="pill warn">يتوقف…</span>' : s.running ? '<span class="pill good">تعمل</span>' : '<span class="pill warn">متوقفة</span>'}${s.error ? ' <span class="pill bad" title="' + esc(s.error.error) + '">خطأ</span>' : ""}</td>
   <td>${fmtNum(s.equity)}</td><td class="${(s.net_return || 0) >= 0 ? "good" : "bad"}">${fmtPct(s.net_return)}</td>
   <td>${esc(JSON.stringify(s.position || {}))}</td><td>${s.fills ?? "—"}</td><td>${s.missed_bars ?? "—"}</td></tr>`).join("")}</table>`;
 }

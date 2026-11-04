@@ -84,23 +84,22 @@ class BarHistory:
         self._bars = visible
         self.as_of = as_of
         self._cache: dict[tuple[Any, ...], tuple[float, ...]] = {}
-        self._shared: _SharedSeries | None = None
 
     @classmethod
     def _view(cls, shared: "_SharedSeries", n: int, as_of: datetime) -> "BarHistory":
-        """Engine-internal fast path: the first n bars of a pre-checked, strictly increasing series.
+        """Engine-internal fast path: the first n bars of a pre-checked series.
 
-        Built-in indicators are computed once over the whole series and sliced to n. That is exact only
-        because every built-in indicator is causal (value i depends on bars 0..i), which the test suite
-        proves indicator by indicator; strategy code still only ever sees bars 0..n-1.
+        The view holds only bars 0..n-1 and values already cut to n: no reference to the shared series or
+        to anything derived from later bars is kept. Built-in indicators were computed once over the
+        whole series; slicing them to n is exact only because every built-in is causal (value i depends on
+        bars 0..i), which the test suite proves indicator by indicator.
         """
-        if not 1 <= n <= len(shared.bars) or shared.bars[n - 1].close_time > as_of:
+        if not 1 <= n <= len(shared.bars) or shared.max_close[n - 1] > as_of:
             raise StrategyError("BarHistory view would expose a bar that is not closed yet (look-ahead).")
         obj = cls.__new__(cls)
         obj._bars = shared.bars[:n]
         obj.as_of = as_of
-        obj._cache = {}
-        obj._shared = shared
+        obj._cache = shared.prefix_cache(n)
         return obj
 
     def __len__(self) -> int:
@@ -118,10 +117,7 @@ class BarHistory:
             raise StrategyError(f"unknown OHLCV field {field_name!r}.")
         key = ("field", field_name)
         if key not in self._cache:
-            if self._shared is not None:
-                self._cache[key] = self._shared.array(field_name)[: len(self._bars)]
-            else:
-                self._cache[key] = tuple(float(getattr(b, field_name)) for b in self._bars)
+            self._cache[key] = tuple(float(getattr(b, field_name)) for b in self._bars)
         return self._cache[key]
 
     @property
@@ -160,43 +156,58 @@ class BarHistory:
 
         key = (name, args, tuple(sorted(kwargs.items())))
         if key not in self._cache:
-            if self._shared is not None and self._shared.shareable(name):
-                self._cache[key] = self._shared.indicator(key, name, args, kwargs)[: len(self._bars)]
-            else:
-                self._cache[key] = indicators.compute(name, self, *args, **kwargs)
+            self._cache[key] = indicators.compute(name, self, *args, **kwargs)
         return self._cache[key]
 
 
 class _SharedSeries:
-    """One float array per OHLCV field and one result per built-in indicator, for a whole run."""
+    """Engine-internal: full-run OHLCV arrays and built-in causal indicators, handed out only as prefixes.
+
+    Never given to strategy code. After each decision the engine calls `learn(view)` so that keys the
+    strategy asked for are computed once over the whole run (built-ins only) and served as prefixes from
+    then on; anything else stays computed on the visible bars by the view itself.
+    """
+
+    _FIELDS = ("open", "high", "low", "close", "volume")
 
     def __init__(self, bars: Sequence[Bar]) -> None:
         self.bars = tuple(bars)
-        for prev, cur in zip(self.bars, self.bars[1:]):
-            if cur.open_time <= prev.open_time:
-                raise StrategyError("bars must be strictly increasing.")
-        self._arrays: dict[str, tuple[float, ...]] = {}
-        self._ind: dict[tuple[Any, ...], tuple[float, ...]] = {}
-
-    def array(self, field_name: str) -> tuple[float, ...]:
-        if field_name not in self._arrays:
-            self._arrays[field_name] = tuple(float(getattr(b, field_name)) for b in self.bars)
-        return self._arrays[field_name]
-
-    def indicator(self, key: tuple[Any, ...], name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[float, ...]:
-        if key not in self._ind:
-            from . import indicators
-
-            full = BarHistory._view(self, len(self.bars), self.bars[-1].close_time)
-            self._ind[key] = indicators.compute(name, full, *args, **kwargs)
-        return self._ind[key]
+        latest = None
+        self.max_close: list[datetime] = []
+        for b in self.bars:                       # running max: a view of n bars is closed iff max_close[n-1] <= as_of
+            latest = b.close_time if latest is None or b.close_time > latest else latest
+            self.max_close.append(latest)
+        self._full: dict[tuple[Any, ...], tuple[float, ...]] = {}
 
     @staticmethod
-    def shareable(name: str) -> bool:
+    def _builtin(name: Any) -> bool:
         from . import indicators
 
         fn = indicators.REGISTRY.get(name)
         return fn is not None and fn is indicators.CAUSAL_BUILTINS.get(name)
+
+    def prefix_cache(self, n: int) -> dict[tuple[Any, ...], tuple[float, ...]]:
+        # re-checked on every view: a built-in replaced in REGISTRY after it was learned is no longer served
+        return {k: v[:n] for k, v in self._full.items() if k[0] == "field" or self._builtin(k[0])}
+
+    def learn(self, view: BarHistory) -> None:
+        from . import indicators
+
+        for key in list(view._cache):
+            if key in self._full:
+                continue
+            try:
+                if key[0] == "field":
+                    if key[1] in self._FIELDS:
+                        self._full[key] = tuple(float(getattr(b, key[1])) for b in self.bars)
+                    continue
+                name, args, kw = key
+                if not self._builtin(name):
+                    continue                      # added or replaced indicator: never computed over the future
+                full = BarHistory(self.bars, self.max_close[-1])
+                self._full[key] = indicators.compute(name, full, *args, **dict(kw))
+            except Exception:                     # a key the engine cannot reproduce stays per-view
+                continue
 
 
 @dataclass(frozen=True)
