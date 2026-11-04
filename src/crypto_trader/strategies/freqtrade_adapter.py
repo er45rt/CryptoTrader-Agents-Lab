@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -36,6 +37,7 @@ from .loader import LoadedStrategy, _sha256
 __all__ = ["load_freqtrade_strategy", "DEFAULT_FT_PYTHON"]
 
 DEFAULT_FT_PYTHON = r"C:\Users\Jamal\ct_trading_pilot\venv\Scripts\python.exe"
+HELPER_TIMEOUT_S = float(os.environ.get("CT_FREQTRADE_TIMEOUT", "600"))
 _HELPER = Path(__file__).with_name("ft_helper.py")
 _UNSUPPORTED_CALLBACKS = {"custom_stoploss", "custom_exit", "custom_stake_amount", "adjust_trade_position",
                           "confirm_trade_entry", "custom_entry_price", "custom_exit_price"}
@@ -51,11 +53,18 @@ class _Helper:
                                      bufsize=1)
         self.meta = self.call({"op": "load", "file": file, "class": class_name, "window": window})["meta"]
 
-    def call(self, msg: dict[str, Any]) -> dict[str, Any]:
+    def call(self, msg: dict[str, Any], timeout: float = HELPER_TIMEOUT_S) -> dict[str, Any]:
         assert self.proc.stdin and self.proc.stdout
         self.proc.stdin.write(json.dumps(msg) + "\n")
         self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        box: list[str] = []
+        reader = threading.Thread(target=lambda: box.append(self.proc.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if reader.is_alive():
+            self.proc.kill()
+            raise StrategyError(f"Freqtrade helper did not answer within {timeout:.0f}s; killed (fail closed).")
+        line = box[0] if box else ""
         if not line:
             raise StrategyError("Freqtrade helper exited unexpectedly.")
         reply = json.loads(line)
@@ -119,7 +128,7 @@ def load_freqtrade_strategy(spec: str) -> LoadedStrategy:
             self._helper = _Helper(python, resolved, class_name, window=int(params.get("window", 1000)))
             self._fed = 0
             self._long_since: int | None = None    # index of the bar whose close issued the entry
-            self._peak = Decimal(0)
+            self._peak: Decimal | None = None
             self.exits: dict[str, int] = {"signal": 0, "stoploss": 0, "roi": 0, "trailing": 0}
 
         def on_bar(self, bars):
@@ -137,7 +146,7 @@ def load_freqtrade_strategy(spec: str) -> LoadedStrategy:
             if self._long_since is None:
                 if reply["enter"]:
                     self._long_since = i
-                    self._peak = close
+                    self._peak = None        # trailing state starts at the ENTRY price, not the signal close
                     return Signal.long(1, "ft:enter_long")
                 return Signal.flat("ft:flat")
             entry_i = self._long_since + 1
@@ -145,7 +154,8 @@ def load_freqtrade_strategy(spec: str) -> LoadedStrategy:
                 return Signal.long(1, "ft:entering")
             entry = bars[entry_i].open
             profit = close / entry - 1
-            self._peak = max(self._peak, close)
+            # peak since entry only (Sol D29 round 1): entry price, then post-entry closes
+            self._peak = max(entry if self._peak is None else self._peak, close)
             minutes = (i - entry_i + 1) * tf_minutes
             reason = None
             # Freqtrade stop semantics, evaluated on closes:

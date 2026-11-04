@@ -72,7 +72,6 @@ def run_fast_backtest(strategy: Strategy, bars: Sequence[Bar], *, market: Market
             price = asks[i] if side == "buy" else bids[i]
             notional = q * price
             fee = notional * fee_rate
-            fees_total += fee
             if side == "buy":
                 if notional + fee > state["cash"]:
                     q = ((state["cash"] / (price * (1 + fee_rate))) / market.quantity_step).to_integral_value(
@@ -96,6 +95,7 @@ def run_fast_backtest(strategy: Strategy, bars: Sequence[Bar], *, market: Market
                                    "quantity": str(open_trade["quantity"]),
                                    "pnl_quote": str((notional - fee - open_trade["cost"]).quantize(Decimal("0.0001")))})
                     open_trade = None
+            fees_total += fee            # after any cash clipping: the fee actually charged (Sol D29 r1)
             fills.append({"time": bar.open_time.isoformat(), "side": side, "quantity": str(q), "price": str(price),
                           "fee": str(fee)})
             pending = None

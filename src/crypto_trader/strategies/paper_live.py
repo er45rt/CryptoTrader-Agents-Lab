@@ -71,18 +71,35 @@ def _load(folder: Path) -> dict[str, Any]:
 
 
 def _read_bars(folder: Path, timeframe: str) -> tuple[list[Bar], list[datetime | None]]:
-    rows = [json.loads(l) for l in (folder / "bars.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    path = folder / "bars.jsonl"
+    text = path.read_text(encoding="utf-8")
+    lines = [l for l in text.splitlines() if l.strip()]
+    rows = []
+    for n, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            if n != len(lines) - 1:
+                raise StrategyError(f"bars.jsonl is corrupt at line {n + 1} (not the tail); refusing to continue.")
+            # a crash during the last append left a partial line: drop exactly that line, durably
+            _write_atomic(path, "".join(l + "\n" for l in lines[:-1]))
+            break
     seen = [datetime.fromisoformat(r["seen_at"]) if r.get("seen_at") else None for r in rows]
     return bars_from_rows(rows, timeframe), seen
 
 
-#: a bar is tradable only if this process saw it before the NEXT bar closed (its fill is at that bar's
-#: open); bars first seen later (process down, network blocked) are recorded as missed, never traded late.
+#: Fills are priced at the next bar's OPEN, which is only honest if the bar was seen promptly after it
+#: closed. A bar is tradable only if first seen strictly within min(one bar, MAX_SIGNAL_LATENCY) of its
+#: close (Sol D29 round 1: the boundary is strict). Later bars (process down, network blocked) are
+#: recorded as missed and never traded.
+MAX_SIGNAL_LATENCY = timedelta(minutes=5)
+
+
 def _tradable(bars: list[Bar], seen: list[datetime | None]) -> list[bool]:
     out = []
     for b, s in zip(bars, seen):
-        step = b.close_time - b.open_time
-        out.append(s is None or s <= b.close_time + step)
+        window = min(b.close_time - b.open_time, MAX_SIGNAL_LATENCY)
+        out.append(s is not None and b.close_time <= s < b.close_time + window)   # unknown = not tradable
     return out
 
 

@@ -167,3 +167,82 @@ def test_freqtrade_adapter_refuses_unsupported_features(tmp_path, extra):
     spec = _ft(tmp_path, "Unsup", 'df["close"] > 0', 'df["close"] < 0', extra=extra)
     with pytest.raises(StrategyError):
         load_strategy(spec)
+
+
+# --- Sol D29 round-1 regressions -------------------------------------------------------------------
+
+def test_tradable_window_is_strict_and_short():
+    from crypto_trader.strategies.paper_live import MAX_SIGNAL_LATENCY, _tradable
+    bars = synthetic_bars(3)
+    b = bars[0]
+    step = b.close_time - b.open_time
+    window = min(step, MAX_SIGNAL_LATENCY)
+    seen = [b.close_time + window - timedelta(seconds=1), b.close_time + window, b.close_time + step]
+    assert _tradable([b, b, b], seen) == [True, False, False]       # exact boundary is NOT tradable
+    assert _tradable([b], [None]) == [False]                          # unknown arrival time: fail closed
+    assert _tradable([b], [b.close_time - timedelta(seconds=1)]) == [False]   # seen before it closed
+
+
+def test_bar_seen_exactly_one_bar_late_never_trades(tmp_path):
+    """Sol's reproduction: two closed bars both first seen at the second bar's close."""
+    bars, spec_file, folder, fetch = _session(tmp_path)
+    for k in range(60, 80):
+        paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[k].close_time + timedelta(minutes=1))
+    st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[81].close_time)   # bar 80 seen 1 bar late
+    report = json.loads((folder / "report.json").read_text())
+    by_ref = {d["market_reference"]: d for d in report["decisions"]}
+    stamp = bars[80].open_time.strftime("@%Y%m%dT%H%M%SZ")
+    late = [r for r in by_ref if r.endswith(stamp)]
+    assert late and by_ref[late[0]]["rationale"] == "missed:bar-arrived-late"
+    assert st["missed_bars"] >= 1
+
+
+def test_truncated_bars_tail_is_dropped_but_inner_corruption_refuses(tmp_path):
+    bars, spec_file, folder, fetch = _session(tmp_path)
+    paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[62].close_time + timedelta(minutes=1))
+    path = folder / "bars.jsonl"
+    good = path.read_text()
+    path.write_text(good + '{"date": "2024-01-11T08:00:00+00:00", "op')        # crash mid-append
+    paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[63].close_time + timedelta(minutes=1))
+    assert all(json.loads(l) for l in path.read_text().splitlines())
+    lines = path.read_text().splitlines()
+    lines[3] = "not json"
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(StrategyError):
+        paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[64].close_time + timedelta(minutes=1))
+
+
+TRAIL = textwrap.dedent("""
+    from freqtrade.strategy import IStrategy
+    class Trail(IStrategy):
+        INTERFACE_VERSION = 3
+        timeframe = "4h"
+        stoploss = -0.10
+        trailing_stop = True
+        minimal_roi = {"0": 10}
+        startup_candle_count = 1
+        def populate_indicators(self, df, md):
+            return df
+        def populate_entry_trend(self, df, md):
+            df.loc[df["close"] == 100, "enter_long"] = 1
+            return df
+        def populate_exit_trend(self, df, md):
+            return df
+""")
+
+
+@needs_ft
+def test_freqtrade_trailing_peak_starts_at_entry_not_at_the_signal_close(tmp_path):
+    """Sol's reproduction: signal close 100, next open 50, next close 55, 10% trailing -> no exit."""
+    from crypto_trader.strategies import Bar, BarHistory
+    f = tmp_path / "Trail.py"
+    f.write_text(TRAIL)
+    strat = load_strategy(f"freqtrade:{f}:Trail").instantiate()
+    t0 = synthetic_bars(1)[0].open_time
+    step = timedelta(hours=4)
+    rows = [(80, 80, 80, 80), (90, 100, 90, 100), (50, 56, 50, 55), (55, 56, 54, 55)]
+    bars = [Bar(open_time=t0 + i * step, open=Decimal(o), high=Decimal(h), low=Decimal(l), close=Decimal(c),
+                volume=Decimal(1), timeframe="4h") for i, (o, h, l, c) in enumerate(rows)]
+    signals = [strat.on_bar(BarHistory(bars[: i + 1], bars[i].close_time)) for i in range(len(bars))]
+    assert signals[1].reason == "ft:enter_long"
+    assert all(s.target == 1 for s in signals[2:]), [s.reason for s in signals]
