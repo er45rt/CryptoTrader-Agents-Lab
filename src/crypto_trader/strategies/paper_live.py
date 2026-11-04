@@ -70,9 +70,20 @@ def _load(folder: Path) -> dict[str, Any]:
     return json.loads((folder / "session.json").read_text(encoding="utf-8"))
 
 
-def _read_bars(folder: Path, timeframe: str) -> list[Bar]:
+def _read_bars(folder: Path, timeframe: str) -> tuple[list[Bar], list[datetime | None]]:
     rows = [json.loads(l) for l in (folder / "bars.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
-    return bars_from_rows(rows, timeframe)
+    seen = [datetime.fromisoformat(r["seen_at"]) if r.get("seen_at") else None for r in rows]
+    return bars_from_rows(rows, timeframe), seen
+
+
+#: a bar is tradable only if this process saw it before the NEXT bar closed (its fill is at that bar's
+#: open); bars first seen later (process down, network blocked) are recorded as missed, never traded late.
+def _tradable(bars: list[Bar], seen: list[datetime | None]) -> list[bool]:
+    out = []
+    for b, s in zip(bars, seen):
+        step = b.close_time - b.open_time
+        out.append(s is None or s <= b.close_time + step)
+    return out
 
 
 def _market(doc: dict[str, Any]) -> MarketSpec:
@@ -108,7 +119,7 @@ def paper_cycle(folder: str | Path, *, fetch: Callable[..., list[Bar]] = fetch_p
     start = datetime.fromisoformat(doc["start"])
     market = _market(doc)
     settings = _settings(doc)
-    bars = _read_bars(folder, tf)
+    bars, seen = _read_bars(folder, tf)
     since = bars[-1].open_time + step if bars else start - step * (doc["warmup_bars"] + 5)
     new = [b for b in fetch(market.symbol, tf, start=since, now=now, cafile=cafile) if b.close_time <= now]
     if bars:
@@ -117,10 +128,12 @@ def paper_cycle(folder: str | Path, *, fetch: Callable[..., list[Bar]] = fetch_p
         with (folder / "bars.jsonl").open("a", encoding="utf-8") as fh:
             for b in new:
                 fh.write(json.dumps({"date": b.open_time.isoformat(), "open": str(b.open), "high": str(b.high),
-                                     "low": str(b.low), "close": str(b.close), "volume": str(b.volume)}) + "\n")
+                                     "low": str(b.low), "close": str(b.close), "volume": str(b.volume),
+                                     "seen_at": now.isoformat()}) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
         bars = bars + new
+        seen = seen + [now] * len(new)
     status: dict[str, Any] = {"cycle_at": now.isoformat(), "bars": len(bars), "new_bars": len(new),
                               "mode": doc["mode"], "strategy": doc["strategy_name"]}
     if bars:
@@ -137,7 +150,8 @@ def paper_cycle(folder: str | Path, *, fetch: Callable[..., list[Bar]] = fetch_p
             report, source, journal = run_session(
                 strategy, bars, market=market, settings=settings, journal_path=folder / "journal.db",
                 session_id=sid, strategy_id=f"{doc['strategy_name']}-paper", trade_from_index=trade_from,
-                next_open=forming)
+                next_open=forming, tradable=_tradable(bars, seen))
+            status["missed_bars"] = sum(1 for i, ok in enumerate(_tradable(bars, seen)) if i >= trade_from and not ok)
             try:
                 metrics, trades, equity = metrics_from_run(bars[trade_from:], report, settings, journal, sid, market)
             finally:
@@ -169,7 +183,23 @@ def run_paper_loop(folder: str | Path, *, poll_seconds: float = 60.0, max_cycles
             raise
         except Exception as exc:   # network trouble: keep state, retry with backoff (never invent data)
             log(f"cycle failed, will retry: {type(exc).__name__}: {exc}")
+            failures = 1
+            err_path = folder / "last_error.json"
+            if err_path.exists():
+                try:
+                    failures = int(json.loads(err_path.read_text(encoding="utf-8")).get("consecutive", 0)) + 1
+                except (ValueError, OSError):
+                    failures = 1
+            _write_atomic(err_path, json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                                                "error": f"{type(exc).__name__}: {exc}",
+                                                "consecutive": failures}, indent=1))
             backoff = min(backoff * 2, 900)
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                return
+            time.sleep(backoff)
+            continue
+        (folder / "last_error.json").unlink(missing_ok=True)
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:
             return

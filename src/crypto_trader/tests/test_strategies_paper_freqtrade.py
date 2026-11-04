@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import textwrap
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -67,10 +68,25 @@ def test_paper_warmup_never_trades_and_replay_is_idempotent(tmp_path):
     assert len(lines) == len({json.loads(l)["date"] for l in lines})   # append-only, no duplicates
 
 
-def test_paper_matches_backtest_over_the_same_live_bars(tmp_path):
+def test_paper_trades_when_every_bar_is_seen_on_time(tmp_path):
     bars, spec_file, folder, fetch = _session(tmp_path)
-    st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[139].close_time)
-    assert st["fills"] > 0 and st["safety_blocked"] == 0
+    for k in range(60, 110):                    # one cycle per bar, right after it closes
+        st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[k].close_time + timedelta(minutes=1))
+    assert st["fills"] > 0 and st["safety_blocked"] == 0 and st["missed_bars"] == 0
+
+
+def test_bars_first_seen_late_are_missed_never_traded_in_the_past(tmp_path):
+    bars, spec_file, folder, fetch = _session(tmp_path)
+    paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[60].close_time)
+    # the process was down for ~30 bars: they arrive together, long after their execution windows
+    st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[100].close_time + timedelta(minutes=1))
+    assert st["missed_bars"] >= 30
+    report = json.loads((folder / "report.json").read_text())
+    missed = [d for d in report["decisions"] if d["rationale"] == "missed:bar-arrived-late"]
+    assert len(missed) >= 30
+    traded = [d for d in report["decisions"] if d["action"] in {"buy", "sell"}]
+    late_refs = {d["market_reference"] for d in missed}
+    assert not any(d["market_reference"] in late_refs for d in traded)
 
 
 def test_paper_refuses_a_changed_strategy_file(tmp_path):

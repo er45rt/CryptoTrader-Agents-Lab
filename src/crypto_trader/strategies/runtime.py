@@ -139,8 +139,9 @@ class StrategyDecisionSource:
 
     def __init__(self, strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec,
                  settings: RunSettings, position: Callable[[MarketObservation], Any],
-                 trade_from_index: int = 0) -> None:
+                 trade_from_index: int = 0, tradable: Sequence[bool] | None = None) -> None:
         self.trade_from_index = trade_from_index   # bars before this index only warm the strategy up
+        self.tradable = tuple(tradable) if tradable is not None else None   # False = bar arrived too late
         self.strategy = strategy
         self.bars = tuple(bars)
         self.market = market
@@ -182,6 +183,10 @@ class StrategyDecisionSource:
             raise StrategyError(f"{type(self.strategy).__name__}.on_bar must return Signal or None.")
         if i < self.trade_from_index:
             return StrategyDecision(action="hold", confidence="low", rationale="pre-session-history", decided_at=at)
+        if self.tradable is not None and not self.tradable[i]:
+            # the bar was only seen after its execution window had passed (process down / offline):
+            # trading on it now would be trading in the past, so the decision is recorded as missed
+            return StrategyDecision(action="hold", confidence="low", rationale="missed:bar-arrived-late", decided_at=at)
         snap = self._snapshot(observation)
         held = snap.position_quantity - snap.open_sell_quantity
         self.signals.append({"index": i, "at": at.isoformat(), "target": None if signal is None else str(signal.target),
@@ -298,7 +303,8 @@ class _IncrementalReader:
 def run_session(strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec, settings: RunSettings,
                 journal_path: Path, session_id: UUID, strategy_id: str,
                 trade_from_index: int = 0,
-                next_open: tuple[datetime, Decimal] | None = None) -> tuple[Any, StrategyDecisionSource, Any]:
+                next_open: tuple[datetime, Decimal] | None = None,
+                tradable: Sequence[bool] | None = None) -> tuple[Any, StrategyDecisionSource, Any]:
     """One deterministic pass of the engine over `bars` (used by backtest and by paper replay)."""
     if len(bars) < 2 and next_open is None:
         raise StrategyError("need at least 2 bars (or the next bar's open) to run.")
@@ -323,10 +329,14 @@ def run_session(strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec, 
     reader = _IncrementalReader(journal, session_id, overlap=TIMEFRAMES[bars[0].timeframe] * 2)
 
     def position(observation: MarketObservation) -> Any:
-        return portfolio_snapshot(reader, config=bridge_cfg, mark=observation.price, as_of=observation.observed_at)
+        # Strictly BEFORE the observation: events stamped at the observation time belong to the decision
+        # being made (validity, risk, intent). On a replay they already exist; counting them would change
+        # the sizing and the engine would refuse the rewritten intent (append-only journal).
+        return portfolio_snapshot(reader, config=bridge_cfg, mark=observation.price,
+                                  as_of=observation.observed_at - timedelta(microseconds=1))
 
     source = StrategyDecisionSource(strategy, bars, market=market, settings=settings, position=position,
-                                    trade_from_index=trade_from_index)
+                                    trade_from_index=trade_from_index, tradable=tradable)
     session = TradingSession(
         config=load_session_config({"mode": TradingMode.PAPER.value, "symbol": market.symbol,
                                     "strategy_id": strategy_id, "session_id": session_id,
