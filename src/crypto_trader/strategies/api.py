@@ -84,6 +84,24 @@ class BarHistory:
         self._bars = visible
         self.as_of = as_of
         self._cache: dict[tuple[Any, ...], tuple[float, ...]] = {}
+        self._shared: _SharedSeries | None = None
+
+    @classmethod
+    def _view(cls, shared: "_SharedSeries", n: int, as_of: datetime) -> "BarHistory":
+        """Engine-internal fast path: the first n bars of a pre-checked, strictly increasing series.
+
+        Built-in indicators are computed once over the whole series and sliced to n. That is exact only
+        because every built-in indicator is causal (value i depends on bars 0..i), which the test suite
+        proves indicator by indicator; strategy code still only ever sees bars 0..n-1.
+        """
+        if not 1 <= n <= len(shared.bars) or shared.bars[n - 1].close_time > as_of:
+            raise StrategyError("BarHistory view would expose a bar that is not closed yet (look-ahead).")
+        obj = cls.__new__(cls)
+        obj._bars = shared.bars[:n]
+        obj.as_of = as_of
+        obj._cache = {}
+        obj._shared = shared
+        return obj
 
     def __len__(self) -> int:
         return len(self._bars)
@@ -100,7 +118,10 @@ class BarHistory:
             raise StrategyError(f"unknown OHLCV field {field_name!r}.")
         key = ("field", field_name)
         if key not in self._cache:
-            self._cache[key] = tuple(float(getattr(b, field_name)) for b in self._bars)
+            if self._shared is not None:
+                self._cache[key] = self._shared.array(field_name)[: len(self._bars)]
+            else:
+                self._cache[key] = tuple(float(getattr(b, field_name)) for b in self._bars)
         return self._cache[key]
 
     @property
@@ -139,8 +160,43 @@ class BarHistory:
 
         key = (name, args, tuple(sorted(kwargs.items())))
         if key not in self._cache:
-            self._cache[key] = indicators.compute(name, self, *args, **kwargs)
+            if self._shared is not None and self._shared.shareable(name):
+                self._cache[key] = self._shared.indicator(key, name, args, kwargs)[: len(self._bars)]
+            else:
+                self._cache[key] = indicators.compute(name, self, *args, **kwargs)
         return self._cache[key]
+
+
+class _SharedSeries:
+    """One float array per OHLCV field and one result per built-in indicator, for a whole run."""
+
+    def __init__(self, bars: Sequence[Bar]) -> None:
+        self.bars = tuple(bars)
+        for prev, cur in zip(self.bars, self.bars[1:]):
+            if cur.open_time <= prev.open_time:
+                raise StrategyError("bars must be strictly increasing.")
+        self._arrays: dict[str, tuple[float, ...]] = {}
+        self._ind: dict[tuple[Any, ...], tuple[float, ...]] = {}
+
+    def array(self, field_name: str) -> tuple[float, ...]:
+        if field_name not in self._arrays:
+            self._arrays[field_name] = tuple(float(getattr(b, field_name)) for b in self.bars)
+        return self._arrays[field_name]
+
+    def indicator(self, key: tuple[Any, ...], name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[float, ...]:
+        if key not in self._ind:
+            from . import indicators
+
+            full = BarHistory._view(self, len(self.bars), self.bars[-1].close_time)
+            self._ind[key] = indicators.compute(name, full, *args, **kwargs)
+        return self._ind[key]
+
+    @staticmethod
+    def shareable(name: str) -> bool:
+        from . import indicators
+
+        fn = indicators.REGISTRY.get(name)
+        return fn is not None and fn is indicators.CAUSAL_BUILTINS.get(name)
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,8 @@ Values before an indicator has enough data are float('nan'). All functions take 
 from __future__ import annotations
 
 import math
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from .api import StrategyError
 
@@ -166,6 +167,9 @@ REGISTRY: dict[str, Callable[..., tuple[float, ...]]] = {
     "bollinger_upper": bollinger_upper, "bollinger_lower": bollinger_lower,
     "macd": macd, "macd_signal": macd_signal, "returns": returns,
 }
+# The built-ins proven causal by the test suite. Only these may be computed once over a whole run and
+# sliced (api._SharedSeries); anything added to REGISTRY later is recomputed on the visible bars only.
+CAUSAL_BUILTINS: Mapping[str, Callable[..., tuple[float, ...]]] = MappingProxyType(dict(REGISTRY))
 
 
 def compute(name: str, bars: Any, *args: Any, **kwargs: Any) -> tuple[float, ...]:

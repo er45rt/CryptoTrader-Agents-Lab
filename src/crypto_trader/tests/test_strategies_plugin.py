@@ -107,6 +107,36 @@ def test_indicators_are_causal(name, args):
             assert (math.isnan(a) and math.isnan(b)) or a == pytest.approx(b, rel=1e-12)
 
 
+def test_shared_view_matches_plain_history_and_refuses_unclosed_bars():
+    from crypto_trader.strategies.api import _SharedSeries
+
+    bars = synthetic_bars(80)
+    shared = _SharedSeries(bars)
+    for cut in (20, 41, 80):
+        view = BarHistory._view(shared, cut, bars[cut - 1].close_time)
+        plain = BarHistory(bars[:cut], bars[cut - 1].close_time)
+        assert view.bars == plain.bars and view.close == plain.close
+        for name, args in (("sma", (5,)), ("rsi", (7,)), ("macd_signal", ())):
+            for a, b in zip(view.indicator(name, *args), plain.indicator(name, *args), strict=True):
+                assert (math.isnan(a) and math.isnan(b)) or a == pytest.approx(b, rel=1e-12)
+    with pytest.raises(StrategyError):
+        BarHistory._view(shared, 30, bars[29].close_time - timedelta(seconds=1))
+    with pytest.raises(StrategyError):
+        _SharedSeries([bars[1], bars[0]])
+
+
+def test_shared_view_never_slices_a_non_builtin_indicator(monkeypatch):
+    from crypto_trader.strategies.api import _SharedSeries
+
+    bars = synthetic_bars(40)
+    peek = lambda b: tuple(b.close[-1] for _ in b.close)   # deliberately non-causal  # noqa: E731
+    monkeypatch.setitem(indicators.REGISTRY, "peek", peek)
+    view = BarHistory._view(_SharedSeries(bars), 10, bars[9].close_time)
+    assert view.indicator("peek")[0] == view.close[-1]      # computed on the 10 visible bars only
+    monkeypatch.setitem(indicators.REGISTRY, "sma", peek)   # replaced built-in: not shared either
+    assert view.indicator("sma")[0] == view.close[-1]
+
+
 # --- data integrity --------------------------------------------------------------------------------
 
 def test_check_bars_detects_gaps_and_order():

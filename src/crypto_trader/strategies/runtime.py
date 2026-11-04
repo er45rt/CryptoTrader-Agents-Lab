@@ -40,7 +40,7 @@ from crypto_trader.risk import load_limits
 from crypto_trader.safety import SafetyController
 from crypto_trader.validity import DecisionValidityGate, load_policy
 
-from .api import TIMEFRAMES, Bar, BarHistory, Signal, Strategy, StrategyError
+from .api import TIMEFRAMES, Bar, BarHistory, Signal, Strategy, StrategyError, _SharedSeries
 
 __all__ = ["MarketSpec", "RunSettings", "StrategyDecisionSource", "build_tape", "run_backtest",
            "BacktestResult", "metrics_from_run"]
@@ -144,6 +144,7 @@ class StrategyDecisionSource:
         self.tradable = tuple(tradable) if tradable is not None else None   # False = bar arrived too late
         self.strategy = strategy
         self.bars = tuple(bars)
+        self._shared = _SharedSeries(self.bars)   # also checks the bars are strictly increasing
         self.market = market
         self.settings = settings
         self.position = position
@@ -177,7 +178,7 @@ class StrategyDecisionSource:
         at = observation.observed_at
         if i + 1 < self.strategy.warmup_bars:
             return StrategyDecision(action="hold", confidence="low", rationale="warmup", decided_at=at)
-        history = BarHistory(self.bars[: i + 1], as_of=at)
+        history = BarHistory._view(self._shared, i + 1, as_of=at)
         signal = self.strategy.on_bar(history)
         if signal is not None and not isinstance(signal, Signal):
             raise StrategyError(f"{type(self.strategy).__name__}.on_bar must return Signal or None.")

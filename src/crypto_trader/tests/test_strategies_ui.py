@@ -1,0 +1,161 @@
+"""D30 local GUI: request guards, workspace actions, experiment log and the sealed-period cutoff."""
+from __future__ import annotations
+
+import csv
+import http.client
+import json
+import threading
+
+from pathlib import Path
+
+import pytest
+
+from crypto_trader.strategies import StrategyError
+from crypto_trader.strategies.ui import server, store
+from crypto_trader.tests.test_strategies_plugin import synthetic_bars
+
+GOOD = '''
+from crypto_trader.strategies import Strategy, Signal
+
+class Up(Strategy):
+    name = "up"
+    timeframe = "4h"
+    warmup_bars = 5
+
+    def on_bar(self, bars):
+        return Signal.long(1) if bars.close[-1] > bars.indicator("sma", 5)[-1] else Signal.flat()
+'''
+
+
+@pytest.fixture()
+def ws(tmp_path: Path) -> store.Workspace:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "settings.json").write_text(json.dumps({
+        "data_dirs": [], "evidence_root": str(tmp_path / "none"), "test_summary_glob": str(tmp_path / "none*.log")}))
+    w = store.Workspace(root)
+    rows = [{"date": b.open_time.isoformat(), "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+             "volume": b.volume} for b in synthetic_bars(200)]
+    with (root / "data" / "SYN_USDT-4h.csv").open("w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        wr.writeheader()
+        wr.writerows(rows)
+    return w
+
+
+def _data(w: store.Workspace) -> str:
+    return w.data_files()["files"][0]["path"]
+
+
+# --- request guards -------------------------------------------------------------------------------------
+
+@pytest.fixture()
+def live(ws: store.Workspace):
+    srv = server.make_server(ws.root, 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+    srv.server_close()
+
+
+def _req(port: int, method: str, path: str, *, host: str = "127.0.0.1", body: dict | None = None,
+         ui_header: bool = True) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    headers = {"Host": host, "Content-Type": "application/json"}
+    if ui_header:
+        headers["X-CT-UI"] = "1"
+    conn.request(method, path, body=json.dumps(body or {}) if method == "POST" else None, headers=headers)
+    resp = conn.getresponse()
+    data = json.loads(resp.read() or b"{}")
+    conn.close()
+    return resp.status, data
+
+
+def test_server_refuses_foreign_host_and_headerless_posts(live):
+    assert _req(live, "GET", "/api/system", host="evil.example")[0] == 403
+    assert _req(live, "GET", "/api/system", host="localhost")[0] == 200
+    status, _ = _req(live, "POST", "/api/risk", body={"capital": "5"}, ui_header=False)
+    assert status == 403
+    status, sysinfo = _req(live, "GET", "/api/system")
+    assert status == 200 and sysinfo["mainnet_enabled"] is False
+
+
+def test_server_reports_bad_input_as_400_and_unknown_routes_as_404(live):
+    assert _req(live, "POST", "/api/risk", body={"risk_overrides": {"no_such_limit": "1"}})[0] == 400
+    assert _req(live, "GET", "/api/run?id=../../etc")[0] == 400
+    assert _req(live, "GET", "/api/orders")[0] == 404
+    assert _req(live, "POST", "/api/order", body={})[0] == 404
+
+
+# --- workspace actions ------------------------------------------------------------------------------------
+
+def test_upload_checks_before_keeping_and_remove_is_confined(ws):
+    with pytest.raises(StrategyError):
+        ws.upload_strategy("broken.py", "this is not python(")
+    assert not (ws.root / "strategies" / "broken.py").exists()
+    with pytest.raises(StrategyError):
+        ws.upload_strategy("../escape.py", GOOD)
+    assert ws.upload_strategy("up.py", GOOD)["ok"]
+    assert any(s["name"] == "up" and s["removable"] for s in ws.strategies()["strategies"])
+    with pytest.raises(StrategyError):
+        ws.remove_strategy("../settings.json")
+    assert ws.remove_strategy("up.py")["ok"]
+    assert not (ws.root / "strategies" / "up.py").exists()
+
+
+def test_backtest_appends_to_the_experiment_log_and_raises_the_trial_count(ws):
+    ws.upload_strategy("up.py", GOOD)
+    spec = next(s["spec"] for s in ws.strategies()["strategies"] if s["name"] == "up")
+    first = ws.backtest({"spec": spec, "data": _data(ws)})
+    assert first["verdict"]["verdict"] in ("promising", "unproven")
+    assert {c["key"] for c in first["verdict"]["checks"]} == {"beats_hold", "both_halves", "fees_x2", "out_of_sample", "dsr"}
+    assert first["bars"] and first["equity"] and first["monthly"]
+    log = ws.root / "runs" / "runs.jsonl"
+    before = log.read_text(encoding="utf-8")
+    second = ws.backtest({"spec": spec, "data": _data(ws)})
+    after = log.read_text(encoding="utf-8")
+    assert after.startswith(before) and len(after.splitlines()) == 2          # append-only
+    dsr = {c["key"]: c for c in second["verdict"]["checks"]}["dsr"]
+    assert "2" in dsr["label"]                                                  # n_trials grew
+    assert ws.run(second["id"])["id"] == second["id"]
+
+
+def test_backtest_refuses_unlisted_data_and_never_reads_the_sealed_period(ws, tmp_path):
+    ws.upload_strategy("up.py", GOOD)
+    spec = next(s["spec"] for s in ws.strategies()["strategies"] if s["name"] == "up")
+    outside = tmp_path / "other-4h.csv"
+    outside.write_text((ws.root / "data" / "SYN_USDT-4h.csv").read_text())
+    with pytest.raises(StrategyError):
+        ws.backtest({"spec": spec, "data": str(outside)})
+    # move the synthetic series so it straddles the sealed start: nothing at or after it may be used
+    bars = synthetic_bars(200)
+    shift = store.SEALED_FROM - bars[100].open_time
+    rows = [{"date": (b.open_time + shift).isoformat(), "open": b.open, "high": b.high, "low": b.low,
+             "close": b.close, "volume": b.volume} for b in bars]
+    with (ws.root / "data" / "SYN_USDT-4h.csv").open("w", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        wr.writeheader()
+        wr.writerows(rows)
+    res = ws.backtest({"spec": spec, "data": _data(ws)})
+    assert res["bars_count"] <= 100
+    assert all(b["t"] < store.SEALED_FROM.isoformat() for b in res["bars"])
+
+
+def test_risk_save_validates_before_writing(ws):
+    before = ws.settings_path.read_text(encoding="utf-8")
+    with pytest.raises(StrategyError):
+        ws.save_risk({"risk_overrides": {"no_such_limit": "1"}})
+    with pytest.raises(StrategyError):
+        ws.save_risk({"capital": "-5"})
+    assert ws.settings_path.read_text(encoding="utf-8") == before
+    assert ws.save_risk({"capital": "2500"})["ok"]
+    assert ws.risk()["editable"]["capital"] == "2500"
+    assert ws.risk()["production"]["mainnet_enabled"] is False
+
+
+def test_paper_names_are_confined(ws):
+    for bad in ("../x", "a/b", "", "..", "x" * 80):
+        with pytest.raises(StrategyError):
+            ws._paper_dir(bad)
+    with pytest.raises(StrategyError):
+        ws.paper_start("missing")
