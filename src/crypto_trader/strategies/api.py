@@ -172,6 +172,9 @@ class _SharedSeries:
 
     def __init__(self, bars: Sequence[Bar]) -> None:
         self.bars = tuple(bars)
+        for prev, cur in zip(self.bars, self.bars[1:]):
+            if cur.open_time <= prev.open_time:
+                raise StrategyError("bars must be strictly increasing.")
         latest = None
         self.max_close: list[datetime] = []
         for b in self.bars:                       # running max: a view of n bars is closed iff max_close[n-1] <= as_of

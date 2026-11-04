@@ -157,6 +157,27 @@ def test_sol_d30_1_an_earlier_unclosed_bar_is_refused():
     assert Daily.seen == []
 
 
+def test_sol_d30_r2_bars_out_of_order_are_refused():
+    """Sol D30 r2: reversed bars must be refused, never filled before the decision."""
+    from crypto_trader.strategies.api import _SharedSeries
+
+    bars = synthetic_bars(5)
+    with pytest.raises(StrategyError):
+        _SharedSeries([bars[1], bars[0]])
+    with pytest.raises(StrategyError):
+        _SharedSeries([bars[0], bars[0]])
+
+    class Always(Strategy):
+        name = "always"
+        timeframe = "4h"
+
+        def on_bar(self, bars):
+            return Signal.long(1)
+
+    with pytest.raises(StrategyError):
+        run_fast_backtest(Always(), [bars[1], bars[0]])
+
+
 def test_sol_d30_2_the_view_given_to_a_strategy_holds_nothing_from_later_bars():
     """Sol D30 r1 #2: no attribute of the view may reach the full-run series."""
     from crypto_trader.strategies.api import _SharedSeries
