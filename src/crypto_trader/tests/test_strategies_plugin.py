@@ -474,3 +474,20 @@ def test_trace_writer_is_append_only_and_flags_a_changed_replay(tmp_path):
     path.write_text(path.read_text() + '{"ref": "r2", "tor')                                          # torn tail
     assert write_decision_traces(path, [dict(a, ref="r3")], recorded_at="t3")["appended"] == 1
     assert "error" in write_decision_traces(tmp_path, [a], recorded_at="t4")                          # a folder: reported, not raised
+
+
+def test_trace_writer_flags_a_changed_sizing_on_replay(tmp_path):
+    # Sol D30-D33 r1 blocker 4: `sizing` was not compared, so a replay with a different held/equity basis
+    # reported mismatch_count 0 while the old evidence stayed on screen. Fields not compared are fixed by the
+    # ref/session (bar times, strategy name/version, decision_source, ai_involved) or follow `read` (read_error).
+    from crypto_trader.strategies.runtime import write_decision_traces
+
+    path = tmp_path / "t.jsonl"
+    a = {"ref": "r1", "signal": {"target": "1", "reason": "up"}, "read": {"sma(4)": 1.5}, "action": "buy",
+         "rationale": "strategy:up", "quantity": "0.1", "tradable": True, "price": "100",
+         "sizing": {"held": "0", "equity_quote": "1000", "quote_free": "1000", "target": "1", "want_qty": "0.1", "delta": "0.1"}}
+    assert write_decision_traces(path, [a], recorded_at="t0")["appended"] == 1
+    assert write_decision_traces(path, [a], recorded_at="t1")["mismatch_count"] == 0
+    changed = dict(a, sizing=dict(a["sizing"], held="0.05"))
+    res = write_decision_traces(path, [changed], recorded_at="t2")
+    assert res["appended"] == 0 and res["mismatches"] == ["r1"] and res["mismatch_count"] == 1

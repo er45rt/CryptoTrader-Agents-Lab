@@ -262,7 +262,7 @@ class StrategyDecisionSource:
                                 quantity=qty, order_type="market", decided_at=at)
 
 
-_TRACE_COMPARED = ("signal", "read", "action", "rationale", "quantity", "tradable", "price")
+_TRACE_COMPARED = ("signal", "read", "action", "rationale", "quantity", "tradable", "price", "sizing")
 
 
 def write_decision_traces(path: Path, traces: Sequence[dict[str, Any]], *, recorded_at: str) -> dict[str, Any]:
