@@ -152,3 +152,32 @@ def test_decision_endpoints_are_read_only_and_guarded(root):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_safety_block_is_shown_as_a_stop_not_as_not_requested():
+    # Sol D30-D33 r1 blocker 5: a safety block is journaled as risk "rejected" + submission "blocked_by_safety"
+    # (paper/session.py), and the safety stage was rendered only when risk was "allowed" -> "not requested".
+    import re as _re
+    import shutil
+    import subprocess
+
+    src = (Path(decisions.__file__).parent / "static" / "decisions.js").read_text(encoding="utf-8")
+    m = _re.search(r"^function safetyStage\(i, intent\) \{.*?^\}", src, _re.S | _re.M)
+    assert m, "safetyStage() must exist in decisions.js"
+    # the decision view must render the safety stage through safetyStage(), not an inline condition
+    assert src.count("step(...safetyStage(i, intent))") == 1
+    assert not _re.search(r'step\([^)]*"الحماية"', src), "safety stage rendered outside safetyStage()"
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    cases = {
+        "safety": ({"kind": "blocked_safety", "risk": {"decision": "rejected", "codes": ["trading_halted"]}}, True),
+        "risk": ({"kind": "rejected_risk", "risk": {"decision": "rejected", "codes": ["max_position"]}}, True),
+        "allowed": ({"kind": "entry", "risk": {"decision": "allowed", "codes": []}}, True),
+        "no_order": ({"kind": "keep", "risk": None}, False),
+    }
+    js = m.group(0) + "\nconst C = " + json.dumps(cases) + ";\n" + \
+        "console.log(JSON.stringify(Object.fromEntries(Object.entries(C).map(([k, [i, t]]) => [k, safetyStage(i, t)[0]]))));"
+    out = subprocess.run([node, "-e", js], capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    assert got == {"safety": "stop", "risk": "skip", "allowed": "pass", "no_order": "skip"}

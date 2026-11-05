@@ -93,6 +93,13 @@ function step(state, who, title, body) {
   const icon = { pass: "✓", stop: "✕", skip: "–", info: "•" }[state];
   return `<div class="dc-step ${state}"><div class="dc-dot">${icon}</div><div class="dc-body"><div class="dc-who">${who}</div><div class="dc-title">${title}</div>${body ? `<div class="dc-text">${body}</div>` : ""}</div></div>`;
 }
+/** Safety stage of one decision, from its records only. A safety block is journaled as risk "rejected" with
+    submission "blocked_by_safety" (kind blocked_safety), so it must be shown as a stop even though risk did not allow. */
+function safetyStage(i, intent) {
+  if (i.kind === "blocked_safety") return ["stop", "الحماية", "أوقفت الأمر"];
+  if (intent && i.risk?.decision === "allowed") return ["pass", "الحماية", "سمحت"];
+  return ["skip", "الحماية", "ما انطلبت"];
+}
 
 async function dcShow(id, keepScroll = false) {
   dcState.selected = id;
@@ -124,8 +131,7 @@ async function dcShow(id, keepScroll = false) {
     intent && i.risk ? step(i.risk.decision === "allowed" ? "pass" : "stop", "محرك المخاطر", esc(arOf(AR.riskDecision, i.risk.decision)),
       i.risk.codes.map((c) => `${esc(arOf(AR.risk, c))} <code class="ltr">${esc(c)}</code>`).join("<br>"))
       : step("skip", "محرك المخاطر", "ما انطلب", intent ? "توقّف القرار قبل محرك المخاطر" : "ما فيه أمر"),
-    intent && i.risk?.decision === "allowed" ? step(i.kind === "blocked_safety" ? "stop" : "pass", "الحماية", i.kind === "blocked_safety" ? "أوقفت الأمر" : "سمحت")
-      : step("skip", "الحماية", "ما انطلبت"),
+    step(...safetyStage(i, intent)),
     step(i.fills.length ? "pass" : intent && !stopAt ? "info" : "skip", "التنفيذ (محاكاة)", esc(AR.submission[i.submission] || i.submission || "—"),
       i.fills.length ? i.fills.map((x) => `كمية ${fmtNum(x.quantity, 6)} عند ${fmtNum(x.price)} <span class="muted">(متبقي ${fmtNum(x.remaining_quantity, 6)})</span>`).join("<br>") : ""),
   ];
