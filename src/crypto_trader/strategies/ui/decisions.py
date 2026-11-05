@@ -123,6 +123,23 @@ def _paper(root: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _demos(root: Path) -> list[dict[str, Any]]:
+    """Demo sessions (D32) are paper sessions in <workspace>/demo; same records, same reading."""
+    out = []
+    base = root / "demo"
+    if not base.is_dir():
+        return out
+    for folder in sorted(base.iterdir()):
+        if not (folder / "session.json").exists() or not (folder / "report.json").exists():
+            continue
+        doc = _json(folder / "session.json")
+        rep = _json(folder / "report.json")
+        source = {"kind": "demo", "name": folder.name, "label": f"تجريبي · {folder.name}", "strategy": doc["strategy_name"],
+                  "symbol": doc["market"]["symbol"], "timeframe": doc["timeframe"]}
+        out += _items(source, rep.get("decisions", []), rep.get("fills", []), _traces(folder / "decision_trace.jsonl"))
+    return out
+
+
 def _backtests(root: Path) -> list[dict[str, Any]]:
     out = []
     base = root / "runs"
@@ -148,7 +165,7 @@ def collect(root: Path, *, source: str | None = None, strategy: str | None = Non
             kinds: list[str] | None = None, since: str | None = None, until: str | None = None,
             limit: int = 300) -> dict[str, Any]:
     """All decisions, newest first, filtered; counts per kind are over the filtered set before `kinds`."""
-    items = _paper(root) + _backtests(root)
+    items = _paper(root) + _demos(root) + _backtests(root)
     facets = {"sources": sorted({(i["source"]["kind"], i["source"]["name"], i["source"]["label"]) for i in items}),
               "strategies": sorted({i["strategy"] for i in items}), "symbols": sorted({i["symbol"] for i in items})}
     lo, hi = _parse_time(since), _parse_time(until)
@@ -172,16 +189,16 @@ def detail(root: Path, item_id: str, *, window: int = 40) -> dict[str, Any]:
     """One decision with its raw evidence and the bars around it (paper: bars.jsonl; backtest: chart bars)."""
     kind, _, rest = item_id.partition(":")
     name, _, ref = rest.partition(":")
-    if kind not in ("paper", "backtest") or not name or not ref:
+    if kind not in ("paper", "demo", "backtest") or not name or not ref:
         raise ValueError("bad decision id.")
-    items = _paper(root) if kind == "paper" else _backtests(root)
+    items = _paper(root) if kind == "paper" else _demos(root) if kind == "demo" else _backtests(root)
     match = next((i for i in items if i["id"] == item_id), None)
     if match is None:
         raise KeyError("decision not found.")
     bars: list[dict[str, Any]] = []
     at = datetime.fromisoformat(match["at"])
-    if kind == "paper":
-        path = root / "paper" / name / "bars.jsonl"
+    if kind in ("paper", "demo"):
+        path = root / kind / name / "bars.jsonl"
         rows = []
         for line in path.read_text(encoding="utf-8").splitlines() if path.exists() else []:
             try:

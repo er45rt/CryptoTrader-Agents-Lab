@@ -294,7 +294,9 @@ PAGES.home = async () => {
   const live = d.sessions.find((s) => s.running) || d.sessions[0];
   main.innerHTML = header("الرئيسية", "نظرة سريعة على جلساتك الورقية وآخر اختباراتك",
     chip(`${d.running} جلسة تعمل`, d.running ? "good" : "") + chip("محاكاة فقط · بدون مفاتيح", ""))
-  + `<div class="kpis">
+  + `<div class="card demo-cta"><div><h2>الوضع التجريبي</h2><div class="muted" style="font-size:13px;margin-top:4px">جرّب أي استراتيجية الحين على أسعار تاريخية حقيقية، بدون فلوس وبدون إنترنت، وشوف أسباب كل قرار.</div></div>
+    <button class="primary" data-nav="demo">▶ ابدأ الوضع التجريبي</button></div>
+  <div class="kpis">
     ${kpi({ k: "الرصيد الورقي", v: d.capital_total ? fmtUsd(equity) : "—", ic: "wallet", s: `رأس المال ${fmtUsd(d.capital_total, 0)}` })}
     ${kpi({ k: "الربح / الخسارة", v: d.capital_total ? (pnl > 0 ? "+" : "") + fmtUsd(pnl) : "—", cls: sign(pnl), ic: pnl >= 0 ? "trend" : "down", tone: pnl >= 0 ? "g" : "r", s: fmtSPct(ret, 2) })}
     ${kpi({ k: "جلسات تعمل", v: `${d.running} / ${d.sessions.length}`, ic: "play", tone: d.running ? "g" : "" })}

@@ -32,12 +32,12 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import decisions, store
+from . import decisions, demo, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/javascript; charset=utf-8",
-                "decisions.js": "text/javascript; charset=utf-8",
+                "decisions.js": "text/javascript; charset=utf-8", "demo.js": "text/javascript; charset=utf-8",
                 "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"
 _JOBS: dict[str, dict[str, Any]] = {}
@@ -137,6 +137,9 @@ class Handler(BaseHTTPRequestHandler):
                     symbol=q.get("symbol") or None, kinds=[k for k in (q.get("kinds") or "").split(",") if k] or None,
                     since=q.get("since") or None, until=q.get("until") or None, limit=int(q.get("limit") or 300)),
                 "/api/decision": lambda: decisions.detail(self.ws.root, q["id"]),
+                # demo mode (D32): offline replay of local bars through the unchanged paper engine
+                "/api/demo": lambda: self.demo.list(),
+                "/api/demo/session": lambda: self.demo.status(q["name"]),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -169,12 +172,44 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.ws.paper_stop(body["name"]))
             if url.path == "/api/risk":
                 return self._send(200, self.ws.save_risk(body))
+            if url.path.startswith("/api/demo/"):
+                return self._send(200, self._demo_post(url.path.rsplit("/", 1)[1], body))
             self._send(404, {"error": "not found"})
         except (StrategyError, KeyError, ValueError, FileNotFoundError, FileExistsError) as exc:
             self._send(400, {"error": str(exc)})
         except Exception as exc:
             self.ws.log_error(f"POST {url.path}: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _demo_post(self: "Handler", action: str, body: dict[str, Any]) -> Any:
+    d = self.demo
+    if action == "new":
+        start = datetime.fromisoformat(body["start"]).replace(tzinfo=timezone.utc) if body.get("start") else None
+        capital = store._dec(body.get("capital", demo.DEFAULT_CAPITAL), "رأس المال")
+        settings = self.ws._run_settings({**body, "capital": str(capital)})
+        res = d.create(spec=body["spec"], data=self.ws._allowed_data(body["data"]), start=start, settings=settings,
+                       params=dict(body.get("params") or {}), speed=str(body.get("speed", "2")))
+        self.ws._event("demo.created", name=res["demo"]["name"], spec=body["spec"])
+        if body.get("autostart"):
+            res = d.start(res["demo"]["name"])
+        return res
+    if action == "start":
+        return d.start(body["name"], body.get("speed"))
+    if action == "pause":
+        return d.pause(body["name"])
+    if action == "step":
+        return d.step(body["name"], int(body.get("n", 1)))
+    if action == "speed":
+        return d.set_speed(body["name"], str(body["speed"]))
+    if action == "delete":
+        res = d.delete(body["name"], str(body.get("confirm", "")))
+        self.ws._event("demo.deleted", name=body["name"])
+        return res
+    raise KeyError("not found")
+
+
+Handler._demo_post = _demo_post   # type: ignore[attr-defined]
 
 
 def _start_job(fn: Any, body: dict[str, Any]) -> str:
@@ -206,6 +241,7 @@ def _job(jid: str) -> dict[str, Any]:
 
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.ws = store.Workspace(workspace)
+    Handler.demo = demo.DemoManager(workspace)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
