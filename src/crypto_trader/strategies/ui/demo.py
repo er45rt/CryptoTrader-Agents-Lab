@@ -75,6 +75,11 @@ class DemoManager:
         self._stop: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
         self._replays: dict[str, _Replay] = {}
+        self._session_locks: dict[str, threading.Lock] = {}   # one step at a time per demo (manual or background)
+
+    def _session_lock(self, name: str) -> threading.Lock:
+        with self._lock:
+            return self._session_locks.setdefault(name, threading.Lock())
 
     # --- lifecycle ------------------------------------------------------------------------------------------
     def folder(self, name: str) -> Path:
@@ -126,7 +131,13 @@ class DemoManager:
         return self._replays[name]
 
     def _step(self, name: str, *, clock: datetime | None = None) -> dict[str, Any]:
-        """Advance the clock by one bar and run ONE unchanged paper cycle at that clock."""
+        """Advance the clock by one bar and run ONE unchanged paper cycle at that clock.
+
+        Serialized per demo: two cycles on one session folder at once would both append the same new bars."""
+        with self._session_lock(name):
+            return self._step_locked(name, clock=clock)
+
+    def _step_locked(self, name: str, *, clock: datetime | None = None) -> dict[str, Any]:
         folder = self.folder(name)
         doc = self._doc(name)
         rp = self._replay(name, doc)

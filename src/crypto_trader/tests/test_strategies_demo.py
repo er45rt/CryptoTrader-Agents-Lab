@@ -152,3 +152,45 @@ def test_demo_endpoints(env):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_concurrent_steps_on_one_demo_are_serialized(env, monkeypatch):
+    # Sol D30-D33 r1 blocker 3: two step requests could run paper_cycle on the same session folder at once
+    # (both reading the same bar-file tail, both appending the same new bars). They must run one at a time.
+    import threading
+
+    ws, dm, spec, data = env
+    name = dm.create(spec=spec, data=data, start=demo.SEALED_FROM - timedelta(hours=4 * 30))["demo"]["name"]
+    cursor0 = dm._doc(name)["cursor"]
+    real = demo.paper_cycle
+    active, peak, guard = [0], [0], threading.Lock()
+
+    def tracked(*a, **k):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            time.sleep(0.3)                  # widen the window so overlapping calls would be seen
+            return real(*a, **k)
+        finally:
+            with guard:
+                active[0] -= 1
+
+    monkeypatch.setattr(demo, "paper_cycle", tracked)
+    gate, errors = threading.Barrier(2), []
+
+    def one():
+        gate.wait()
+        try:
+            dm.step(name, 1)
+        except Exception as exc:            # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=one) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join(60) for t in threads]
+    assert not errors, errors
+    assert peak[0] == 1, f"{peak[0]} paper cycles ran at once on one demo"
+    assert dm._doc(name)["cursor"] == cursor0 + 2
+    opens = [json.loads(l)["date"] for l in (dm.folder(name) / "bars.jsonl").read_text().splitlines() if l.strip()]
+    assert len(opens) == len(set(opens))
