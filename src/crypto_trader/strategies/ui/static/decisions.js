@@ -149,6 +149,6 @@ function dcMark(c, bars, t) {   // highlight the decided bar (same geometry as c
   const g = c.getContext("2d"), w = c.clientWidth, h = c.clientHeight, L = 8, R = w - 72, bw = (R - L) / bars.length;
   const ts = msOf(t); let k = 0; bars.forEach((b, n) => { if (msOf(b.t) <= ts) k = n; });
   g.save(); g.fillStyle = "rgba(59,130,246,0.16)"; g.fillRect(L + k * bw, 12, Math.max(3, bw), h - 38);
-  g.fillStyle = css("--accent"); g.textAlign = "center"; g.fillText("القرار", L + k * bw + bw / 2, 8); g.restore();
+  g.fillStyle = css("--accent"); g.textAlign = "center"; g.fillText(tr("القرار"), L + k * bw + bw / 2, 8); g.restore();
 }
 

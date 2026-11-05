@@ -67,7 +67,7 @@ async function demoDraw(full) {
     ${doc.state === "error" ? `<div class="err">توقفت التجربة بسبب خطأ: ${esc(trErr(doc.error).ar || "خطأ غير معروف")}<details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(doc.error)}</pre></details></div>` : ""}
     <div class="demo-progress"><div style="width:${(pct * 100).toFixed(1)}%"></div></div>
     <div class="muted" style="font-size:12.5px;margin:6px 0 14px">الساعة التجريبية: <span class="ltr">${esc((doc.clock || doc.replay_from).slice(0, 16).replace("T", " "))} غرينتش</span> ·
-      ${d.progress.done} من ${d.progress.total} شمعة · البيانات من <span class="ltr">${esc(doc.replay_from.slice(0, 10))}</span> إلى <span class="ltr">${esc(doc.replay_to.slice(0, 10))}</span></div>
+      تقدّم الإعادة ${d.progress.done} / ${d.progress.total} · فترة البيانات <span class="ltr">${esc(doc.replay_from.slice(0, 10))} – ${esc(doc.replay_to.slice(0, 10))}</span></div>
     <div class="kpis">
       ${kpi({ k: "الرصيد", v: fmtUsd(eq), ic: "wallet", s: `رأس المال ${fmtUsd(cap, 0)}`, spark: "dsp" })}
       ${kpi({ k: "الربح / الخسارة", v: (pnl > 0 ? "+" : "") + fmtUsd(pnl), cls: sign(pnl), ic: pnl >= 0 ? "trend" : "down", tone: pnl >= 0 ? "g" : "r", s: fmtSPct(cap ? pnl / cap : null, 2) })}

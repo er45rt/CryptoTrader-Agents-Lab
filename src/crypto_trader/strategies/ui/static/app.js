@@ -178,7 +178,7 @@ function hover(c, count, xOf, html) {
 function candles(c, bars, trades, overlays = [], h = 360, view = null) {
   const draw = () => {
     const { g, w } = setupCanvas(c, h);
-    if (!bars.length) { g.fillStyle = css("--muted"); g.textAlign = "center"; g.fillText("لا توجد بيانات بعد", w / 2, h / 2); return; }
+    if (!bars.length) { g.fillStyle = css("--muted"); g.textAlign = "center"; g.fillText(tr("لا توجد بيانات بعد"), w / 2, h / 2); return; }
     bars._ms = bars._ms || bars.map((b) => msOf(b.t));
     const ms = bars._ms, L = 8, R = w - 72, T = 12, B = h - 26;
     let i0 = 0, i1 = bars.length;
@@ -607,4 +607,8 @@ window.addEventListener("hashchange", () => { const p = location.hash.slice(1); 
 let resizeT = null;
 window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (current === "backtest" && window.__last && $("#bres")) showResult(window.__last, false); }, 250); });
 // first page only after every script (e.g. decisions.js) has registered its pages
-window.addEventListener("DOMContentLoaded", () => nav((location.hash || "#home").slice(1)));
+window.addEventListener("DOMContentLoaded", async () => {
+  await initLang();                       // lang.js: Arabic or English, display only
+  $("#lang-btn").onclick = () => setLang(LANG === "en" ? "ar" : "en");
+  nav((location.hash || "#home").slice(1));
+});

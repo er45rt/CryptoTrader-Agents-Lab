@@ -163,6 +163,7 @@ const ERRS = [
 /** Any error text -> {ar, raw}; ar is null only when nothing safe is known (then the raw text is shown as technical detail). */
 function trErr(text) {
   const raw = String(text ?? "").replace(/^ERROR: /, "");
+  if (typeof LANG !== "undefined" && LANG === "en" && !/[\u0600-\u06FF]/.test(raw)) return { ar: raw, raw: null };   // English: the original message
   if (/[؀-ۿ]/.test(raw)) return { ar: raw, raw: null };   // the UI's own messages are already Arabic
   for (const [re, fn] of ERRS) { const m = re.exec(raw); if (m) return { ar: fn(m), raw }; }
   const net = netCause(raw);
@@ -173,6 +174,7 @@ function trErr(text) {
 
 /** paper loop.log line -> Arabic (known shapes only; everything else unchanged). */
 function logLineAr(line) {
+  if (typeof LANG !== "undefined" && LANG === "en") return line;   // English: the original log line
   let m = /^\[([^\]]+)\] bars=(\d+) new=(\d+) live=(\d+) equity=(\S+) fills=(\S+) position=(.*)$/.exec(line);
   if (m) {
     let pos = m[7];
@@ -189,6 +191,7 @@ function logLineAr(line) {
 /** pytest summary line -> Arabic counts. */
 function pytestAr(line) {
   const s = String(line || "");
+  if (typeof LANG !== "undefined" && LANG === "en") return s;
   const n = (w) => (new RegExp("(\\d+) " + w).exec(s) || [])[1];
   const parts = [[n("passed"), "ناجح"], [n("failed"), "فاشل"], [n("errors?"), "خطأ"], [n("skipped"), "متجاوَز"], [n("xfailed"), "فشل متوقَّع"],
     [n("xpassed"), "نجاح غير متوقَّع"], [n("deselected"), "مستبعَد"], [n("warnings?"), "تحذير"]].filter(([v]) => v).map(([v, w]) => `${v} ${w}`);
