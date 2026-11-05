@@ -246,3 +246,30 @@ def test_freqtrade_trailing_peak_starts_at_entry_not_at_the_signal_close(tmp_pat
     signals = [strat.on_bar(BarHistory(bars[: i + 1], bars[i].close_time)) for i in range(len(bars))]
     assert signals[1].reason == "ft:enter_long"
     assert all(s.target == 1 for s in signals[2:]), [s.reason for s in signals]
+
+
+def test_paper_decision_trace_is_written_once_per_bar_and_matches_the_journal(tmp_path):
+    """D31: the decision center's per-bar evidence is recorded while deciding, append-only, and agrees with
+    the journal-derived report; replaying the same bars (every cycle) adds nothing and reports no mismatch."""
+    bars, _, folder, fetch = _session(tmp_path)
+    paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[60].close_time)
+    for k in range(61, 75):
+        st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[k].close_time + timedelta(minutes=1))
+    st = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[90].close_time + timedelta(minutes=1))  # 15 late bars
+    path = folder / "decision_trace.jsonl"
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    assert len(rows) == len({r["ref"] for r in rows})
+    assert st["trace"].get("mismatch_count") == 0 and "error" not in st["trace"]
+    before = path.read_text()
+    again = paper_cycle(folder, fetch=fetch, fetch_open=fetch.open, now=bars[90].close_time + timedelta(minutes=2))
+    assert path.read_text() == before and again["trace"]["appended"] == 0
+    report = json.loads((folder / "report.json").read_text())
+    by_ref = {r["ref"]: r for r in rows}
+    live = [d for d in report["decisions"] if d["rationale"] not in ("warmup", "pre-session-history")]
+    assert live and all(d["market_reference"] in by_ref for d in live)
+    for d in live:
+        t = by_ref[d["market_reference"]]
+        assert (t["action"], t["rationale"]) == (d["action"], d["rationale"]) and t["ai_involved"] is False
+        if d["rationale"] == "missed:bar-arrived-late":
+            assert t["tradable"] is False
+    assert any(t["tradable"] is False for t in rows) and any(t["tradable"] for t in rows)

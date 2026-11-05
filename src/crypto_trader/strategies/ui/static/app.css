@@ -209,6 +209,26 @@ th[data-k]{cursor:pointer;user-select:none}th[data-k]:hover{color:var(--text)}
 canvas{direction:ltr}
 .heat{direction:rtl;grid-template-columns:48px repeat(12,minmax(34px,1fr)) 58px;min-width:560px}.heat .c,.heat .t{direction:ltr}
 
+/* decision center (D31) */
+.dc-cols{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);align-items:start}
+.dc-cols .stack{position:sticky;top:14px}
+.dc-sum{font-size:15px;font-weight:600}
+.dc-steps{position:relative;margin-top:14px;display:grid;gap:0}
+.dc-step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;position:relative;padding-bottom:14px}
+.dc-step:not(:last-child)::after{content:"";position:absolute;right:14px;top:30px;bottom:0;width:2px;background:var(--line)}
+.dc-dot{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:13px;background:var(--panel2);border:1px solid var(--line2);color:var(--muted);z-index:1}
+.dc-step.pass .dc-dot{background:var(--good-bg);color:var(--good);border-color:rgba(22,199,132,.4)}
+.dc-step.stop .dc-dot{background:var(--bad-bg);color:var(--bad);border-color:rgba(234,57,67,.45)}
+.dc-step.info .dc-dot{background:var(--accent-bg);color:var(--accent);border-color:rgba(59,130,246,.4)}
+.dc-step.skip{opacity:.62}
+.dc-who{font-size:12px;color:var(--muted);font-weight:600}
+.dc-title{font-weight:650;margin:1px 0 2px}
+.dc-text{font-size:13px;color:var(--text)}
+.dc-step.stop .dc-title{color:var(--bad)}
+details.dc-ev{margin-top:6px;border-top:1px solid var(--line);padding-top:10px}
+details.dc-ev summary{cursor:pointer;color:var(--accent);font-weight:600}
+@media (max-width:1100px){.dc-cols .stack{position:static}}
+
 /* Arabic display (D30 audit): RTL tooltips/logs, in-page dialogs, Arabic file picker, collapsible technical detail */
 .tip{direction:rtl;text-align:right}
 .tip .tt{direction:ltr;text-align:right}
@@ -222,3 +242,5 @@ details.tech pre{margin-top:6px;max-height:180px}
 .modal{position:fixed;inset:0;background:rgba(3,6,12,.6);display:grid;place-items:center;z-index:50;animation:rise .15s ease both}
 .modal-box{background:var(--panel);border:1px solid var(--line2);border-radius:var(--r);padding:20px 22px;min-width:300px;max-width:min(90vw,460px);box-shadow:0 30px 60px -20px rgba(0,0,0,.7)}
 .modal-text{font-size:15px;font-weight:600}
+@media (max-width:1100px){.dc-cols{grid-template-columns:1fr}}
+

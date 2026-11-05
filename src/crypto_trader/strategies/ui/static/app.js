@@ -133,7 +133,7 @@ function grid(g, L, R, T, B, lo, hi, fmt, ticks) {
 }
 function timeAxis(g, L, R, B, t0, t1) {
   g.fillStyle = css("--faint"); g.textAlign = "center";
-  const span = t1 - t0, n = 6, longSpan = span > 86400e3 * 3;
+  const span = t1 - t0, n = Math.max(2, Math.min(6, Math.floor((R - L) / 95) + 1)), longSpan = span > 86400e3 * 3;   // labels never overlap
   for (let k = 0; k < n; k++) { const t = t0 + span * k / (n - 1), x = L + (R - L) * k / (n - 1);
     const s = new Date(t).toISOString(); g.fillText(longSpan ? s.slice(0, 10) : s.slice(5, 16).replace("T", " "), Math.min(R - 32, Math.max(L + 32, x)), B + 14); }
 }
@@ -323,6 +323,8 @@ function sessionTable(ss) {
 }
 document.addEventListener("click", (e) => { const a = e.target.closest("[data-session]"); if (a) { e.preventDefault(); paperDetail(a.dataset.session); } });
 document.addEventListener("click", (e) => { const a = e.target.closest("[data-nav]"); if (a) { e.preventDefault(); nav(a.dataset.nav); } });
+document.addEventListener("click", (e) => { const a = e.target.closest("[data-dc-source]"); if (!a || typeof dcState === "undefined") return;
+  e.preventDefault(); Object.assign(dcState.filters, { source: a.dataset.dcSource, strategy: "", symbol: "", kinds: [] }); dcState.selected = null; nav("decisions"); });
 function runSummary(r) {
   const edge = r.net_return - r.hold_return;
   return `<div class="muted" style="margin-bottom:10px">${esc(r.strategy)} · ${r.mode === "engine" ? "كامل عبر المحرك" : "سريع"} · <span class="ltr">${esc(r.at.slice(0, 16).replace("T", " "))}</span></div>
@@ -519,7 +521,8 @@ async function paperDetail(name) {
     const lastBar = d.bars[d.bars.length - 1], prev = d.bars[d.bars.length - 2], ch = lastBar && prev ? lastBar.c / prev.c - 1 : null;
     const nextOpen = s.next_open ? s.next_open[0] : null;
     el.innerHTML = `<div class="card"><div class="card-h"><h2>${esc(name)} <small>${esc(d.session.strategy_name)} · ${esc(d.session.market.symbol)} · ${esc(tfAr(d.session.timeframe))}</small></h2>
-      ${d.running ? '<span class="pill good">تعمل · تحدّث كل 30 ثانية</span>' : '<span class="pill">متوقفة</span>'}</div>
+      <div class="actions" style="margin:0">${d.running ? '<span class="pill good">تعمل · تحدّث كل 30 ثانية</span>' : '<span class="pill">متوقفة</span>'}
+      <button class="sm" data-dc-source="paper:${esc(name)}">قراراتها في مركز القرارات ←</button></div></div>
     ${d.error ? `<div class="err"><b>الجلسة ما تقدر تجيب الأسعار</b> · آخر محاولة <span class="ltr">${esc(String(d.error.at).slice(0, 16).replace("T", " "))} غرينتش</span> · ${esc(d.error.consecutive)} محاولة متتالية فشلت.
       <br>السبب: ${esc(trErr(d.error.error).ar || "خطأ غير معروف")}. الشموع اللي تفوت وقتها تنسجّل «فائتة» وما تتداول.
       <details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(d.error.error)}</pre></details></div>` : ""}
@@ -601,4 +604,5 @@ PAGES.system = async () => {
 window.addEventListener("hashchange", () => { const p = location.hash.slice(1); if (p && p !== current && PAGES[p]) nav(p); });
 let resizeT = null;
 window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (current === "backtest" && window.__last && $("#bres")) showResult(window.__last, false); }, 250); });
-nav((location.hash || "#home").slice(1));
+// first page only after every script (e.g. decisions.js) has registered its pages
+window.addEventListener("DOMContentLoaded", () => nav((location.hash || "#home").slice(1)));

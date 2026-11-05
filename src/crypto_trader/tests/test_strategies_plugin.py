@@ -1,6 +1,7 @@
 """D29 strategy plug-in layer: contract, look-ahead safety, loader, data integrity, engine path."""
 from __future__ import annotations
 
+import json
 import math
 import textwrap
 from datetime import datetime, timedelta, timezone
@@ -189,7 +190,9 @@ def test_sol_d30_2_the_view_given_to_a_strategy_holds_nothing_from_later_bars():
     assert warm.close
     shared.learn(warm)                                       # full-run arrays now exist engine-side
     view = BarHistory._view(shared, 2, bars[1].close_time)
-    assert set(vars(view)) == {"_bars", "as_of", "_cache"}
+    # _read / _depth (D31 decision trace) hold only the names of keys the strategy asked for and a counter
+    assert set(vars(view)) == {"_bars", "as_of", "_cache", "_read", "_depth"}
+    assert view._read == {} and view._depth == 0
     assert len(view._bars) == 2 and all(len(v) == 2 for v in view._cache.values())
     assert not any(isinstance(v, _SharedSeries) for v in vars(view).values())
 
@@ -333,3 +336,62 @@ def test_output_folder_is_never_reused(tmp_path):
     run_backtest(Hold(), synthetic_bars(20), out_dir=tmp_path)
     with pytest.raises(StrategyError):
         run_backtest(Hold(), synthetic_bars(20), out_dir=tmp_path)
+
+
+# --- D31 decision trace -----------------------------------------------------------------------------------
+
+def test_trace_records_only_what_the_strategy_itself_read():
+    bars = synthetic_bars(30)
+    view = BarHistory(bars, bars[-1].close_time)
+    view.indicator("sma", 5)               # sma reads close internally: that must NOT count as the strategy's read
+    assert list(view._read) == [("sma", (5,), ())]
+    assert view.close[-1] > 0              # an explicit read does count
+    trace = view._trace()
+    assert list(trace) == ["sma(5)", "close"]
+    assert trace["sma(5)"] == pytest.approx(sum(float(b.close) for b in bars[-5:]) / 5)
+    early = BarHistory(bars[:3], bars[2].close_time)
+    early.indicator("sma", 5)
+    assert early._trace() == {"sma(5)": None}   # not enough data yet: no value is invented
+
+
+def test_engine_backtest_writes_the_decision_chain_and_traces(tmp_path):
+    bars = synthetic_bars(120)
+    out = tmp_path / "run"
+    run_backtest(Cross(), bars, settings=RunSettings(capital_quote=Decimal("1000")), out_dir=out)
+    chain = json.loads((out / "decisions.json").read_text())
+    traces = [json.loads(l) for l in (out / "decision_trace.jsonl").read_text().splitlines()]
+    assert {"decisions", "orders", "fills"} <= set(chain)
+    by_ref = {t["ref"]: t for t in traces}
+    decided = [d for d in chain["decisions"] if d["rationale"] != "warmup"]
+    assert decided and all(d["market_reference"] in by_ref for d in decided)
+    assert not any(d["market_reference"] in by_ref for d in chain["decisions"] if d["rationale"] == "warmup")
+    for d in decided:                        # the trace agrees with the journal-derived decision, field by field
+        t = by_ref[d["market_reference"]]
+        assert (t["action"], t["rationale"]) == (d["action"], d["rationale"])
+        assert t["ai_involved"] is False and t["decision_source"] == "strategy-plugin"
+        assert set(t["read"]) == {"sma(4)", "sma(12)"}
+    # values are the ones the strategy saw on that bar (prefix only), not values computed later over the full run
+    k = next(i for i, b in enumerate(bars) if b.open_time.isoformat() == traces[10]["bar_open"])
+    expect = sum(float(b.close) for b in bars[k - 3:k + 1]) / 4
+    assert traces[10]["read"]["sma(4)"] == pytest.approx(expect)
+    if (lines := (out / "decision_trace.jsonl").read_text().splitlines()):
+        assert len(lines) == len({json.loads(l)["ref"] for l in lines})
+
+
+def test_trace_writer_is_append_only_and_flags_a_changed_replay(tmp_path):
+    from crypto_trader.strategies.runtime import write_decision_traces
+
+    path = tmp_path / "t.jsonl"
+    a = {"ref": "r1", "signal": {"target": "1", "reason": "up"}, "read": {"sma(4)": 1.5}, "action": "buy",
+         "rationale": "strategy:up", "quantity": "0.1", "tradable": True, "price": "100"}
+    assert write_decision_traces(path, [a], recorded_at="t0")["appended"] == 1
+    again = write_decision_traces(path, [a], recorded_at="t1")
+    assert again == {"appended": 0, "mismatches": [], "mismatch_count": 0}
+    changed = dict(a, read={"sma(4)": 9.9})
+    res = write_decision_traces(path, [changed], recorded_at="t2")
+    assert res["appended"] == 0 and res["mismatches"] == ["r1"]
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["read"] == {"sma(4)": 1.5} and rows[0]["recorded_at"] == "t0"   # never rewritten
+    path.write_text(path.read_text() + '{"ref": "r2", "tor')                                          # torn tail
+    assert write_decision_traces(path, [dict(a, ref="r3")], recorded_at="t3")["appended"] == 1
+    assert "error" in write_decision_traces(tmp_path, [a], recorded_at="t4")                          # a folder: reported, not raised

@@ -6,6 +6,7 @@ A session folder holds everything; the process can be killed and restarted at an
   journal.db     the engine journal (idempotent: every cycle replays the same bars, only new events land)
   status.json    last cycle: equity, position, last signal, counts, timestamps
   report.json    the engine RunReport of the last cycle
+  decision_trace.jsonl  append-only: per decided bar, what the strategy read and returned (D31 decision center)
   STOP           create this file to stop the loop
 
 Each cycle: fetch newly closed bars -> append -> rebuild the simulator -> replay ALL bars through the
@@ -27,7 +28,7 @@ from uuid import UUID, uuid4
 from .api import TIMEFRAMES, Bar, StrategyError
 from .loader import load_strategy
 from .ohlcv import bars_from_rows, check_bars, fetch_forming_open, fetch_public_klines
-from .runtime import MarketSpec, RunSettings, metrics_from_run, run_session
+from .runtime import MarketSpec, RunSettings, metrics_from_run, run_session, write_decision_traces
 
 __all__ = ["create_paper_session", "paper_cycle", "run_paper_loop"]
 
@@ -174,6 +175,9 @@ def paper_cycle(folder: str | Path, *, fetch: Callable[..., list[Bar]] = fetch_p
             finally:
                 journal.__exit__(None, None, None)
             _write_atomic(folder / "report.json", report.to_json())
+            # D31: what the strategy read and returned when it decided, written once per bar (append-only)
+            status["trace"] = write_decision_traces(folder / "decision_trace.jsonl", source.traces,
+                                                    recorded_at=now.isoformat())
             status |= {"equity_quote": metrics["final_equity_quote"], "net_return": metrics["net_return"],
                        "max_drawdown": metrics["max_drawdown"], "fills": metrics["fills"],
                        "position": {k: str(v) for k, v in report.positions.items()},

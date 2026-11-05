@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -150,6 +151,7 @@ class StrategyDecisionSource:
         self.position = position
         self._index = {_ref(i, b): i for i, b in enumerate(self.bars)}
         self.signals: list[dict[str, Any]] = []
+        self.traces: list[dict[str, Any]] = []      # D31 decision trace, one per bar from trade_from_index
         self._last_target: Decimal | None = None
         self._cached: Any = None
         self._cached_mark: Decimal | None = None
@@ -183,6 +185,41 @@ class StrategyDecisionSource:
         self._shared.learn(history)
         if signal is not None and not isinstance(signal, Signal):
             raise StrategyError(f"{type(self.strategy).__name__}.on_bar must return Signal or None.")
+        sizing: dict[str, str] = {}
+        decision = self._act(observation, i, at, signal, sizing)
+        if i >= self.trade_from_index:
+            self._record(observation, i, at, signal, history, decision, sizing)
+        return decision
+
+    def _record(self, observation: MarketObservation, i: int, at: datetime, signal: Signal | None,
+                history: BarHistory, decision: StrategyDecision, sizing: dict[str, str]) -> None:
+        """Decision trace (D31), written while deciding: what the strategy read and what it returned.
+
+        Evidence only; it never changes the decision and never raises. No AI takes part in this path:
+        the decision comes from a plug-in strategy through this deterministic source."""
+        try:
+            read: dict[str, float | None] | None = history._trace()
+            read_error = None
+        except Exception as exc:  # pragma: no cover - defensive
+            read, read_error = None, f"{type(exc).__name__}: {exc}"
+        try:
+            qty = getattr(decision, "quantity", None)
+            bar = self.bars[i]
+            self.traces.append({
+                "ref": observation.market_reference, "bar_open": bar.open_time.isoformat(),
+                "bar_close": bar.close_time.isoformat(), "decided_at": at.isoformat(), "price": str(observation.price),
+                "decision_source": "strategy-plugin", "ai_involved": False,
+                "strategy": type(self.strategy).name, "strategy_version": type(self.strategy).version,
+                "signal": None if signal is None else {"target": str(signal.target), "reason": signal.reason},
+                "read": read, "read_error": read_error,
+                "tradable": None if self.tradable is None else bool(self.tradable[i]),
+                "sizing": dict(sizing), "action": decision.action, "rationale": decision.rationale,
+                "quantity": None if qty is None else str(qty)})
+        except Exception:  # pragma: no cover - evidence must never stop a decision
+            pass
+
+    def _act(self, observation: MarketObservation, i: int, at: datetime, signal: Signal | None,
+             sizing: dict[str, str]) -> StrategyDecision:
         if i < self.trade_from_index:
             return StrategyDecision(action="hold", confidence="low", rationale="pre-session-history", decided_at=at)
         if self.tradable is not None and not self.tradable[i]:
@@ -191,6 +228,7 @@ class StrategyDecisionSource:
             return StrategyDecision(action="hold", confidence="low", rationale="missed:bar-arrived-late", decided_at=at)
         snap = self._snapshot(observation)
         held = snap.position_quantity - snap.open_sell_quantity
+        sizing.update(held=str(held), equity_quote=str(snap.equity_quote), quote_free=str(snap.quote_free))
         self.signals.append({"index": i, "at": at.isoformat(), "target": None if signal is None else str(signal.target),
                              "reason": "" if signal is None else signal.reason, "held": str(held)})
         if signal is None:
@@ -202,6 +240,7 @@ class StrategyDecisionSource:
                      signal.target * self.settings.position_cap)
         want_qty = _q(budget / price, self.market.quantity_step)
         delta = want_qty - held
+        sizing.update(target=str(signal.target), want_qty=str(want_qty), delta=str(delta))
         unchanged = self._last_target is not None and signal.target == self._last_target
         within_band = abs(delta) <= REBALANCE_BAND * max(want_qty, held)
         if abs(delta) * price < self.market.min_order_quote or (unchanged and within_band):
@@ -221,6 +260,38 @@ class StrategyDecisionSource:
         qty = _q(-delta, self.market.quantity_step)
         return StrategyDecision(action="sell", confidence="high", rationale=f"strategy:{signal.reason}",
                                 quantity=qty, order_type="market", decided_at=at)
+
+
+_TRACE_COMPARED = ("signal", "read", "action", "rationale", "quantity", "tradable", "price")
+
+
+def write_decision_traces(path: Path, traces: Sequence[dict[str, Any]], *, recorded_at: str) -> dict[str, Any]:
+    """Append decision traces to an append-only JSONL file, once per market reference (D31).
+
+    A trace is written the first time its bar is decided and never rewritten. On later replays the same
+    bar must produce the same trace; any difference is reported as a mismatch (evidence of a changed
+    input), never silently overwritten. Never raises: a failure is returned, the engine carries on."""
+    try:
+        known: dict[str, dict[str, Any]] = {}
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                    known.setdefault(row["ref"], row)
+                except (ValueError, KeyError, TypeError):
+                    continue        # a torn last line from a crash is ignored, never "repaired" by guessing
+        fresh = [t for t in traces if t["ref"] not in known]
+        mismatches = [t["ref"] for t in traces if t["ref"] in known
+                      and any(json.loads(json.dumps(t.get(k), default=str)) != known[t["ref"]].get(k) for k in _TRACE_COMPARED)]
+        if fresh:
+            with path.open("a", encoding="utf-8") as fh:
+                for t in fresh:
+                    fh.write(json.dumps({**t, "recorded_at": recorded_at}, default=str) + chr(10))
+                fh.flush()
+                os.fsync(fh.fileno())
+        return {"appended": len(fresh), "mismatches": mismatches[:20], "mismatch_count": len(mismatches)}
+    except Exception as exc:  # evidence must never stop the engine
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 @dataclass
@@ -471,6 +542,13 @@ def run_backtest(strategy: Strategy, bars: Sequence[Bar], *, market: MarketSpec 
         metrics, trades, equity = metrics_from_run(bars, report, settings, journal, session_id, market)
     finally:
         journal.__exit__(None, None, None)
+    if out_dir:     # decision center (D31): the journal-derived decision chain and the traces, beside the journal
+        try:
+            full = report.to_dict()
+            (work / "decisions.json").write_text(json.dumps({k: full[k] for k in ("decisions", "orders", "fills")}))
+        except Exception:  # pragma: no cover - evidence must never fail the backtest
+            pass
+        write_decision_traces(work / "decision_trace.jsonl", source.traces, recorded_at=datetime.now(timezone.utc).isoformat())
     result = BacktestResult(
         strategy=type(strategy).name, strategy_version=type(strategy).version, symbol=market.symbol,
         timeframe=bars[0].timeframe, start=bars[0].open_time.isoformat(), end=bars[-1].close_time.isoformat(),

@@ -32,11 +32,12 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import store
+from . import decisions, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/javascript; charset=utf-8",
+                "decisions.js": "text/javascript; charset=utf-8",
                 "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"
 _JOBS: dict[str, dict[str, Any]] = {}
@@ -130,6 +131,12 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/risk": lambda: self.ws.risk(),
                 "/api/logs": lambda: self.ws.logs(),
                 "/api/system": lambda: self.ws.system(),
+                # decision center (D31): read-only views over the engine's recorded decisions
+                "/api/decisions": lambda: decisions.collect(
+                    self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,
+                    symbol=q.get("symbol") or None, kinds=[k for k in (q.get("kinds") or "").split(",") if k] or None,
+                    since=q.get("since") or None, until=q.get("until") or None, limit=int(q.get("limit") or 300)),
+                "/api/decision": lambda: decisions.detail(self.ws.root, q["id"]),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})

@@ -84,6 +84,8 @@ class BarHistory:
         self._bars = visible
         self.as_of = as_of
         self._cache: dict[tuple[Any, ...], tuple[float, ...]] = {}
+        self._read: dict[tuple[Any, ...], None] = {}   # keys the strategy itself asked for, in order (decision trace)
+        self._depth = 0                                   # >0 while an indicator reads fields on its own behalf
 
     @classmethod
     def _view(cls, shared: "_SharedSeries", n: int, as_of: datetime) -> "BarHistory":
@@ -100,6 +102,8 @@ class BarHistory:
         obj._bars = shared.bars[:n]
         obj.as_of = as_of
         obj._cache = shared.prefix_cache(n)
+        obj._read = {}
+        obj._depth = 0
         return obj
 
     def __len__(self) -> int:
@@ -116,6 +120,8 @@ class BarHistory:
         if field_name not in {"open", "high", "low", "close", "volume"}:
             raise StrategyError(f"unknown OHLCV field {field_name!r}.")
         key = ("field", field_name)
+        if not self._depth:
+            self._read.setdefault(key, None)
         if key not in self._cache:
             self._cache[key] = tuple(float(getattr(b, field_name)) for b in self._bars)
         return self._cache[key]
@@ -155,9 +161,31 @@ class BarHistory:
         from . import indicators
 
         key = (name, args, tuple(sorted(kwargs.items())))
+        if not self._depth:
+            self._read.setdefault(key, None)
         if key not in self._cache:
-            self._cache[key] = indicators.compute(name, self, *args, **kwargs)
+            self._depth += 1
+            try:
+                self._cache[key] = indicators.compute(name, self, *args, **kwargs)
+            finally:
+                self._depth -= 1
         return self._cache[key]
+
+    def _trace(self) -> dict[str, float | None]:
+        """Last visible value of every series/indicator the strategy itself read (engine-internal)."""
+        out: dict[str, float | None] = {}
+        for key in self._read:
+            values = self._cache.get(key)
+            if not values:
+                continue
+            if key[0] == "field":
+                label = key[1]
+            else:
+                name, args, kw = key
+                label = f"{name}(" + ", ".join([repr(a) for a in args] + [f"{k}={v!r}" for k, v in kw]) + ")"
+            last = values[-1]
+            out[label] = None if last != last else float(last)    # NaN (not enough data yet) -> None
+        return out
 
 
 class _SharedSeries:
