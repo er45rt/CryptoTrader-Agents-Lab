@@ -279,3 +279,25 @@ def test_paper_detail_reports_the_last_loop_error(ws):
     assert ws.paper_detail("s2")["error"] is None
     (folder / "last_error.json").write_text(json.dumps({"at": "2026-11-05T03:06:42+00:00", "error": "PermissionError: x", "consecutive": 3}))
     assert ws.paper_detail("s2")["error"]["consecutive"] == 3
+
+
+def test_only_the_listed_static_files_are_served(live):
+    for name, ctype in (("i18n.js", "javascript"), ("app.js", "javascript"), ("app.css", "css")):
+        conn = http.client.HTTPConnection("127.0.0.1", live, timeout=30)
+        conn.request("GET", "/" + name, headers={"Host": "127.0.0.1"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 200 and ctype in resp.getheader("Content-Type")
+    for path in ("/store.py", "/server.py", "/../server.py", "/static/app.js", "/%2e%2e/store.py"):
+        assert _req(live, "GET", path)[0] == 404
+
+
+def test_ui_messages_are_arabic_at_the_source(ws):
+    with pytest.raises(StrategyError, match="لازم يكون رقمًا"):
+        ws.save_risk({"capital": "abc"})
+    with pytest.raises(StrategyError, match="صفرًا أو أكثر"):
+        ws.save_risk({"slippage_bps": "-1"})
+    with pytest.raises(StrategyError, match="ملف بيانات"):
+        ws._allowed_data("nope.csv")
+    assert "تداول فوري" in ws.risk()["rules"][0] and "برمجيًا" in ws.risk()["production"]["note"]

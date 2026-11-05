@@ -82,7 +82,7 @@ def robustness_verdict(result: Any, *, rerun_with_fees: Callable[[Decimal], Any]
         checks.append({"key": key, "label": label, "ok": ok, "detail": detail})
 
     s, bs = m.get("sharpe"), b.get("sharpe")
-    add("beats_hold", "يتفوق على الاحتفاظ (Sharpe)", None if s is None or bs is None else s > bs,
+    add("beats_hold", "يتفوق على الاحتفاظ (نسبة شارب)", None if s is None or bs is None else s > bs,
         f"{(s or 0):.2f} مقابل {(bs or 0):.2f}")
     half = len(eq) // 2
     if half >= 2:
@@ -105,7 +105,7 @@ def robustness_verdict(result: Any, *, rerun_with_fees: Callable[[Decimal], Any]
     else:
         add("out_of_sample", "ينجح على آخر 30% (خارج العينة)", None, "بيانات قليلة")
     p = dsr_probability(_daily_like_returns(eq), n_trials)
-    add("dsr", f"DSR ≥ 0.95 بعد {n_trials} تجربة", None if p is None else p >= 0.95,
+    add("dsr", f"نسبة شارب المصحَّحة ≥ 0.95 (عدد التجارب: {n_trials})", None if p is None else p >= 0.95,
         "غير معرّف" if p is None else f"{p:.2f}")
     required = {"beats_hold", "both_halves", "fees_x2", "out_of_sample", "dsr"}
     passed = {c["key"] for c in checks if c["ok"] is True}

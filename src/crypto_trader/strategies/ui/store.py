@@ -42,9 +42,9 @@ def _dec(text: Any, name: str, *, positive: bool = True) -> Decimal:
     try:
         value = Decimal(str(text))
     except (InvalidOperation, ValueError):
-        raise StrategyError(f"{name}: not a number.") from None
+        raise StrategyError(f"{name}: لازم يكون رقمًا.") from None
     if not value.is_finite() or (positive and value <= 0) or value < 0:
-        raise StrategyError(f"{name}: must be a positive number.")
+        raise StrategyError(f"{name}: لازم يكون رقمًا أكبر من صفر." if positive else f"{name}: لازم يكون صفرًا أو أكثر.")
     return value
 
 
@@ -124,16 +124,16 @@ class Workspace:
     def upload_strategy(self, filename: str, content: str) -> dict[str, Any]:
         stem = filename[:-3] if filename.endswith(".py") else filename
         if not _NAME.match(stem):
-            raise StrategyError("file name: letters, digits, '_' or '-' only, ending in .py.")
+            raise StrategyError("اسم الملف: يبدأ بحرف إنجليزي أو رقم، ثم حروف إنجليزية وأرقام و _ أو - فقط (حد أقصى 64)، وينتهي بـ .py")
         target = self.root / "strategies" / f"{stem}.py"
         if target.exists():
-            raise StrategyError(f"{target.name} already exists; remove it first.")
+            raise StrategyError(f"الملف {target.name} موجود؛ احذفه أولًا.")
         target.write_text(content, encoding="utf-8")
         try:
             listed = [x for x in list_strategies(target.parent) if _spec_file(x["spec"]) == target.name]
             ok = [x for x in listed if x.get("ok")]
             if not ok:
-                raise StrategyError("; ".join(x.get("error", "no Strategy class") for x in listed) or "no Strategy class found.")
+                raise StrategyError("; ".join(x.get("error", "الملف ما فيه صنف استراتيجية يرث من Strategy.") for x in listed) or "الملف ما فيه صنف استراتيجية يرث من Strategy.")
         except StrategyError:
             target.unlink(missing_ok=True)
             raise
@@ -143,7 +143,7 @@ class Workspace:
     def remove_strategy(self, filename: str) -> dict[str, Any]:
         target = (self.root / "strategies" / filename).resolve()
         if target.parent != (self.root / "strategies").resolve() or target.suffix != ".py":
-            raise StrategyError("only files in the workspace strategies folder can be removed.")
+            raise StrategyError("تقدر تحذف ملفات مجلد الاستراتيجيات في مساحة العمل فقط.")
         target.unlink()
         self._event("strategy.removed", file=filename)
         return {"ok": True}
@@ -165,18 +165,18 @@ class Workspace:
     def _allowed_data(self, path: str) -> Path:
         allowed = {f["path"] for f in self.data_files()["files"]}
         if path not in allowed:
-            raise StrategyError("data file must be one of the listed data files.")
+            raise StrategyError("اختر ملف بيانات من القائمة المعروضة.")
         return Path(path)
 
     # --- backtest ----------------------------------------------------------------------------------------
     def _run_settings(self, body: dict[str, Any]) -> RunSettings:
         s = self.settings()
-        fee = _dec(body.get("fee", s["fee"]), "fee")
+        fee = _dec(body.get("fee", s["fee"]), "الرسوم")
         overrides = dict(s.get("risk_overrides") or {}) | dict(body.get("risk_overrides") or {})
         mp = body.get("max_position", s.get("max_position"))
-        settings = RunSettings(capital_quote=_dec(body.get("capital", s["capital"]), "capital"), taker_fee=fee, maker_fee=fee,
-                               slippage_bps=_dec(body.get("slippage_bps", s["slippage_bps"]), "slippage", positive=False),
-                               max_position_quote=_dec(mp, "max position") if mp not in (None, "") else None,
+        settings = RunSettings(capital_quote=_dec(body.get("capital", s["capital"]), "رأس المال"), taker_fee=fee, maker_fee=fee,
+                               slippage_bps=_dec(body.get("slippage_bps", s["slippage_bps"]), "الانزلاق", positive=False),
+                               max_position_quote=_dec(mp, "الحد الأقصى للمركز") if mp not in (None, "") else None,
                                risk_overrides=overrides)
         try:
             load_limits(_limits(settings))     # validates override keys/values the engine way
@@ -197,7 +197,7 @@ class Workspace:
         bars = load_bars(self._allowed_data(body["data"]), loaded.cls.timeframe, start=start, end=end,
                          not_after=SEALED_FROM, allow_gaps=True)
         if len(bars) < loaded.cls.warmup_bars + 3:
-            raise StrategyError(f"only {len(bars)} bars in range; the strategy needs {loaded.cls.warmup_bars}+ to warm up.")
+            raise StrategyError(f"الفترة المختارة فيها {len(bars)} شمعة فقط، والاستراتيجية تحتاج {loaded.cls.warmup_bars + 3} شمعة على الأقل؛ وسّع الفترة.")
         settings = self._run_settings(body)
         rid = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
         run_dir = self.root / "runs" / rid
@@ -247,13 +247,13 @@ class Workspace:
 
     def run(self, rid: str) -> dict[str, Any]:
         if not re.match(r"^[0-9T]+-[0-9a-f]{6}$", rid):
-            raise StrategyError("bad run id.")
+            raise StrategyError("معرّف التجربة غير صالح.")
         return json.loads((self.root / "runs" / rid / "result.json").read_text(encoding="utf-8"))
 
     # --- paper ---------------------------------------------------------------------------------------------
     def _paper_dir(self, name: str) -> Path:
         if not _NAME.match(name):
-            raise StrategyError("session name: letters, digits, '_' or '-'.")
+            raise StrategyError("اسم الجلسة: يبدأ بحرف إنجليزي أو رقم، ثم حروف إنجليزية وأرقام و _ أو - فقط (حد أقصى 64).")
         return self.root / "paper" / name
 
     def _running(self, folder: Path) -> bool:
@@ -291,7 +291,7 @@ class Workspace:
     def paper_start(self, name: str) -> dict[str, Any]:
         folder = self._paper_dir(name)
         if not (folder / "session.json").exists():
-            raise StrategyError("no such session.")
+            raise StrategyError("الجلسة غير موجودة.")
         with self._lock:
             return self._start_locked(name, folder)
 
@@ -299,7 +299,7 @@ class Workspace:
         if self._running(folder):
             if (folder / "STOP").exists():
                 # the old loop has not reached its STOP check yet; removing STOP now would leave two loops
-                raise StrategyError("the previous loop is still stopping; try again after one poll interval.")
+                raise StrategyError("التشغيل السابق لهذه الجلسة ما توقف بعد؛ أعد المحاولة بعد قليل (عادة 30 ثانية، وقد تطول حتى 15 دقيقة بعد أخطاء الاتصال).")
             return {"ok": True, "already_running": True}
         (folder / "STOP").unlink(missing_ok=True)
         env = dict(os.environ, PYTHONPATH=str(REPO / "src"), PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
@@ -316,7 +316,7 @@ class Workspace:
         folder = self._paper_dir(name)
         (folder / "STOP").write_text(_now(), encoding="utf-8")
         self._event("paper.stopped", name=name)
-        return {"ok": True, "note": "the loop stops at its next check (within one poll interval)."}
+        return {"ok": True, "note": "تتوقف الجلسة عند فحصها التالي (عادة خلال 30 ثانية، وقد تطول حتى 15 دقيقة بعد أخطاء الاتصال)."}
 
     def paper_detail(self, name: str) -> dict[str, Any]:
         folder = self._paper_dir(name)
@@ -341,10 +341,10 @@ class Workspace:
         settings = self._run_settings({})
         return {"editable": {k: s[k] for k in ("capital", "fee", "slippage_bps", "max_position", "risk_overrides")},
                 "effective_engine_limits": _limits(settings),
-                "rules": ["Spot، شراء فقط، بدون رافعة", "الصفقة عند افتتاح الشمعة التالية ± الانزلاق",
+                "rules": ["تداول فوري، شراء فقط، بدون رافعة مالية", "الصفقة عند افتتاح الشمعة التالية ± الانزلاق",
                           "الشمعة المتأخرة (> 5 دقائق أو شمعة) ما تتداول", "قرار آخر شمعة في الاختبار ما يتنفذ"],
                 "production": {"mainnet_enabled": MAINNET_ENABLED,
-                               "note": "حدود المسار الإنتاجي تُعرض فقط ولا تُعدَّل من الواجهة؛ التداول الحقيقي معطّل في الكود."}}
+                               "note": "حدود المسار الإنتاجي تُعرض فقط ولا تُعدَّل من الواجهة؛ التداول الحقيقي معطّل برمجيًا."}}
 
     def save_risk(self, body: dict[str, Any]) -> dict[str, Any]:
         current = json.loads(self.settings_path.read_text(encoding="utf-8"))

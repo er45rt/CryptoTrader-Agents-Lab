@@ -21,7 +21,7 @@ let savedTheme = "dark";
 try { savedTheme = localStorage.getItem("ct-theme") || "dark"; } catch { /* default */ }
 applyTheme(savedTheme);
 $("#theme-btn").onclick = () => { applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"); if (current) nav(current); };
-const tick = () => { $("#clock").textContent = new Date().toISOString().slice(0, 19).replace("T", " ") + " UTC"; };
+const tick = () => { $("#clock").textContent = new Date().toISOString().slice(0, 19).replace("T", " ") + " غرينتش"; };
 tick(); setInterval(tick, 1000);
 
 async function api(path, body, timeoutMs) {
@@ -50,7 +50,19 @@ async function apiOnce(path, body, timeoutMs) {
     throw e;
   } finally { clearTimeout(to); }
 }
-const errBox = (e) => `<div class="err">${esc(e.message || e)}</div>`;
+function errBox(e) {   // Arabic message; the original text stays available under «تفاصيل تقنية»
+  const { ar, raw } = trErr(e && e.message !== undefined ? e.message : e);
+  return `<div class="err">${esc(ar || "حدث خطأ.")}${raw ? `<details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(raw)}</pre></details>` : ""}</div>`;
+}
+function uiConfirm(text, okLabel = "تأكيد") {   // in-page dialog instead of the browser's English confirm()
+  return new Promise((resolve) => {
+    const d = document.createElement("div"); d.className = "modal";
+    d.innerHTML = `<div class="modal-box"><div class="modal-text">${esc(text)}</div><div class="actions"><button class="danger" data-ok>${esc(okLabel)}</button><button data-no>إلغاء</button></div></div>`;
+    const done = (v) => { d.remove(); resolve(v); };
+    d.onclick = (e) => { if (e.target.closest("[data-ok]")) done(true); else if (e.target.closest("[data-no]") || e.target === d) done(false); };
+    document.body.appendChild(d); d.querySelector("[data-no]").focus();
+  });
+}
 const loading = (t) => `<div class="loading"><div class="spin"></div>${esc(t)}</div>`;
 let timer = null, current = null;
 function nav(page) {
@@ -89,6 +101,10 @@ const header = (title, sub, chips = "") => `<div class="ph"><div><h1>${title}</h
 const chip = (text, tone = "") => `<span class="chip ${tone}"><i></i>${text}</span>`;
 const empty = (text, ic = "layers") => `<div class="empty">${svg(ic)}<div>${text}</div></div>`;
 const verdictPill = (v) => v === "promising" ? '<span class="pill good">واعدة</span>' : '<span class="pill warn">غير مثبتة</span>';
+function opDetails(o) {   // operations.jsonl entry -> «label: value» pairs (stored keys unchanged)
+  const fmt = (k, v) => k === "mode" ? arOf(AR.mode, v) : v && typeof v === "object" ? Object.entries(v).map(([a, b]) => `${arOf(AR.opKeys, a)}: ${typeof b === "object" ? JSON.stringify(b) : b}`).join("، ") : v;
+  return Object.entries(o).filter(([k]) => !["at", "kind"].includes(k)).map(([k, v]) => `${esc(arOf(AR.opKeys, k))}: <span class="ltr">${esc(fmt(k, v))}</span>`).join(" · ");
+}
 const note = (t) => `<div class="note">${svg("info")}<div>${t}</div></div>`;
 
 /* ---------- charts (canvas, no library) ----------
@@ -192,8 +208,8 @@ function candles(c, bars, trades, overlays = [], h = 360, view = null) {
     timeAxis(g, L, R, B, ms[i0], ms[Math.max(i0, i1 - 1)]);
     hover(c, vb.length, x, (k, py) => { const b = vb[k], prev = vb[k - 1] || b, ch = prev.c ? b.c / prev.c - 1 : 0, here = vis.filter((m) => m.i === k);
       const price = lo + (hi - lo) * (B - py) / (B - T);
-      return `<div class="tt">${esc(b.t.slice(0, 16).replace("T", " "))} · ${fmtNum(price, price > 100 ? 0 : 2)}</div>O ${fmtNum(b.o)} &nbsp;H ${fmtNum(b.h)}<br>L ${fmtNum(b.l)} &nbsp;C <b>${fmtNum(b.c)}</b> <span class="${sign(ch)}">${fmtSPct(ch, 2)}</span>` +
-        here.map((m) => `<br><b class="${m.buy ? "good" : "bad"}">${m.buy ? "▲ دخول" : "▼ خروج"} @ ${fmtNum(m.p)}</b>${!m.buy && isNum(m.t.pnl_quote) ? ` <span class="${sign(m.t.pnl_quote)}">${fmtNum(m.t.pnl_quote)}</span>` : ""}`).join(""); });
+      return `<div class="tt">${esc(b.t.slice(0, 16).replace("T", " "))} · ${fmtNum(price, price > 100 ? 0 : 2)}</div>افتتاح ${fmtNum(b.o)} · أعلى ${fmtNum(b.h)}<br>أدنى ${fmtNum(b.l)} · إغلاق <b>${fmtNum(b.c)}</b> <span class="${sign(ch)}">${fmtSPct(ch, 2)}</span>` +
+        here.map((m) => `<br><b class="${m.buy ? "good" : "bad"}">${m.buy ? "▲ دخول" : "▼ خروج"} عند ${fmtNum(m.p)}</b>${!m.buy && isNum(m.t.pnl_quote) ? ` <span class="${sign(m.t.pnl_quote)}">${fmtNum(m.t.pnl_quote)}</span>` : ""}`).join(""); });
     interact(c, view, L, () => c.clientWidth - 72);
   };
   draw(); if (view) view.subs.push(draw);
@@ -255,13 +271,13 @@ const thin = (arr, n = 80) => { const step = Math.max(1, Math.ceil(arr.length / 
 function heat(monthly) {
   if (!monthly.length) return empty("ما فيه بيانات شهرية");
   const years = {}; monthly.forEach((m) => { const [yy, mm] = m.month.split("-"); (years[yy] ||= {})[+mm] = m.return; });
-  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const names = AR.months;
   const col = (v) => { const a = Math.min(1, Math.abs(v) / 0.25); return v >= 0 ? `rgba(22,199,132,${0.14 + a * 0.75})` : `rgba(234,57,67,${0.14 + a * 0.75})`; };
   let html = `<div class="heatw"><div class="heat"><div></div>${names.map((n) => `<div class="h">${n}</div>`).join("")}<div class="h">السنة</div>`;
   Object.keys(years).sort().forEach((yy) => { const row = years[yy]; let tot = 1;
     html += `<div class="y">${yy}</div>`;
     for (let m = 1; m <= 12; m++) { const v = row[m]; if (v === undefined) { html += `<div class="c e"></div>`; continue; } tot *= 1 + v;
-      html += `<div class="c" style="background:${col(v)}" title="${yy}-${String(m).padStart(2, "0")}: ${fmtSPct(v)}">${(v * 100).toFixed(1)}</div>`; }
+      html += `<div class="c" style="background:${col(v)}" title="${AR.months[m - 1]} ${yy}: ${fmtSPct(v)}">${(v * 100).toFixed(1)}</div>`; }
     html += `<div class="t ${sign(tot - 1)}">${fmtSPct(tot - 1, 0)}</div>`; });
   return html + "</div></div>";
 }
@@ -283,15 +299,15 @@ PAGES.home = async () => {
     ${kpi({ k: "الربح / الخسارة", v: d.capital_total ? (pnl > 0 ? "+" : "") + fmtUsd(pnl) : "—", cls: sign(pnl), ic: pnl >= 0 ? "trend" : "down", tone: pnl >= 0 ? "g" : "r", s: fmtSPct(ret, 2) })}
     ${kpi({ k: "جلسات تعمل", v: `${d.running} / ${d.sessions.length}`, ic: "play", tone: d.running ? "g" : "" })}
     ${kpi({ k: "مراكز مفتوحة", v: String(d.open_positions.length), ic: "box", tone: d.open_positions.length ? "w" : "" })}
-    ${kpi({ k: "تجارب الاختبار", v: String(d.experiments), ic: "flask", s: "كل تجربة ترفع عتبة DSR" })}
+    ${kpi({ k: "تجارب الاختبار", v: String(d.experiments), ic: "flask", s: "كل تجربة ترفع عتبة حكم المتانة" })}
   </div>
   <div class="cols">
-    <div class="card"><div class="card-h"><h2>${live ? `السوق الآن <small>${esc(live.symbol)} · ${esc(live.timeframe)} · من جلسة ${esc(live.name)}</small>` : "السوق الآن"}</h2></div>
+    <div class="card"><div class="card-h"><h2>${live ? `السوق الآن <small>${esc(live.symbol)} · ${esc(tfAr(live.timeframe))} · من جلسة ${esc(live.name)}</small>` : "السوق الآن"}</h2></div>
       <div id="hmk">${live ? loading("تحميل الشموع…") : empty("شغّل جلسة ورقية عشان تشوف السوق هنا", "play")}</div></div>
     <div class="card"><div class="card-h"><h2>آخر اختبار</h2></div>${d.last_run ? runSummary(d.last_run) : empty("ما فيه اختبارات بعد", "flask")}</div>
   </div>
   <div class="card"><div class="card-h"><h2>الجلسات الورقية</h2><button class="sm" data-nav="paper">إدارة الجلسات</button></div>${sessionTable(d.sessions)}</div>
-  ${note("كل الأرقام هنا ورقية (محاكاة على أسعار Binance العامة). ما فيه اتصال بحساب حقيقي، والتداول الحقيقي معطّل في الكود.")}`;
+  ${note("كل الأرقام هنا ورقية (محاكاة على أسعار Binance العامة). ما فيه اتصال بحساب حقيقي، والتداول الحقيقي معطّل برمجيًا.")}`;
   if (live) api("/api/paper/session?name=" + encodeURIComponent(live.name)).then((s) => {
     const el = $("#hmk"); if (!el) return; el.innerHTML = `<canvas id="hc"></canvas>`;
     candles($("#hc"), s.bars.slice(-120), [], [{ values: sma(s.bars.slice(-120), 20), color: css("--sma1") }], 280); }).catch(() => {});
@@ -299,9 +315,9 @@ PAGES.home = async () => {
 };
 function sessionTable(ss) {
   if (!ss.length) return empty("ما فيه جلسات. أنشئ وحدة من صفحة التداول الورقي.", "play");
-  return `<div class="tw"><table><thead><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>المركز</th><th>صفقات</th><th>فائتة</th><th>آخر دورة</th></tr></thead><tbody>
-  ${ss.map((s) => `<tr><td><a href="#" data-session="${esc(s.name)}"><b>${esc(s.name)}</b></a></td><td>${esc(s.strategy)} <span class="muted">· ${esc(s.symbol)} · ${esc(s.timeframe)}</span></td>
-  <td>${s.running && s.stopping ? '<span class="pill warn">يتوقف…</span>' : s.running ? '<span class="pill good">تعمل</span>' : '<span class="pill">متوقفة</span>'}${s.error ? ' <span class="pill bad" title="' + esc(s.error.error) + '">خطأ</span>' : ""}</td>
+  return `<div class="tw"><table><thead><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>المركز</th><th>عمليات التنفيذ</th><th>فائتة</th><th>آخر دورة</th></tr></thead><tbody>
+  ${ss.map((s) => `<tr><td><a href="#" data-session="${esc(s.name)}"><b>${esc(s.name)}</b></a></td><td>${esc(s.strategy)} <span class="muted">· ${esc(s.symbol)} · ${esc(tfAr(s.timeframe))}</span></td>
+  <td>${s.running && s.stopping ? '<span class="pill warn">يتوقف…</span>' : s.running ? '<span class="pill good">تعمل</span>' : '<span class="pill">متوقفة</span>'}${s.error ? ' <span class="pill bad" title="' + esc(trErr(s.error.error).ar || "خطأ في الجلسة") + '">خطأ</span>' : ""}</td>
   <td class="ltr">${isNum(s.equity) ? fmtUsd(s.equity) : `<span class="muted">${fmtUsd(s.capital)}</span>`}</td><td class="ltr ${sign(s.net_return)}">${fmtSPct(s.net_return, 2)}</td>
   <td>${posText(s.position)}</td><td>${s.fills ?? "—"}</td><td>${s.missed_bars ?? "—"}</td><td class="muted ltr">${esc((s.last_cycle || "—").slice(11, 19))}</td></tr>`).join("")}</tbody></table></div>`;
 }
@@ -313,7 +329,7 @@ function runSummary(r) {
   <div class="big ${sign(r.net_return)} ltr" style="text-align:right">${fmtSPct(r.net_return)}</div>
   <div class="kv" style="margin-top:10px"><div>الاحتفاظ بنفس الفترة</div><div>${fmtSPct(r.hold_return)}</div>
   <div>الفرق عن الاحتفاظ</div><div class="${sign(edge)}">${fmtSPct(edge)}</div><div>أقصى تراجع</div><div class="bad">${fmtPct(r.max_drawdown)}</div>
-  <div>Sharpe</div><div>${fmtNum(r.sharpe)}</div><div>حكم المتانة</div><div>${verdictPill(r.verdict)}</div></div>
+  <div>نسبة شارب</div><div>${fmtNum(r.sharpe)}</div><div>حكم المتانة</div><div>${verdictPill(r.verdict)}</div></div>
   <div class="actions"><button class="primary sm" data-run="${esc(r.id)}">عرض النتيجة كاملة</button></div>`;
 }
 document.addEventListener("click", (e) => { const b = e.target.closest("[data-run]"); if (b) { nav("backtest"); setTimeout(() => api("/api/run?id=" + b.dataset.run).then(showResult), 300); } });
@@ -324,22 +340,23 @@ PAGES.strategies = async () => {
   main.innerHTML = header("الاستراتيجيات", "أضف استراتيجيتك وافحصها قبل الاختبار", chip(`${ok} تعمل`, "good") + chip(`${d.strategies.length - ok} مرفوضة`, d.strategies.length - ok ? "bad" : ""))
   + `<div class="cols"><div class="card"><div class="card-h"><h2>إضافة استراتيجية</h2></div>
     <p class="muted" style="margin-top:0">ملف Python فيه صنف يرث من <code>Strategy</code>. يُفحص قبل الحفظ، والملف المرفوض ما ينحفظ.</p>
-    <div class="drop">${svg("layers")}<input type="file" id="up" accept=".py"><button class="primary" id="upb">رفع وفحص</button></div><div id="upr"></div></div>
+    <div class="drop">${svg("layers")}<label class="filebtn"><input type="file" id="up" accept=".py" hidden>اختر ملف .py</label><span id="upname" class="muted">ما اخترت ملف</span><button class="primary" id="upb">رفع وفحص</button></div><div id="upr"></div></div>
   <div class="card"><div class="card-h"><h2>فحص بمسار <small>Freqtrade أو ملف</small></h2></div>
     <label>المسار</label><input id="spec" class="ltr" placeholder="freqtrade:C:\\path\\MyStrategy.py:MyStrategy">
     <div class="actions"><button id="chk">فحص</button></div><div id="chr"></div></div></div>
   <div class="card"><div class="card-h"><h2>الاستراتيجيات المركّبة <small>${d.strategies.length}</small></h2></div>
   <div class="tw"><table><thead><tr><th>الاسم</th><th>الإطار</th><th>التهيئة</th><th>المصدر</th><th>الحالة</th><th></th></tr></thead><tbody>
-  ${d.strategies.map((s) => `<tr><td><b>${esc(s.name || s.file)}</b><div class="muted" style="font-size:11.5px">${esc(s.file)}</div></td><td><span class="pill">${esc(s.timeframe || "—")}</span></td><td>${s.warmup_bars ?? "—"} شمعة</td><td>${s.folder === "workspace" ? "مضافة" : "أمثلة"}</td>
+  ${d.strategies.map((s) => `<tr><td><b>${esc(s.name || s.file)}</b><div class="muted" style="font-size:11.5px">${esc(s.file)}</div></td><td><span class="pill">${esc(tfAr(s.timeframe))}</span></td><td>${s.warmup_bars ?? "—"} شمعة</td><td>${s.folder === "workspace" ? "مضافة" : "أمثلة"}</td>
   <td>${s.ok ? '<span class="pill good">تعمل</span>' : '<span class="pill bad" title="' + esc(s.error) + '">مرفوضة</span>'}</td>
   <td class="wrap">${s.ok ? `<button class="sm primary" data-bt="${esc(s.spec)}">اختبار</button> <button class="sm" data-pp="${esc(s.spec)}">ورقي</button>` : `<span class="muted">${esc(s.error || "")}</span>`}
   ${s.removable ? ` <button class="sm danger" data-rm="${esc(s.file)}">حذف</button>` : ""}</td></tr>`).join("")}</tbody></table></div></div>`;
+  $("#up").onchange = () => { $("#upname").textContent = $("#up").files[0]?.name || "ما اخترت ملف"; };
   $("#upb").onclick = async () => { const f = $("#up").files[0]; if (!f) { $("#upr").innerHTML = errBox("اختر ملف .py"); return; }
     try { const r = await api("/api/strategies/upload", { filename: f.name, content: await f.text() }); await PAGES.strategies(); $("#upr").innerHTML = `<div class="okmsg">انضافت: ${esc(r.file)}</div>`; }
     catch (e) { $("#upr").innerHTML = errBox(e); } };
   $("#chk").onclick = async () => { try { const r = await api("/api/strategies/check", { spec: $("#spec").value });
-    $("#chr").innerHTML = `<div class="okmsg">تعمل: ${esc(r.name)} · ${esc(r.timeframe)} · تهيئة ${r.warmup_bars}</div>`; } catch (e) { $("#chr").innerHTML = errBox(e); } };
-  document.querySelectorAll("[data-rm]").forEach((b) => b.onclick = async () => { if (!confirm("حذف " + b.dataset.rm + "؟")) return;
+    $("#chr").innerHTML = `<div class="okmsg">تعمل: ${esc(r.name)} · ${esc(tfAr(r.timeframe))} · ${esc(countAr(r.warmup_bars, "شمعة تهيئة واحدة", "شمعتا تهيئة", "شموع تهيئة", "شمعة تهيئة"))}</div>`; } catch (e) { $("#chr").innerHTML = errBox(e); } };
+  document.querySelectorAll("[data-rm]").forEach((b) => b.onclick = async () => { if (!(await uiConfirm("تحذف " + b.dataset.rm + " من مساحة العمل؟", "حذف"))) return;
     await api("/api/strategies/remove", { filename: b.dataset.rm }); PAGES.strategies(); });
   document.querySelectorAll("[data-bt]").forEach((b) => b.onclick = () => { sessionStorage.setItem("spec", b.dataset.bt); nav("backtest"); });
   document.querySelectorAll("[data-pp]").forEach((b) => b.onclick = () => { sessionStorage.setItem("spec", b.dataset.pp); nav("paper"); });
@@ -353,18 +370,19 @@ PAGES.backtest = async () => {
   main.innerHTML = header("الاختبار التاريخي", "جرّب الاستراتيجية على بيانات الماضي مع الرسوم والانزلاق، وقارنها بالاحتفاظ",
     chip("الفترة المختومة من 2025-09-07 ما تنقرأ", ""))
   + `<div class="card"><div class="form">
-    <div><label>الاستراتيجية</label><select id="bs">${okS.map((s) => `<option value="${esc(s.spec)}" data-tf="${esc(s.timeframe)}" ${s.spec === pre ? "selected" : ""}>${esc(s.name)} (${esc(s.timeframe)})</option>`).join("")}</select></div>
+    <div><label>الاستراتيجية</label><select id="bs">${okS.map((s) => `<option value="${esc(s.spec)}" data-tf="${esc(s.timeframe)}" ${s.spec === pre ? "selected" : ""}>${esc(s.name)} (${esc(tfAr(s.timeframe))})</option>`).join("")}</select></div>
     <div><label>البيانات</label><select id="bd">${df.files.map((f) => `<option value="${esc(f.path)}" data-tf="${esc(f.timeframe || "")}">${esc(f.name)}</option>`).join("")}</select></div>
     <div><label>من</label><input id="bfrom" type="date" value="2020-01-01"></div>
     <div><label>إلى (قبل 2025-09-07)</label><input id="bto" type="date" value="2025-09-06" max="2025-09-06"></div>
     <div><label>رأس المال</label><input id="bcap" class="ltr" value="${esc(risk.editable.capital)}"></div>
     <div><label>الرسوم لكل جانب</label><input id="bfee" class="ltr" value="${esc(risk.editable.fee)}"></div>
-    <div><label>الانزلاق (bps)</label><input id="bslip" class="ltr" value="${esc(risk.editable.slippage_bps)}"></div>
+    <div><label>الانزلاق (نقطة أساس، 1 = 0.01%)</label><input id="bslip" class="ltr" value="${esc(risk.editable.slippage_bps)}"></div>
     <div><label>معاملات (JSON)</label><input id="bpar" class="ltr" placeholder='{"fast": 20, "slow": 50}'></div>
   </div><div class="actions"><button class="primary" id="bfast">▶ اختبار سريع</button><button id="beng">كامل عبر المحرك</button><span class="muted" style="font-size:12.5px">السريع يطابق المحرك، والكامل يمر على كل طبقات الأمان (أبطأ)</span></div>
   <div id="bmsg"></div></div><div id="bres"></div>`;
   const go = async (engine) => {
-    let params = {}; try { params = $("#bpar").value ? JSON.parse($("#bpar").value) : {}; } catch { $("#bmsg").innerHTML = errBox("المعاملات لازم تكون JSON صحيح"); return; }
+    let params = {}; try { params = $("#bpar").value ? JSON.parse($("#bpar").value) : {}; if (!params || typeof params !== "object" || Array.isArray(params)) throw 0; }
+    catch { $("#bmsg").innerHTML = errBox('المعاملات لازم تكون بصيغة JSON بين قوسين { }، مثل: {"fast": 20, "slow": 50}'); return; }
     const body = { spec: $("#bs").value, data: $("#bd").value, start: $("#bfrom").value || null, end: $("#bto").value || null,
       capital: $("#bcap").value, fee: $("#bfee").value, slippage_bps: $("#bslip").value, params, engine };
     $("#bfast").disabled = $("#beng").disabled = true;
@@ -392,18 +410,18 @@ function showResult(r, scroll = true) {
   const best = trades.reduce((a, t) => (isNum(t.pnl_quote) && (!a || +t.pnl_quote > +a.pnl_quote) ? t : a), null);
   const worst = trades.reduce((a, t) => (isNum(t.pnl_quote) && (!a || +t.pnl_quote < +a.pnl_quote) ? t : a), null);
   $("#bres").innerHTML = `
-  <div class="card-h" style="margin:6px 0 12px"><h2 style="font-size:18px">${esc(r.strategy)} <small>${esc(r.timeframe)} · ${r.mode === "engine" ? "كامل عبر المحرك" : "سريع"} · <span class="ltr">${esc(r.start.slice(0, 10))} → ${esc(r.end.slice(0, 10))}</span> · ${fmtNum(r.bars_count, 0)} شمعة</small></h2>${verdictPill(v.verdict)}</div>
+  <div class="card-h" style="margin:6px 0 12px"><h2 style="font-size:18px">${esc(r.strategy)} <small>${esc(tfAr(r.timeframe))} · ${r.mode === "engine" ? "كامل عبر المحرك" : "سريع"} · <span class="ltr">${esc(r.start.slice(0, 10))} → ${esc(r.end.slice(0, 10))}</span> · ${fmtNum(r.bars_count, 0)} شمعة</small></h2>${verdictPill(v.verdict)}</div>
   <div class="kpis">
     ${kpi({ k: "العائد الصافي", v: fmtSPct(m.net_return), cls: sign(m.net_return), ic: m.net_return >= 0 ? "trend" : "down", tone: m.net_return >= 0 ? "g" : "r", s: `الاحتفاظ ${fmtSPct(b.net_return)}`, spark: "sp1" })}
     ${kpi({ k: "الفرق عن الاحتفاظ", v: fmtSPct(edge), cls: sign(edge), ic: "pct", tone: edge >= 0 ? "g" : "r", s: edge >= 0 ? "أحسن من الشراء والاحتفاظ" : "أقل من الشراء والاحتفاظ" })}
-    ${kpi({ k: "Sharpe", v: fmtNum(m.sharpe), ic: "gauge", s: `الاحتفاظ ${fmtNum(b.sharpe)}`, tone: (m.sharpe || 0) > (b.sharpe || 0) ? "g" : "w" })}
+    ${kpi({ k: "نسبة شارب", v: fmtNum(m.sharpe), ic: "gauge", s: `الاحتفاظ ${fmtNum(b.sharpe)}`, tone: (m.sharpe || 0) > (b.sharpe || 0) ? "g" : "w" })}
     ${kpi({ k: "أقصى تراجع", v: fmtPct(m.max_drawdown), cls: "bad", ic: "down", tone: "r", s: `الاحتفاظ ${fmtPct(b.max_drawdown)}`, spark: "sp2" })}
     ${kpi({ k: "الصفقات · نسبة الربح", v: `${m.round_trips} · ${fmtPct(m.win_rate, 0)}`, ic: "box", s: `وقت في السوق ${fmtPct(m.time_in_market, 0)}` })}
     ${kpi({ k: "الرسوم + الانزلاق", v: fmtUsd(m.fees_quote + m.slippage_cost_quote_est), ic: "coins", tone: "w", s: `من رأس مال ${fmtUsd(r.settings.capital_quote, 0)}` })}
   </div>
   <div class="card"><div class="card-h"><h2>الشموع والصفقات</h2><div class="tabs" id="rng"></div></div>
-    <div class="card-h" style="margin-bottom:8px"><div class="legend"><span><i class="tri-up"></i>دخول</span><span><i class="tri-dn"></i>خروج</span><span><i style="background:var(--sma1)"></i>SMA20</span><span><i style="background:var(--sma2)"></i>SMA50</span></div>
-    <span class="muted" style="font-size:12px">🖱 العجلة للتكبير · اسحب للتنقّل · نقرتين للكل · الشارتات تحت تتحرك معه</span></div>
+    <div class="card-h" style="margin-bottom:8px"><div class="legend"><span><i class="tri-up"></i>دخول</span><span><i class="tri-dn"></i>خروج</span><span><i style="background:var(--sma1)"></i>متوسط متحرك 20</span><span><i style="background:var(--sma2)"></i>متوسط متحرك 50</span></div>
+    <span class="muted" style="font-size:12px">🖱 العجلة للتكبير · اسحب للتنقّل · نقرتين للكل · الرسوم تحت تتحرك معه</span></div>
     <canvas id="cc"></canvas></div>
   <div class="cols">
     <div class="card"><div class="card-h"><h2>رأس المال <small>الاستراتيجية مقابل الاحتفاظ</small></h2><div class="tabs" id="scale"><button class="on" data-log="0">عادي</button><button data-log="1">لوغاريتمي</button></div></div>
@@ -420,14 +438,14 @@ function showResult(r, scroll = true) {
       <div>متوسط الخسارة</div><div class="bad">${fmtNum(losses.reduce((a, t) => a + +t.pnl_quote, 0) / (losses.length || 1))}</div>
       <div>أفضل صفقة</div><div>${best ? `<a href="#" data-jump="${best._i}" class="good">${fmtNum(best.pnl_quote)}</a>` : "—"}</div>
       <div>أسوأ صفقة</div><div>${worst ? `<a href="#" data-jump="${worst._i}" class="bad">${fmtNum(worst.pnl_quote)}</a>` : "—"}</div>
-      <div>رأس المال · الرسوم · الانزلاق</div><div>${fmtUsd(r.settings.capital_quote, 0)} · ${fmtPct(+r.settings.taker_fee, 2)} · ${esc(r.settings.slippage_bps)}bps</div>
+      <div>رأس المال · الرسوم · الانزلاق</div><div>${fmtUsd(r.settings.capital_quote, 0)} · ${fmtPct(+r.settings.taker_fee, 2)} · ${fmtPct(+r.settings.slippage_bps / 10000, 2)}</div>
       <div>المعاملات</div><div>${esc(JSON.stringify(r.params || {}))}</div></div></div>
     </div>
   </div>
     <div class="card"><div class="card-h"><h2>العائد الشهري <small>مرّر على أي شهر · العمود الأخير للسنة</small></h2></div>${heat(r.monthly)}</div>
-  <div class="card"><div class="card-h"><h2>الصفقات <small>${trades.length} · اضغط على صفقة تشوفها على الشارت</small></h2>
+  <div class="card"><div class="card-h"><h2>الصفقات <small>${trades.length} · اضغط على صفقة تشوفها على الرسم</small></h2>
     <div class="tabs" id="tf"><button class="on" data-f="all">الكل</button><button data-f="win">رابحة</button><button data-f="loss">خاسرة</button><button data-f="open">مفتوحة</button></div></div>
-    <div class="tw"><table class="sortable"><thead><tr><th data-k="entry_time">دخول ⇅</th><th>سعر</th><th data-k="exit_time">خروج ⇅</th><th>سعر</th><th>كمية</th><th data-k="pnl_quote">ربح/خسارة ⇅</th><th data-k="_pct">٪ ⇅</th></tr></thead><tbody id="tb"></tbody></table></div></div>`;
+    <div class="tw"><table class="sortable"><thead><tr><th data-k="entry_time">دخول ⇅</th><th>سعر</th><th data-k="exit_time">خروج ⇅</th><th>سعر</th><th>كمية</th><th data-k="pnl_quote">ربح/خسارة ⇅</th><th data-k="_pct">% ⇅</th></tr></thead><tbody id="tb"></tbody></table></div></div>`;
   // one time window for the three charts
   const ms = r.bars.map((x) => msOf(x.t)), view = makeView(ms[0], ms[ms.length - 1] || ms[0] + 1);
   rangeButtons(view, "rng");
@@ -447,7 +465,7 @@ function showResult(r, scroll = true) {
     const rows = trades.filter((t) => filter === "all" || (filter === "win" ? +t.pnl_quote > 0 : filter === "loss" ? isNum(t.pnl_quote) && +t.pnl_quote <= 0 : !t.exit_time))
       .sort((a, b2) => { const x = a[sortK], y2 = b2[sortK]; const nx = isNum(x) ? +x : x || "", ny = isNum(y2) ? +y2 : y2 || ""; return (nx > ny ? 1 : nx < ny ? -1 : 0) * sortDir; }).slice(0, 400);
     $("#tb").innerHTML = rows.map((t) => `<tr data-jump="${t._i}" style="cursor:pointer"><td class="ltr">${esc((t.entry_time || "").slice(0, 16).replace("T", " "))}</td><td class="ltr">${fmtNum(t.entry_price)}</td><td class="ltr">${t.exit_time ? esc(t.exit_time.slice(0, 16).replace("T", " ")) : '<span class="pill warn">مفتوحة</span>'}</td><td class="ltr">${fmtNum(t.exit_price)}</td><td class="ltr">${fmtNum(t.quantity, 5)}</td>
-      <td class="ltr ${sign(t.pnl_quote)}">${isNum(t.pnl_quote) ? fmtNum(t.pnl_quote) : "—"}</td><td class="ltr ${sign(t._pct)}">${fmtSPct(t._pct, 2)}</td></tr>`).join("") || `<tr><td colspan="7" class="muted">ما فيه صفقات بهالفلتر</td></tr>`;
+      <td class="ltr ${sign(t.pnl_quote)}">${isNum(t.pnl_quote) ? fmtNum(t.pnl_quote) : "—"}</td><td class="ltr ${sign(t._pct)}">${fmtSPct(t._pct, 2)}</td></tr>`).join("") || `<tr><td colspan="7" class="muted">ما فيه صفقات بهالتصفية</td></tr>`;
   };
   renderTrades();
   $("#tf").onclick = (e) => { const bt = e.target.closest("button"); if (!bt) return; filter = bt.dataset.f; $("#tf").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === bt)); renderTrades(); };
@@ -460,11 +478,11 @@ function showResult(r, scroll = true) {
   if (scroll) $("#bres").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 const CHECK_HELP = {
-  beats_hold: "لازم يكون Sharpe الاستراتيجية أعلى من مجرد الشراء والاحتفاظ بنفس الفترة والتكاليف. لو مو أعلى، الاحتفاظ أبسط وأحسن.",
+  beats_hold: "لازم تكون نسبة شارب للاستراتيجية أعلى من مجرد الشراء والاحتفاظ بنفس الفترة والتكاليف. لو مو أعلى، الاحتفاظ أبسط وأحسن.",
   both_halves: "نقسم الفترة نصين: لازم الربح يكون موجب في الاثنين. لو كل الربح جاء من نص واحد، غالبًا صدفة فترة معيّنة.",
   fees_x2: "نعيد الاختبار بضعف الرسوم. لو الربح اختفى، الاستراتيجية هشّة وتعتمد على تكاليف مثالية.",
   out_of_sample: "أول 70% للحكم، وآخر 30% كأنها مستقبل ما شافته. لازم تنجح في الاثنين.",
-  dsr: "Deflated Sharpe: يعاقب كثرة التجارب. كل ما جرّبت أكثر، صار لازم الأداء أقوى عشان ما يكون حظ.",
+  dsr: "نسبة شارب المصحَّحة: تعاقب كثرة التجارب. كل ما جرّبت أكثر، صار لازم الأداء أقوى عشان ما يكون حظ.",
 };
 
 PAGES.paper = async () => {
@@ -478,14 +496,15 @@ PAGES.paper = async () => {
   <div id="pdet"></div>
   <div class="card"><div class="card-h"><h2>جلسة جديدة</h2></div>
   <div class="form"><div><label>الاسم</label><input id="pn" class="ltr" placeholder="btc-sma-1"></div>
-  <div><label>الاستراتيجية</label><select id="ps">${st.strategies.filter((s) => s.ok).map((s) => `<option value="${esc(s.spec)}" ${s.spec === pre ? "selected" : ""}>${esc(s.name)} (${esc(s.timeframe)})</option>`).join("")}</select></div>
+  <div><label>الاستراتيجية</label><select id="ps">${st.strategies.filter((s) => s.ok).map((s) => `<option value="${esc(s.spec)}" ${s.spec === pre ? "selected" : ""}>${esc(s.name)} (${esc(tfAr(s.timeframe))})</option>`).join("")}</select></div>
   <div><label>الزوج</label><input id="psym" class="ltr" value="BTCUSDT"></div><div><label>رأس المال الورقي</label><input id="pcap" class="ltr" value="1000"></div></div>
   <div class="actions"><button class="primary" id="pcreate">إنشاء وتشغيل</button><span class="muted" style="font-size:12.5px">تشغيل الجلسة يعتبر تفويضًا منك لهالجلسة. ما ينرسل أي أمر لأي منصة.</span></div><div id="pmsg"></div></div>`;
   $("#pcreate").onclick = async () => { try { const name = $("#pn").value.trim();
     $("#pmsg").innerHTML = loading("جاري تحميل البيانات وإنشاء الجلسة…");
-    await api("/api/paper/new", { name, spec: $("#ps").value, symbol: $("#psym").value.trim(), base: $("#psym").value.trim().replace(/USDT$/, ""), capital: $("#pcap").value });
+    await api("/api/paper/new", { name, spec: $("#ps").value, symbol: $("#psym").value.trim().toUpperCase(), base: $("#psym").value.trim().toUpperCase().replace(/USDT$/, ""), capital: $("#pcap").value });
     await api("/api/paper/start", { name }); PAGES.paper(); } catch (e) { $("#pmsg").innerHTML = errBox(e); } };
-  document.querySelectorAll("[data-start]").forEach((b) => b.onclick = async () => { try { await api("/api/paper/start", { name: b.dataset.start }); } catch (e) { alert(e.message); } PAGES.paper(); });
+  document.querySelectorAll("[data-start]").forEach((b) => b.onclick = async () => { try { await api("/api/paper/start", { name: b.dataset.start }); }
+    catch (e) { await PAGES.paper(); if ($("#pmsg")) $("#pmsg").innerHTML = errBox(e); return; } PAGES.paper(); });
   document.querySelectorAll("[data-stop]").forEach((b) => b.onclick = async () => { await api("/api/paper/stop", { name: b.dataset.stop }); PAGES.paper(); });
   const pick = d.sessions.find((s) => s.name === shownSession) || d.sessions.find((s) => s.running) || d.sessions[0];
   if (pick) paperDetail(pick.name);
@@ -499,24 +518,25 @@ async function paperDetail(name) {
     if (!el || shownSession !== name) return;
     const lastBar = d.bars[d.bars.length - 1], prev = d.bars[d.bars.length - 2], ch = lastBar && prev ? lastBar.c / prev.c - 1 : null;
     const nextOpen = s.next_open ? s.next_open[0] : null;
-    el.innerHTML = `<div class="card"><div class="card-h"><h2>${esc(name)} <small>${esc(d.session.strategy_name)} · ${esc(d.session.market.symbol)} · ${esc(d.session.timeframe)}</small></h2>
+    el.innerHTML = `<div class="card"><div class="card-h"><h2>${esc(name)} <small>${esc(d.session.strategy_name)} · ${esc(d.session.market.symbol)} · ${esc(tfAr(d.session.timeframe))}</small></h2>
       ${d.running ? '<span class="pill good">تعمل · تحدّث كل 30 ثانية</span>' : '<span class="pill">متوقفة</span>'}</div>
-    ${d.error ? `<div class="err"><b>الجلسة ما تقدر تجيب الأسعار</b> · آخر محاولة <span class="ltr">${esc(String(d.error.at).slice(0, 16).replace("T", " "))} UTC</span> · ${esc(d.error.consecutive)} محاولة متتالية فشلت.
-      ${/aswMonFltProxy/.test(d.error.error) ? "<br>السبب: برنامج الحماية Avast يمنع اتصال الجلسة بـ Binance. الشموع اللي تفوت وقتها تنسجّل «فائتة» وما تتداول." : `<br><span class="ltr">${esc(d.error.error)}</span>`}</div>` : ""}
+    ${d.error ? `<div class="err"><b>الجلسة ما تقدر تجيب الأسعار</b> · آخر محاولة <span class="ltr">${esc(String(d.error.at).slice(0, 16).replace("T", " "))} غرينتش</span> · ${esc(d.error.consecutive)} محاولة متتالية فشلت.
+      <br>السبب: ${esc(trErr(d.error.error).ar || "خطأ غير معروف")}. الشموع اللي تفوت وقتها تنسجّل «فائتة» وما تتداول.
+      <details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(d.error.error)}</pre></details></div>` : ""}
     <div class="kpis">
       ${kpi({ k: "آخر سعر", v: lastBar ? fmtUsd(lastBar.c) : "—", ic: "trend", s: ch === null ? "" : `<span class="${sign(ch)}">${fmtSPct(ch, 2)}</span> عن الشمعة السابقة` })}
       ${kpi({ k: "الرصيد", v: isNum(s.equity_quote) ? fmtUsd(s.equity_quote) : fmtUsd(d.session.settings.capital_quote), ic: "wallet", s: isNum(s.equity_quote) ? "" : "قبل أول قرار حي" })}
       ${kpi({ k: "العائد", v: fmtSPct(s.net_return, 2), cls: sign(s.net_return), ic: "pct", tone: isNum(s.net_return) ? (s.net_return >= 0 ? "g" : "r") : "" })}
       ${kpi({ k: "المركز", v: posText(s.position), ic: "box", small: true })}
-      ${kpi({ k: "شموع حيّة", v: String(s.live_bars ?? 0), ic: "clock", s: nextOpen ? `الشمعة الجاية تفتح <span class="ltr">${esc(nextOpen.slice(11, 16))} UTC</span>` : "", small: false })}
+      ${kpi({ k: "شموع حيّة", v: String(s.live_bars ?? 0), ic: "clock", s: nextOpen ? `الشمعة الجاية تفتح <span class="ltr">${esc(nextOpen.slice(11, 16))} غرينتش</span>` : "", small: false })}
     </div>
     <div class="card-h"><h2>السعر <small>${d.bars.length} شمعة · العجلة للتكبير، اسحب للتنقّل</small></h2><div class="tabs" id="prng"></div></div>
     <canvas id="pc"></canvas>
     <div class="cols" style="margin-top:16px;margin-bottom:0"><div><h2 style="margin-bottom:10px">القرارات</h2>${d.decisions.length ? `<div class="tw" style="max-height:300px"><table><thead><tr><th>الوقت</th><th>القرار</th><th>السبب</th><th>المخاطر</th></tr></thead><tbody>
     ${d.decisions.map((x) => `<tr><td class="ltr">${esc(x.at.slice(0, 16).replace("T", " "))}</td><td>${x.action === "buy" ? '<span class="pill good">شراء</span>' : x.action === "sell" ? '<span class="pill bad">بيع</span>' : '<span class="pill">انتظار</span>'}</td>
-    <td class="${x.rationale.startsWith("missed") ? "warn" : ""}">${esc(x.rationale.startsWith("missed") ? "فائتة (وصلت متأخرة)" : x.rationale)}</td><td>${esc(x.risk || "—")}</td></tr>`).join("")}</tbody></table></div>`
+    <td class="${x.rationale.startsWith("missed") ? "warn" : ""}">${esc(rationaleText(x.rationale))}</td><td>${esc(x.risk ? arOf(AR.riskDecision, x.risk) : "—")}</td></tr>`).join("")}</tbody></table></div>`
       : empty("ما فيه قرارات حيّة بعد. أول قرار بعد ما تقفل الشمعة الجاية.", "clock")}</div>
-    <div><h2 style="margin-bottom:10px">السجل</h2><pre>${esc(d.log.slice(-25).join("\n"))}</pre></div></div></div>`;
+    <div><h2 style="margin-bottom:10px">السجل</h2><pre class="rtl-log">${esc(d.log.slice(-25).map(logLineAr).join("\n"))}</pre></div></div></div>`;
     const bars = d.bars; if (!bars.length) { candles($("#pc"), bars, [], [], 340); return; }
     const ms = bars.map((x) => msOf(x.t)), view = makeView(ms[0], ms[ms.length - 1]);
     const keep = paperZoom[name];                       // keep the user's zoom across the 30 s refresh
@@ -533,16 +553,17 @@ PAGES.risk = async () => {
   + `<div class="cols"><div class="card"><div class="card-h"><h2>إعدادات الاختبار والورقي <small>قابلة للتعديل</small></h2></div><div class="form">
   <div><label>رأس المال الافتراضي</label><input id="rcap" class="ltr" value="${esc(d.editable.capital)}"></div>
   <div><label>الرسوم لكل جانب</label><input id="rfee" class="ltr" value="${esc(d.editable.fee)}"></div>
-  <div><label>الانزلاق (bps)</label><input id="rslip" class="ltr" value="${esc(d.editable.slippage_bps)}"></div>
+  <div><label>الانزلاق (نقطة أساس، 1 = 0.01%)</label><input id="rslip" class="ltr" value="${esc(d.editable.slippage_bps)}"></div>
   <div><label>حد أقصى للمركز (اختياري)</label><input id="rmax" class="ltr" value="${esc(d.editable.max_position ?? "")}"></div></div>
   <label style="margin-top:12px">حدود مخاطر إضافية للمحرك (JSON، مثل {"max_order_notional_quote": "500"})</label>
   <textarea id="rov" rows="3" class="ltr">${esc(JSON.stringify(d.editable.risk_overrides || {}))}</textarea>
   <div class="actions"><button class="primary" id="rsave">حفظ</button></div><div id="rmsg"></div></div>
   <div class="card"><div class="card-h"><h2>قواعد ثابتة</h2></div><ul class="rules">${d.rules.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
   <div class="card-h" style="margin-top:18px"><h2>المسار الإنتاجي</h2></div>
-  <p style="margin:0 0 6px">${d.production.mainnet_enabled ? '<span class="pill bad">مفعّل!</span>' : '<span class="pill bad">التداول الحقيقي معطّل في الكود</span>'}</p><p class="muted" style="margin:0">${esc(d.production.note)}</p></div></div>
-  <div class="card"><div class="card-h"><h2>الحدود الفعلية اللي يطبقها المحرك</h2></div><div class="kv">${Object.entries(d.effective_engine_limits).map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("")}</div></div>`;
-  $("#rsave").onclick = async () => { let ov; try { ov = JSON.parse($("#rov").value || "{}"); } catch { $("#rmsg").innerHTML = errBox("الحدود الإضافية لازم تكون JSON صحيح"); return; }
+  <p style="margin:0 0 6px">${d.production.mainnet_enabled ? '<span class="pill bad">مفعّل!</span>' : '<span class="pill bad">التداول الحقيقي معطّل برمجيًا</span>'}</p><p class="muted" style="margin:0">${esc(d.production.note)}</p></div></div>
+  <div class="card"><div class="card-h"><h2>الحدود الفعلية اللي يطبقها المحرك</h2></div><div class="kv">${Object.entries(d.effective_engine_limits).map(([k, v]) => `<div>${esc(arOf(AR.limits, k))} <code class="ltr">${esc(k)}</code></div><div>${esc(v === true ? "مفعّل" : v === false ? "غير مفعّل" : v)}</div>`).join("")}</div></div>`;
+  $("#rsave").onclick = async () => { let ov; try { ov = JSON.parse($("#rov").value || "{}"); if (!ov || typeof ov !== "object" || Array.isArray(ov)) throw 0; }
+    catch { $("#rmsg").innerHTML = errBox('الحدود الإضافية لازم تكون بصيغة JSON بين قوسين { }، مثل: {"max_order_notional_quote": "500"}'); return; }
     try { await api("/api/risk", { capital: $("#rcap").value, fee: $("#rfee").value, slippage_bps: $("#rslip").value, max_position: $("#rmax").value || null, risk_overrides: ov });
       $("#rmsg").innerHTML = '<div class="okmsg">انحفظ.</div>'; } catch (e) { $("#rmsg").innerHTML = errBox(e); } };
 };
@@ -555,9 +576,9 @@ PAGES.logs = async () => {
   <td class="ltr ${sign(r.net_return)}">${fmtSPct(r.net_return)}</td><td class="ltr">${fmtSPct(r.hold_return)}</td><td class="ltr bad">${fmtPct(r.max_drawdown)}</td>
   <td>${verdictPill(r.verdict)}</td><td><button class="sm" data-run="${esc(r.id)}">عرض</button></td></tr>`).join("")}</tbody></table></div>` : empty("ما فيه تجارب بعد", "flask")}</div>
   <div class="cols"><div class="card"><div class="card-h"><h2>العمليات</h2></div><div class="tw" style="max-height:380px"><table><thead><tr><th>الوقت</th><th>العملية</th><th>التفاصيل</th></tr></thead><tbody>
-  ${d.operations.map((o) => `<tr><td class="ltr">${esc(o.at.slice(0, 19).replace("T", " "))}</td><td><span class="pill">${esc(o.kind)}</span></td><td class="muted ltr">${esc(JSON.stringify(Object.fromEntries(Object.entries(o).filter(([k]) => !["at", "kind"].includes(k)))))}</td></tr>`).join("")}</tbody></table></div></div>
+  ${d.operations.map((o) => `<tr><td class="ltr">${esc(o.at.slice(0, 19).replace("T", " "))}</td><td><span class="pill">${esc(arOf(AR.ops, o.kind))}</span></td><td class="muted wrap">${opDetails(o)}</td></tr>`).join("")}</tbody></table></div></div>
   <div class="card"><div class="card-h"><h2>الأخطاء</h2></div>${d.errors.length ? `<pre>${esc(d.errors.join("\n"))}</pre>` : empty("ما فيه أخطاء", "check")}</div></div>
-  ${Object.entries(d.paper_logs).map(([k, v]) => `<div class="card"><div class="card-h"><h2>سجل الجلسة <small>${esc(k)}</small></h2></div><pre>${esc(v.join("\n"))}</pre></div>`).join("")}`;
+  ${Object.entries(d.paper_logs).map(([k, v]) => `<div class="card"><div class="card-h"><h2>سجل الجلسة <small>${esc(k)}</small></h2></div><pre class="rtl-log">${esc(v.map(logLineAr).join("\n"))}</pre></div>`).join("")}`;
 };
 
 PAGES.system = async () => {
@@ -567,14 +588,14 @@ PAGES.system = async () => {
   const passed = (tests.match(/(\d+) passed/) || [])[1], failed = (tests.match(/(\d+) failed/) || [])[1];
   main.innerHTML = header("حالة النظام", "صحة المحرك ومكوّناته", chip(d.mainnet_enabled ? "التداول الحقيقي مفعّل!" : "التداول الحقيقي معطّل", d.mainnet_enabled ? "bad" : "good"))
   + `<div class="kpis">
-  ${kpi({ k: "التداول الحقيقي", v: d.mainnet_enabled ? "مفعّل!" : "معطّل", cls: d.mainnet_enabled ? "bad" : "good", ic: "shield", tone: d.mainnet_enabled ? "r" : "g", s: "MAINNET_ENABLED في الكود" })}
+  ${kpi({ k: "التداول الحقيقي", v: d.mainnet_enabled ? "مفعّل!" : "معطّل", cls: d.mainnet_enabled ? "bad" : "good", ic: "shield", tone: d.mainnet_enabled ? "r" : "g", s: "مُقفل برمجيًا (MAINNET_ENABLED)" })}
   ${kpi({ k: "جامع الأدلة", v: ev.available ? `${fmtNum(ev.entries, 0)} لقطة` : "غير متاح", ic: "db", tone: ev.available ? "g" : "w", s: ev.available ? `آخر لقطة <span class="ltr">${esc(String(ev.last || "").slice(0, 16).replace("T", " "))}</span>` : "" })}
   ${kpi({ k: "الاختبارات الآلية", v: passed ? `${fmtNum(passed, 0)} ناجح` : "—", cls: failed ? "bad" : "good", ic: "check", tone: failed ? "r" : "g", s: failed ? `${failed} فاشل` : "صفر فشل" })}
   </div>
-  <div class="cols">${ev.available ? `<div class="card"><div class="card-h"><h2>جامع الأدلة</h2></div><div class="kv">${Object.entries(ev.kinds).map(([k, v]) => `<div>${esc(k)}</div><div>${fmtNum(v, 0)}</div>`).join("")}</div>
+  <div class="cols">${ev.available ? `<div class="card"><div class="card-h"><h2>جامع الأدلة</h2></div><div class="kv">${Object.entries(ev.kinds).map(([k, v]) => `<div>${esc(arOf(AR.evidence, k))}</div><div>${fmtNum(v, 0)}</div>`).join("")}</div>
   <div style="margin-top:12px">${ev.alerts.length ? `<pre>${esc(ev.alerts.join("\n"))}</pre>` : '<div class="okmsg">ما فيه تنبيهات.</div>'}</div></div>` : ""}
   <div class="card"><div class="card-h"><h2>تفاصيل</h2></div><div class="kv"><div>آخر تشغيل للاختبارات</div><div>${esc(d.tests ? d.tests.file : "—")}</div>
-  <div>الملخص</div><div style="white-space:normal">${esc(tests || "—")}</div><div>مساحة العمل</div><div>${esc(d.workspace)}</div><div>وقت الخادم</div><div>${esc(d.time.slice(0, 19).replace("T", " "))} UTC</div></div></div></div>`;
+  <div>الملخص</div><div style="white-space:normal">${esc(tests ? pytestAr(tests) : "—")}</div><div>مساحة العمل</div><div>${esc(d.workspace)}</div><div>وقت الخادم</div><div>${esc(d.time.slice(0, 19).replace("T", " "))} غرينتش</div></div></div></div>`;
 };
 
 window.addEventListener("hashchange", () => { const p = location.hash.slice(1); if (p && p !== current && PAGES[p]) nav(p); });

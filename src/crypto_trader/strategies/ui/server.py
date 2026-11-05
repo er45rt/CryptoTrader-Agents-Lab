@@ -36,6 +36,8 @@ from . import store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/javascript; charset=utf-8",
+                "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -112,10 +114,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path in ("/", "/index.html"):
                 return self._send(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
-            if url.path == "/app.js":
-                return self._send(200, (STATIC / "app.js").read_bytes(), "text/javascript; charset=utf-8")
-            if url.path == "/app.css":
-                return self._send(200, (STATIC / "app.css").read_bytes(), "text/css; charset=utf-8")
+            if url.path.lstrip("/") in STATIC_FILES:      # a fixed list: no path is ever built from the request
+                name = url.path.lstrip("/")
+                return self._send(200, (STATIC / name).read_bytes(), STATIC_FILES[name])
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             routes = {
                 "/api/home": lambda: self.ws.home(),

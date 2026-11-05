@@ -208,3 +208,17 @@ th[data-k]{cursor:pointer;user-select:none}th[data-k]:hover{color:var(--text)}
 .kpi canvas.spark{top:14px;bottom:auto;left:14px;width:84px;height:28px;opacity:.95}
 canvas{direction:ltr}
 .heat{direction:rtl;grid-template-columns:48px repeat(12,minmax(34px,1fr)) 58px;min-width:560px}.heat .c,.heat .t{direction:ltr}
+
+/* Arabic display (D30 audit): RTL tooltips/logs, in-page dialogs, Arabic file picker, collapsible technical detail */
+.tip{direction:rtl;text-align:right}
+.tip .tt{direction:ltr;text-align:right}
+pre.rtl-log{direction:rtl;text-align:right;unicode-bidi:plaintext}
+details.tech{margin-top:6px;font-size:12px}
+details.tech summary{cursor:pointer;opacity:.85}
+details.tech pre{margin-top:6px;max-height:180px}
+.filebtn{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:10px;border:1px solid var(--line2);background:var(--panel2);font-weight:600;cursor:pointer;color:var(--text);flex:0 0 auto}
+.filebtn:hover{border-color:var(--faint)}
+#upname{flex:1;min-width:120px}
+.modal{position:fixed;inset:0;background:rgba(3,6,12,.6);display:grid;place-items:center;z-index:50;animation:rise .15s ease both}
+.modal-box{background:var(--panel);border:1px solid var(--line2);border-radius:var(--r);padding:20px 22px;min-width:300px;max-width:min(90vw,460px);box-shadow:0 30px 60px -20px rgba(0,0,0,.7)}
+.modal-text{font-size:15px;font-weight:600}
