@@ -81,6 +81,32 @@ def _cut(bars: list[Bar], start: datetime | None, end: datetime | None, not_afte
     return keep
 
 
+_OHLCV = ["date", "open", "high", "low", "close", "volume"]
+
+
+def _feather_rows_before(path: Path, not_after: datetime | None) -> list[dict]:
+    """Feather (Arrow IPC) rows before `not_after`, record batch by record batch.
+
+    For each batch only the date column is converted to find the cut; OHLCV values are converted for the rows
+    before it only, and no batch after the one holding the first cut-off row is ever loaded."""
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    rows: list[dict] = []
+    with pa.memory_map(str(path), "r") as source:
+        reader = ipc.open_file(source)
+        for k in range(reader.num_record_batches):
+            batch = reader.get_batch(k)
+            n = batch.num_rows
+            if not_after is not None:
+                dates = batch.column(batch.schema.get_field_index("date")).to_pylist()
+                n = next((j for j, d in enumerate(dates) if _dt(d) >= not_after), n)
+            rows.extend(batch.slice(0, n).select(_OHLCV).to_pylist())
+            if n < batch.num_rows:
+                break
+    return rows
+
+
 def load_bars(path: str | Path, timeframe: str, *, start: datetime | None = None,
               end: datetime | None = None, not_after: datetime | None = None,
               allow_gaps: bool = False) -> list[Bar]:
@@ -88,14 +114,17 @@ def load_bars(path: str | Path, timeframe: str, *, start: datetime | None = None
     path = Path(path)
     if timeframe not in TIMEFRAMES:
         raise StrategyError(f"unsupported timeframe {timeframe!r}.")
+    # Reading stops at the first row at/after `not_after` (files are chronological; check_bars enforces it):
+    # only that row's date is decoded, its prices/volume and every later row are never read or converted.
     if path.suffix == ".feather":
-        import pandas as pd
-
-        frame = pd.read_feather(path)
-        rows = frame[["date", "open", "high", "low", "close", "volume"]].to_dict("records")
+        rows = _feather_rows_before(path, not_after)
     elif path.suffix == ".csv":
+        rows = []
         with path.open(newline="", encoding="utf-8") as fh:
-            rows = list(csv.DictReader(fh))
+            for row in csv.DictReader(fh):
+                if not_after is not None and _dt(row["date"]) >= not_after:
+                    break
+                rows.append(row)
     else:
         raise StrategyError("data file must be .csv or .feather.")
     bars = _cut(bars_from_rows(rows, timeframe), start, end, not_after, None)

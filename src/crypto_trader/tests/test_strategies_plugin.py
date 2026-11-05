@@ -240,6 +240,85 @@ def test_load_bars_hard_cutoff(tmp_path):
     assert len(bars) == 20 and all(b.open_time < cutoff for b in bars)
 
 
+def test_load_bars_never_parses_values_at_or_after_the_cutoff(tmp_path):
+    # Sol D30-D33 r1 blocker 2: sealed rows were converted to Decimal before the not_after filter.
+    # A row at the cut-off with an unparseable price must not be touched (it would raise if parsed).
+    rows = [{"date": b.open_time.isoformat(), "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+             "volume": b.volume} for b in synthetic_bars(30)]
+    cutoff = T0 + timedelta(hours=4 * 20)
+    for r in rows[20:]:
+        r["open"] = r["high"] = r["low"] = r["close"] = "SEALED-NOT-A-NUMBER"
+    path = tmp_path / "d.csv"
+    import csv
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    bars = load_bars(path, "4h", not_after=cutoff)
+    assert len(bars) == 20 and all(b.open_time < cutoff for b in bars)
+    with pytest.raises(Exception):          # without a cut-off the bad values are parsed (proves the probe bites)
+        load_bars(path, "4h")
+
+
+def test_load_bars_csv_stops_reading_at_the_first_cutoff_row(tmp_path):
+    # Owner decision D35: reading stops at the first row at/after not_after. Rows after it are never read:
+    # here they are not even valid CSV dates/prices, and the load still succeeds.
+    rows = [{"date": b.open_time.isoformat(), "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+             "volume": b.volume} for b in synthetic_bars(30)]
+    cutoff = T0 + timedelta(hours=4 * 20)
+    rows[20].update(open="SEALED", high="SEALED", low="SEALED", close="SEALED")
+    for r in rows[21:]:
+        r.update(date="SEALED-NOT-A-DATE", open="SEALED", high="SEALED", low="SEALED", close="SEALED")
+    path = tmp_path / "d.csv"
+    import csv
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    bars = load_bars(path, "4h", not_after=cutoff)
+    assert len(bars) == 20 and bars[-1].open_time == cutoff - timedelta(hours=4)
+
+
+def test_load_bars_feather_never_loads_batches_after_the_cutoff(tmp_path, monkeypatch):
+    # Owner decision D35: a Feather file is read record batch by record batch; only dates are converted to find
+    # the cut, OHLCV of rows at/after it is never converted, and later batches are never loaded.
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    bars = synthetic_bars(30)
+    cutoff = T0 + timedelta(hours=4 * 15)                      # cut inside batch 1 (rows 10-19)
+    def col(attr, sealed):
+        return [float(getattr(b, attr)) if i < 15 else sealed for i, b in enumerate(bars)]
+    table = pa.table({"date": pa.array([b.open_time for b in bars], pa.timestamp("ms", tz="UTC")),
+                      "open": col("open", 5.0), "high": col("high", 1.0), "low": col("low", 9.0),   # high < low:
+                      "close": col("close", 5.0), "volume": [float(b.volume) for b in bars]})         # Bar refuses it
+    path = tmp_path / "BTC_USDT-4h.feather"
+    with pa.OSFile(str(path), "wb") as sink, ipc.new_file(sink, table.schema) as writer:
+        for batch in table.to_batches(max_chunksize=10):
+            writer.write_batch(batch)
+
+    loaded: list[int] = []
+    real_open = ipc.open_file
+
+    class Spy:
+        def __init__(self, source):
+            self._r = real_open(source)
+            self.num_record_batches = self._r.num_record_batches
+
+        def get_batch(self, k):
+            loaded.append(k)
+            return self._r.get_batch(k)
+
+    monkeypatch.setattr(ipc, "open_file", Spy)
+    out = load_bars(path, "4h", not_after=cutoff)
+    assert len(out) == 15 and out[-1].open_time == cutoff - timedelta(hours=4)
+    assert loaded == [0, 1], f"batches loaded: {loaded}"
+    loaded.clear()
+    with pytest.raises(StrategyError):      # without a cut-off the sealed values are converted (probe bites)
+        load_bars(path, "4h")
+    assert loaded == [0, 1, 2]              # without a cut-off every batch is read
+
+
 def test_naive_timestamps_are_refused():
     with pytest.raises(StrategyError):
         bars_from_rows([{"date": "2024-01-01T00:00:00", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 0}], "4h")
