@@ -53,3 +53,64 @@ def test_language_is_display_only():
     for f in ("server.py", "store.py", "decisions.py", "demo.py"):
         # the static file name "lang.js" (served as a file) is not a language parameter
         assert not re.search(r"\blang(uage)?\b(?!\.js)", (STRAT / "ui" / f).read_text(encoding="utf-8")), f
+
+
+_NODE_HARNESS = r"""
+const fs = require("fs"), vm = require("vm");
+const queue = [];                       // pending MutationRecords, delivered like the browser does
+let observer = null, writes = 0;
+function textNode(v) {
+  let value = v;
+  return { nodeType: 3, parentElement: { tagName: "SPAN" },
+    get nodeValue() { return value; },
+    set nodeValue(x) { value = x; writes++; queue.push({ type: "characterData", target: this }); } };
+}
+const body = { querySelectorAll: () => [], getAttribute: () => null };
+const ctx = {
+  localStorage: { getItem: () => "en", setItem() {} },
+  fetch: async () => ({ json: async () => JSON.parse(process.argv[2]) }),
+  document: { body, documentElement: {}, getElementById: () => null,
+              createTreeWalker: () => ({ nextNode: () => false }) },
+  NodeFilter: { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2 },
+  MutationObserver: class { constructor(cb) { observer = cb; } observe() {} },
+  location: { reload() {} },
+};
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8") + "\n;globalThis.__init = initLang;", ctx);
+ctx.__init().then(() => {
+  const nodes = JSON.parse(process.argv[3]).map(textNode);
+  nodes.forEach((n) => queue.push({ type: "characterData", target: n }));
+  let rounds = 0;
+  while (queue.length && rounds < 50) { const batch = queue.splice(0); observer(batch); rounds++; }
+  console.log(JSON.stringify({ writes, pending: queue.length, rounds, values: nodes.map((n) => n.nodeValue) }));
+});
+"""
+
+
+def _run_lang_js(texts: list[str], en: dict[str, str]) -> dict:
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    out = subprocess.run([node, "-e", _NODE_HARNESS, "--", str(STATIC / "lang.js"),
+                          json.dumps(en, ensure_ascii=False), json.dumps(texts, ensure_ascii=False)],
+                         capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_english_mode_does_not_rewrite_untranslatable_arabic_forever():
+    # Sol D30-D33 r1 blocker 1: an Arabic strategy name with no English entry was rewritten on every
+    # mutation, each write producing another mutation (unbounded loop). It must settle with no write at all.
+    res = _run_lang_js(["تجربتي"], {"الرصيد": "Balance"})
+    assert res["pending"] == 0 and res["writes"] == 0, res
+    assert res["values"] == ["تجربتي"]
+
+
+def test_english_mode_translates_once_then_settles():
+    res = _run_lang_js(["الرصيد: تجربتي"], {"الرصيد": "Balance"})
+    assert res["pending"] == 0 and res["writes"] == 1, res
+    assert res["values"] == ["Balance: تجربتي"]

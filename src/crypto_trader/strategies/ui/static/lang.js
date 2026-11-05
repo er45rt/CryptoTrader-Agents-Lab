@@ -21,6 +21,14 @@ function tr(s) {
   if (EN_RE) out = out.replace(EN_RE, (m) => EN[m] ?? m);
   return out.replace(/[،؛؟«»]/g, (c) => PUNCT[c]);
 }
+/** Translate one text node in place. Writes only when the text actually changes: an unchanged write would be
+    observed again by the MutationObserver below and loop forever (e.g. an Arabic strategy name with no entry). */
+function trText(n) {
+  const v = n.nodeValue;
+  if (!/[؀-ۿ]/.test(v)) return;
+  const t = tr(v);
+  if (t !== v) n.nodeValue = t;
+}
 const SKIP = new Set(["SCRIPT", "STYLE", "CODE"]);
 function translateNode(root) {
   if (LANG !== "en" || !root) return;
@@ -30,11 +38,11 @@ function translateNode(root) {
   });
   const nodes = [];
   while (walk.nextNode()) nodes.push(walk.currentNode);
-  nodes.forEach((n) => { n.nodeValue = tr(n.nodeValue); });
+  nodes.forEach(trText);
   const els = root.querySelectorAll ? root.querySelectorAll("[title],[placeholder],option") : [];
   [root, ...els].forEach((el) => {
     if (!el.getAttribute) return;
-    ["title", "placeholder"].forEach((a) => { const v = el.getAttribute(a); if (v && /[؀-ۿ]/.test(v)) el.setAttribute(a, tr(v)); });
+    ["title", "placeholder"].forEach((a) => { const v = el.getAttribute(a); if (v && /[؀-ۿ]/.test(v) && tr(v) !== v) el.setAttribute(a, tr(v)); });
   });
 }
 function applyLangChrome() {
@@ -56,8 +64,8 @@ async function initLang() {
   new MutationObserver((muts) => {
     if (LANG !== "en") return;
     for (const m of muts) {
-      if (m.type === "characterData") { if (/[؀-ۿ]/.test(m.target.nodeValue)) m.target.nodeValue = tr(m.target.nodeValue); }
-      else m.addedNodes.forEach((n) => (n.nodeType === 3 ? (/[؀-ۿ]/.test(n.nodeValue) && (n.nodeValue = tr(n.nodeValue))) : translateNode(n)));
+      if (m.type === "characterData") trText(m.target);
+      else m.addedNodes.forEach((n) => (n.nodeType === 3 ? trText(n) : translateNode(n)));
     }
   }).observe(document.body, { childList: true, subtree: true, characterData: true });
 }
