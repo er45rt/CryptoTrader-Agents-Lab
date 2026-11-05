@@ -245,3 +245,37 @@ def test_sol_d30_7_start_is_refused_while_a_stopped_loop_is_still_alive(ws, monk
     assert (folder / "STOP").exists() and spawned == []     # STOP kept, no second loop
     (folder / "STOP").unlink()
     assert ws.paper_start("s1") == {"ok": True, "already_running": True} and spawned == []
+
+
+# --- D30 UI refresh: compressed responses and visible paper errors ------------------------------------------
+
+def test_large_responses_are_gzipped_only_when_the_client_accepts_it(live, ws):
+    import gzip as _gzip
+
+    ws.upload_strategy("up.py", GOOD)
+    spec = next(s["spec"] for s in ws.strategies()["strategies"] if s["name"] == "up")
+    rid = ws.backtest({"spec": spec, "data": _data(ws)})["id"]
+    for accept in ("gzip, deflate, br", None):
+        conn = http.client.HTTPConnection("127.0.0.1", live, timeout=30)
+        headers = {"Host": "127.0.0.1"} | ({"Accept-Encoding": accept} if accept else {})
+        conn.request("GET", f"/api/run?id={rid}", headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        assert resp.status == 200
+        if accept:
+            assert resp.getheader("Content-Encoding") == "gzip" and int(resp.getheader("Content-Length")) == len(raw)
+            raw = _gzip.decompress(raw)
+        else:
+            assert resp.getheader("Content-Encoding") is None
+        assert json.loads(raw)["id"] == rid
+
+
+def test_paper_detail_reports_the_last_loop_error(ws):
+    folder = ws.root / "paper" / "s2"
+    folder.mkdir()
+    (folder / "session.json").write_text(json.dumps({"strategy_name": "x", "market": {"symbol": "BTCUSDT"}, "timeframe": "4h",
+                                                     "settings": {"capital_quote": "1000"}}))
+    assert ws.paper_detail("s2")["error"] is None
+    (folder / "last_error.json").write_text(json.dumps({"at": "2026-11-05T03:06:42+00:00", "error": "PermissionError: x", "consecutive": 3}))
+    assert ws.paper_detail("s2")["error"]["consecutive"] == 3

@@ -331,8 +331,9 @@ class Workspace:
             decisions = [{"at": d["observed_at"], "action": d["action"], "rationale": d["rationale"],
                           "risk": d.get("risk_decision"), "validity": d.get("validity_disposition")}
                          for d in rep.get("decisions", []) if d["rationale"] not in ("warmup", "pre-session-history")][-50:]
+        err = json.loads((folder / "last_error.json").read_text(encoding="utf-8")) if (folder / "last_error.json").exists() else None
         return {"session": doc, "status": st, "running": self._running(folder), "bars": bars, "decisions": decisions[::-1],
-                "log": _tail(folder / "loop.log", 40)}
+                "log": _tail(folder / "loop.log", 40), "error": err}
 
     # --- risk / logs / system / home --------------------------------------------------------------------------
     def risk(self) -> dict[str, Any]:

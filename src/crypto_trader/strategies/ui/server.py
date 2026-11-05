@@ -12,6 +12,7 @@ Workspace (default %USERPROFILE%\\ct_engine_workspace): strategies/, data/, runs
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import subprocess
@@ -65,6 +66,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: Any, ctype: str = "application/json; charset=utf-8") -> None:
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=_json_default).encode("utf-8")
         self.send_response(code)
+        # compress: on this machine local responses above ~200 KB are cut by the network filter (reset after ~19 s);
+        # a backtest result is ~350 KB raw and ~70 KB gzipped
+        if len(data) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            data = gzip.compress(data, 6)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
