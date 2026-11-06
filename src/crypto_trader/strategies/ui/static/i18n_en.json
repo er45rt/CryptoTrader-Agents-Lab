@@ -910,5 +910,21 @@
 "ما فيه اختبارين بنفس البيانات والفترة والإعدادات بعد. شغّل استراتيجيتين على نفس الملف والفترة عشان تظهر المقارنة هنا.": "No two backtests share the same data, period and settings yet. Run two strategies on the same file and period to compare them here.",
 "اختبارات بلا نظير قابل للمقارنة": "Backtests without a comparable peer",
 "تجربة بدون ملف نتيجة، ما دخلت المقارنة.": "runs without a result file were left out of the comparison.",
-"نقارن فقط داخل المجموعة الواحدة: نفس ملف البيانات والإطار والفترة ونوع الاختبار والرسوم والانزلاق. ما نرتّب المجموعات مقابل بعض. كل تجربة إضافية ترفع عتبة حكم المتانة.": "Comparisons are only within one group: same data file, timeframe, period, backtest type, fees and slippage. Groups are never ranked against each other. Every extra run raises the robustness bar."
+"نقارن فقط داخل المجموعة الواحدة: نفس ملف البيانات والإطار والفترة ونوع الاختبار والرسوم والانزلاق. ما نرتّب المجموعات مقابل بعض. كل تجربة إضافية ترفع عتبة حكم المتانة.": "Comparisons are only within one group: same data file, timeframe, period, backtest type, fees and slippage. Groups are never ranked against each other. Every extra run raises the robustness bar.",
+"غير معروف": "unknown",
+"قبل": "age",
+"خطأ مسجّل": "recorded error",
+"تعمل لكن بياناتها متأخرة (آخر دورة": "is running but its data is late (last cycle",
+"الجلسة التجريبية": "Demo session",
+"متأخر": "late",
+"جامع الأدلة يعمل · آخر قيد": "Evidence collector running · last entry",
+"جامع الأدلة متأخر · آخر قيد": "Evidence collector late · last entry",
+"جامع الأدلة غير مرصود": "Evidence collector not monitored",
+"شراء شهري فات موعده": "Monthly buy missed",
+"خطأ في الواجهة خلال 24 ساعة": "UI errors in the last 24 hours",
+"مشكلة": "problems",
+"تنبيه": "alerts",
+"كل شي سليم": "All clear",
+"تحديث": "Updated",
+"أشهر، آخرها": "months, latest"
 }

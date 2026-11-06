@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
+from . import alerts, compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -151,6 +151,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/dca": lambda: self.dca.status(),
                 # dashboard (D42 B2): backtests side by side only when comparable
                 "/api/compare": lambda: compare.comparison(self.ws.root),
+                # dashboard (D42 B3): one status/alerts bar, read-only and without network
+                "/api/status": lambda: alerts.status(self.ws, demos=self.demo.list, price_cache=self.prices.cached,
+                                                     dca_status=lambda: self.dca.status(priced=False)),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})

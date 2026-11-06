@@ -126,12 +126,12 @@ class Plans:
         return tx
 
     # --- status ----------------------------------------------------------------------------------------
-    def status(self) -> dict[str, Any]:
+    def status(self, *, priced: bool = True) -> dict[str, Any]:
         today = self._today()
         with self.ledger._lock:          # one snapshot of both files, never read while a writer replaces them
             plans = self._load()
             txs = self.ledger._load()
-        quotes = self._prices(sorted({p["asset"] for p in plans})) if (self._prices and plans) else {}
+        quotes = self._prices(sorted({p["asset"] for p in plans})) if (priced and self._prices and plans) else {}
         out, reminders = [], []
         for p in plans:
             buys = sorted((t for t in txs if t.get("dca_plan") == p["id"] and t["type"] == "buy"

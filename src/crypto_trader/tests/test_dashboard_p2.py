@@ -94,3 +94,83 @@ def test_the_comparison_endpoint_and_card(live, ws):
     assert r.status == 200 and set(doc) == {"groups", "runs", "missing"}
     body = DASH[DASH.index("async function dbCompare"):]
     assert 'api("/api/compare")' in body and "comparable" in body and "dbCompare();" in DASH
+
+
+class _WS:
+    def __init__(self, root, sessions, collector):
+        self.root, self._s, self._c = root, sessions, collector
+
+    def paper_sessions(self):
+        return {"sessions": self._s}
+
+    def system(self):
+        return {"evidence_collector": self._c}
+
+
+def test_status_tells_stale_data_from_a_stopped_process(tmp_path):
+    from datetime import datetime, timezone
+
+    from crypto_trader.strategies.ui import alerts
+
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    sess = lambda name, running, last, error=None: {"name": name, "running": running, "last_cycle": last,  # noqa: E731
+                                                   "timeframe": "4h", "error": error}
+    ws = _WS(tmp_path, [sess("fresh", True, "2026-03-10T08:01:00+00:00"), sess("late", True, "2026-03-09T20:00:00+00:00"),
+                        sess("off", False, "2026-03-01T00:00:00+00:00"),
+                        sess("broken", False, None, {"at": "2026-03-10T11:00:00+00:00", "error": "PermissionError"})],
+             {"available": True, "entries": 9, "last": "2026-03-10T11:45:00+00:00"})
+    (tmp_path / "ui_errors.log").write_text("[2026-03-10T09:00:00+00:00] GET /x: boom\n  traceback line\n"
+                                            "[2026-03-01T09:00:00+00:00] old\n", encoding="utf-8")
+    st = alerts.status(ws, now=now, demos=lambda: {"demos": [{"name": "d1", "state": "error"}, {"name": "d2", "state": "done"}]},
+                       price_cache=lambda: {"BTC": {"price": "1", "at": "2026-03-10T11:58:00+00:00"},
+                                            "ETH": {"price": "1", "at": "2026-03-10T10:00:00+00:00"},
+                                            "XYZ": {"price": None, "reason": "no Binance USDT pair"}},
+                       dca_status=lambda: {"reminders": [{"state": "missed", "asset": "BTC", "month": m,
+                                                          "planned_date": m + "-05"} for m in ("2026-01", "2026-02")]})
+    got = {(i["code"], i.get("name") or i.get("asset")): i["level"] for i in st["items"]}
+    assert got[("paper_running", "fresh")] == "ok"
+    assert got[("paper_stale", "late")] == "warn"                 # alive, but its last cycle is 16 h old on 4h bars
+    assert got[("paper_stopped", "off")] == "info"                # not alive: stopped, not "stale"
+    assert got[("session_error", "broken")] == "bad" and got[("paper_stopped", "broken")] == "info"
+    assert got[("demo_error", "d1")] == "bad" and ("demo_error", "d2") not in got
+    assert ("price_stale", "BTC") not in got and got[("price_stale", "ETH")] == "warn"
+    assert got[("price_unavailable", "XYZ")] == "warn"
+    assert got[("collector_ok", None)] == "ok" and got[("dca_missed", "BTC")] == "warn"
+    missed = [i for i in st["items"] if i["code"] == "dca_missed"]
+    assert len(missed) == 1 and missed[0]["count"] == 2 and missed[0]["month"] == "2026-02"   # one line per asset
+    assert got[("live_disabled", None)] == "ok"
+    err = next(i for i in st["items"] if i["code"] == "ui_errors")
+    assert err["count"] == 1                                       # only the last 24 h, only timestamped lines
+    late = alerts.status(_WS(tmp_path, [], {"available": True, "last": "2026-03-10T10:00:00+00:00"}), now=now)
+    assert [i["code"] for i in late["items"] if i["area"] == "collector"] == ["collector_stale"]
+    assert st["summary"] == {k: sum(i["level"] == k for i in st["items"]) for k in ("bad", "warn", "info", "ok")}
+
+
+def test_the_status_bar_never_fetches(tmp_path):
+    from crypto_trader.strategies.ui import alerts, dca, portfolio, prices
+
+    p = prices.BinancePrices(tmp_path, fetch=lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched")))
+    assert p.cached() == {}
+    lg = portfolio.Ledger(tmp_path)
+    plans = dca.Plans(lg, prices=lambda a: (_ for _ in ()).throw(AssertionError("priced")))
+    plans.create({"asset": "BTC", "amount": "10", "day": "5", "start": "2026-01"})
+    assert plans.status(priced=False)["plans"][0]["price_missing"]
+    src = Path(alerts.__file__).read_text(encoding="utf-8")
+    assert "urllib" not in src and "fetch_public_klines" not in src and "socket" not in src
+    assert "price_cache=self.prices.cached" in Path(server.__file__).read_text(encoding="utf-8")
+
+
+def test_the_status_endpoint_and_bar(live, ws):
+    import json as _json
+
+    c = http.client.HTTPConnection("127.0.0.1", live, timeout=30)
+    c.request("GET", "/api/status", headers={"Host": "127.0.0.1"})
+    r = c.getresponse()
+    doc = _json.loads(r.read())
+    c.close()
+    assert r.status == 200 and {i["code"] for i in doc["items"]} >= {"live_disabled"}
+    body = DASH[DASH.index("const DB_ST = {"):]
+    from crypto_trader.strategies.ui import alerts
+    codes = set(re.findall(r'add\("\w+", "\w+", "(\w+)"', Path(alerts.__file__).read_text(encoding="utf-8")))
+    codes |= {"live_enabled", "collector_stale", "dca_due", "dca_missed"}
+    assert all(f"{c}:" in body for c in codes), [c for c in codes if f"{c}:" not in body]

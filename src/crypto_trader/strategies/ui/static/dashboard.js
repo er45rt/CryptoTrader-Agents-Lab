@@ -17,6 +17,8 @@ PAGES.home = async () => {
   <div class="card" id="db-compare"></div>`;
   $("#db-spaces").onclick = (e) => { const b = e.target.closest("[data-space]"); if (!b) return; DB.space = b.dataset.space; dbPaint(); dbDetail(); };
   dbPaint();
+  dbStatus();
+  timer = setInterval(() => { if (current === "home") dbStatus(); }, 60000);
   dbCompare();
   const load = (k, p) => p.then((d) => { DB.spaces[k] = { ok: true, d }; }, (e) => { DB.spaces[k] = { ok: false, e }; })
     .then(() => { if (current !== "home") return; dbCard(k); if (k === DB.space) dbDetail(); });
@@ -135,4 +137,39 @@ async function dbCompare() {
       ${alone.map((g) => `<div class="cmp-g"><div class="cmp-h">${head(g.key)}</div>${table(g.runs)}</div>`).join("")}</details>` : ""}
     ${d.missing.length ? `<div class="warn" style="font-size:12px;margin-top:6px">${d.missing.length} تجربة بدون ملف نتيجة، ما دخلت المقارنة.</div>` : ""}
     <div class="muted" style="font-size:12px;margin-top:8px">نقارن فقط داخل المجموعة الواحدة: نفس ملف البيانات والإطار والفترة ونوع الاختبار والرسوم والانزلاق. ما نرتّب المجموعات مقابل بعض. كل تجربة إضافية ترفع عتبة حكم المتانة.</div>`;
+}
+
+/** Status and alerts bar (B3): one line per recorded fact from /api/status (no network behind it). Stale data (a process
+    alive but late) and a stopped process are worded apart; problems first, then information, then what is fine. */
+const dbAgo = (s) => (!isNum(s) ? "غير معروف" : s < 3600 ? `قبل ${Math.max(1, Math.round(s / 60))} دقيقة` : s < 172800 ? `قبل ${Math.round(s / 3600)} ساعة` : `قبل ${Math.round(s / 86400)} يوم`);
+const DB_ST = {
+  live_disabled: () => "التداول الحقيقي معطّل",
+  live_enabled: () => "التداول الحقيقي مفعّل",
+  session_error: (i) => `جلسة ${i.name}: خطأ مسجّل ${i.at ? dbAt(i.at) : ""}`,
+  paper_stale: (i) => `جلسة ${i.name} تعمل لكن بياناتها متأخرة (آخر دورة ${dbAgo(i.age_s)})`,
+  paper_running: (i) => `جلسة ${i.name} تعمل`,
+  paper_stopped: (i) => `جلسة ${i.name} متوقفة`,
+  demo_error: (i) => `الجلسة التجريبية ${i.name}: خطأ`,
+  price_unavailable: (i) => `سعر ${i.asset} غير متاح`,
+  price_stale: (i) => `سعر ${i.asset} متأخر (${dbAgo(i.age_s)})`,
+  collector_ok: (i) => `جامع الأدلة يعمل · آخر قيد ${dbAgo(i.age_s)}`,
+  collector_stale: (i) => `جامع الأدلة متأخر · آخر قيد ${dbAgo(i.age_s)}`,
+  collector_unavailable: () => "جامع الأدلة غير مرصود",
+  dca_due: (i) => `شراء شهري مستحق اليوم: ${i.asset}`,
+  dca_missed: (i) => `شراء شهري فات موعده: ${i.asset} (${i.count > 1 ? i.count + " أشهر، آخرها " : ""}${i.month})`,
+  ui_errors: (i) => `${i.count} خطأ في الواجهة خلال 24 ساعة`,
+};
+const DB_ST_NAV = { paper: "paper", demo: "demo", prices: "portfolio", collector: "system", dca: "dca", errors: "logs" };
+async function dbStatus() {
+  const box = $("#db-status"); if (!box) return;
+  let d; try { d = await api("/api/status"); } catch (e) { box.innerHTML = `<div class="stbar">${errBox(e)}</div>`; return; }
+  if (current !== "home" || !$("#db-status")) return;
+  const order = { bad: 0, warn: 1, info: 2, ok: 3 }, tone = { bad: "bad", warn: "warn", info: "", ok: "good" };
+  const items = [...d.items].sort((a, b) => order[a.level] - order[b.level]);
+  const head = d.summary.bad ? `<span class="pill bad">${d.summary.bad} مشكلة</span>` : d.summary.warn ? `<span class="pill warn">${d.summary.warn} تنبيه</span>`
+    : `<span class="pill good">كل شي سليم</span>`;
+  box.innerHTML = `<div class="stbar">${head}${items.map((i) => {
+    const nav = DB_ST_NAV[i.area], text = (DB_ST[i.code] || (() => i.code))(i);
+    return `<span class="pill ${tone[i.level]}" ${nav ? `data-nav="${nav}" style="cursor:pointer"` : ""} title="${esc(i.detail || "")}">${esc(text)}</span>`; }).join("")}
+    <span class="muted stbar-at">تحديث <span class="ltr">${esc(dbAt(d.at))}</span> غرينتش</span></div>`;
 }

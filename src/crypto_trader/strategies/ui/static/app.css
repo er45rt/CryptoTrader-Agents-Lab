@@ -284,3 +284,7 @@ details.tech pre{margin-top:6px;max-height:180px}
 /* strategy comparison (phase 2, B2) */
 .cmp-g{margin-top:12px}.cmp-h{font-size:12.5px;color:var(--muted);margin-bottom:6px}
 .cmp-alone{margin-top:12px}.cmp-alone summary{cursor:pointer;font-weight:600}
+
+/* status and alerts bar (phase 2, B3) */
+.stbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px;margin-bottom:14px;border-radius:12px;background:var(--panel);border:1px solid var(--line)}
+.stbar .pill{white-space:normal}.stbar-at{font-size:11.5px;margin-inline-start:auto}

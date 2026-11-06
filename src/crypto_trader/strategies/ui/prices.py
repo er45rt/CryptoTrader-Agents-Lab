@@ -65,6 +65,11 @@ class BinancePrices:
             out[asset] = res
         return out
 
+    def cached(self) -> dict[str, dict[str, Any]]:
+        """The latest prices already served, without fetching (status bar, D42 B3)."""
+        with self._lock:
+            return {a: dict(v[1]) for a, v in self._latest.items()}
+
     # --- daily closes for history ----------------------------------------------------------------------
     def daily(self, asset: str, since: date) -> dict[str, Any]:
         """{'closes': {'YYYY-MM-DD': 'close'}, 'reason': None|str} for closed daily candles from `since`.
