@@ -118,6 +118,60 @@ def test_the_server_prices_come_only_from_the_public_klines_fetcher(tmp_path):
         srv.server_close()
 
 
+class _Resp:
+    def __init__(self, rows):
+        self._b = __import__("json").dumps(rows).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._b
+
+
+def _kline(open_ms, close):
+    return [open_ms, close, close, close, close, "1", open_ms + 59_999, "0", 0, "0", "0", "0"]
+
+
+def test_the_price_request_carries_exactly_the_approved_fields_to_the_one_url(tmp_path, monkeypatch):
+    # owner decision D41 (Sol D40 blocker 7): GET to KLINES_URL with exactly symbol, interval, startTime, endTime and
+    # limit=1000 - no other field, no credentials, no owner data. Exercised through the real fetch_public_klines with the
+    # urllib opener replaced, so no socket is opened.
+    import urllib.parse
+    import urllib.request
+
+    seen = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            seen.append(req)
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)
+            start = int(q["startTime"][0])
+            step = 60_000 if q["interval"] == ["1m"] else 86_400_000
+            return _Resp([_kline(start + step * i, "70000") for i in range(2)])
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *handlers: Opener())
+    now = datetime(2026, 3, 10, 12, 0, 30, tzinfo=timezone.utc)
+    p = prices.BinancePrices(tmp_path, now=lambda: now)          # the real fetcher
+    assert p.latest(["BTC"])["BTC"]["price"] == "70000"
+    assert p.daily("ETH", date(2026, 3, 1))["reason"] is None
+    assert len(seen) == 2
+    for req in seen:
+        parts = urllib.parse.urlsplit(req.full_url)
+        q = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        assert f"{parts.scheme}://{parts.netloc}{parts.path}" == KLINES_URL
+        assert sorted(q) == ["endTime", "interval", "limit", "startTime", "symbol"], q
+        assert q["limit"] == ["1000"] and all(len(v) == 1 for v in q.values())
+        assert q["symbol"][0] in ("BTCUSDT", "ETHUSDT") and q["interval"][0] in ("1m", "1d")
+        assert q["startTime"][0].isdigit() and q["endTime"][0].isdigit()
+        assert req.get_method() == "GET" and req.data is None
+        assert {(k.lower(), v) for k, v in req.header_items()} == {("user-agent", "ct-strategy-ohlcv/1")}, \
+            req.header_items()
+
+
 def test_bad_asset_symbols_never_reach_the_price_url(tmp_path):
     with pytest.raises(StrategyError):
         portfolio.parse_tx({"type": "buy", "asset": "BTC&x=1", "at": "2026-01-01", "qty": "1", "price": "1"})

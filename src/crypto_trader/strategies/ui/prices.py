@@ -1,7 +1,8 @@
 """Prices for My Portfolio (owner decision D40): Binance PUBLIC klines only, read-only.
 
 The only network call is ohlcv.fetch_public_klines: GET to the one allow-listed URL (KLINES_URL), no keys, no redirects,
-no proxy. Pair = <ASSET>USDT. A price is the close of the last CLOSED 1-minute candle and is shown with its source and
+no proxy. The query carries exactly symbol, interval, startTime, endTime and limit=1000 (fixed page size; owner decision
+D41) - nothing about the owner or the ledger. Pair = <ASSET>USDT. A price is the close of the last CLOSED 1-minute candle and is shown with its source and
 time. When there is no pair, no network or any error, the asset gets price None plus the reason - never a guessed
 number. Daily closes for the value-over-time chart are cached in <workspace>/portfolio/prices/ and only the missing
 tail is fetched.
