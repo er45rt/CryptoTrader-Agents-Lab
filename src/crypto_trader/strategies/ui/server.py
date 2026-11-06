@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import decisions, demo, portfolio, prices, store
+from . import decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -186,6 +186,19 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/portfolio/delete":
                 res = self.ledger.delete(str(body["id"]))
                 self.ws._event("portfolio.deleted", id=res["deleted"])
+                return self._send(200, res)
+            if url.path == "/api/portfolio/import/preview":
+                return self._send(200, portfolio_csv.preview(str(body["text"]), self.ledger,
+                                                             skip_duplicates=bool(body.get("skip_duplicates"))))
+            if url.path == "/api/portfolio/import/confirm":
+                res = portfolio_csv.confirm(str(body["text"]), str(body["sha256"]), self.ledger,
+                                            skip_duplicates=bool(body.get("skip_duplicates")),
+                                            filename=str(body.get("filename") or ""))
+                self.ws._event("portfolio.imported", batch=res["batch"], rows=res["imported"])
+                return self._send(200, res)
+            if url.path == "/api/portfolio/import/undo":
+                res = self.ledger.delete_batch(str(body["batch"]))
+                self.ws._event("portfolio.import_undone", batch=res["deleted_batch"], rows=res["removed"])
                 return self._send(200, res)
             self._send(404, {"error": "not found"})
         except (StrategyError, KeyError, ValueError, FileNotFoundError, FileExistsError) as exc:
