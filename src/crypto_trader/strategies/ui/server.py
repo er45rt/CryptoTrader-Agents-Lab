@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import decisions, demo, store
+from . import decisions, demo, portfolio, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -141,6 +141,8 @@ class Handler(BaseHTTPRequestHandler):
                 # demo mode (D32): offline replay of local bars through the unchanged paper engine
                 "/api/demo": lambda: self.demo.list(),
                 "/api/demo/session": lambda: self.demo.status(q["name"]),
+                # my portfolio (D40): the owner's own ledger, local only
+                "/api/portfolio": lambda: {**self.ledger.summary(), "transactions": self.ledger.transactions()},
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -175,6 +177,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.ws.save_risk(body))
             if url.path.startswith("/api/demo/"):
                 return self._send(200, self._demo_post(url.path.rsplit("/", 1)[1], body))
+            if url.path == "/api/portfolio/add":
+                tx = self.ledger.add(body)
+                self.ws._event("portfolio.added", id=tx["id"], type=tx["type"], asset=tx["asset"])
+                return self._send(200, {"transaction": tx})
+            if url.path == "/api/portfolio/delete":
+                res = self.ledger.delete(str(body["id"]))
+                self.ws._event("portfolio.deleted", id=res["deleted"])
+                return self._send(200, res)
             self._send(404, {"error": "not found"})
         except (StrategyError, KeyError, ValueError, FileNotFoundError, FileExistsError) as exc:
             self._send(400, {"error": str(exc)})
@@ -243,6 +253,7 @@ def _job(jid: str) -> dict[str, Any]:
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.ws = store.Workspace(workspace)
     Handler.demo = demo.DemoManager(workspace)
+    Handler.ledger = portfolio.Ledger(workspace)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 

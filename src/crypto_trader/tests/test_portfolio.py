@@ -1,0 +1,169 @@
+"""D40 phase 1, item 1: the owner's portfolio ledger and Weighted Average Cost accounting."""
+from __future__ import annotations
+
+import http.client
+import json
+from decimal import Decimal
+
+import pytest
+
+from crypto_trader.strategies import StrategyError
+from crypto_trader.strategies.ui import portfolio
+from crypto_trader.tests.test_strategies_ui import live, ws  # noqa: F401  (server fixtures)
+
+
+def _ledger(tmp_path, prices=None):
+    return portfolio.Ledger(tmp_path, prices=prices)
+
+
+def _row(summary, asset):
+    return next(a for a in summary["assets"] if a["asset"] == asset)
+
+
+def test_wac_buy_buy_sell_keeps_the_average_and_books_realized_profit(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "btc", "at": "2026-01-05", "qty": "0.1", "price": "60000", "fee": "6"})
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-02-05", "qty": "0.1", "price": "70000", "fee": "7"})
+    # basis = 6006 + 7007 = 13013 for 0.2 -> avg 65065
+    s = compute_one(lg, "BTC")
+    assert (s["qty"], s["basis"], s["avg_cost"]) == (Decimal("0.2"), Decimal("13013"), Decimal("65065"))
+    lg.add({"type": "sell", "asset": "BTC", "at": "2026-03-05", "qty": "0.05", "price": "80000", "fee": "4"})
+    s = compute_one(lg, "BTC")
+    # realized = 0.05*80000 - 4 - 0.05*65065 = 4000 - 4 - 3253.25 = 742.75 ; avg unchanged
+    assert s["realized"] == Decimal("742.75") and s["avg_cost"] == Decimal("65065")
+    assert s["qty"] == Decimal("0.15") and s["basis"] == Decimal("9759.75")
+    assert s["invested"] == Decimal("13013") and s["fees_quote"] == Decimal("17")
+
+
+def compute_one(lg, asset):
+    return portfolio.compute(lg._load())[asset]
+
+
+def test_fee_in_the_asset_on_a_buy_is_capitalised_into_the_average(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-01", "qty": "2", "price": "2500", "fee": "0.002",
+            "fee_asset": "ETH"})
+    s = compute_one(lg, "ETH")
+    assert s["qty"] == Decimal("1.998") and s["basis"] == Decimal("5000")
+    assert s["avg_cost"] == Decimal("5000") / Decimal("1.998") and s["realized"] == 0
+
+
+def test_transfer_between_own_wallets_is_never_a_gain_and_its_network_fee_is_a_cost(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-01", "qty": "2", "price": "2500"})
+    lg.add({"type": "transfer", "asset": "ETH", "at": "2026-01-02", "qty": "2", "fee": "0", "wallet": "ledger"})
+    s = compute_one(lg, "ETH")
+    assert (s["qty"], s["basis"], s["realized"]) == (Decimal(2), Decimal(5000), 0)
+    lg.add({"type": "transfer", "asset": "ETH", "at": "2026-01-03", "qty": "1", "fee": "0.01", "network": "Arbitrum"})
+    s = compute_one(lg, "ETH")
+    # fee 0.01 ETH at avg 2500 = 25 USDT cost; avg unchanged
+    assert s["qty"] == Decimal("1.99") and s["realized"] == Decimal("-25") and s["avg_cost"] == Decimal(2500)
+    assert s["fees_asset_cost"] == Decimal(25) and s["networks"] == ["Arbitrum"]
+
+
+def test_selling_more_than_held_is_refused_and_nothing_is_written(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "SOL", "at": "2026-01-01", "qty": "10", "price": "100"})
+    before = lg.path.read_bytes()
+    with pytest.raises(StrategyError, match="أكبر من الرصيد"):
+        lg.add({"type": "sell", "asset": "SOL", "at": "2026-01-02", "qty": "11", "price": "120"})
+    assert lg.path.read_bytes() == before
+
+
+def test_a_sale_dated_before_its_buy_is_refused(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "SOL", "at": "2026-02-01", "qty": "10", "price": "100"})
+    with pytest.raises(StrategyError):
+        lg.add({"type": "sell", "asset": "SOL", "at": "2026-01-15", "qty": "1", "price": "120"})
+
+
+def test_deleting_a_buy_that_a_later_sale_needs_is_refused(tmp_path):
+    lg = _ledger(tmp_path)
+    buy = lg.add({"type": "buy", "asset": "SOL", "at": "2026-01-01", "qty": "10", "price": "100"})
+    lg.add({"type": "sell", "asset": "SOL", "at": "2026-01-02", "qty": "5", "price": "120"})
+    with pytest.raises(StrategyError):
+        lg.delete(buy["id"])
+    assert len(lg.transactions()) == 2
+
+
+def test_add_many_is_all_or_nothing(tmp_path):
+    lg = _ledger(tmp_path)
+    rows = [{"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "50000"},
+            {"type": "sell", "asset": "BTC", "at": "2026-01-02", "qty": "2", "price": "50000"}]
+    with pytest.raises(StrategyError):
+        lg.add_many(rows, source="test")
+    assert lg.transactions() == [] and not lg.path.exists()
+
+
+@pytest.mark.parametrize("body, match", [
+    ({"type": "buy", "asset": "USDT", "at": "2026-01-01", "qty": "1", "price": "1"}, "عملة التسعير"),
+    ({"type": "buy", "asset": "BTC", "at": "2999-01-01", "qty": "1", "price": "1"}, "المستقبل"),
+    ({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "-1", "price": "1"}, "أكبر من صفر"),
+    ({"type": "swap", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "1"}, "نوع العملية"),
+    ({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "1", "fee_asset": "ETH"}, "عملة الرسوم"),
+    ({"type": "sell", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "1", "dca_plan": "p1"}, "للمشتريات فقط"),
+])
+def test_invalid_transactions_are_refused_in_arabic(tmp_path, body, match):
+    with pytest.raises(StrategyError, match=match):
+        _ledger(tmp_path).add(body)
+
+
+def test_summary_values_priced_assets_and_marks_unpriced_ones_instead_of_inventing_a_number(tmp_path):
+    def prices(assets):
+        assert assets == ["BTC", "ETH", "XYZ"]
+        return {"BTC": {"price": "70000", "source": "test", "at": "t"}, "ETH": {"price": "2500", "source": "test"},
+                "XYZ": {"price": None, "reason": "no market"}}
+
+    lg = _ledger(tmp_path, prices)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "0.1", "price": "60000"})
+    lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-01", "qty": "2", "price": "2400"})
+    lg.add({"type": "buy", "asset": "XYZ", "at": "2026-01-01", "qty": "100", "price": "1"})
+    s = lg.summary()
+    t = s["totals"]
+    assert t["value"] == "12000" and t["priced_basis"] == "10800" and t["unrealized"] == "1200"
+    assert t["unrealized_pct"] == "11.11" and t["value_complete"] is False and s["unpriced"] == ["XYZ"]
+    assert t["basis"] == "10900"
+    xyz = _row(s, "XYZ")
+    assert xyz["value"] is None and xyz["price_missing"] == "no market" and xyz["allocation_pct"] is None
+    assert _row(s, "BTC")["allocation_pct"] == "58.33" and _row(s, "ETH")["unrealized_pct"] == "4.17"
+
+
+def test_closed_positions_keep_their_realized_result_and_need_no_price(tmp_path):
+    lg = _ledger(tmp_path, prices=lambda assets: pytest.fail("no price lookup for closed positions"))
+    lg.add({"type": "buy", "asset": "ADA", "at": "2026-01-01", "qty": "3", "price": "0.1"})
+    lg.add({"type": "sell", "asset": "ADA", "at": "2026-01-02", "qty": "3", "price": "0.4"})
+    row = _row(lg.summary(), "ADA")
+    assert row["closed"] and row["qty"] == "0" and row["realized"] == "0.9" and row["value"] is None
+
+
+def _post(port, path, body, header=True):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    h = {"Host": "127.0.0.1", "Content-Type": "application/json"} | ({"X-CT-UI": "1"} if header else {})
+    conn.request("POST", path, body=json.dumps(body), headers=h)
+    resp = conn.getresponse()
+    out = (resp.status, json.loads(resp.read()))
+    conn.close()
+    return out
+
+
+def _get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("GET", path, headers={"Host": "127.0.0.1"})
+    resp = conn.getresponse()
+    out = (resp.status, json.loads(resp.read()))
+    conn.close()
+    return out
+
+
+def test_portfolio_api_adds_lists_and_deletes_with_the_ui_guard(live, ws):
+    buy = {"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "0.5", "price": "40000"}
+    assert _post(live, "/api/portfolio/add", buy, header=False)[0] == 403
+    status, res = _post(live, "/api/portfolio/add", buy)
+    assert status == 200 and res["transaction"]["asset"] == "BTC"
+    status, res = _post(live, "/api/portfolio/add", {**buy, "type": "sell", "qty": "1"})
+    assert status == 400 and "أكبر من الرصيد" in res["error"]
+    status, doc = _get(live, "/api/portfolio")
+    assert status == 200 and doc["n_transactions"] == 1 and doc["totals"]["basis"] == "20000"
+    assert (ws.root / "portfolio" / "ledger.json").exists()
+    assert _post(live, "/api/portfolio/delete", {"id": doc["transactions"][0]["id"]})[0] == 200
+    assert _get(live, "/api/portfolio")[1]["n_transactions"] == 0
