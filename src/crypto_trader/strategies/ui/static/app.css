@@ -254,3 +254,14 @@ details.tech pre{margin-top:6px;max-height:180px}
 :root[dir=ltr] pre.rtl-log{direction:ltr;text-align:left}
 :root[dir=ltr] .kpi .v{text-align:left}
 :root[dir=ltr] body{font-family:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif}
+
+/* decision funnel (phase 2, A1) */
+.fn{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:10px}
+.fn-st{padding:12px;border-radius:12px;background:var(--panel2);border:1px solid var(--line)}
+.fn-st small{display:block;color:var(--muted);font-weight:600;font-size:12px}
+.fn-st b{display:block;font-size:22px;margin-top:2px}
+.fn-bar{height:6px;border-radius:4px;background:var(--line);margin-top:8px;overflow:hidden}.fn-bar i{display:block;height:100%;background:var(--accent)}
+.fn-stop{margin-top:6px;font-size:12px;color:var(--bad);background:none;border:0;padding:0;cursor:pointer;text-align:start}
+.fn-stop[disabled]{color:var(--muted);cursor:default}
+.fn-why{margin-top:10px;font-weight:600}
+@media (max-width:760px){.fn{grid-template-columns:1fr 1fr}}

@@ -31,14 +31,14 @@ const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", un
 PAGES.decisions = async () => {
   main.innerHTML = header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
     chip("الذكاء الاصطناعي: غير مشارك في هذا المحرك", "") + `<span class="chip" style="cursor:pointer" id="dc-auto"><i></i>تحديث تلقائي</span>`)
-  + `<div class="kpis" id="dc-kpis"><div class="skel"></div></div>
-  <div class="card"><div class="form" id="dc-form">
+  + `<div class="card"><div class="form" id="dc-form">
     <div><label>المصدر</label><select id="dc-source"><option value="">الكل</option></select></div>
     <div><label>الاستراتيجية</label><select id="dc-strategy"><option value="">الكل</option></select></div>
     <div><label>الزوج</label><select id="dc-symbol"><option value="">الكل</option></select></div>
     <div><label>من</label><input id="dc-since" type="datetime-local"></div>
     <div><label>إلى</label><input id="dc-until" type="datetime-local"></div>
   </div><div class="actions"><div class="tabs" id="dc-kinds"></div></div></div>
+  <div class="card" id="dc-funnel"><div class="skel"></div></div>
   <div class="cols dc-cols"><div class="card"><div class="card-h"><h2>القرارات <small id="dc-total"></small></h2></div><div class="tw" style="max-height:640px"><table>
     <thead><tr><th>الوقت (غرينتش)</th><th>النوع</th><th>الاستراتيجية · الزوج</th><th>الخلاصة</th></tr></thead><tbody id="dc-rows"></tbody></table></div></div>
   <div class="stack" id="dc-detail">${empty("اختر قرار من القائمة عشان تشوف سلسلته كاملة", "layers")}</div></div>`;
@@ -61,18 +61,13 @@ async function dcLoad(quiet = false) {
   let d;
   try { d = await api("/api/decisions?" + q.toString()); } catch (e) { if (!quiet) $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; return; }
   dcState.data = d;
-  if (current !== "decisions" || !$("#dc-kpis")) return;   // the user moved to another page meanwhile
+  if (current !== "decisions" || !$("#dc-funnel")) return;   // the user moved to another page meanwhile
   const fill = (id, opts, cur) => { const el = $(id); if (!el) return; el.innerHTML = `<option value="">الكل</option>` + opts.map(([v, t]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(t)}</option>`).join(""); };
   fill("#dc-source", d.facets.sources.map((s) => [s.id, s.label]), f.source);
   fill("#dc-strategy", d.facets.strategies.map((s) => [s, s]), f.strategy);
   fill("#dc-symbol", d.facets.symbols.map((s) => [s, s]), f.symbol);
   const c = d.counts;
-  $("#dc-kpis").innerHTML = [
-    kpi({ k: "دخول", v: String(c.entry), ic: "trend", tone: "g" }), kpi({ k: "خروج", v: String(c.exit), ic: "down", tone: "w" }),
-    kpi({ k: "رفض (مخاطر · صلاحية · حماية)", v: String(c.rejected_risk + c.rejected_validity + c.blocked_safety), ic: "shield", tone: (c.rejected_risk + c.rejected_validity + c.blocked_safety) ? "r" : "" }),
-    kpi({ k: "فائتة", v: String(c.missed), ic: "clock", tone: c.missed ? "w" : "", s: "شموع وصلت متأخرة وما تداولت" }),
-    kpi({ k: "امتناع عن الدخول", v: String(c.no_entry), ic: "box" }), kpi({ k: "إبقاء المركز", v: String(c.keep), ic: "layers" }),
-  ].join("");
+  dcFunnel(d.funnel);
   const kt = $("#dc-kinds");
   kt.innerHTML = `<button data-k="" class="${f.kinds.length ? "" : "on"}">الكل</button>` + KIND_ORDER.filter((k) => c[k]).map((k) =>
     `<button data-k="${k}" class="${f.kinds.includes(k) ? "on" : ""}">${esc(DC.kinds[k][0])} <span class="muted">${c[k]}</span></button>`).join("");
@@ -87,6 +82,32 @@ async function dcLoad(quiet = false) {
   if (dcState.selected && !quiet) dcShow(dcState.selected, true);
 }
 const KIND_ORDER = ["entry", "exit", "rejected_risk", "rejected_validity", "blocked_safety", "missed", "no_entry", "keep", "other"];
+
+/** Decision funnel (phase 2, A1): counts from the recorded chain, each decision once; a stopped count opens the list
+    filtered to exactly those decisions. The one-line answer is a fixed template over these counts. */
+function dcFunnel(fl) {
+  const box = $("#dc-funnel"); if (!box) return;
+  const pct = (n) => (fl.signals ? Math.round((n * 100) / fl.signals) + "%" : "—");
+  const stage = (title, n, stopped, kind) => `<div class="fn-st"><small>${title}</small><b class="ltr">${n}</b>
+    <div class="fn-bar"><i style="width:${fl.signals ? Math.round((n * 100) / fl.signals) : 0}%"></i></div>
+    <span class="muted" style="font-size:12px">${pct(n)} من الإشارات</span>
+    ${stopped === null ? "" : `<button class="fn-stop" data-kinds="${kind}" ${stopped ? "" : "disabled"}>توقّف هنا: <span class="ltr">${stopped}</span></button>`}</div>`;
+  const stops = [["الصلاحية", fl.stopped.validity], ["المخاطر", fl.stopped.risk], ["الحماية", fl.stopped.safety]].filter(([, n]) => n);
+  stops.sort((a, b) => b[1] - a[1]);
+  const why = !fl.evaluated ? "ما فيه قرارات بهالفلاتر."
+    : !fl.signals ? "ما فيه ولا إشارة تداول بهالفلاتر: الاستراتيجية نفسها ما طلبت دخول ولا خروج."
+    : stops.length ? `أكثر مرحلة أوقفت الإشارات: ${stops[0][0]} (${stops[0][1]} من ${fl.signals}).`
+    : fl.sent - fl.filled ? `كل الإشارات عبرت الفحوصات؛ ${fl.sent - fl.filled} أُرسلت وما تنفّذت بعد.` : "كل الإشارات عبرت الفحوصات وتنفّذت.";
+  box.innerHTML = `<div class="card-h"><h2>مسار القرار</h2><small class="muted">من <span class="ltr">${fl.evaluated}</span> شمعة مقيّمة:
+      <a href="#" data-kinds="no_entry,keep">${fl.no_signal} بدون إشارة تداول</a> ·
+      <a href="#" data-kinds="missed">${fl.missed} فائتة</a>${fl.unclassified ? ` · <span class="warn">${fl.unclassified} غير مصنّفة</span>` : ""}</small></div>
+    <div class="fn">${stage("إشارة تداول", fl.signals, null)}${stage("عبرت الصلاحية", fl.passed.validity, fl.stopped.validity, "rejected_validity")}
+      ${stage("عبرت المخاطر", fl.passed.risk, fl.stopped.risk, "rejected_risk")}${stage("عبرت الحماية", fl.passed.safety, fl.stopped.safety, "blocked_safety")}
+      ${stage("تنفّذت", fl.filled, null)}</div>
+    <div class="fn-why">${esc(why)}</div>`;
+  box.onclick = (e) => { const el = e.target.closest("[data-kinds]"); if (!el || el.disabled) return; e.preventDefault();
+    dcState.filters.kinds = el.dataset.kinds.split(","); dcLoad(); };
+}
 
 function step(state, who, title, body) {
   // state: pass | stop | skip | info

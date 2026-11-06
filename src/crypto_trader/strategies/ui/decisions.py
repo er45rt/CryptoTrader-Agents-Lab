@@ -157,6 +157,37 @@ def _backtests(root: Path) -> list[dict[str, Any]]:
     return out
 
 
+#: where an order intent stopped, from the journaled submission (each decision is counted once, at one stage)
+_STOPPED_AT = {"stopped_by_validity": "validity", "stopped_by_risk": "risk", "blocked_by_safety": "safety"}
+
+
+def funnel(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Decision funnel (phase 2, A1): evaluated bars -> trade signals -> validity -> risk -> safety -> sent -> filled.
+    Built only from recorded fields: a signal is a decision whose action is buy/sell; the stage where it stopped is its
+    journaled submission. A submission recorded with any other value is counted as unclassified, never guessed."""
+    out = {"evaluated": len(items), "missed": 0, "no_signal": 0, "signals": 0, "unclassified": 0,
+           "stopped": {"validity": 0, "risk": 0, "safety": 0}, "sent": 0, "filled": 0}
+    for i in items:
+        if i["kind"] == "missed":
+            out["missed"] += 1
+        elif i["action"] not in ("buy", "sell"):
+            out["no_signal"] += 1
+        else:
+            out["signals"] += 1
+            sub = i.get("submission")
+            if sub in _STOPPED_AT:
+                out["stopped"][_STOPPED_AT[sub]] += 1
+            elif sub == "submitted_to_simulator":
+                out["sent"] += 1
+                out["filled"] += bool(i["fills"])
+            else:
+                out["unclassified"] += 1
+    passed = out["signals"] - out["unclassified"] - out["stopped"]["validity"]
+    out["passed"] = {"validity": passed, "risk": passed - out["stopped"]["risk"],
+                     "safety": passed - out["stopped"]["risk"] - out["stopped"]["safety"]}
+    return out
+
+
 def _parse_time(text: str | None) -> datetime | None:
     return datetime.fromisoformat(text) if text else None
 
@@ -176,12 +207,13 @@ def collect(root: Path, *, source: str | None = None, strategy: str | None = Non
     counts = {k: 0 for k in KINDS}
     for i in sel:
         counts[i["kind"]] += 1
+    flow = funnel(sel)
     if kinds:
         sel = [i for i in sel if i["kind"] in kinds]
     sel.sort(key=lambda i: i["at"], reverse=True)
     total = len(sel)
     return {"items": [{k: v for k, v in i.items() if k != "evidence"} for i in sel[: max(1, min(limit, 2000))]],
-            "total": total, "counts": counts, "facets": {**facets, "sources": [
+            "total": total, "counts": counts, "funnel": flow, "facets": {**facets, "sources": [
                 {"id": f"{k}:{n}", "label": label} for k, n, label in facets["sources"]]}}
 
 
