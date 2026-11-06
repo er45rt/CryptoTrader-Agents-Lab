@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import dca, decisions, demo, portfolio, portfolio_csv, prices, store
+from . import compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -149,6 +149,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/portfolio/asset": lambda: self.ledger.asset_view(q["asset"], self.prices.daily, prices.SOURCE),
                 # monthly DCA plans (D40): tracking only, executed buys are the ledger's own transactions
                 "/api/dca": lambda: self.dca.status(),
+                # dashboard (D42 B2): backtests side by side only when comparable
+                "/api/compare": lambda: compare.comparison(self.ws.root),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})

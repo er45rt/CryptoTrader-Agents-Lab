@@ -280,3 +280,7 @@ details.tech pre{margin-top:6px;max-height:180px}
 .space.on{box-shadow:0 0 0 2px var(--sp) inset;background:var(--panel2)}
 .sp-portfolio{--sp:#3b82f6}.sp-demo{--sp:#f5a524}.sp-paper{--sp:#8b5cf6}.sp-backtest{--sp:#14b8a6}
 @media (max-width:1000px){.spaces{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* strategy comparison (phase 2, B2) */
+.cmp-g{margin-top:12px}.cmp-h{font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.cmp-alone{margin-top:12px}.cmp-alone summary{cursor:pointer;font-weight:600}

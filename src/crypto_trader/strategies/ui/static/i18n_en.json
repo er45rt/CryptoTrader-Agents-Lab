@@ -901,5 +901,14 @@
 "التنفيذات": "Fills",
 "ما فيه منحنى رصيد بعد لهالجلسة.": "No equity curve for this session yet.",
 "كل جلسة برأس مالها الورقي": "Each session with its own paper capital",
-"آخر اختبار تاريخي": "Latest backtest"
+"آخر اختبار تاريخي": "Latest backtest",
+"تحميل المقارنة": "Loading the comparison",
+"انزلاق": "slippage",
+"شارب": "Sharpe",
+"وقت التجربة": "Run time",
+"مقارنة أداء الاستراتيجيات": "Strategy performance comparison",
+"ما فيه اختبارين بنفس البيانات والفترة والإعدادات بعد. شغّل استراتيجيتين على نفس الملف والفترة عشان تظهر المقارنة هنا.": "No two backtests share the same data, period and settings yet. Run two strategies on the same file and period to compare them here.",
+"اختبارات بلا نظير قابل للمقارنة": "Backtests without a comparable peer",
+"تجربة بدون ملف نتيجة، ما دخلت المقارنة.": "runs without a result file were left out of the comparison.",
+"نقارن فقط داخل المجموعة الواحدة: نفس ملف البيانات والإطار والفترة ونوع الاختبار والرسوم والانزلاق. ما نرتّب المجموعات مقابل بعض. كل تجربة إضافية ترفع عتبة حكم المتانة.": "Comparisons are only within one group: same data file, timeframe, period, backtest type, fees and slippage. Groups are never ranked against each other. Every extra run raises the robustness bar."
 }

@@ -17,6 +17,7 @@ PAGES.home = async () => {
   <div class="card" id="db-compare"></div>`;
   $("#db-spaces").onclick = (e) => { const b = e.target.closest("[data-space]"); if (!b) return; DB.space = b.dataset.space; dbPaint(); dbDetail(); };
   dbPaint();
+  dbCompare();
   const load = (k, p) => p.then((d) => { DB.spaces[k] = { ok: true, d }; }, (e) => { DB.spaces[k] = { ok: false, e }; })
     .then(() => { if (current !== "home") return; dbCard(k); if (k === DB.space) dbDetail(); });
   DB.spaces = {};
@@ -109,4 +110,29 @@ async function dbDetail() {
   const r = d.runs[0];
   box.innerHTML = `<div class="card-h"><h2>${title} <small>آخر اختبار تاريخي</small></h2><button class="sm" data-nav="backtest">الاختبار التاريخي</button></div>
     ${r ? runSummary(r) : empty("ما فيه اختبارات بعد", "flask")}`;
+}
+
+/** Strategy comparison (B2): backtests side by side only inside a group with the same data, timeframe, period, mode and
+    costs; groups are never ranked against each other, and a run without a comparable peer is listed apart. */
+async function dbCompare() {
+  const box = $("#db-compare"); if (!box) return;
+  box.innerHTML = loading("تحميل المقارنة…");
+  let d; try { d = await api("/api/compare"); } catch (e) { box.innerHTML = errBox(e); return; }
+  if (current !== "home" || !$("#db-compare")) return;
+  const pct = (x) => (isNum(x) ? fmtSPct(x) : "—");
+  const head = (k) => `<span class="ltr">${esc(k.data)}</span> · ${esc(tfAr(k.timeframe))} · <span class="ltr">${esc(dbAt(k.start).slice(0, 10))} → ${esc(dbAt(k.end).slice(0, 10))}</span>
+    · ${k.mode === "engine" ? "كامل عبر المحرك" : "سريع"} · رسوم <span class="ltr">${isNum(k.taker_fee) ? (+k.taker_fee * 100).toFixed(2) + "%" : "—"}</span> · انزلاق <span class="ltr">${esc(k.slippage_bps ?? "—")} bps</span>`;
+  const table = (rs) => `<div class="tw"><table><thead><tr><th>الاستراتيجية</th><th>العائد</th><th>الاحتفاظ</th><th>أقصى تراجع</th><th>الصفقات</th><th>الرسوم</th><th>شارب</th><th>الحكم</th><th>وقت التجربة</th></tr></thead><tbody>
+    ${rs.map((r) => `<tr><td><b>${esc(r.strategy)}</b>${Object.keys(r.params).length ? ` <code class="ltr muted" style="font-size:11px">${esc(JSON.stringify(r.params))}</code>` : ""}</td>
+      <td class="ltr ${sign(r.net_return)}">${pct(r.net_return)}</td><td class="ltr">${pct(r.hold_return)}</td><td class="ltr bad">${isNum(r.max_drawdown) ? fmtPct(r.max_drawdown) : "—"}</td>
+      <td class="ltr">${r.round_trips ?? "—"}</td><td class="ltr">${isNum(r.fees_quote) ? fmtUsd(r.fees_quote) : "—"}</td><td class="ltr">${isNum(r.sharpe) ? fmtNum(r.sharpe) : "—"}</td>
+      <td>${verdictPill(r.verdict)}</td><td><a href="#" data-run="${esc(r.id)}" class="ltr">${esc(dbAt(r.at))}</a></td></tr>`).join("")}</tbody></table></div>`;
+  const comp = d.groups.filter((g) => g.comparable), alone = d.groups.filter((g) => !g.comparable);
+  box.innerHTML = `<div class="card-h"><h2>مقارنة أداء الاستراتيجيات <small class="muted"><span class="ltr">${d.runs}</span> اختبار</small></h2></div>
+    ${comp.length ? comp.map((g) => `<div class="cmp-g"><div class="cmp-h">${head(g.key)}</div>${table(g.runs)}</div>`).join("")
+      : `<div class="muted">ما فيه اختبارين بنفس البيانات والفترة والإعدادات بعد. شغّل استراتيجيتين على نفس الملف والفترة عشان تظهر المقارنة هنا.</div>`}
+    ${alone.length ? `<details class="cmp-alone"><summary>اختبارات بلا نظير قابل للمقارنة (<span class="ltr">${alone.length}</span>)</summary>
+      ${alone.map((g) => `<div class="cmp-g"><div class="cmp-h">${head(g.key)}</div>${table(g.runs)}</div>`).join("")}</details>` : ""}
+    ${d.missing.length ? `<div class="warn" style="font-size:12px;margin-top:6px">${d.missing.length} تجربة بدون ملف نتيجة، ما دخلت المقارنة.</div>` : ""}
+    <div class="muted" style="font-size:12px;margin-top:8px">نقارن فقط داخل المجموعة الواحدة: نفس ملف البيانات والإطار والفترة ونوع الاختبار والرسوم والانزلاق. ما نرتّب المجموعات مقابل بعض. كل تجربة إضافية ترفع عتبة حكم المتانة.</div>`;
 }
