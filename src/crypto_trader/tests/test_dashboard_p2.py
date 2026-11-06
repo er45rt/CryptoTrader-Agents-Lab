@@ -174,3 +174,22 @@ def test_the_status_endpoint_and_bar(live, ws):
     codes = set(re.findall(r'add\("\w+", "\w+", "(\w+)"', Path(alerts.__file__).read_text(encoding="utf-8")))
     codes |= {"live_enabled", "collector_stale", "dca_due", "dca_missed"}
     assert all(f"{c}:" in body for c in codes), [c for c in codes if f"{c}:" not in body]
+
+
+def test_a_recorded_metric_is_never_inserted_as_markup(tmp_path):
+    # Sol D42 blocker 2: metrics.round_trips = "<img ...>" from result.json reached innerHTML unescaped
+    import json as _json
+
+    from crypto_trader.strategies.ui import compare
+
+    (tmp_path / "runs").mkdir()
+    _run(tmp_path, "x", at="2026-01-01")
+    doc = _json.loads((tmp_path / "runs" / "x" / "result.json").read_text(encoding="utf-8"))
+    doc["metrics"].update(round_trips='<img src=x data-injected="yes">', fees_quote="1e3", net_return=True,
+                          sharpe=float("nan"))
+    (tmp_path / "runs" / "x" / "result.json").write_text(_json.dumps(doc), encoding="utf-8")
+    r = compare.comparison(tmp_path)["groups"][0]["runs"][0]
+    assert (r["round_trips"], r["fees_quote"], r["net_return"], r["sharpe"]) == (None, None, None, None)
+    body = DASH[DASH.index("async function dbCompare"):]
+    assert "${r.round_trips ?? " not in body and "fmtNum(r.round_trips, 0)" in body
+    assert "${x.fills ?? " not in DASH

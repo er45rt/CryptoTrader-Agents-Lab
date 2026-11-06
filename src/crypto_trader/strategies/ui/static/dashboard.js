@@ -92,7 +92,7 @@ async function dbDetail() {
       <div class="tw"><table><thead><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>التنفيذات</th></tr></thead><tbody>
       ${ds.map((x) => `<tr data-db-demo="${esc(x.name)}" class="${x.name === DB.demo ? "sel" : ""}" style="cursor:pointer"><td><b>${esc(x.name)}</b></td><td>${esc(x.strategy)} <span class="muted">· ${esc(tfAr(x.timeframe))}</span></td>
         <td>${x.running ? '<span class="pill good">تعمل</span>' : `<span class="pill">${esc(x.state)}</span>`}</td><td class="ltr">${isNum(x.equity) ? fmtUsd(x.equity) : fmtUsd(x.capital)}</td>
-        <td class="ltr ${sign(x.net_return)}">${fmtSPct(x.net_return, 2)}</td><td>${x.fills ?? "—"}</td></tr>`).join("")}</tbody></table></div>
+        <td class="ltr ${sign(x.net_return)}">${fmtSPct(x.net_return, 2)}</td><td>${isNum(x.fills) ? fmtNum(x.fills, 0) : "—"}</td></tr>`).join("")}</tbody></table></div>
       <div class="chart" style="margin-top:12px"><canvas id="db-c"></canvas></div>`;
     box.querySelector("tbody").onclick = (e) => { const tr = e.target.closest("[data-db-demo]"); if (tr) { DB.demo = tr.dataset.dbDemo; dbDetail(); } };
     api("/api/demo/session?name=" + encodeURIComponent(DB.demo)).then((x) => { if (current !== "home" || DB.space !== "demo" || !$("#db-c")) return;
@@ -127,7 +127,7 @@ async function dbCompare() {
   const table = (rs) => `<div class="tw"><table><thead><tr><th>الاستراتيجية</th><th>العائد</th><th>الاحتفاظ</th><th>أقصى تراجع</th><th>الصفقات</th><th>الرسوم</th><th>شارب</th><th>الحكم</th><th>وقت التجربة</th></tr></thead><tbody>
     ${rs.map((r) => `<tr><td><b>${esc(r.strategy)}</b>${Object.keys(r.params).length ? ` <code class="ltr muted" style="font-size:11px">${esc(JSON.stringify(r.params))}</code>` : ""}</td>
       <td class="ltr ${sign(r.net_return)}">${pct(r.net_return)}</td><td class="ltr">${pct(r.hold_return)}</td><td class="ltr bad">${isNum(r.max_drawdown) ? fmtPct(r.max_drawdown) : "—"}</td>
-      <td class="ltr">${r.round_trips ?? "—"}</td><td class="ltr">${isNum(r.fees_quote) ? fmtUsd(r.fees_quote) : "—"}</td><td class="ltr">${isNum(r.sharpe) ? fmtNum(r.sharpe) : "—"}</td>
+      <td class="ltr">${isNum(r.round_trips) ? fmtNum(r.round_trips, 0) : "—"}</td><td class="ltr">${isNum(r.fees_quote) ? fmtUsd(r.fees_quote) : "—"}</td><td class="ltr">${isNum(r.sharpe) ? fmtNum(r.sharpe) : "—"}</td>
       <td>${verdictPill(r.verdict)}</td><td><a href="#" data-run="${esc(r.id)}" class="ltr">${esc(dbAt(r.at))}</a></td></tr>`).join("")}</tbody></table></div>`;
   const comp = d.groups.filter((g) => g.comparable), alone = d.groups.filter((g) => !g.comparable);
   box.innerHTML = `<div class="card-h"><h2>مقارنة أداء الاستراتيجيات <small class="muted"><span class="ltr">${d.runs}</span> اختبار</small></h2></div>

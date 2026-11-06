@@ -15,6 +15,12 @@ __all__ = ["comparison", "comparable_key"]
 _cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 
 
+def _n(v: Any) -> float | None:
+    """A recorded metric is shown only as a number; anything else in the file is "not available", never markup
+    (Sol D42 blocker 2)."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v else None
+
+
 def _result(path: Path) -> dict[str, Any] | None:
     try:
         st = path.stat()
@@ -32,9 +38,10 @@ def _result(path: Path) -> dict[str, Any] | None:
            "params": doc.get("params") or {}, "mode": doc.get("mode"), "data": Path(str(doc.get("data") or "")).name,
            "timeframe": doc.get("timeframe"), "start": doc.get("start"), "end": doc.get("end"), "bars": doc.get("bars_count"),
            "capital": s.get("capital_quote"), "taker_fee": s.get("taker_fee"), "maker_fee": s.get("maker_fee"),
-           "slippage_bps": s.get("slippage_bps"), "net_return": m.get("net_return"), "max_drawdown": m.get("max_drawdown"),
-           "sharpe": m.get("sharpe"), "round_trips": m.get("round_trips"), "fills": m.get("fills"),
-           "fees_quote": m.get("fees_quote"), "hold_return": (doc.get("benchmark") or {}).get("net_return"),
+           "slippage_bps": s.get("slippage_bps"), "net_return": _n(m.get("net_return")),
+           "max_drawdown": _n(m.get("max_drawdown")), "sharpe": _n(m.get("sharpe")), "round_trips": _n(m.get("round_trips")),
+           "fills": _n(m.get("fills")), "fees_quote": _n(m.get("fees_quote")),
+           "hold_return": _n((doc.get("benchmark") or {}).get("net_return")),
            "verdict": (doc.get("verdict") or {}).get("verdict")}
     _cache[str(path)] = (st.st_mtime, st.st_size, row)
     return row
