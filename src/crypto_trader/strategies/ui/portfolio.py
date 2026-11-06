@@ -173,14 +173,67 @@ def _s(d: Decimal | None, places: int = 8) -> str | None:
     return format(q, "f")
 
 
+class _LedgerLock:
+    """One lock per workspace, across threads AND processes (Sol D40 blocker 6): a thread lock plus an OS byte-range
+    lock on <workspace>/portfolio/.lock, so two servers on the same workspace can never interleave load -> save."""
+
+    def __init__(self, path: Path, timeout: float = 15.0) -> None:
+        self.path, self.timeout = path, timeout
+        self._thread = threading.Lock()
+        self._fh = None
+
+    def __enter__(self) -> "_LedgerLock":
+        import time
+
+        if not self._thread.acquire(timeout=self.timeout):
+            raise StrategyError("سجل المحفظة مشغول؛ حاول بعد لحظات.")
+        fh = open(self.path, "a+b")
+        deadline = time.monotonic() + self.timeout
+        try:
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise StrategyError("سجل المحفظة مشغول؛ حاول بعد لحظات.") from None
+                    time.sleep(0.05)
+        except BaseException:
+            fh.close()
+            self._thread.release()
+            raise
+        self._fh = fh
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        fh, self._fh = self._fh, None
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+            self._thread.release()
+
+
 class Ledger:
-    """The owner's transaction ledger in <workspace>/portfolio/ledger.json (atomic writes, one lock)."""
+    """The owner's transaction ledger in <workspace>/portfolio/ledger.json (atomic writes, one workspace lock)."""
 
     def __init__(self, root: Path, prices: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None) -> None:
         self.dir = Path(root) / "portfolio"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / "ledger.json"
-        self._lock = threading.Lock()
+        self._lock = _LedgerLock(self.dir / ".lock")
         self._prices = prices
         self.plan_check: Callable[[dict[str, Any]], None] | None = None   # set by dca.Plans
 

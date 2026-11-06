@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+from pathlib import Path
 from decimal import Decimal
 
 import pytest
@@ -79,6 +80,53 @@ def test_selling_more_than_held_is_refused_and_nothing_is_written(tmp_path):
     with pytest.raises(StrategyError, match="أكبر من الرصيد"):
         lg.add({"type": "sell", "asset": "SOL", "at": "2026-01-02", "qty": "11", "price": "120"})
     assert lg.path.read_bytes() == before
+
+
+def test_two_ledgers_on_one_workspace_never_lose_a_write(tmp_path):
+    # Sol D40 blocker 6: each instance had its own thread lock, so two servers could load the same snapshot and
+    # the later save dropped the other's transaction. A: load inside its lock; B: add from another thread; A: save.
+    import threading
+    import time
+
+    a, b = _ledger(tmp_path), _ledger(tmp_path)
+    done = threading.Event()
+    with a._lock:
+        snap = a._load()
+        t = threading.Thread(target=lambda: (b.add({"type": "buy", "asset": "ETH", "at": "2026-01-02", "qty": "1",
+                                                    "price": "2000"}), done.set()))
+        t.start()
+        time.sleep(0.5)
+        assert not done.is_set()                      # B waits for A's workspace lock
+        a._save(snap + [{**portfolio.parse_tx({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1",
+                                               "price": "50000"}), "id": "a1", "seq": 1, "source": "t"}])
+    t.join(20)
+    assert done.is_set() and sorted(x["asset"] for x in a.transactions()) == ["BTC", "ETH"]
+
+
+def test_a_second_process_waits_for_the_workspace_lock(tmp_path):
+    import subprocess
+    import sys
+
+    import time
+
+    # the child prints "ready" right before add() and the wall-clock time add() returned; the parent holds the
+    # workspace lock until well after "ready", so the write can only finish after the parent released the lock
+    code = ("import sys, time; sys.path.insert(0, sys.argv[2]);"
+            "from crypto_trader.strategies.ui import portfolio;"
+            "lg = portfolio.Ledger(sys.argv[1]); print('ready', flush=True);"
+            "lg.add({'type':'buy','asset':'SOL','at':'2026-01-03','qty':'1','price':'100'});"
+            "print(time.time(), flush=True)")
+    lg = _ledger(tmp_path)
+    src = str(Path(portfolio.__file__).resolve().parents[3])
+    with lg._lock:
+        p = subprocess.Popen([sys.executable, "-c", code, str(tmp_path), src], stdout=subprocess.PIPE, text=True)
+        assert p.stdout.readline().strip() == "ready"
+        time.sleep(1.0)
+        assert p.poll() is None and lg._load() == []  # blocked on the lock file, nothing written
+        released = time.time()
+    out, _ = p.communicate(timeout=60)
+    assert p.returncode == 0 and float(out.strip()) >= released
+    assert [x["asset"] for x in lg.transactions()] == ["SOL"]
 
 
 def test_a_sale_dated_before_its_buy_is_refused(tmp_path):

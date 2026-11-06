@@ -820,5 +820,6 @@
 "الخطة غير موجودة.": "Plan not found.",
 "يُربط بالخطة شراءٌ لنفس الأصل فقط.": "Only a buy of the same asset can be linked to the plan.",
 "رسوم الشراء بنفس الأصل لازم تكون أقل من الكمية المشتراة.": "A purchase fee paid in the same asset must be smaller than the quantity bought.",
-"تاريخ الشراء خارج فترة الخطة.": "The purchase date is outside the plan period."
+"تاريخ الشراء خارج فترة الخطة.": "The purchase date is outside the plan period.",
+"سجل المحفظة مشغول؛ حاول بعد لحظات.": "The portfolio ledger is busy; try again in a moment."
 }
