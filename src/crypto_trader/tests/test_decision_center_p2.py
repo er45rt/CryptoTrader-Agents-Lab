@@ -85,3 +85,41 @@ def test_the_inspector_shows_only_recorded_fields_and_opens_the_real_source():
         assert field in body, field
     assert 'if (s.kind === "paper")' in body and 'if (s.kind === "demo")' in body and "/api/run?id=" in body
     assert "&window=200" in JS
+
+
+def test_rejection_reasons_are_ranked_from_recorded_codes_and_drill_down_exactly(root):
+    res = decisions.collect(root, limit=2000)
+    rs, items = res["reasons"], res["items"]
+    blocked = [i for i in items if decisions.block_reasons(i)]
+    assert rs["blocked"] == len(blocked) > 0
+    counts = [r["count"] for r in rs["rows"]]
+    assert counts == sorted(counts, reverse=True)
+    for r in rs["rows"]:
+        carrying = [i for i in items if r["key"] in decisions.block_reasons(i)]
+        assert r["count"] == len(carrying) and r["last_at"] == max(i["at"] for i in carrying)
+        drill = decisions.collect(root, reason=r["key"], limit=2000)
+        assert {i["id"] for i in drill["items"]} == {i["id"] for i in carrying}
+        assert drill["reasons"] == rs and drill["funnel"] == res["funnel"]       # drill-down never changes the totals
+    keys = {r["key"] for r in rs["rows"]}
+    assert "risk:max_order_notional_exceeded" in keys and "missed:bar-arrived-late" in keys
+    capped = decisions.collect(root, source="paper:capped", limit=2000)["reasons"]
+    assert capped["rows"][0]["key"] == "risk:max_order_notional_exceeded" and capped["rows"][0]["strategies"] == ["dc-cross"]
+
+
+def test_only_prevented_trades_have_block_reasons():
+    base = {"strategy": "s", "at": "2026-01-01T00:00:00+00:00", "risk": None, "validity": None, "rationale": ""}
+    assert decisions.block_reasons({**base, "kind": "no_entry", "rationale": "strategy:keep"}) == []
+    assert decisions.block_reasons({**base, "kind": "entry"}) == []
+    assert decisions.block_reasons({**base, "kind": "no_entry", "rationale": "strategy:no_cash"}) == ["cash:no_cash"]
+    assert decisions.block_reasons({**base, "kind": "rejected_risk", "risk": {"decision": "rejected", "codes": []}}) == \
+        ["risk:unrecorded"]
+    two = {**base, "kind": "rejected_risk", "risk": {"decision": "rejected", "codes": ["a", "b"]}}
+    rs = decisions.reasons([two])
+    assert rs["blocked"] == 1 and [r["share"] for r in rs["rows"]] == [1, 1]
+
+
+def test_the_reasons_card_never_calls_a_stopped_trade_a_missed_profit():
+    body = JS[JS.index("const DC_STAGE"):JS.index("const dcT")]
+    assert "dcReasons(d.reasons)" in JS and 'q.set("reason", dcState.reason)' in JS
+    for word in ("ربح ضائع", "فرصة ضائعة", "خسرت فرصة", "missed profit"):
+        assert word not in body

@@ -188,14 +188,51 @@ def funnel(items: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def block_reasons(i: dict[str, Any]) -> list[str]:
+    """Why this decision did not become a trade, as "<stage>:<recorded code>" keys (phase 2, A3). Only recorded fields:
+    the validity reason, the risk/safety reason codes, a late bar, or the strategy's own no-cash rationale. A decision
+    the strategy did not want to trade has no block reason - it was not prevented, it was not asked for."""
+    k = i["kind"]
+    if k == "rejected_validity":
+        return [f"validity:{(i.get('validity') or {}).get('reason') or 'unrecorded'}"]
+    if k in ("rejected_risk", "blocked_safety"):
+        stage = "risk" if k == "rejected_risk" else "safety"
+        return [f"{stage}:{c}" for c in ((i.get("risk") or {}).get("codes") or ["unrecorded"])]
+    if k == "missed":
+        return ["missed:bar-arrived-late"]
+    if i.get("rationale") == "strategy:no_cash":
+        return ["cash:no_cash"]
+    return []
+
+
+def reasons(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Block reasons ranked by the number of decisions carrying them; a decision with several codes counts once per
+    code, so shares are of blocked decisions and may sum above 100%."""
+    rows: dict[str, dict[str, Any]] = {}
+    blocked = 0
+    for i in items:
+        keys = block_reasons(i)
+        blocked += bool(keys)
+        for key in dict.fromkeys(keys):
+            r = rows.setdefault(key, {"key": key, "stage": key.split(":", 1)[0], "code": key.split(":", 1)[1],
+                                      "count": 0, "last_at": None, "strategies": set()})
+            r["count"] += 1
+            r["last_at"] = max(r["last_at"] or i["at"], i["at"])
+            r["strategies"].add(i["strategy"])
+    ranked = sorted(rows.values(), key=lambda r: (-r["count"], r["key"]))
+    return {"blocked": blocked, "rows": [{**r, "strategies": sorted(r["strategies"]),
+                                          "share": r["count"] / blocked if blocked else 0} for r in ranked]}
+
+
 def _parse_time(text: str | None) -> datetime | None:
     return datetime.fromisoformat(text) if text else None
 
 
 def collect(root: Path, *, source: str | None = None, strategy: str | None = None, symbol: str | None = None,
             kinds: list[str] | None = None, since: str | None = None, until: str | None = None,
-            limit: int = 300) -> dict[str, Any]:
-    """All decisions, newest first, filtered; counts per kind are over the filtered set before `kinds`."""
+            reason: str | None = None, limit: int = 300) -> dict[str, Any]:
+    """All decisions, newest first, filtered; counts, funnel and reasons are over the filtered set before the
+    `kinds` / `reason` drill-down."""
     items = _paper(root) + _demos(root) + _backtests(root)
     facets = {"sources": sorted({(i["source"]["kind"], i["source"]["name"], i["source"]["label"]) for i in items}),
               "strategies": sorted({i["strategy"] for i in items}), "symbols": sorted({i["symbol"] for i in items})}
@@ -207,13 +244,15 @@ def collect(root: Path, *, source: str | None = None, strategy: str | None = Non
     counts = {k: 0 for k in KINDS}
     for i in sel:
         counts[i["kind"]] += 1
-    flow = funnel(sel)
+    flow, why = funnel(sel), reasons(sel)
     if kinds:
         sel = [i for i in sel if i["kind"] in kinds]
+    if reason:
+        sel = [i for i in sel if reason in block_reasons(i)]
     sel.sort(key=lambda i: i["at"], reverse=True)
     total = len(sel)
     return {"items": [{k: v for k, v in i.items() if k != "evidence"} for i in sel[: max(1, min(limit, 2000))]],
-            "total": total, "counts": counts, "funnel": flow, "facets": {**facets, "sources": [
+            "total": total, "counts": counts, "funnel": flow, "reasons": why, "facets": {**facets, "sources": [
                 {"id": f"{k}:{n}", "label": label} for k, n, label in facets["sources"]]}}
 
 

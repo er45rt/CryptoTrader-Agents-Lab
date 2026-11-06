@@ -857,5 +857,18 @@
 "ما فيه خروج مسجّل بعد (المركز مفتوح أو الجلسة انتهت)": "No exit recorded yet (position open or the session ended)",
 "شموع أقل": "Fewer bars",
 "شموع أكثر": "More bars",
-"افتح المصدر": "Open the source"
+"افتح المصدر": "Open the source",
+"شمعة متأخرة": "Late bar",
+"الشمعة وصلت متأخرة وما انقيّمت": "The bar arrived late and was not evaluated",
+"الاستراتيجية طلبت شراء والرصيد ما يكفي": "The strategy asked to buy and the balance was not enough",
+"أسباب منع الصفقات": "Why trades were stopped",
+"قرار موقوف": "stopped decisions",
+"إلغاء تصفية السبب": "Clear reason filter",
+"المرحلة": "Stage",
+"النسبة": "Share",
+"آخر مرة (غرينتش)": "Last time (GMT)",
+"النسبة من القرارات الموقوفة، والقرار الواحد قد يحمل أكثر من سبب. التوقّف ما يعني إن الصفقة كانت بتربح أو بتخسر؛ هذا سجل السبب فقط.": "Share of stopped decisions; one decision can carry more than one reason. Being stopped does not mean the trade would have won or lost; this records the reason only.",
+"يظهر أول": "Showing the first",
+"سبب.": "reasons.",
+"ما فيه صفقات موقوفة بهالفلاتر.": "No stopped trades with these filters."
 }

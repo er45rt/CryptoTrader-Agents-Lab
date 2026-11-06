@@ -26,7 +26,7 @@ function oneLine(i) {   // fixed template over recorded fields; no free text is 
   return rationaleAr(i.rationale);
 }
 
-const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null, wide: false };
+const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null, wide: false, reason: "" };
 
 PAGES.decisions = async () => {
   main.innerHTML = header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
@@ -39,6 +39,7 @@ PAGES.decisions = async () => {
     <div><label>إلى</label><input id="dc-until" type="datetime-local"></div>
   </div><div class="actions"><div class="tabs" id="dc-kinds"></div></div></div>
   <div class="card" id="dc-funnel"><div class="skel"></div></div>
+  <div class="card" id="dc-reasons"></div>
   <div class="cols dc-cols"><div class="card"><div class="card-h"><h2>القرارات <small id="dc-total"></small></h2></div><div class="tw" style="max-height:640px"><table>
     <thead><tr><th>الوقت (غرينتش)</th><th>النوع</th><th>الاستراتيجية · الزوج</th><th>الخلاصة</th></tr></thead><tbody id="dc-rows"></tbody></table></div></div>
   <div class="stack" id="dc-detail">${empty("اختر قرار من القائمة عشان تشوف سلسلته كاملة", "layers")}</div></div>`;
@@ -57,6 +58,7 @@ async function dcLoad(quiet = false) {
   if (f.since) q.set("since", new Date(f.since + "Z").toISOString());
   if (f.until) q.set("until", new Date(f.until + "Z").toISOString());
   if (f.kinds.length) q.set("kinds", f.kinds.join(","));
+  if (dcState.reason) q.set("reason", dcState.reason);
   q.set("limit", "400");
   let d;
   try { d = await api("/api/decisions?" + q.toString()); } catch (e) { if (!quiet) $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; return; }
@@ -68,6 +70,7 @@ async function dcLoad(quiet = false) {
   fill("#dc-symbol", d.facets.symbols.map((s) => [s, s]), f.symbol);
   const c = d.counts;
   dcFunnel(d.funnel);
+  dcReasons(d.reasons);
   const kt = $("#dc-kinds");
   kt.innerHTML = `<button data-k="" class="${f.kinds.length ? "" : "on"}">الكل</button>` + KIND_ORDER.filter((k) => c[k]).map((k) =>
     `<button data-k="${k}" class="${f.kinds.includes(k) ? "on" : ""}">${esc(DC.kinds[k][0])} <span class="muted">${c[k]}</span></button>`).join("");
@@ -179,6 +182,31 @@ async function dcShow(id, keepScroll = false) {
     candles($("#dc-chart"), bars, fills, [{ values: sma(bars, 20), color: css("--sma1") }], dcState.wide ? 300 : 230);
     dcMark($("#dc-chart"), bars, i.bar_open || i.at);
   } else $("#dc-chart").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "ما فيه شموع محفوظة لهالمصدر." }));
+}
+/** Rejection reasons (phase 2, A3): ranked from the recorded codes over the filtered decisions. A stopped decision is
+    shown as stopped, never as a "missed profit": nothing here says what the trade would have earned. */
+const DC_STAGE = { validity: "الصلاحية", risk: "المخاطر", safety: "الحماية", missed: "شمعة متأخرة", cash: "الرصيد" };
+function dcReasonText(r) {
+  if (r.stage === "validity") return arOf(AR.validityReason, r.code);
+  if (r.stage === "risk" || r.stage === "safety") return arOf(AR.risk, r.code);
+  if (r.stage === "missed") return "الشمعة وصلت متأخرة وما انقيّمت";
+  if (r.stage === "cash") return "الاستراتيجية طلبت شراء والرصيد ما يكفي";
+  return r.code;
+}
+function dcReasons(rs) {
+  const box = $("#dc-reasons"); if (!box) return;
+  const active = dcState.reason, rows = rs.rows.slice(0, 12);
+  box.innerHTML = `<div class="card-h"><h2>أسباب منع الصفقات <small class="muted"><span class="ltr">${rs.blocked}</span> قرار موقوف</small></h2>
+      ${active ? `<button class="sm" data-reason="">✕ إلغاء تصفية السبب</button>` : ""}</div>
+    ${rows.length ? `<div class="tw"><table><thead><tr><th>السبب</th><th>المرحلة</th><th>القرارات</th><th>النسبة</th><th>آخر مرة (غرينتش)</th><th>الاستراتيجيات</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr data-reason="${esc(r.key)}" class="${r.key === active ? "sel" : ""}" style="cursor:pointer">
+        <td class="wrap">${esc(dcReasonText(r))} <code class="ltr muted" style="font-size:11px">${esc(r.code)}</code></td><td>${esc(DC_STAGE[r.stage] || r.stage)}</td>
+        <td class="ltr">${r.count}</td><td class="ltr">${Math.round(r.share * 100)}%</td><td class="ltr">${esc(dcT(r.last_at))}</td><td>${r.strategies.map(esc).join("، ")}</td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:6px">النسبة من القرارات الموقوفة، والقرار الواحد قد يحمل أكثر من سبب. التوقّف ما يعني إن الصفقة كانت بتربح أو بتخسر؛ هذا سجل السبب فقط.${rs.rows.length > rows.length ? ` يظهر أول ${rows.length} من ${rs.rows.length} سبب.` : ""}</div>`
+      : `<div class="muted">ما فيه صفقات موقوفة بهالفلاتر.</div>`}`;
+  box.onclick = (e) => { const el = e.target.closest("[data-reason]"); if (!el) return;
+    dcState.reason = el.dataset.reason === active ? "" : el.dataset.reason; dcLoad(); };
 }
 const dcT = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
 /** Trade inspector (phase 2, A2): the recorded facts of one decision in one place - strategy, bar, price at decision,
