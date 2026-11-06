@@ -128,6 +128,10 @@ function wireTxForm() {
   const sync = () => { const ty = $("#tf-type").value; document.querySelectorAll("[data-for]").forEach((d) => { d.style.display = d.dataset.for.split(" ").includes(ty) ? "" : "none"; });
     $("#tf-hint").textContent = ty === "transfer" ? "التحويل بين محافظك ما يغيّر الكمية ولا المتوسط؛ الرسوم بنفس الأصل." : ty === "fee" ? "رسوم مدفوعة بالأصل نفسه (مثل رسوم شبكة)." : ""; };
   $("#tf-type").onchange = sync; sync();
+  const plansFor = () => { const a = $("#tf-asset").value.trim().toUpperCase();   // only plans of the typed asset
+    [...$("#tf-plan").options].forEach((o) => { o.hidden = !!o.value && o.dataset.a !== a; });
+    if ($("#tf-plan").selectedOptions[0]?.hidden) $("#tf-plan").value = ""; };
+  $("#tf-asset").oninput = plansFor; plansFor();
   $("#tf-go").onclick = async () => {
     const ty = $("#tf-type").value, asset = $("#tf-asset").value.trim().toUpperCase();
     const body = { type: ty, asset, at: $("#tf-at").value ? new Date($("#tf-at").value).toISOString() : "", fee: $("#tf-fee").value,

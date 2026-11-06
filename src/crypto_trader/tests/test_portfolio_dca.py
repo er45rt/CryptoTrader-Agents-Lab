@@ -42,6 +42,23 @@ def test_dca_buys_are_ordinary_ledger_transactions_not_a_second_copy(tmp_path):
     assert "dca" not in lg.path.read_text(encoding="utf-8").replace("dca_plan", "")
 
 
+@pytest.mark.parametrize("plan_id, asset, match", [("p-missing", "BTC", "غير موجودة"), (None, "ETH", "لنفس الأصل")])
+def test_a_new_buy_can_only_be_tagged_with_an_existing_plan_of_its_asset(tmp_path, plan_id, asset, match):
+    # Sol D40 blocker 4: an ETH buy tagged with a BTC plan was accepted and counted as BTC
+    lg, plans = _setup(tmp_path, prices=lambda a: {"BTC": {"price": "100", "source": "t"}})
+    p = plans.create({"asset": "BTC", "amount": "20", "day": "5", "start": "2026-04"})
+    with pytest.raises(StrategyError, match=match):
+        lg.add({"type": "buy", "asset": asset, "at": "2026-04-05", "qty": "2", "price": "10",
+                "dca_plan": plan_id or p["id"]})
+    assert lg.transactions() == [] and plans.status()["plans"][0]["qty"] == "0"
+
+
+def test_a_ledger_without_plans_refuses_plan_tags(tmp_path):
+    with pytest.raises(StrategyError, match="غير موجودة"):
+        portfolio.Ledger(tmp_path).add({"type": "buy", "asset": "BTC", "at": "2026-04-05", "qty": "1", "price": "1",
+                                         "dca_plan": "x"})
+
+
 def test_link_and_unlink_an_existing_buy_same_asset_only(tmp_path):
     lg, plans = _setup(tmp_path)
     p = plans.create({"asset": "ETH", "amount": "50", "day": "1", "start": "2026-04"})

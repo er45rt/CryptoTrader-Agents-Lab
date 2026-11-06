@@ -182,6 +182,7 @@ class Ledger:
         self.path = self.dir / "ledger.json"
         self._lock = threading.Lock()
         self._prices = prices
+        self.plan_check: Callable[[dict[str, Any]], None] | None = None   # set by dca.Plans
 
     def _load(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -205,6 +206,11 @@ class Ledger:
         """All or nothing: every row is validated and the whole ledger replayed before anything is written.
         `guard` sees the ledger as loaded under the lock and may refuse (e.g. a CSV batch already imported)."""
         new = [parse_tx(b) for b in bodies]
+        for tx in new:
+            if tx.get("dca_plan"):        # only an existing plan for the same asset (Sol D40 blocker 4)
+                if self.plan_check is None:
+                    raise StrategyError("الخطة غير موجودة.")
+                self.plan_check(tx)
         with self._lock:
             txs = self._load()
             if guard:

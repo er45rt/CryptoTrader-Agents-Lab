@@ -46,6 +46,15 @@ class Plans:
                  today: Callable[[], date] = lambda: datetime.now(timezone.utc).date()) -> None:
         self.ledger, self._prices, self._today = ledger, prices, today
         self.path = ledger.dir / "dca.json"
+        ledger.plan_check = self.check      # every ledger write tagged with a plan is validated here
+
+    def check(self, tx: dict[str, Any]) -> None:
+        """A buy may carry dca_plan only for an existing plan of the same asset."""
+        plan = next((p for p in self._load() if p["id"] == tx.get("dca_plan")), None)
+        if plan is None:
+            raise StrategyError("الخطة غير موجودة.")
+        if tx.get("type") != "buy" or tx.get("asset") != plan["asset"]:
+            raise StrategyError("يُربط بالخطة شراءٌ لنفس الأصل فقط.")
 
     def _load(self) -> list[dict[str, Any]]:
         return json.loads(self.path.read_text(encoding="utf-8"))["plans"] if self.path.exists() else []
@@ -115,7 +124,8 @@ class Plans:
         quotes = self._prices(sorted({p["asset"] for p in plans})) if (self._prices and plans) else {}
         out, reminders = [], []
         for p in plans:
-            buys = sorted((t for t in txs if t.get("dca_plan") == p["id"]), key=lambda t: t["at"])
+            buys = sorted((t for t in txs if t.get("dca_plan") == p["id"] and t["type"] == "buy"
+                           and t["asset"] == p["asset"]), key=lambda t: t["at"])
             stop = date.fromisoformat(p["stopped_at"]) if p.get("stopped_at") else None
             last = (stop or today)
             months = []
