@@ -9,8 +9,9 @@ STRAT = Path(__file__).resolve().parents[1] / "strategies"
 STATIC = STRAT / "ui" / "static"
 AR = re.compile(r"[؀-ۿ]")
 SEG = re.compile(r"[؀-ۿ][؀-ۿً-ٰٟ\s«»،؛؟\-…:()0-9%.+/×·—–]*[؀-ۿ»)؟.]|[؀-ۿ]")
-SOURCES = [STATIC / f for f in ("app.js", "decisions.js", "demo.js", "i18n.js", "index.html")] + \
-          [STRAT / "ui" / f for f in ("store.py", "decisions.py", "demo.py", "server.py")] + [STRAT / "analysis.py"]
+SOURCES = [STATIC / f for f in ("app.js", "decisions.js", "demo.js", "portfolio.js", "i18n.js", "index.html")] + \
+          [STRAT / "ui" / f for f in ("store.py", "decisions.py", "demo.py", "server.py", "portfolio.py", "portfolio_csv.py",
+                                      "dca.py", "prices.py", "launcher.py")] + [STRAT / "analysis.py"]
 
 
 def _segments() -> dict[str, str]:
@@ -46,11 +47,11 @@ def test_every_arabic_phrase_in_the_ui_has_an_english_translation():
 
 def test_language_is_display_only():
     # the language lives in the browser (localStorage) and is never sent to the server
-    for f in ("app.js", "decisions.js", "demo.js", "lang.js"):
+    for f in ("app.js", "decisions.js", "demo.js", "portfolio.js", "lang.js"):
         src = (STATIC / f).read_text(encoding="utf-8")
         assert not re.search(r"api\([^)]*(lang|LANG)", src), f
         assert "ct-lang" not in src or f == "lang.js"
-    for f in ("server.py", "store.py", "decisions.py", "demo.py"):
+    for f in ("server.py", "store.py", "decisions.py", "demo.py", "portfolio.py", "portfolio_csv.py", "dca.py", "prices.py"):
         # the static file name "lang.js" (served as a file) is not a language parameter
         assert not re.search(r"\blang(uage)?\b(?!\.js)", (STRAT / "ui" / f).read_text(encoding="utf-8")), f
 

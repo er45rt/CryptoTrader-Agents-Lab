@@ -67,6 +67,7 @@ const loading = (t) => `<div class="loading"><div class="spin"></div>${esc(t)}</
 let timer = null, current = null;
 function nav(page) {
   clearInterval(timer);
+  main.onclick = null;   // a page's delegated click handler never outlives the page
   current = page;
   document.querySelectorAll(".side a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
   (PAGES[page] || PAGES.home)().catch((e) => { main.innerHTML = errBox(e); });
