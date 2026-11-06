@@ -33,7 +33,11 @@ def _n(value: Any) -> str | None:
     if value is None:
         return None
     d = Decimal(str(value))
-    return "0" if d == 0 else format(d.normalize(), "f")
+    if d == 0:
+        return "0"
+    # exact and context-free: normalize() rounds to the ambient 28 digits and merged distinct numbers (Sol D40 recheck)
+    s = format(d, "f")
+    return s.rstrip("0").rstrip(".") if "." in s else s
 
 
 def _key(tx: dict[str, Any]) -> tuple:

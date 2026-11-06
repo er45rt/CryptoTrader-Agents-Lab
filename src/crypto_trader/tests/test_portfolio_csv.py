@@ -180,6 +180,19 @@ def test_two_concurrent_confirms_of_the_same_file_import_it_once(tmp_path, monke
     assert str(portfolio.compute(lg._load())["BTC"]["qty"]) == "1"
 
 
+def test_distinct_numbers_beyond_28_digits_are_never_merged_as_duplicates(tmp_path):
+    # Sol D40 recheck, blocker 2: normalize() rounded both quantities to one key and skip_duplicates dropped a real buy
+    text = ("date,type,asset,quantity,price\n"
+            "2026-01-01,buy,BTC,123456789012345.123456789012345678,1\n"
+            "2026-01-01,buy,BTC,123456789012345.123456789012345679,1\n")
+    lg = _lg(tmp_path)
+    p = pcsv.preview(text, lg, skip_duplicates=True)
+    assert p["n_duplicates"] == 0 and p["n_ok"] == 2
+    assert pcsv.confirm(text, p["sha256"], lg, skip_duplicates=True) == {"batch": p["batch"], "imported": 2,
+                                                                         "skipped_duplicates": 0}
+    assert pcsv._n("1.10") == pcsv._n("1.1") == pcsv._n("11e-1") == "1.1" and pcsv._n("1E+2") == "100"
+
+
 def test_too_many_columns_in_a_row_is_an_error_not_a_silent_shift(tmp_path):
     text = "date,type,asset,quantity,price\n2026-01-01,buy,ETH,1,2000,extra\n"
     p = pcsv.preview(text, _lg(tmp_path))
