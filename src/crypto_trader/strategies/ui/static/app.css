@@ -271,3 +271,12 @@ details.tech pre{margin-top:6px;max-height:180px}
 .insp>div{padding:8px 2px;border-bottom:1px solid var(--line);font-size:13px;overflow-wrap:anywhere;min-width:0}
 .insp>div:nth-child(odd){color:var(--muted)}
 .insp-sub{display:block;color:var(--muted);font-size:11.5px;margin-top:2px}
+
+/* dashboard (phase 2, B1): four separate money spaces, each with its own colour and label */
+.spaces{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.space{white-space:normal;display:flex;flex-direction:column;align-items:stretch;gap:4px;text-align:start;padding:14px;border-radius:14px;background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--sp);cursor:pointer;color:var(--text);min-width:0}
+.space small{font-weight:650;font-size:12.5px}.space b{font-size:22px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.space .sp-sub{display:block;font-size:12.5px;overflow-wrap:anywhere}.space .sp-src{display:block;font-size:11.5px;color:var(--muted);overflow-wrap:anywhere}
+.space.on{box-shadow:0 0 0 2px var(--sp) inset;background:var(--panel2)}
+.sp-portfolio{--sp:#3b82f6}.sp-demo{--sp:#f5a524}.sp-paper{--sp:#8b5cf6}.sp-backtest{--sp:#14b8a6}
+@media (max-width:1000px){.spaces{grid-template-columns:repeat(2,minmax(0,1fr))}}

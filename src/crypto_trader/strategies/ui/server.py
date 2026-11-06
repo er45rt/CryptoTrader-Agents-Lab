@@ -38,7 +38,7 @@ STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/javascript; charset=utf-8",
                 "decisions.js": "text/javascript; charset=utf-8", "demo.js": "text/javascript; charset=utf-8",
-                "portfolio.js": "text/javascript; charset=utf-8",
+                "portfolio.js": "text/javascript; charset=utf-8", "dashboard.js": "text/javascript; charset=utf-8",
                 "lang.js": "text/javascript; charset=utf-8", "i18n_en.json": "application/json; charset=utf-8",
                 "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"

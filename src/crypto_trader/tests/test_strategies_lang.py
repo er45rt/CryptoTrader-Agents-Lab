@@ -9,7 +9,7 @@ STRAT = Path(__file__).resolve().parents[1] / "strategies"
 STATIC = STRAT / "ui" / "static"
 AR = re.compile(r"[؀-ۿ]")
 SEG = re.compile(r"[؀-ۿ][؀-ۿً-ٰٟ\s«»،؛؟\-…:()0-9%.+/×·—–]*[؀-ۿ»)؟.]|[؀-ۿ]")
-SOURCES = [STATIC / f for f in ("app.js", "decisions.js", "demo.js", "portfolio.js", "i18n.js", "index.html")] + \
+SOURCES = [STATIC / f for f in ("app.js", "decisions.js", "demo.js", "portfolio.js", "dashboard.js", "i18n.js", "index.html")] + \
           [STRAT / "ui" / f for f in ("store.py", "decisions.py", "demo.py", "server.py", "portfolio.py", "portfolio_csv.py",
                                       "dca.py", "prices.py", "launcher.py")] + [STRAT / "analysis.py"]
 

@@ -287,35 +287,6 @@ const posText = (p) => { if (!p) return "—"; const e = Object.entries(p).filte
 
 /* ---------- pages ---------- */
 const PAGES = {};
-PAGES.home = async () => {
-  const d = await api("/api/home");
-  // a session with no live decision yet still holds its starting capital (its equity is not reported yet)
-  const equity = d.sessions.reduce((a, s) => a + (isNum(s.equity) ? +s.equity : +s.capital), 0);
-  const pnl = equity - d.capital_total, ret = d.capital_total ? pnl / d.capital_total : null;
-  const live = d.sessions.find((s) => s.running) || d.sessions[0];
-  main.innerHTML = header("الرئيسية", "نظرة سريعة على جلساتك الورقية وآخر اختباراتك",
-    chip(`${d.running} جلسة تعمل`, d.running ? "good" : "") + chip("محاكاة فقط · بدون مفاتيح", ""))
-  + `<div class="card demo-cta"><div><h2>الوضع التجريبي</h2><div class="muted" style="font-size:13px;margin-top:4px">جرّب أي استراتيجية الحين على أسعار تاريخية حقيقية، بدون فلوس وبدون إنترنت، وشوف أسباب كل قرار.</div></div>
-    <button class="primary" data-nav="demo">▶ ابدأ الوضع التجريبي</button></div>
-  <div class="kpis">
-    ${kpi({ k: "الرصيد الورقي", v: d.capital_total ? fmtUsd(equity) : "—", ic: "wallet", s: `رأس المال ${fmtUsd(d.capital_total, 0)}` })}
-    ${kpi({ k: "الربح / الخسارة", v: d.capital_total ? (pnl > 0 ? "+" : "") + fmtUsd(pnl) : "—", cls: sign(pnl), ic: pnl >= 0 ? "trend" : "down", tone: pnl >= 0 ? "g" : "r", s: fmtSPct(ret, 2) })}
-    ${kpi({ k: "جلسات تعمل", v: `${d.running} / ${d.sessions.length}`, ic: "play", tone: d.running ? "g" : "" })}
-    ${kpi({ k: "مراكز مفتوحة", v: String(d.open_positions.length), ic: "box", tone: d.open_positions.length ? "w" : "" })}
-    ${kpi({ k: "تجارب الاختبار", v: String(d.experiments), ic: "flask", s: "كل تجربة ترفع عتبة حكم المتانة" })}
-  </div>
-  <div class="cols">
-    <div class="card"><div class="card-h"><h2>${live ? `السوق الآن <small>${esc(live.symbol)} · ${esc(tfAr(live.timeframe))} · من جلسة ${esc(live.name)}</small>` : "السوق الآن"}</h2></div>
-      <div id="hmk">${live ? loading("تحميل الشموع…") : empty("شغّل جلسة ورقية عشان تشوف السوق هنا", "play")}</div></div>
-    <div class="card"><div class="card-h"><h2>آخر اختبار</h2></div>${d.last_run ? runSummary(d.last_run) : empty("ما فيه اختبارات بعد", "flask")}</div>
-  </div>
-  <div class="card"><div class="card-h"><h2>الجلسات الورقية</h2><button class="sm" data-nav="paper">إدارة الجلسات</button></div>${sessionTable(d.sessions)}</div>
-  ${note("كل الأرقام هنا ورقية (محاكاة على أسعار Binance العامة). ما فيه اتصال بحساب حقيقي، والتداول الحقيقي معطّل برمجيًا.")}`;
-  if (live) api("/api/paper/session?name=" + encodeURIComponent(live.name)).then((s) => {
-    const el = $("#hmk"); if (!el) return; el.innerHTML = `<canvas id="hc"></canvas>`;
-    candles($("#hc"), s.bars.slice(-120), [], [{ values: sma(s.bars.slice(-120), 20), color: css("--sma1") }], 280); }).catch(() => {});
-  timer = setInterval(() => { if (current === "home") PAGES.home().catch(() => {}); }, 30000);
-};
 function sessionTable(ss) {
   if (!ss.length) return empty("ما فيه جلسات. أنشئ وحدة من صفحة التداول الورقي.", "play");
   return `<div class="tw"><table><thead><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>المركز</th><th>عمليات التنفيذ</th><th>فائتة</th><th>آخر دورة</th></tr></thead><tbody>

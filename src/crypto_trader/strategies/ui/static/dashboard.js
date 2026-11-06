@@ -1,0 +1,112 @@
+"use strict";
+/* لوحة المتابعة (phase 2, owner decision D42). Four separate money spaces - my real portfolio, demo, paper and backtest.
+   Each card shows its own numbers with their source and time and loads on its own; numbers from different spaces are
+   never added, netted or compared in one figure. */
+
+const DB = { space: "portfolio", spaces: {}, demo: null };
+const DB_SPACES = [["portfolio", "محفظتي", "حقيقية"], ["demo", "التجريبي", "Demo"], ["paper", "التداول الورقي", "Paper"], ["backtest", "الاختبارات", "Backtest"]];
+const dbAt = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
+
+PAGES.home = async () => {
+  main.innerHTML = header("لوحة المتابعة", "كل مساحة مالية لحالها: محفظتك الحقيقية، والتجريبي، والورقي، والاختبارات. أرقامها ما تنجمع مع بعض أبدًا.",
+    chip("التداول الحقيقي معطّل", "") + chip("بدون مفاتيح", ""))
+  + `<div id="db-status"></div>
+  <div class="spaces" id="db-spaces">${DB_SPACES.map(([k, t, s]) => `<button type="button" class="space sp-${k}" data-space="${k}">
+    <small>${t} <span class="muted">· ${s}</span></small><b>…</b><span class="sp-sub"></span><span class="sp-src"></span></button>`).join("")}</div>
+  <div class="card" id="db-detail">${loading("تحميل…")}</div>
+  <div class="card" id="db-compare"></div>`;
+  $("#db-spaces").onclick = (e) => { const b = e.target.closest("[data-space]"); if (!b) return; DB.space = b.dataset.space; dbPaint(); dbDetail(); };
+  dbPaint();
+  const load = (k, p) => p.then((d) => { DB.spaces[k] = { ok: true, d }; }, (e) => { DB.spaces[k] = { ok: false, e }; })
+    .then(() => { if (current !== "home") return; dbCard(k); if (k === DB.space) dbDetail(); });
+  DB.spaces = {};
+  await Promise.all([load("portfolio", api("/api/portfolio")), load("demo", api("/api/demo")), load("paper", api("/api/paper")),
+    load("backtest", api("/api/runs"))]);
+};
+
+function dbPaint() { document.querySelectorAll("#db-spaces [data-space]").forEach((b) => b.classList.toggle("on", b.dataset.space === DB.space)); }
+
+/** One space's headline, from that space's own endpoint only. */
+function dbCard(k) {
+  const el = $(`#db-spaces [data-space="${k}"]`); if (!el) return;
+  const s = DB.spaces[k], set = (v, sub, src) => { el.querySelector("b").innerHTML = v; el.querySelector(".sp-sub").innerHTML = sub; el.querySelector(".sp-src").innerHTML = src; };
+  if (!s) return;
+  if (!s.ok) return set("—", `<span class="bad">${esc(trErr(s.e.message).ar || "تعذّر التحميل")}</span>`, "");
+  const d = s.d;
+  if (k === "portfolio") {
+    const t = d.totals, at = d.assets.map((a) => a.price_at).filter(Boolean).sort().pop();
+    return set(t.value ? fmtUsd(t.value) : "—",
+      (t.unrealized !== null ? `<span class="${sign(t.unrealized)}">${+t.unrealized > 0 ? "+" : ""}${fmtUsd(t.unrealized)}</span> غير محقق` : "ما فيه أصول مسعّرة")
+        + (t.value_complete ? "" : ` · <span class="warn">${d.unpriced.length} أصل بدون سعر</span>`),
+      `سجل المحفظة · أسعار Binance العامة${at ? ` · <span class="ltr">${esc(dbAt(at))}</span>` : ""}`);
+  }
+  if (k === "demo") {
+    const last = [...d.demos].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+    return set(last && isNum(last.equity) ? fmtUsd(last.equity) : last ? fmtUsd(last.capital) : "—",
+      last ? `${esc(last.name)} · <span class="${sign(last.net_return)}">${fmtSPct(last.net_return, 2)}</span> · ${d.demos.length} جلسة` : "ما فيه جلسات تجريبية",
+      `إعادة تشغيل محلية لأسعار تاريخية${last?.clock ? ` · <span class="ltr">${esc(dbAt(last.clock))}</span>` : ""}`);
+  }
+  if (k === "paper") {
+    const run = d.sessions.filter((x) => x.running).length, last = d.sessions.map((x) => x.last_cycle).filter(Boolean).sort().pop();
+    return set(`<span class="ltr">${run} / ${d.sessions.length}</span> تعمل`,
+      d.sessions.length ? d.sessions.slice(0, 2).map((x) => `${esc(x.name)} <span class="${sign(x.net_return)}">${fmtSPct(x.net_return, 2)}</span>`).join(" · ") : "ما فيه جلسات ورقية",
+      `أسعار Binance العامة الحية · محاكاة${last ? ` · <span class="ltr">${esc(dbAt(last))}</span>` : ""}`);
+  }
+  const r = d.runs[0];
+  return set(`<span class="ltr">${d.count}</span> اختبار`,
+    r ? `آخرها ${esc(r.strategy)} · <span class="${sign(r.net_return)}">${fmtSPct(r.net_return)}</span>` : "ما فيه اختبارات بعد",
+    `سجل التجارب runs.jsonl${r ? ` · <span class="ltr">${esc(dbAt(r.at))}</span>` : ""}`);
+}
+
+/** The selected space in detail, with its own chart. */
+async function dbDetail() {
+  const box = $("#db-detail"), k = DB.space, s = DB.spaces[k]; if (!box) return;
+  const title = DB_SPACES.find((x) => x[0] === k)[1];
+  if (!s) { box.innerHTML = loading("تحميل…"); return; }
+  if (!s.ok) { box.innerHTML = `<div class="card-h"><h2>${title}</h2></div>${errBox(s.e)}`; return; }
+  const d = s.d;
+  if (k === "portfolio") {
+    const t = d.totals;
+    box.innerHTML = `<div class="card-h"><h2>${title} <small>القيمة من الأصول المسعّرة فقط</small></h2><button class="sm" data-nav="portfolio">افتح محفظتي</button></div>
+      <div class="kv"><div>القيمة الحالية</div><div>${t.value ? fmtUsd(t.value) : "—"}</div><div>تكلفة الأصول المسعّرة</div><div>${fmtUsd(t.priced_basis)}</div>
+      <div>غير محقق</div><div class="${sign(t.unrealized)}">${t.unrealized !== null ? fmtUsd(t.unrealized) : "—"}</div><div>محقق</div><div class="${sign(t.realized)}">${fmtUsd(t.realized)}</div>
+      <div>الرسوم بالدولار</div><div>${fmtUsd(t.fees_quote)}</div><div>العمليات</div><div>${d.n_transactions}</div></div>
+      ${t.value_complete ? "" : note(`أصول بدون سعر من Binance ما دخلت في القيمة: ${d.unpriced.map(esc).join("، ")}`)}
+      <div class="chart" style="margin-top:12px"><canvas id="db-c"></canvas></div>`;
+    if (!d.n_transactions) { $("#db-c").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "ما فيه عمليات مسجّلة بعد." })); return; }
+    api("/api/portfolio/history", undefined, 20000).then((h) => { if (current !== "home" || DB.space !== "portfolio" || !$("#db-c")) return;
+      const acc = css("--accent");
+      lines($("#db-c"), [{ name: "القيمة", points: h.points.map((p) => [p.d, +p.value]), color: acc, area: [acc + "44", acc + "00"] },
+        { name: "التكلفة", points: h.points.map((p) => [p.d, +p.basis]), color: css("--hold"), dash: true, width: 1.5 }], 240); })
+      .catch((e) => { const c = $("#db-c"); if (c) c.replaceWith(Object.assign(document.createElement("div"), { innerHTML: errBox(e) })); });
+    return;
+  }
+  if (k === "demo") {
+    const ds = [...d.demos].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+    if (!ds.length) { box.innerHTML = `<div class="card-h"><h2>${title}</h2></div>${empty("ما فيه جلسات تجريبية. ابدأ وحدة من صفحة الوضع التجريبي.", "play")}<div class="actions"><button class="primary sm" data-nav="demo">▶ الوضع التجريبي</button></div>`; return; }
+    if (!DB.demo || !ds.some((x) => x.name === DB.demo)) DB.demo = ds[0].name;
+    box.innerHTML = `<div class="card-h"><h2>${title} <small>جلسات تعيد تشغيل أسعار تاريخية محليًا</small></h2><button class="sm" data-nav="demo">افتح الوضع التجريبي</button></div>
+      <div class="tw"><table><thead><tr><th>الجلسة</th><th>الاستراتيجية</th><th>الحالة</th><th>الرصيد</th><th>العائد</th><th>التنفيذات</th></tr></thead><tbody>
+      ${ds.map((x) => `<tr data-db-demo="${esc(x.name)}" class="${x.name === DB.demo ? "sel" : ""}" style="cursor:pointer"><td><b>${esc(x.name)}</b></td><td>${esc(x.strategy)} <span class="muted">· ${esc(tfAr(x.timeframe))}</span></td>
+        <td>${x.running ? '<span class="pill good">تعمل</span>' : `<span class="pill">${esc(x.state)}</span>`}</td><td class="ltr">${isNum(x.equity) ? fmtUsd(x.equity) : fmtUsd(x.capital)}</td>
+        <td class="ltr ${sign(x.net_return)}">${fmtSPct(x.net_return, 2)}</td><td>${x.fills ?? "—"}</td></tr>`).join("")}</tbody></table></div>
+      <div class="chart" style="margin-top:12px"><canvas id="db-c"></canvas></div>`;
+    box.querySelector("tbody").onclick = (e) => { const tr = e.target.closest("[data-db-demo]"); if (tr) { DB.demo = tr.dataset.dbDemo; dbDetail(); } };
+    api("/api/demo/session?name=" + encodeURIComponent(DB.demo)).then((x) => { if (current !== "home" || DB.space !== "demo" || !$("#db-c")) return;
+      const acc = css("--warn");
+      if (!x.equity.length) { $("#db-c").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "ما فيه منحنى رصيد بعد لهالجلسة." })); return; }
+      lines($("#db-c"), [{ name: "الرصيد", points: x.equity.map((p) => [p.t, +p.equity]), color: acc, area: [acc + "44", acc + "00"] }], 240); }).catch(() => {});
+    return;
+  }
+  if (k === "paper") {
+    box.innerHTML = `<div class="card-h"><h2>${title} <small>كل جلسة برأس مالها الورقي</small></h2><button class="sm" data-nav="paper">إدارة الجلسات</button></div>${sessionTable(d.sessions)}
+      ${d.sessions.length ? `<div class="chart" style="margin-top:12px"><canvas id="db-c"></canvas></div>` : ""}`;
+    const live = d.sessions.find((x) => x.running) || d.sessions[0];
+    if (live) api("/api/paper/session?name=" + encodeURIComponent(live.name)).then((x) => { if (current !== "home" || DB.space !== "paper" || !$("#db-c")) return;
+      const b = x.bars.slice(-120); if (!b.length) return; candles($("#db-c"), b, [], [{ values: sma(b, 20), color: css("--sma1") }], 260); }).catch(() => {});
+    return;
+  }
+  const r = d.runs[0];
+  box.innerHTML = `<div class="card-h"><h2>${title} <small>آخر اختبار تاريخي</small></h2><button class="sm" data-nav="backtest">الاختبار التاريخي</button></div>
+    ${r ? runSummary(r) : empty("ما فيه اختبارات بعد", "flask")}`;
+}
