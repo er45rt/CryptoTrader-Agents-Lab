@@ -94,5 +94,15 @@ def confirm(text: str, sha256: str, ledger: portfolio.Ledger, *, skip_duplicates
         raise StrategyError("لا يمكن الاستيراد: صحّح الأخطاء أو التكرار في المعاينة أولًا.")
     bodies = [{**r["tx"], "qty": r["tx"].get("qty")} for r in p["rows"]
               if "tx" in r and not (skip_duplicates and r.get("duplicate"))]
-    added = ledger.add_many(bodies, source=f"csv:{portfolio._text(filename)[:60]}", batch=p["batch"])
+    keys = {_key(portfolio.parse_tx(b)) for b in bodies}
+
+    def guard(current: list[dict[str, Any]]) -> None:
+        # re-checked under the ledger lock: a concurrent confirm of the same file, or a matching transaction added
+        # after the preview, refuses this import instead of doubling holdings
+        if any(t.get("batch") == p["batch"] for t in current):
+            raise StrategyError("هذا الملف مستورد من قبل.")
+        if keys & {_key(t) for t in current}:
+            raise StrategyError("لا يمكن الاستيراد: صحّح الأخطاء أو التكرار في المعاينة أولًا.")
+
+    added = ledger.add_many(bodies, source=f"csv:{portfolio._text(filename)[:60]}", batch=p["batch"], guard=guard)
     return {"batch": p["batch"], "imported": len(added), "skipped_duplicates": p["n_duplicates"] if skip_duplicates else 0}

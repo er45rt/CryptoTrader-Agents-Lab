@@ -199,11 +199,15 @@ class Ledger:
     def add(self, body: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
         return self.add_many([body], source=source)[0]
 
-    def add_many(self, bodies: list[dict[str, Any]], *, source: str, batch: str | None = None) -> list[dict[str, Any]]:
-        """All or nothing: every row is validated and the whole ledger replayed before anything is written."""
+    def add_many(self, bodies: list[dict[str, Any]], *, source: str, batch: str | None = None,
+                 guard: Callable[[list[dict[str, Any]]], None] | None = None) -> list[dict[str, Any]]:
+        """All or nothing: every row is validated and the whole ledger replayed before anything is written.
+        `guard` sees the ledger as loaded under the lock and may refuse (e.g. a CSV batch already imported)."""
         new = [parse_tx(b) for b in bodies]
         with self._lock:
             txs = self._load()
+            if guard:
+                guard(txs)
             seq = max((t.get("seq", 0) for t in txs), default=0)
             for tx in new:
                 seq += 1

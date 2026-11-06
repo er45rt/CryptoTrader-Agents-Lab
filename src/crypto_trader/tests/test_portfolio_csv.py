@@ -122,6 +122,34 @@ def test_import_api_preview_confirm_undo(tmp_path, monkeypatch):
         srv.server_close()
 
 
+def test_two_concurrent_confirms_of_the_same_file_import_it_once(tmp_path, monkeypatch):
+    # Sol D40 blocker 1: both confirms pass their preview, then race into add_many; the guard runs under the lock
+    import threading
+
+    text = "date,type,asset,quantity,price\n2026-01-01,buy,BTC,1,100\n"
+    lg = _lg(tmp_path)
+    sha = pcsv.preview(text, lg)["sha256"]
+    barrier, orig, results = threading.Barrier(2), lg.add_many, []
+
+    def synced(*a, **k):
+        barrier.wait(timeout=10)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(lg, "add_many", synced)
+
+    def run():
+        try:
+            results.append(pcsv.confirm(text, sha, lg)["imported"])
+        except StrategyError as exc:
+            results.append(str(exc))
+
+    th = [threading.Thread(target=run) for _ in range(2)]
+    [t.start() for t in th]
+    [t.join(20) for t in th]
+    assert sorted(map(str, results)) == ["1", "هذا الملف مستورد من قبل."]
+    assert str(portfolio.compute(lg._load())["BTC"]["qty"]) == "1"
+
+
 def test_too_many_columns_in_a_row_is_an_error_not_a_silent_shift(tmp_path):
     text = "date,type,asset,quantity,price\n2026-01-01,buy,ETH,1,2000,extra\n"
     p = pcsv.preview(text, _lg(tmp_path))
