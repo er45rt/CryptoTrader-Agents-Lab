@@ -123,3 +123,13 @@ def test_the_reasons_card_never_calls_a_stopped_trade_a_missed_profit():
     assert "dcReasons(d.reasons)" in JS and 'q.set("reason", dcState.reason)' in JS
     for word in ("ربح ضائع", "فرصة ضائعة", "خسرت فرصة", "missed profit"):
         assert word not in body
+
+
+def test_a_decision_detail_reads_only_its_own_session(root, monkeypatch):
+    # D42 performance: detail() parsed every session of the same kind; measured 282 ms at 40 demo sessions
+    pick = next(i for i in decisions.collect(root, source="paper:ok", limit=2000)["items"] if i["kind"] == "entry")
+    seen = []
+    real = decisions._items
+    monkeypatch.setattr(decisions, "_items", lambda source, *a: seen.append(source["name"]) or real(source, *a))
+    assert decisions.detail(root, pick["id"])["item"]["id"] == pick["id"]
+    assert seen == ["ok"]

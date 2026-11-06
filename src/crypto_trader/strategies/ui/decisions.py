@@ -107,12 +107,14 @@ def _items(source: dict[str, Any], decisions: list[dict[str, Any]], fills: list[
     return out
 
 
-def _paper(root: Path) -> list[dict[str, Any]]:
+def _paper(root: Path, only: str | None = None) -> list[dict[str, Any]]:
     out = []
     base = root / "paper"
     if not base.is_dir():
         return out
     for folder in sorted(base.iterdir()):
+        if only is not None and folder.name != only:   # one decision reads only its own session
+            continue
         if not (folder / "session.json").exists() or not (folder / "report.json").exists():
             continue
         doc = _json(folder / "session.json")
@@ -123,13 +125,15 @@ def _paper(root: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _demos(root: Path) -> list[dict[str, Any]]:
+def _demos(root: Path, only: str | None = None) -> list[dict[str, Any]]:
     """Demo sessions (D32) are paper sessions in <workspace>/demo; same records, same reading."""
     out = []
     base = root / "demo"
     if not base.is_dir():
         return out
     for folder in sorted(base.iterdir()):
+        if only is not None and folder.name != only:
+            continue
         if not (folder / "session.json").exists() or not (folder / "report.json").exists():
             continue
         doc = _json(folder / "session.json")
@@ -140,12 +144,14 @@ def _demos(root: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _backtests(root: Path) -> list[dict[str, Any]]:
+def _backtests(root: Path, only: str | None = None) -> list[dict[str, Any]]:
     out = []
     base = root / "runs"
     if not base.is_dir():
         return out
     for run in sorted(base.iterdir()):
+        if only is not None and run.name != only:
+            continue
         eng = run / "engine"
         if not (eng / "decisions.json").exists() or not (eng / "backtest_result.json").exists():
             continue
@@ -262,7 +268,8 @@ def detail(root: Path, item_id: str, *, window: int = 40) -> dict[str, Any]:
     name, _, ref = rest.partition(":")
     if kind not in ("paper", "demo", "backtest") or not name or not ref:
         raise ValueError("bad decision id.")
-    items = _paper(root) if kind == "paper" else _demos(root) if kind == "demo" else _backtests(root)
+    # D42 performance: read only the decision's own session (was: every session of that kind, linear in their number)
+    items = (_paper if kind == "paper" else _demos if kind == "demo" else _backtests)(root, only=name)
     match = next((i for i in items if i["id"] == item_id), None)
     if match is None:
         raise KeyError("decision not found.")
