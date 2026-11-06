@@ -139,6 +139,45 @@ def test_two_ledgers_on_one_workspace_never_lose_a_write(tmp_path):
     assert done.is_set() and sorted(x["asset"] for x in a.transactions()) == ["BTC", "ETH"]
 
 
+def test_readers_never_break_concurrent_writes(tmp_path):
+    # adversarial check of D40: DCA status and CSV preview read ledger.json / dca.json without the workspace lock; on
+    # Windows an open reader handle makes the writer's os.replace fail (PermissionError) and valid adds were refused
+    import threading
+
+    from crypto_trader.strategies.ui import dca, portfolio_csv
+
+    lg = _ledger(tmp_path)
+    plans = dca.Plans(lg)
+    plan = plans.create({"asset": "BTC", "amount": "10", "day": "1", "start": "2026-01"})
+    errors, stop = [], threading.Event()
+    csv_text = "date,type,asset,quantity,price\n2026-01-01,buy,ETH,1,100\n"
+
+    def reader():
+        while not stop.is_set():
+            try:
+                plans.status()
+                portfolio_csv.preview(csv_text, lg)
+            except Exception as exc:              # noqa: BLE001 - any failure is the defect
+                errors.append("read " + repr(exc))
+
+    def writer(k):
+        for i in range(40):
+            try:
+                lg.add({"type": "buy", "asset": "BTC", "at": f"2026-01-{1 + i % 28:02d}", "qty": "0.001",
+                        "price": "100", "note": f"w{k}-{i}", "dca_plan": plan["id"]})
+                plans.set_active(plan["id"], True)
+            except Exception as exc:              # noqa: BLE001
+                errors.append("write " + repr(exc))
+
+    rs = [threading.Thread(target=reader) for _ in range(3)]
+    ws_ = [threading.Thread(target=writer, args=(k,)) for k in range(3)]
+    [t.start() for t in rs + ws_]
+    [t.join(120) for t in ws_]
+    stop.set()
+    [t.join(30) for t in rs]
+    assert errors == [] and len(lg.transactions()) == 120
+
+
 def test_a_second_process_waits_for_the_workspace_lock(tmp_path):
     import subprocess
     import sys

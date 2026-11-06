@@ -128,8 +128,9 @@ class Plans:
     # --- status ----------------------------------------------------------------------------------------
     def status(self) -> dict[str, Any]:
         today = self._today()
-        plans = self._load()
-        txs = self.ledger._load()
+        with self.ledger._lock:          # one snapshot of both files, never read while a writer replaces them
+            plans = self._load()
+            txs = self.ledger._load()
         quotes = self._prices(sorted({p["asset"] for p in plans})) if (self._prices and plans) else {}
         out, reminders = [], []
         for p in plans:

@@ -274,12 +274,12 @@ class Ledger:
         """All or nothing: every row is validated and the whole ledger replayed before anything is written.
         `guard` sees the ledger as loaded under the lock and may refuse (e.g. a CSV batch already imported)."""
         new = [parse_tx(b) for b in bodies]
-        for tx in new:
-            if tx.get("dca_plan"):        # only an existing plan for the same asset (Sol D40 blocker 4)
-                if self.plan_check is None:
-                    raise StrategyError("الخطة غير موجودة.")
-                self.plan_check(tx)
         with self._lock:
+            for tx in new:
+                if tx.get("dca_plan"):    # only an existing plan for the same asset (Sol D40 blocker 4); read
+                    if self.plan_check is None:          # under the lock like every other workspace file
+                        raise StrategyError("الخطة غير موجودة.")
+                    self.plan_check(tx)
             txs = self._load()
             if guard:
                 guard(txs)

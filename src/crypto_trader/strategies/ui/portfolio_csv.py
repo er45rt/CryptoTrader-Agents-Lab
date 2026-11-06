@@ -43,7 +43,7 @@ def _key(tx: dict[str, Any]) -> tuple:
             None if fee == "0" else tx["fee_asset"])
 
 
-def _parse(text: str, ledger: portfolio.Ledger) -> dict[str, Any]:
+def _parse(text: str, current: list[dict[str, Any]]) -> dict[str, Any]:
     if text.startswith("﻿"):
         text = text[1:]                      # Excel's UTF-8 BOM
     reader = csv.DictReader(io.StringIO(text, newline=""))
@@ -54,7 +54,7 @@ def _parse(text: str, ledger: portfolio.Ledger) -> dict[str, Any]:
         raise StrategyError(f"عنوان الملف غير صحيح. الأعمدة المسموحة: {', '.join(COLUMNS)}"
                             + (f" — غير معروفة: {', '.join(unknown)}" if unknown else "")
                             + (f" — ناقصة: {', '.join(missing)}" if missing else ""))
-    existing = {_key(t) for t in ledger._load()}
+    existing = {_key(t) for t in current}
     rows, seen = [], set()
     for n, raw in enumerate(reader, start=2):          # line numbers as the owner sees them in Excel
         if n - 1 > MAX_ROWS:
@@ -78,17 +78,19 @@ def _parse(text: str, ledger: portfolio.Ledger) -> dict[str, Any]:
 
 
 def preview(text: str, ledger: portfolio.Ledger, *, skip_duplicates: bool = False) -> dict[str, Any]:
-    parsed = _parse(text, ledger)
+    with ledger._lock:          # one snapshot, never read while a writer replaces the file (Windows sharing errors)
+        current = ledger._load()
+    parsed = _parse(text, current)
     rows = parsed["rows"]
     errors = [r for r in rows if "error" in r]
     dups = [r for r in rows if r.get("duplicate")]
     take = [r["tx"] for r in rows if "tx" in r and not (skip_duplicates and r.get("duplicate"))]
     batch = parsed["sha256"][:16]
-    already = any(t.get("batch") == batch for t in ledger._load())
+    already = any(t.get("batch") == batch for t in current)
     replay_error = None
     if not errors and take:
         try:
-            portfolio.compute(ledger._load() + take)
+            portfolio.compute(current + take)
         except StrategyError as exc:
             replay_error = str(exc)
     blocking = bool(errors) or replay_error is not None or already or (dups and not skip_duplicates) or not take
