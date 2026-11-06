@@ -134,8 +134,9 @@ def compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             a["invested"] += qty * price + (_ZERO if in_asset else fee)
             a["bought_qty"] += qty
             if in_asset:
-                if fee > a["qty"]:
-                    raise StrategyError(f"{tx['asset']} في {tx['at'][:10]}: رسوم أكبر من الكمية.")
+                # the fee must leave part of THIS purchase, otherwise its cost would vanish from basis and P&L
+                if fee >= qty:
+                    raise StrategyError(f"{tx['asset']} في {tx['at'][:10]}: رسوم الشراء بنفس الأصل لازم تكون أقل من الكمية المشتراة.")
                 a["qty"] -= fee          # capitalised: basis kept
             else:
                 a["fees_quote"] += fee

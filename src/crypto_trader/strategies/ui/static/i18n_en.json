@@ -818,5 +818,6 @@
 "شهر البداية لازم يكون مثل 2026-01.": "Start month must look like 2026-01.",
 "يوم الشراء لازم يكون بين 1 و28 (حتى يوجد في كل شهر).": "Purchase day must be between 1 and 28 (so it exists in every month).",
 "الخطة غير موجودة.": "Plan not found.",
-"يُربط بالخطة شراءٌ لنفس الأصل فقط.": "Only a buy of the same asset can be linked to the plan."
+"يُربط بالخطة شراءٌ لنفس الأصل فقط.": "Only a buy of the same asset can be linked to the plan.",
+"رسوم الشراء بنفس الأصل لازم تكون أقل من الكمية المشتراة.": "A purchase fee paid in the same asset must be smaller than the quantity bought."
 }

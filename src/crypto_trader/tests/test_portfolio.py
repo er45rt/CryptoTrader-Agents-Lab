@@ -48,6 +48,17 @@ def test_fee_in_the_asset_on_a_buy_is_capitalised_into_the_average(tmp_path):
     assert s["avg_cost"] == Decimal("5000") / Decimal("1.998") and s["realized"] == 0
 
 
+@pytest.mark.parametrize("fee", ["1", "1.5"])
+def test_an_asset_fee_that_eats_the_whole_purchase_is_refused(tmp_path, fee):
+    # Sol D40 blocker 3: buy 1 BTC @ 100 with a 1 BTC fee left qty 0, basis 0, realized 0 - the 100 USDT vanished
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "5", "price": "100"})   # other holdings exist
+    with pytest.raises(StrategyError, match="أقل من الكمية المشتراة"):
+        lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-02", "qty": "1", "price": "100", "fee": fee,
+                "fee_asset": "BTC"})
+    assert len(lg.transactions()) == 1
+
+
 def test_transfer_between_own_wallets_is_never_a_gain_and_its_network_fee_is_a_cost(tmp_path):
     lg = _ledger(tmp_path)
     lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-01", "qty": "2", "price": "2500"})
