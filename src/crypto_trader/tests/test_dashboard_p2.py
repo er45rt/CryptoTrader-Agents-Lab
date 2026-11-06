@@ -321,3 +321,69 @@ def test_status_never_creates_a_missing_lock_file_and_ignores_a_client_that_left
     with server.Handler.ledger._lock:                           # writers still create the lock on first use
         pass
     assert lock.exists()
+
+
+def test_no_error_on_the_status_route_is_written_anywhere(tmp_path, monkeypatch):
+    # Sol D42 recheck 3, blocker 1: TimeoutError / OSError / RuntimeError while sending /api/status still reached the
+    # ui_errors.log append; the route now has its own path where no error is logged, written or printed
+    import io
+    import sys
+    import threading
+
+    from crypto_trader.strategies.ui import alerts
+
+    srv = server.make_server(tmp_path, 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    def get(path):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        c.request("GET", path, headers={"Host": "127.0.0.1"})
+        try:
+            r = c.getresponse()
+            r.read()
+            return r.status
+        except (http.client.RemoteDisconnected, ConnectionError):
+            return None
+        finally:
+            c.close()
+
+    real_send, real_status = server.Handler._send, alerts.status
+    try:
+        server.Handler.dca.create({"asset": "BTC", "amount": "10", "day": "1", "start": "2026-01"})
+        before = _files(tmp_path)
+        for exc in (TimeoutError("t"), OSError(5, "io"), RuntimeError("r"), BrokenPipeError(32, "gone")):
+            def bad_send(self, code, payload, *a, _exc=exc, **k):
+                raise _exc
+            monkeypatch.setattr(server.Handler, "_send", bad_send)
+            get("/api/status")
+            monkeypatch.setattr(server.Handler, "_send", real_send)
+            assert _files(tmp_path) == before, type(exc).__name__
+        monkeypatch.setattr(alerts, "status", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("source")))
+        assert get("/api/status") == 500 and _files(tmp_path) == before          # answered, not logged
+        monkeypatch.setattr(alerts, "status", real_status)
+        assert get("/api/status") == 200 and _files(tmp_path) == before
+        assert err.getvalue() == ""
+        monkeypatch.setattr(server.Handler, "_send", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+                            if self.path.startswith("/api/runs") and a[0] == 200 else real_send(self, *a, **k))
+        get("/api/runs")
+        assert (tmp_path / "ui_errors.log").exists()                             # other routes still log as before
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_nested_no_create_scopes_keep_the_outer_scope(tmp_path):
+    from crypto_trader.strategies.ui import portfolio
+
+    lock = portfolio._LedgerLock(tmp_path / ".lock", timeout=0.3)
+    with lock.no_create():
+        with lock.no_create():
+            pass
+        with __import__("pytest").raises(FileNotFoundError):     # still no-create after the inner scope ended
+            lock.__enter__()
+    with lock:                                                    # outside: a writer creates it
+        pass
+    assert (tmp_path / ".lock").exists()

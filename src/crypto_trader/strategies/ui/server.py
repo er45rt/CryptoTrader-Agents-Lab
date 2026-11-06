@@ -111,6 +111,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- routing --------------------------------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
+        if urlparse(self.path).path == "/api/status":
+            return self._get_status()
         if not self._guard(False):
             return
         url = urlparse(self.path)
@@ -151,9 +153,6 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/dca": lambda: self.dca.status(),
                 # dashboard (D42 B2): backtests side by side only when comparable
                 "/api/compare": lambda: compare.comparison(self.ws.root),
-                # dashboard (D42 B3): one status/alerts bar, read-only and without network
-                "/api/status": lambda: alerts.status(self.ws, demos=self.demo.list, price_cache=self.prices.cached,
-                                                     dca_status=self._status_dca),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -161,10 +160,22 @@ class Handler(BaseHTTPRequestHandler):
         except (StrategyError, KeyError, ValueError, FileNotFoundError) as exc:
             self._send(400, {"error": str(exc)})
         except Exception as exc:  # report, never crash the server
-            if url.path == "/api/status" and isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
-                return                       # the status bar writes nothing, not even for a client that went away
             self.ws.log_error(f"GET {url.path}: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _get_status(self) -> None:
+        """Dashboard status/alerts bar (D42 B3): read-only and without network. Its own path so that no error of any
+        kind - in the guard, the sources or the response write - reaches a log, a file or stderr (Sol D42 recheck 3)."""
+        try:
+            if not self._guard(False):
+                return
+            self._send(200, alerts.status(self.ws, demos=self.demo.list, price_cache=self.prices.cached,
+                                          dca_status=self._status_dca))
+        except Exception as exc:  # noqa: BLE001 - nothing is logged for this route
+            try:
+                self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+            except Exception:  # noqa: BLE001 - the client may be gone
+                pass
 
     def _status_dca(self) -> dict[str, Any]:
         """DCA reminders for the status bar: no plans file -> no plans; otherwise read under the ledger lock without ever

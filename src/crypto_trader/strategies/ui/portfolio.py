@@ -217,11 +217,11 @@ class _LedgerLock:
 
         @contextlib.contextmanager
         def ctx():
-            self._local.no_create = True
+            self._local.no_create = getattr(self._local, "no_create", 0) + 1     # a depth, so nesting is safe
             try:
                 yield self
             finally:
-                self._local.no_create = False
+                self._local.no_create -= 1
         return ctx()
 
     def __enter__(self) -> "_LedgerLock":
