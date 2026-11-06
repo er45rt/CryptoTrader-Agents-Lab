@@ -929,5 +929,9 @@
 "أشهر، آخرها": "months, latest",
 "إضافة لصفقة بدأت عند": "Added to a trade opened at",
 "تخفيف جزئي من صفقة بدأت عند": "Partial reduction of a trade opened at",
-"الصفقة": "Trade"
+"الصفقة": "Trade",
+"تعذّر فحص": "Could not check",
+"الجلسات التجريبية": "demo sessions",
+"الشراء الشهري": "monthly buys",
+"سجل الأخطاء": "error log"
 }

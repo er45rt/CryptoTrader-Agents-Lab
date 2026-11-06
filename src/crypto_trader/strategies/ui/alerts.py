@@ -49,50 +49,70 @@ def status(ws: Any, *, demos: Callable[[], dict[str, Any]] | None = None,
         items.append({"level": level, "area": area, "code": code, **facts})
 
     add("ok" if not MAINNET_ENABLED else "bad", "engine", "live_disabled" if not MAINNET_ENABLED else "live_enabled")
-    for s in ws.paper_sessions()["sessions"]:
-        if s["error"]:
-            add("bad", "paper", "session_error", name=s["name"], at=s["error"].get("at"), detail=str(s["error"].get("error"))[:300])
-        if s["running"]:
-            age, bar = _age(now, s["last_cycle"]), tf_seconds(s["timeframe"])
-            if age is None or (bar and age > 2 * bar + 600):
-                add("warn", "paper", "paper_stale", name=s["name"], age_s=age, last=s["last_cycle"])
+
+    def _paper() -> None:
+        for s in ws.paper_sessions()["sessions"]:
+            if s["error"]:
+                add("bad", "paper", "session_error", name=s["name"], at=s["error"].get("at"), detail=str(s["error"].get("error"))[:300])
+            if s["running"]:
+                age, bar = _age(now, s["last_cycle"]), tf_seconds(s["timeframe"])
+                if age is None or (bar and age > 2 * bar + 600):
+                    add("warn", "paper", "paper_stale", name=s["name"], age_s=age, last=s["last_cycle"])
+                else:
+                    add("ok", "paper", "paper_running", name=s["name"], last=s["last_cycle"])
             else:
-                add("ok", "paper", "paper_running", name=s["name"], last=s["last_cycle"])
+                add("info", "paper", "paper_stopped", name=s["name"], last=s["last_cycle"])
+
+    def _demo() -> None:
+        for d in (demos()["demos"] if demos else []):
+            if d.get("state") == "error":
+                add("bad", "demo", "demo_error", name=d["name"])
+
+    def _prices() -> None:
+        for asset, q in sorted((price_cache() if price_cache else {}).items()):
+            if q.get("price") is None:
+                add("warn", "prices", "price_unavailable", asset=asset, reason=q.get("reason"))
+            else:
+                age = _age(now, q.get("at"))
+                if age is None or age > PRICE_STALE_S:
+                    add("warn", "prices", "price_stale", asset=asset, age_s=age, at=q.get("at"))
+
+    def _collector() -> None:
+        ev = ws.system()["evidence_collector"]
+        if not ev.get("available"):
+            add("info", "collector", "collector_unavailable")
         else:
-            add("info", "paper", "paper_stopped", name=s["name"], last=s["last_cycle"])
-    for d in (demos()["demos"] if demos else []):
-        if d.get("state") == "error":
-            add("bad", "demo", "demo_error", name=d["name"])
-    for asset, q in sorted((price_cache() if price_cache else {}).items()):
-        if q.get("price") is None:
-            add("warn", "prices", "price_unavailable", asset=asset, reason=q.get("reason"))
-        else:
-            age = _age(now, q.get("at"))
-            if age is None or age > PRICE_STALE_S:
-                add("warn", "prices", "price_stale", asset=asset, age_s=age, at=q.get("at"))
-    ev = ws.system()["evidence_collector"]
-    if not ev.get("available"):
-        add("info", "collector", "collector_unavailable")
-    else:
-        age = _age(now, ev.get("last"))
-        add("warn" if age is None or age > COLLECTOR_STALE_S else "ok", "collector",
-            "collector_stale" if age is None or age > COLLECTOR_STALE_S else "collector_ok", age_s=age, last=ev.get("last"),
-            entries=ev.get("entries"))
-    grouped: dict[tuple[str, str], list[str]] = {}       # one line per asset and state, not one per month
-    for r in (dca_status()["reminders"] if dca_status else []):
-        grouped.setdefault((r["asset"], r["state"]), []).append(r["month"])
-    for (asset, state), months in sorted(grouped.items()):
-        add("warn" if state == "missed" else "info", "dca", f"dca_{state}", asset=asset, months=sorted(months),
-            count=len(months), month=max(months))
-    errors, last = 0, None
-    log = ws.root / "ui_errors.log"
-    if log.exists():
-        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
-            m = re.match(r"^\[([^\]]+)\] ", line)
-            if m and (age := _age(now, m.group(1))) is not None and age <= 86400:
-                errors, last = errors + 1, m.group(1)
-    if errors:
-        add("warn", "errors", "ui_errors", count=errors, last=last)
+            age = _age(now, ev.get("last"))
+            add("warn" if age is None or age > COLLECTOR_STALE_S else "ok", "collector",
+                "collector_stale" if age is None or age > COLLECTOR_STALE_S else "collector_ok", age_s=age, last=ev.get("last"),
+                entries=ev.get("entries"))
+
+    def _dca() -> None:
+        grouped: dict[tuple[str, str], list[str]] = {}       # one line per asset and state, not one per month
+        for r in (dca_status()["reminders"] if dca_status else []):
+            grouped.setdefault((r["asset"], r["state"]), []).append(r["month"])
+        for (asset, state), months in sorted(grouped.items()):
+            add("warn" if state == "missed" else "info", "dca", f"dca_{state}", asset=asset, months=sorted(months),
+                count=len(months), month=max(months))
+
+    def _errors() -> None:
+        errors, last = 0, None
+        log = ws.root / "ui_errors.log"
+        if log.exists():
+            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+                m = re.match(r"^\[([^\]]+)\] ", line)
+                if m and (age := _age(now, m.group(1))) is not None and age <= 86400:
+                    errors, last = errors + 1, m.group(1)
+        if errors:
+            add("warn", "errors", "ui_errors", count=errors, last=last)
+
+    for area, check in (("paper", _paper), ("demo", _demo), ("prices", _prices), ("collector", _collector), ("dca", _dca),
+                        ("errors", _errors)):
+        try:
+            check()
+        except Exception as exc:  # noqa: BLE001 - reported on the bar itself, never raised to the server
+            add("warn", area, "check_failed", detail=f"{type(exc).__name__}: {exc}"[:300])
+
     summary = {k: sum(i["level"] == k for i in items) for k in ("bad", "warn", "info", "ok")}
     return {"at": now.isoformat(), "items": items, "summary": summary}
 

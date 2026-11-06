@@ -153,7 +153,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/compare": lambda: compare.comparison(self.ws.root),
                 # dashboard (D42 B3): one status/alerts bar, read-only and without network
                 "/api/status": lambda: alerts.status(self.ws, demos=self.demo.list, price_cache=self.prices.cached,
-                                                     dca_status=lambda: self.dca.status(priced=False)),
+                                                     # no plans file -> no plans: never touch the ledger lock for it
+                                                     dca_status=lambda: (self.dca.status(priced=False)
+                                                                         if self.dca.path.exists() else {"reminders": []})),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})

@@ -216,7 +216,9 @@ class _LedgerLock:
         if not self._thread.acquire(timeout=self.timeout):
             raise StrategyError("سجل المحفظة مشغول؛ حاول بعد لحظات.")
         try:
-            fh = open(self.path, "a+b")
+            # an existing lock file is opened read-only (a byte-range lock needs no write access, and a reader then
+            # never holds a write-capable handle - Sol D42 recheck); it is created only on first use
+            fh = open(self.path, "rb") if self.path.exists() else open(self.path, "a+b")
         except BaseException:          # a failed open must not leave the thread lock held (Sol D40 recheck backlog)
             self._thread.release()
             raise

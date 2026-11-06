@@ -158,7 +158,9 @@ const DB_ST = {
   dca_due: (i) => `شراء شهري مستحق اليوم: ${i.asset}`,
   dca_missed: (i) => `شراء شهري فات موعده: ${i.asset} (${i.count > 1 ? i.count + " أشهر، آخرها " : ""}${i.month})`,
   ui_errors: (i) => `${i.count} خطأ في الواجهة خلال 24 ساعة`,
+  check_failed: (i) => `تعذّر فحص ${DB_ST_AREA[i.area] || i.area}`,
 };
+const DB_ST_AREA = { paper: "الجلسات الورقية", demo: "الجلسات التجريبية", prices: "الأسعار", collector: "جامع الأدلة", dca: "الشراء الشهري", errors: "سجل الأخطاء" };
 const DB_ST_NAV = { paper: "paper", demo: "demo", prices: "portfolio", collector: "system", dca: "dca", errors: "logs" };
 async function dbStatus() {
   const box = $("#db-status"); if (!box) return;

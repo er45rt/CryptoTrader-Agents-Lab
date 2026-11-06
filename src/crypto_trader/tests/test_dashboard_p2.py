@@ -208,3 +208,67 @@ def test_same_file_name_in_another_folder_is_another_dataset(tmp_path):
     assert [sorted(r["id"] for r in g["runs"]) for g in comp] == [["a", "c"]]
     assert [r["id"] for g in groups if not g["comparable"] for r in g["runs"]] == ["b"]
     assert all(g["key"]["data"] == "BTC_USDT-4h.feather" for g in groups)
+
+
+def _files(root):
+    return {str(p.relative_to(root)): (p.stat().st_size, p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+
+
+def test_the_status_route_creates_or_changes_no_file(tmp_path):
+    # Sol D42 recheck, blocker 1: /api/status opened portfolio/.lock write-capable (creating it when absent), and a
+    # failing read made the server append to ui_errors.log
+    import json as _json
+    import threading
+
+    srv = server.make_server(tmp_path, 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    def status():
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        c.request("GET", "/api/status", headers={"Host": "127.0.0.1"})
+        r = c.getresponse()
+        out = (r.status, _json.loads(r.read()))
+        c.close()
+        return out
+
+    try:
+        before = _files(tmp_path)
+        assert not (tmp_path / "portfolio" / ".lock").exists()
+        assert status()[0] == 200 and _files(tmp_path) == before          # fresh workspace: nothing created
+        lg = server.Handler.ledger
+        lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "1"})
+        server.Handler.dca.create({"asset": "BTC", "amount": "10", "day": "1", "start": "2026-01"})
+        before = _files(tmp_path)
+        assert status()[0] == 200 and _files(tmp_path) == before          # with plans: read, never written
+
+        def broken():
+            raise PermissionError(13, "Access is denied")
+
+        real = server.Handler.ws.paper_sessions
+        server.Handler.ws.paper_sessions = broken
+        try:
+            st, doc = status()
+        finally:
+            server.Handler.ws.paper_sessions = real
+        assert st == 200 and _files(tmp_path) == before                   # a failing source: no 500, no log write
+        assert any(i["code"] == "check_failed" and i["area"] == "paper" for i in doc["items"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_an_existing_lock_file_is_locked_through_a_read_only_handle(tmp_path):
+    from crypto_trader.strategies.ui import portfolio
+
+    lock = portfolio._LedgerLock(tmp_path / ".lock", timeout=0.3)
+    with lock:                                            # first use creates it
+        pass
+    other = portfolio._LedgerLock(tmp_path / ".lock", timeout=0.3)
+    with lock:
+        assert "r" in lock._fh.mode and "+" not in lock._fh.mode and "a" not in lock._fh.mode
+        import pytest as _pytest
+        from crypto_trader.strategies import StrategyError
+        with _pytest.raises(StrategyError):                # still exclusive against another holder
+            other.__enter__()
+    assert (tmp_path / ".lock").stat().st_size == 0
