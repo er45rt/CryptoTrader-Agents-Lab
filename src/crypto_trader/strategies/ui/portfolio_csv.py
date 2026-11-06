@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+from decimal import Decimal
 from typing import Any
 
 from ..api import StrategyError
@@ -27,8 +28,14 @@ COLUMNS = ("date", "type", "asset", "quantity", "price", "fee", "fee_asset", "ne
 REQUIRED = ("date", "type", "asset")
 
 
+def _n(value: Any) -> str | None:
+    # numeric identity, not spelling: "1", "1.0" and "1.00" are the same quantity (Sol D40 blocker 2)
+    return None if value is None else format(Decimal(str(value)).normalize(), "f")
+
+
 def _key(tx: dict[str, Any]) -> tuple:
-    return (tx["at"], tx["type"], tx["asset"], tx.get("qty"), tx.get("price"), tx.get("fee"), tx["fee_asset"])
+    return (tx["at"], tx["type"], tx["asset"], _n(tx.get("qty")), _n(tx.get("price")), _n(tx.get("fee")),
+            tx["fee_asset"])
 
 
 def _parse(text: str, ledger: portfolio.Ledger) -> dict[str, Any]:

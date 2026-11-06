@@ -122,6 +122,14 @@ def test_import_api_preview_confirm_undo(tmp_path, monkeypatch):
         srv.server_close()
 
 
+def test_a_duplicate_written_with_different_decimals_is_still_a_duplicate(tmp_path):
+    # Sol D40 blocker 2: "1.0 @ 100.0" is the same transaction as "1 @ 100"
+    lg = _lg(tmp_path)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "100"})
+    p = pcsv.preview("date,type,asset,quantity,price,fee\n2026-01-01,buy,BTC,1.0,100.00,0.0\n", lg)
+    assert p["n_duplicates"] == 1 and p["rows"][0]["duplicate"] == "existing" and not p["can_import"]
+
+
 def test_two_concurrent_confirms_of_the_same_file_import_it_once(tmp_path, monkeypatch):
     # Sol D40 blocker 1: both confirms pass their preview, then race into add_many; the guard runs under the lock
     import threading
