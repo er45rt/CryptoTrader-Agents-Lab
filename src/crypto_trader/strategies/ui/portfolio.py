@@ -197,6 +197,10 @@ def _s(d: Decimal | None, places: int = 8) -> str | None:
     return format(q, "f")
 
 
+class DuplicateTransaction(StrategyError):
+    """A manual entry identical to a recorded transaction; the UI asks the owner before recording it again."""
+
+
 class _LedgerLock:
     """One lock per workspace, across threads AND processes (Sol D40 blocker 6): a thread lock plus an OS byte-range
     lock on <workspace>/portfolio/.lock, so two servers on the same workspace can never interleave load -> save."""
@@ -211,7 +215,11 @@ class _LedgerLock:
 
         if not self._thread.acquire(timeout=self.timeout):
             raise StrategyError("سجل المحفظة مشغول؛ حاول بعد لحظات.")
-        fh = open(self.path, "a+b")
+        try:
+            fh = open(self.path, "a+b")
+        except BaseException:          # a failed open must not leave the thread lock held (Sol D40 recheck backlog)
+            self._thread.release()
+            raise
         deadline = time.monotonic() + self.timeout
         try:
             while True:
@@ -277,6 +285,19 @@ class Ledger:
 
     def add(self, body: dict[str, Any], *, source: str = "manual") -> dict[str, Any]:
         return self.add_many([body], source=source)[0]
+
+    def add_checked(self, body: dict[str, Any], *, allow_duplicate: bool = False) -> dict[str, Any]:
+        """Manual add: a transaction identical to one already recorded (same key as the CSV duplicate check) is
+        refused with DuplicateTransaction unless the owner confirms it is a second, real transaction."""
+        from .portfolio_csv import _key           # lazy: portfolio_csv imports this module
+
+        key = _key(parse_tx(body))
+
+        def guard(current: list[dict[str, Any]]) -> None:
+            if not allow_duplicate and any(_key(t) == key for t in current):
+                raise DuplicateTransaction("عملية مطابقة مسجّلة من قبل (نفس التاريخ والنوع والأصل والكمية والسعر والرسوم).")
+
+        return self.add_many([body], source="manual", guard=guard)[0]
 
     def add_many(self, bodies: list[dict[str, Any]], *, source: str, batch: str | None = None,
                  guard: Callable[[list[dict[str, Any]]], None] | None = None) -> list[dict[str, Any]]:

@@ -141,8 +141,14 @@ function wireTxForm() {
     if (ty === "fee" || ty === "transfer") body.fee_asset = asset;
     if (ty === "buy" && $("#tf-plan").value) body.dca_plan = $("#tf-plan").value;
     $("#tf-go").disabled = true;
-    try { await api("/api/portfolio/add", body); PAGES.portfolio(); }
-    catch (e) { $("#pf-msg").innerHTML = errBox(e); $("#tf-go").disabled = false; }
+    try {
+      try { await api("/api/portfolio/add", body); }
+      catch (e) {   // an identical transaction exists: record a second one only if the owner confirms it is real
+        if (e.status !== 409 || !(await uiConfirm(e.message + " هل هي عملية ثانية فعلية وتبي تسجّلها؟", "سجّلها"))) throw e;
+        await api("/api/portfolio/add", { ...body, allow_duplicate: true });
+      }
+      PAGES.portfolio();
+    } catch (e) { $("#pf-msg").innerHTML = errBox(e); $("#tf-go").disabled = false; }
   };
 }
 

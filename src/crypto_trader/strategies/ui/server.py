@@ -183,7 +183,10 @@ class Handler(BaseHTTPRequestHandler):
             if url.path.startswith("/api/demo/"):
                 return self._send(200, self._demo_post(url.path.rsplit("/", 1)[1], body))
             if url.path == "/api/portfolio/add":
-                tx = self.ledger.add(body)
+                try:
+                    tx = self.ledger.add_checked(body, allow_duplicate=body.get("allow_duplicate") is True)
+                except portfolio.DuplicateTransaction as exc:
+                    return self._send(409, {"error": str(exc), "duplicate": True})
                 self.ws._event("portfolio.added", id=tx["id"], type=tx["type"], asset=tx["asset"])
                 return self._send(200, {"transaction": tx})
             if url.path == "/api/portfolio/delete":

@@ -825,5 +825,8 @@
 "دقة الرقم أكبر من المسموح (حتى": "more precision than allowed (up to",
 "خانة عشرية و": "decimal places and ",
 "خانة قبل الفاصلة).": "digits before the decimal point).",
-"عملية محفوظة برقم خارج حدود الدقة؛ احذفها وأعد إدخالها.": "a saved transaction has a number beyond the allowed precision; delete it and enter it again."
+"عملية محفوظة برقم خارج حدود الدقة؛ احذفها وأعد إدخالها.": "a saved transaction has a number beyond the allowed precision; delete it and enter it again.",
+"هل هي عملية ثانية فعلية وتبي تسجّلها؟": "Is it a second, real transaction you want to record?",
+"سجّلها": "Record it",
+"عملية مطابقة مسجّلة من قبل (نفس التاريخ والنوع والأصل والكمية والسعر والرسوم).": "An identical transaction is already recorded (same date, type, asset, quantity, price and fee)."
 }

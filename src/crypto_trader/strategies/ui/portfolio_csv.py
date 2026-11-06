@@ -41,6 +41,10 @@ def _n(value: Any) -> str | None:
 
 
 def _key(tx: dict[str, Any]) -> tuple:
+    # stored numbers are read within the ledger bounds, so a damaged or blank field is an explicit refusal naming the
+    # transaction, never an InvalidOperation (Sol D40 recheck backlog)
+    num = {f: (portfolio._held(tx, f) if f in tx else None) for f in ("qty", "price", "fee")}
+    tx = {**tx, **num}
     fee = _n(tx.get("fee")) or "0"
     # a zero fee has no currency: "fee 0 in USDT" and "fee 0 in BTC" are the same transaction
     return (tx["at"], tx["type"], tx["asset"], _n(tx.get("qty")), _n(tx.get("price")), fee,

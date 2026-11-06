@@ -323,3 +323,53 @@ def test_a_saved_number_beyond_the_bounds_is_refused_on_replay_never_rounded(tmp
         lg.summary()
     lg.delete("legacy1")                      # the owner can remove it and enter it again
     assert [a["asset"] for a in lg.summary()["assets"]] == ["ETH"]
+
+
+def test_a_failed_lock_file_open_never_leaves_the_ledger_locked(tmp_path, monkeypatch):
+    # Sol D40 recheck (non-blocking, phase 2 item 0): one transient open() error left the thread lock held, so every
+    # later write on that instance timed out until restart
+    lock = portfolio._LedgerLock(tmp_path / ".lock", timeout=0.5)
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise PermissionError("transient")
+        return open(*a, **k)
+
+    monkeypatch.setattr(portfolio, "open", flaky, raising=False)
+    with pytest.raises(PermissionError):
+        lock.__enter__()
+    with lock:                                  # the next attempt opens the file and locks normally
+        pass
+    assert len(calls) == 2
+
+
+def test_a_manual_entry_identical_to_a_recorded_one_needs_confirmation(tmp_path):
+    lg = _ledger(tmp_path)
+    body = {"type": "buy", "asset": "BTC", "at": "2026-01-05", "qty": "0.010", "price": "65000"}
+    lg.add_checked(body)
+    with pytest.raises(portfolio.DuplicateTransaction, match="مطابقة"):
+        lg.add_checked({**body, "qty": "0.01"})            # same number, other spelling
+    assert len(lg.transactions()) == 1
+    lg.add_checked({**body, "qty": "0.01"}, allow_duplicate=True)   # the owner confirmed a second real buy
+    lg.add_checked({**body, "qty": "0.02"})                 # a different transaction is never questioned
+    assert len(lg.transactions()) == 3
+
+
+def test_the_add_endpoint_answers_409_for_a_duplicate_and_records_it_only_when_confirmed(live, ws):
+    def post(body):
+        c = http.client.HTTPConnection("127.0.0.1", live, timeout=30)
+        c.request("POST", "/api/portfolio/add", json.dumps(body),
+                  {"Host": "127.0.0.1", "X-CT-UI": "1", "Content-Type": "application/json"})
+        r = c.getresponse()
+        out = (r.status, json.loads(r.read()))
+        c.close()
+        return out
+
+    body = {"type": "buy", "asset": "ETH", "at": "2026-02-01", "qty": "1", "price": "2000"}
+    assert post(body)[0] == 200
+    st, doc = post(body)
+    assert st == 409 and doc["duplicate"] is True
+    assert post({**body, "allow_duplicate": "yes"})[0] == 409          # only an explicit true confirms
+    assert post({**body, "allow_duplicate": True})[0] == 200

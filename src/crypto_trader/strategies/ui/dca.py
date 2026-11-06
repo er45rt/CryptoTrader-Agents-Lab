@@ -142,8 +142,8 @@ class Plans:
             for (y, m) in _months(_month(p["start"]), (last.year, last.month)):
                 planned = date(y, m, min(p["day"], calendar.monthrange(y, m)[1]))
                 done = [t for t in buys if t["at"][:7] == f"{y:04d}-{m:02d}"]
-                paid = sum((Decimal(t["qty"]) * Decimal(t["price"]) +
-                            (Decimal(t["fee"]) if t["fee_asset"] != t["asset"] else _ZERO) for t in done), _ZERO)
+                paid = sum((portfolio._held(t, "qty") * portfolio._held(t, "price") +
+                            (portfolio._held(t, "fee") if t["fee_asset"] != t["asset"] else _ZERO) for t in done), _ZERO)
                 state = ("executed" if done else "due" if planned == today else
                          "missed" if planned < today else "upcoming")
                 if stop and planned > stop and not done:
@@ -154,10 +154,10 @@ class Plans:
                 if state in ("due", "missed") and p["active"]:
                     reminders.append({"plan": p["id"], "asset": p["asset"], "month": months[-1]["month"],
                                       "planned_date": planned.isoformat(), "state": state})
-            qty = sum((Decimal(t["qty"]) - (Decimal(t["fee"]) if t["fee_asset"] == t["asset"] else _ZERO)
+            qty = sum((portfolio._held(t, "qty") - (portfolio._held(t, "fee") if t["fee_asset"] == t["asset"] else _ZERO)
                        for t in buys), _ZERO)
-            paid = sum((Decimal(t["qty"]) * Decimal(t["price"]) +
-                        (Decimal(t["fee"]) if t["fee_asset"] != t["asset"] else _ZERO) for t in buys), _ZERO)
+            paid = sum((portfolio._held(t, "qty") * portfolio._held(t, "price") +
+                        (portfolio._held(t, "fee") if t["fee_asset"] != t["asset"] else _ZERO) for t in buys), _ZERO)
             outside = [t["id"] for t in txs if t.get("dca_plan") == p["id"] and t not in buys]
             q = quotes.get(p["asset"]) or {}
             price = Decimal(q["price"]) if q.get("price") is not None else None

@@ -158,3 +158,16 @@ def test_dca_api_create_link_stop(tmp_path, monkeypatch):
 
 def test_status_says_tracking_only(tmp_path):
     assert "no purchase is ever placed" in _setup(tmp_path)[1].status()["note"]
+
+
+def test_status_reads_stored_numbers_within_the_ledger_bounds(tmp_path):
+    # Sol D40 recheck (non-blocking, phase 2 item 0): status computed from unbounded stored decimals and reported a
+    # purchase the portfolio replay refuses
+    lg, plans = _setup(tmp_path, prices=lambda a: {"BTC": {"price": "100", "source": "test", "at": "t"}})
+    pid = plans.create({"asset": "BTC", "amount": "100", "day": "5", "start": "2026-04"})["id"]
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-04-05", "qty": "1", "price": "100", "dca_plan": pid})
+    txs = lg._load()
+    txs[0]["qty"] = "1." + "0" * 80 + "1"
+    lg._save(txs)
+    with pytest.raises(StrategyError, match="خارج حدود الدقة"):
+        plans.status()

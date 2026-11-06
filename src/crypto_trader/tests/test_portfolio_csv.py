@@ -197,3 +197,14 @@ def test_too_many_columns_in_a_row_is_an_error_not_a_silent_shift(tmp_path):
     text = "date,type,asset,quantity,price\n2026-01-01,buy,ETH,1,2000,extra\n"
     p = pcsv.preview(text, _lg(tmp_path))
     assert p["n_errors"] == 1 and "زائدة" in p["rows"][0]["error"]
+
+
+def test_a_stored_blank_number_is_an_explicit_refusal_in_preview(tmp_path):
+    # Sol D40 recheck (non-blocking, phase 2 item 0): a blank stored number raised a bare InvalidOperation
+    lg = _lg(tmp_path)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "100"})
+    txs = lg._load()
+    txs[0]["price"] = ""
+    lg._save(txs)
+    with pytest.raises(StrategyError, match="خارج حدود الدقة"):
+        pcsv.preview("date,type,asset,quantity,price\n2026-01-02,buy,BTC,1,100\n", lg)
