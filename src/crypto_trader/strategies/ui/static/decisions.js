@@ -177,8 +177,10 @@ async function dcShow(id, keepScroll = false) {
   if (bars.length) {
     // the recorded fills of this decision and, when shown, of the other side of the same trade (A2)
     const f0 = i.fills[0]?.price, lf = d.linked?.fills?.[0]?.price ?? null, la = d.linked?.at ?? null;
-    const fills = f0 === undefined ? [] : [i.action === "buy" ? { entry_time: i.at, entry_price: f0, exit_time: lf === null ? null : la, exit_price: lf }
-      : { entry_time: lf === null ? null : la, entry_price: lf, exit_time: i.at, exit_price: f0 }];
+    const fills = f0 === undefined ? [] : d.role === "open" ? [{ entry_time: i.at, entry_price: f0, exit_time: lf === null ? null : la, exit_price: lf }]
+      : d.role === "close" ? [{ entry_time: lf === null ? null : la, entry_price: lf, exit_time: i.at, exit_price: f0 }]
+      : [i.action === "buy" ? { entry_time: i.at, entry_price: f0, exit_time: null, exit_price: null }       // add / reduce: this fill only
+        : { entry_time: null, entry_price: null, exit_time: i.at, exit_price: f0 }];
     candles($("#dc-chart"), bars, fills, [{ values: sma(bars, 20), color: css("--sma1") }], dcState.wide ? 300 : 230);
     dcMark($("#dc-chart"), bars, i.bar_open || i.at);
   } else $("#dc-chart").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "ما فيه شموع محفوظة لهالمصدر." }));
@@ -208,6 +210,9 @@ function dcReasons(rs) {
   box.onclick = (e) => { const el = e.target.closest("[data-reason]"); if (!el) return;
     dcState.reason = el.dataset.reason === active ? "" : el.dataset.reason; dcLoad(); };
 }
+/** The decision's place in its trade, from the recorded fills (Sol D42 blocker 4): the link always points at the trade's
+    closing exit (from its opening entry) or at its opening entry (from any other part of it). */
+const DC_ROLE = { open: "خروج هذه الصفقة", close: "دخول هذه الصفقة", add: "إضافة لصفقة بدأت عند", reduce: "تخفيف جزئي من صفقة بدأت عند" };
 const dcT = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
 /** Trade inspector (phase 2, A2): the recorded facts of one decision in one place - strategy, bar, price at decision,
     recorded reason, fills, the records it was read from, and the other side of the same trade. */
@@ -223,9 +228,9 @@ function dcInspector(i, d) {
     <div>التنفيذ (محاكاة)</div><div>${fills}</div>
     <div>مصدر البيانات</div><div>${esc(i.source.label)}<span class="insp-sub ltr">${esc(i.ref)}</span>
       <span class="insp-sub ltr">${[r.decision, r.trace, r.bars].filter(Boolean).map(esc).join(" · ")}</span></div>
-    ${d.linked ? `<div>${i.kind === "entry" ? "خروج هذه الصفقة" : "دخول هذه الصفقة"}</div><div><a href="#" data-dc-link="${esc(d.linked.id)}">${kindPill(d.linked.kind)}
+    ${d.linked ? `<div>${DC_ROLE[d.role] || "الصفقة"}</div><div><a href="#" data-dc-link="${esc(d.linked.id)}">${kindPill(d.linked.kind)}
       <span class="ltr">${esc(dcT(d.linked.at))}</span>${d.linked.fills.length ? ` · <span class="ltr">${fmtNum(d.linked.fills[0].price)}</span>` : ""}</a></div>`
-      : i.kind === "entry" ? `<div>خروج هذه الصفقة</div><div class="muted">ما فيه خروج مسجّل بعد (المركز مفتوح أو الجلسة انتهت)</div>` : ""}
+      : d.role === "open" ? `<div>خروج هذه الصفقة</div><div class="muted">ما فيه خروج مسجّل بعد (المركز مفتوح أو الجلسة انتهت)</div>` : ""}
   </div>
   <div class="actions"><button class="sm" id="dc-wide">${dcState.wide ? "شموع أقل" : "شموع أكثر"}</button><button class="sm" id="dc-open">افتح المصدر</button></div>`;
 }

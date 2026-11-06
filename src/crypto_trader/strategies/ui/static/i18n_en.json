@@ -926,5 +926,8 @@
 "تنبيه": "alerts",
 "كل شي سليم": "All clear",
 "تحديث": "Updated",
-"أشهر، آخرها": "months, latest"
+"أشهر، آخرها": "months, latest",
+"إضافة لصفقة بدأت عند": "Added to a trade opened at",
+"تخفيف جزئي من صفقة بدأت عند": "Partial reduction of a trade opened at",
+"الصفقة": "Trade"
 }

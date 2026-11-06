@@ -294,17 +294,47 @@ def detail(root: Path, item_id: str, *, window: int = 40) -> dict[str, Any]:
         k = max((i for i, t in enumerate(times) if t <= at), default=0)
         window = max(10, min(int(window), 300))
         bars = bars[max(0, k - window): k + 12 + window // 4]
-    # trade inspector (phase 2, A2): the other side of the same trade, read from the same source's records only -
-    # an entry's next exit, an exit's last entry; nothing is computed from them
+    # trade inspector (phase 2, A2): the trade this decision belongs to, from the same source's recorded fills
     same = sorted((i for i in items if i["source"]["name"] == name), key=lambda i: i["at"])
-    linked = None
-    if match["kind"] == "entry":
-        linked = next((i for i in same if i["kind"] == "exit" and i["at"] > match["at"]), None)
-    elif match["kind"] == "exit":
-        linked = next((i for i in reversed(same) if i["kind"] == "entry" and i["at"] < match["at"]), None)
+    trade = next((t for t in trades(same) if any(m["id"] == match["id"] for m in t["members"])), None)
+    role, linked = None, None
+    if trade is not None:
+        role = ("open" if trade["open"]["id"] == match["id"] else
+                "close" if trade["close"] is not None and trade["close"]["id"] == match["id"] else
+                "add" if match["action"] == "buy" else "reduce")
+        linked = trade["close"] if role == "open" else trade["open"]
     base = f"runs/{name}/engine" if kind == "backtest" else f"{kind}/{name}"
     records = {"decision": f"{base}/{'decisions.json' if kind == 'backtest' else 'report.json'}",
                "trace": f"{base}/decision_trace.jsonl" if match["evidence"]["trace"] else None,
                "bars": f"runs/{name}/result.json" if kind == "backtest" else f"{kind}/{name}/bars.jsonl"}
-    return {"item": match, "bars": bars, "records": records,
+    return {"item": match, "bars": bars, "records": records, "role": role,
             "linked": None if linked is None else {k: linked[k] for k in ("id", "kind", "at", "fills", "exit_kind")}}
+
+
+def trades(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trades from recorded fills, the same rule as the engine's trade list (runtime.py): a trade opens with the first
+    buy fill while flat and closes with the sell that brings the filled quantity back to zero; buys and sells between
+    them are adds and partial reductions of that trade (Sol D42 blocker 4). `items` are one source, oldest first."""
+    out: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    qty = Decimal(0)
+    for i in items:
+        if i.get("action") not in ("buy", "sell") or not i.get("fills"):
+            continue
+        q = sum((_dec(f.get("quantity")) or Decimal(0) for f in i["fills"]), Decimal(0))
+        if i["action"] == "buy":
+            qty += q
+            if cur is None:
+                cur = {"open": i, "close": None, "members": []}
+            cur["members"].append(i)
+        else:
+            qty -= q
+            if cur is not None:
+                cur["members"].append(i)
+                if qty <= 0:
+                    cur["close"] = i
+                    out.append(cur)
+                    cur = None
+    if cur is not None:
+        out.append(cur)
+    return out
