@@ -75,7 +75,7 @@ async function dcLoad(quiet = false) {
   kt.innerHTML = `<button data-k="" class="${f.kinds.length ? "" : "on"}">الكل</button>` + KIND_ORDER.filter((k) => c[k]).map((k) =>
     `<button data-k="${k}" class="${f.kinds.includes(k) ? "on" : ""}">${esc(DC.kinds[k][0])} <span class="muted">${c[k]}</span></button>`).join("");
   kt.onclick = (e) => { const b = e.target.closest("button"); if (!b) return; const k = b.dataset.k;
-    f.kinds = !k ? [] : f.kinds.includes(k) ? f.kinds.filter((x) => x !== k) : [...f.kinds, k]; dcLoad(); };
+    f.kinds = !k ? [] : f.kinds.includes(k) ? f.kinds.filter((x) => x !== k) : [...f.kinds, k]; dcState.reason = ""; dcLoad(); };
   $("#dc-total").textContent = d.total > d.items.length ? `أحدث ${d.items.length} من ${d.total}` : `${d.total}`;
   $("#dc-rows").innerHTML = d.items.map((i) => `<tr data-dc="${esc(i.id)}" class="${i.id === dcState.selected ? "sel" : ""}" style="cursor:pointer">
     <td class="ltr">${esc(i.at.slice(0, 16).replace("T", " "))}</td><td>${kindPill(i.kind)}</td>
@@ -109,7 +109,7 @@ function dcFunnel(fl) {
       ${stage("تنفّذت", fl.filled, null)}</div>
     <div class="fn-why">${esc(why)}</div>`;
   box.onclick = (e) => { const el = e.target.closest("[data-kinds]"); if (!el || el.disabled) return; e.preventDefault();
-    dcState.filters.kinds = el.dataset.kinds.split(","); dcLoad(); };
+    dcState.filters.kinds = el.dataset.kinds.split(","); dcState.reason = ""; dcLoad(); };   // one drill-down at a time
 }
 
 function step(state, who, title, body) {
@@ -208,7 +208,7 @@ function dcReasons(rs) {
       <div class="muted" style="font-size:12px;margin-top:6px">النسبة من القرارات الموقوفة، والقرار الواحد قد يحمل أكثر من سبب. التوقّف ما يعني إن الصفقة كانت بتربح أو بتخسر؛ هذا سجل السبب فقط.${rs.rows.length > rows.length ? ` يظهر أول ${rows.length} من ${rs.rows.length} سبب.` : ""}</div>`
       : `<div class="muted">ما فيه صفقات موقوفة بهالفلاتر.</div>`}`;
   box.onclick = (e) => { const el = e.target.closest("[data-reason]"); if (!el) return;
-    dcState.reason = el.dataset.reason === active ? "" : el.dataset.reason; dcLoad(); };
+    dcState.reason = el.dataset.reason === active ? "" : el.dataset.reason; dcState.filters.kinds = []; dcLoad(); };
 }
 /** The decision's place in its trade, from the recorded fills (Sol D42 blocker 4): the link always points at the trade's
     closing exit (from its opening entry) or at its opening entry (from any other part of it). */

@@ -155,3 +155,22 @@ def test_trade_links_follow_the_recorded_position_when_it_is_scaled(monkeypatch,
     reopened = items + [item(5, "buy")]                    # a buy after the close opens a new, still open trade
     assert [(t["open"]["id"], t["close"]) for t in decisions.trades(reopened)][1] == ("paper:s:r5", None)
     assert "DC_ROLE[d.role]" in JS and 'd.role === "open"' in JS
+
+
+def test_each_drill_down_clears_the_other_so_a_shown_count_opens_its_decisions(root):
+    # Sol D42 blocker 5: a reason filter kept while clicking a funnel stop count (or the reverse) opened 0 decisions
+    res = decisions.collect(root, limit=2000)
+    risk = next(r for r in res["reasons"]["rows"] if r["stage"] == "risk")
+    both = decisions.collect(root, kinds=["missed"], reason=risk["key"], limit=2000)
+    assert both["total"] == 0                                 # why the page must never send both at once
+    handlers = {
+        "funnel": JS[JS.index("function dcFunnel"):JS.index("const DC_STAGE")],
+        "reasons": JS[JS.index("function dcReasons"):JS.index("const dcT")],
+        "tabs": JS[JS.index("kt.onclick"):JS.index("$(\"#dc-total\")")],
+    }
+    assert 'dcState.reason = ""' in handlers["funnel"] and 'dcState.reason = ""' in handlers["tabs"]
+    assert "dcState.filters.kinds = []" in handlers["reasons"]
+    for stage, kind in (("risk", "rejected_risk"), ("missed", "missed")):
+        row = next(r for r in res["reasons"]["rows"] if r["stage"] == stage)
+        assert decisions.collect(root, reason=row["key"], limit=2000)["total"] == row["count"] > 0
+        assert decisions.collect(root, kinds=[kind], limit=2000)["total"] == res["counts"][kind]
