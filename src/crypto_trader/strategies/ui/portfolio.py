@@ -233,6 +233,57 @@ class Ledger:
             self._save(keep)
         return {"deleted_batch": batch, "removed": len(txs) - len(keep)}
 
+    def history(self, daily: Callable[[str, Any], dict[str, Any]]) -> dict[str, Any]:
+        """Portfolio value and cost basis at each daily close, from the first transaction to the last closed day.
+        A day is `complete` only if every asset held that day has a close; otherwise the missing assets are left out
+        of `value` (never guessed) and listed in `missing`."""
+        from datetime import date, timedelta
+
+        with self._lock:
+            txs = sorted(self._load(), key=lambda t: (t["at"], t.get("seq", 0)))
+        if not txs:
+            return {"points": [], "missing": {}}
+        first = date.fromisoformat(txs[0]["at"][:10])
+        assets = sorted({t["asset"] for t in txs})
+        closes, missing = {}, {}
+        for a in assets:
+            res = daily(a, first)
+            closes[a] = res["closes"]
+            if res.get("reason"):
+                missing[a] = res["reason"]
+        points, i, day = [], 0, first
+        last_day = datetime.now(timezone.utc).date() - timedelta(days=1)
+        while day <= last_day:
+            while i < len(txs) and txs[i]["at"][:10] <= day.isoformat():
+                i += 1
+            state = compute(txs[:i])
+            value, complete, basis = _ZERO, True, _ZERO
+            for a, s in state.items():
+                basis += s["basis"]
+                if s["qty"] > 0:
+                    c = closes.get(a, {}).get(day.isoformat())
+                    if c is None:
+                        complete = False
+                    else:
+                        value += s["qty"] * Decimal(c)
+            points.append({"d": day.isoformat(), "value": _s(value, 2), "basis": _s(basis, 2), "complete": complete})
+            day += timedelta(days=1)
+        return {"points": points, "missing": missing}
+
+    def asset_view(self, asset: str, daily: Callable[[str, Any], dict[str, Any]], source: str) -> dict[str, Any]:
+        """One asset: its daily closes from its first transaction (or 90 days if none) and its transactions."""
+        from datetime import date, timedelta
+
+        asset = str(asset).strip().upper()
+        if not asset or len(asset) > 15 or not set(asset) <= _ASSET_OK:
+            raise StrategyError("رمز الأصل غير صحيح.")
+        txs = [t for t in self.transactions() if t["asset"] == asset]
+        since = (date.fromisoformat(min(t["at"][:10] for t in txs)) - timedelta(days=30) if txs
+                 else datetime.now(timezone.utc).date() - timedelta(days=90))
+        res = daily(asset, since)
+        return {"asset": asset, "source": source, "closes": res["closes"], "reason": res.get("reason"),
+                "transactions": txs}
+
     def summary(self) -> dict[str, Any]:
         with self._lock:
             txs = self._load()

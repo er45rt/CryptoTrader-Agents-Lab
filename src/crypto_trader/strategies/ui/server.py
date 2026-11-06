@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import decisions, demo, portfolio, store
+from . import decisions, demo, portfolio, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -143,6 +143,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/demo/session": lambda: self.demo.status(q["name"]),
                 # my portfolio (D40): the owner's own ledger, local only
                 "/api/portfolio": lambda: {**self.ledger.summary(), "transactions": self.ledger.transactions()},
+                "/api/portfolio/history": lambda: self.ledger.history(self.prices.daily),
+                "/api/portfolio/asset": lambda: self.ledger.asset_view(q["asset"], self.prices.daily, prices.SOURCE),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -253,7 +255,8 @@ def _job(jid: str) -> dict[str, Any]:
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.ws = store.Workspace(workspace)
     Handler.demo = demo.DemoManager(workspace)
-    Handler.ledger = portfolio.Ledger(workspace)
+    Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
+    Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 

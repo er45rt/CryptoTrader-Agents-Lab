@@ -155,7 +155,11 @@ def _get(port, path):
     return out
 
 
-def test_portfolio_api_adds_lists_and_deletes_with_the_ui_guard(live, ws):
+def test_portfolio_api_adds_lists_and_deletes_with_the_ui_guard(live, ws, monkeypatch):
+    from crypto_trader.strategies.ui import server
+
+    # offline: the server's price lookup is replaced; prices have their own tests (test_portfolio_prices.py)
+    monkeypatch.setattr(server.Handler, "ledger", portfolio.Ledger(ws.root, prices=lambda assets: {}))
     buy = {"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "0.5", "price": "40000"}
     assert _post(live, "/api/portfolio/add", buy, header=False)[0] == 403
     status, res = _post(live, "/api/portfolio/add", buy)
