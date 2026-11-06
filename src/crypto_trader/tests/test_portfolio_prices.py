@@ -75,6 +75,36 @@ def test_daily_closes_are_cached_and_only_the_missing_tail_is_fetched(tmp_path):
     assert max(res["closes"]) == "2026-03-11" and (tmp_path / "daily_ETHUSDT.json").exists()
 
 
+def test_concurrent_history_requests_never_corrupt_the_cache(tmp_path):
+    # adversarial check of D40: history and an asset view ask for the same asset at once with different `since`;
+    # both wrote one shared .tmp file, the cache became invalid JSON and every later daily() raised until deleted by hand
+    import threading
+
+    rec = Recorder({"BTCUSDT": "70000"})
+    p = prices.BinancePrices(tmp_path, fetch=rec, now=lambda: NOW)
+    errors = []
+
+    def call(since):
+        try:
+            assert p.daily("BTC", since)["reason"] is None
+        except Exception as exc:          # noqa: BLE001 - the test collects any failure
+            errors.append(repr(exc))
+
+    for _ in range(15):
+        (tmp_path / "daily_BTCUSDT.json").unlink(missing_ok=True)
+        th = [threading.Thread(target=call, args=(d,)) for d in (date(2020, 1, 1), date(2025, 12, 1)) * 2]
+        [t.start() for t in th]
+        [t.join(30) for t in th]
+        call(date(2024, 1, 1))
+    assert errors == [] and not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_damaged_cache_is_rebuilt_not_trusted(tmp_path):
+    (tmp_path / "daily_ETHUSDT.json").write_text('{"2026-03-01": "1"}garbage', encoding="utf-8")
+    res = prices.BinancePrices(tmp_path, fetch=Recorder({"ETHUSDT": "2500"}), now=lambda: NOW).daily("ETH", date(2026, 3, 1))
+    assert res["reason"] is None and res["closes"]["2026-03-01"] == "2500"
+
+
 def test_summary_uses_the_price_service_and_marks_unpriced_assets(tmp_path):
     rec = Recorder({"BTCUSDT": "70000"}, fail={"XYZUSDT": RuntimeError("HTTP Error 400")})
     p = prices.BinancePrices(tmp_path / "px", fetch=rec, now=lambda: NOW)

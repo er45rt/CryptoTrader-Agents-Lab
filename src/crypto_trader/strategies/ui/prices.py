@@ -39,6 +39,7 @@ class BinancePrices:
         self._fetch, self._now = fetch, now
         self._latest: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        self._asset_locks: dict[str, threading.Lock] = {}
 
     # --- latest ---------------------------------------------------------------------------------------
     def latest(self, assets: list[str]) -> dict[str, dict[str, Any]]:
@@ -66,10 +67,23 @@ class BinancePrices:
 
     # --- daily closes for history ----------------------------------------------------------------------
     def daily(self, asset: str, since: date) -> dict[str, Any]:
-        """{'closes': {'YYYY-MM-DD': 'close'}, 'reason': None|str} for closed daily candles from `since`."""
+        """{'closes': {'YYYY-MM-DD': 'close'}, 'reason': None|str} for closed daily candles from `since`.
+        One caller per asset at a time; each write uses its own temp file, and an unreadable cache file is treated as
+        empty and re-fetched (the page loads history and an asset view at once - adversarial check of D40)."""
+        with self._lock:
+            lock = self._asset_locks.setdefault(asset, threading.Lock())
+        with lock:
+            return self._daily(asset, since)
+
+    def _daily(self, asset: str, since: date) -> dict[str, Any]:
         self.dir.mkdir(parents=True, exist_ok=True)
         path = self.dir / f"daily_{asset}USDT.json"
-        cached: dict[str, str] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        try:
+            cached: dict[str, str] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(cached, dict):
+                cached = {}
+        except (OSError, ValueError):
+            cached = {}                 # a damaged cache is rebuilt from the source, never trusted
         today = self._now().date()
         want_from = since
         if cached:
@@ -83,11 +97,15 @@ class BinancePrices:
                 bars = self._fetch(f"{asset}USDT", "1d", start=start, now=self._now(), timeout=20)
                 for b in bars:
                     cached[b.open_time.date().isoformat()] = str(b.close)
-                tmp = path.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(cached, sort_keys=True), encoding="utf-8")
-                os.replace(tmp, path)
             except Exception as exc:
                 reason = _reason(exc)
+            else:
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                try:
+                    tmp.write_text(json.dumps(cached, sort_keys=True), encoding="utf-8")
+                    os.replace(tmp, path)
+                except OSError:         # the cache is best effort (e.g. another process reading it on Windows)
+                    tmp.unlink(missing_ok=True)
         closes = {d: c for d, c in cached.items() if d >= since.isoformat()}
         if not closes and reason is None:
             reason = "no daily candles"
