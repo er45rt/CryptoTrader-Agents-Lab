@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import decisions, demo, portfolio, portfolio_csv, prices, store
+from . import dca, decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -145,6 +145,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/portfolio": lambda: {**self.ledger.summary(), "transactions": self.ledger.transactions()},
                 "/api/portfolio/history": lambda: self.ledger.history(self.prices.daily),
                 "/api/portfolio/asset": lambda: self.ledger.asset_view(q["asset"], self.prices.daily, prices.SOURCE),
+                # monthly DCA plans (D40): tracking only, executed buys are the ledger's own transactions
+                "/api/dca": lambda: self.dca.status(),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -200,6 +202,14 @@ class Handler(BaseHTTPRequestHandler):
                 res = self.ledger.delete_batch(str(body["batch"]))
                 self.ws._event("portfolio.import_undone", batch=res["deleted_batch"], rows=res["removed"])
                 return self._send(200, res)
+            if url.path == "/api/dca/create":
+                plan = self.dca.create(body)
+                self.ws._event("dca.created", id=plan["id"], asset=plan["asset"])
+                return self._send(200, {"plan": plan})
+            if url.path == "/api/dca/active":
+                return self._send(200, {"plan": self.dca.set_active(str(body["id"]), bool(body.get("active")))})
+            if url.path == "/api/dca/link":
+                return self._send(200, {"transaction": self.dca.link(str(body["tx_id"]), body.get("plan") or None)})
             self._send(404, {"error": "not found"})
         except (StrategyError, KeyError, ValueError, FileNotFoundError, FileExistsError) as exc:
             self._send(400, {"error": str(exc)})
@@ -270,6 +280,7 @@ def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.demo = demo.DemoManager(workspace)
     Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
     Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)
+    Handler.dca = dca.Plans(Handler.ledger, prices=Handler.prices.latest)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
