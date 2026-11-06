@@ -26,7 +26,7 @@ function oneLine(i) {   // fixed template over recorded fields; no free text is 
   return rationaleAr(i.rationale);
 }
 
-const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null };
+const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null, wide: false };
 
 PAGES.decisions = async () => {
   main.innerHTML = header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
@@ -127,7 +127,7 @@ async function dcShow(id, keepScroll = false) {
   document.querySelectorAll("#dc-rows tr").forEach((tr) => tr.classList.toggle("sel", tr.dataset.dc === id));
   const box = $("#dc-detail"); if (!box) return;
   if (!keepScroll) box.innerHTML = `<div class="card">${loading("تحميل سلسلة القرار…")}</div>`;
-  let d; try { d = await api("/api/decision?id=" + encodeURIComponent(id)); } catch (e) { box.innerHTML = `<div class="card">${errBox(e)}</div>`; return; }
+  let d; try { d = await api("/api/decision?id=" + encodeURIComponent(id) + (dcState.wide ? "&window=200" : "")); } catch (e) { box.innerHTML = `<div class="card">${errBox(e)}</div>`; return; }
   const i = d.item, sig = i.signal, read = i.read || {}, sz = i.sizing || {};
   const intent = i.action === "buy" || i.action === "sell";
   const stopAt = i.kind === "rejected_validity" ? "validity" : i.kind === "rejected_risk" ? "risk" : i.kind === "blocked_safety" ? "safety" : null;
@@ -158,6 +158,7 @@ async function dcShow(id, keepScroll = false) {
   ];
   box.innerHTML = `<div class="card"><div class="card-h"><h2>${kindPill(i.kind)} <span class="ltr">${esc(i.at.slice(0, 16).replace("T", " "))} غرينتش</span></h2><small class="muted">${esc(i.source.label)}</small></div>
     <div class="dc-sum">${esc(oneLine(i))}${i.kind === "exit" ? ` <span class="pill warn">${esc(DC.exitKinds[i.exit_kind] || "")}</span>` : ""}</div>
+    ${dcInspector(i, d)}
     <div class="chart" style="margin-top:10px"><canvas id="dc-chart"></canvas></div>
     <div class="dc-steps">${steps.join("")}</div>
     <details class="dc-ev"><summary>الدليل من السجلات</summary>
@@ -165,12 +166,46 @@ async function dcShow(id, keepScroll = false) {
       <pre>${esc(JSON.stringify(i.evidence.journal_decision, null, 1))}</pre>
       ${i.evidence.trace ? `<pre style="margin-top:8px">${esc(JSON.stringify(i.evidence.trace, null, 1))}</pre>` : `<div class="err">ما فيه سجل إشارة لهالقرار (قرار قبل تفعيل تسجيل الإشارات).</div>`}
     </details></div>`;
+  $("#dc-wide").onclick = () => { dcState.wide = !dcState.wide; dcShow(id, true); };
+  $("#dc-open").onclick = () => dcOpenSource(i.source);
+  const link = box.querySelector("[data-dc-link]");
+  if (link) link.onclick = (e) => { e.preventDefault(); dcShow(link.dataset.dcLink); };
   const bars = d.bars || [];
   if (bars.length) {
-    const fills = i.fills.map((x) => ({ entry_time: i.action === "buy" ? i.at : null, entry_price: x.price, exit_time: i.action === "sell" ? i.at : null, exit_price: x.price }));
-    candles($("#dc-chart"), bars, fills, [{ values: sma(bars, 20), color: css("--sma1") }], 230);
+    // the recorded fills of this decision and, when shown, of the other side of the same trade (A2)
+    const f0 = i.fills[0]?.price, lf = d.linked?.fills?.[0]?.price ?? null, la = d.linked?.at ?? null;
+    const fills = f0 === undefined ? [] : [i.action === "buy" ? { entry_time: i.at, entry_price: f0, exit_time: lf === null ? null : la, exit_price: lf }
+      : { entry_time: lf === null ? null : la, entry_price: lf, exit_time: i.at, exit_price: f0 }];
+    candles($("#dc-chart"), bars, fills, [{ values: sma(bars, 20), color: css("--sma1") }], dcState.wide ? 300 : 230);
     dcMark($("#dc-chart"), bars, i.bar_open || i.at);
   } else $("#dc-chart").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "ما فيه شموع محفوظة لهالمصدر." }));
+}
+const dcT = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
+/** Trade inspector (phase 2, A2): the recorded facts of one decision in one place - strategy, bar, price at decision,
+    recorded reason, fills, the records it was read from, and the other side of the same trade. */
+function dcInspector(i, d) {
+  const t = i.evidence?.trace || {}, r = d.records || {};
+  const fills = i.fills.length ? i.fills.map((x) => `<span class="ltr">${fmtNum(x.quantity, 6)} @ ${fmtNum(x.price)}</span>`).join("، ") : "—";
+  return `<div class="insp">
+    <div>الاستراتيجية</div><div><b>${esc(i.strategy)}</b>${t.strategy_version ? ` <span class="muted ltr">v${esc(t.strategy_version)}</span>` : ""}</div>
+    <div>الزوج · الإطار</div><div><span class="ltr">${esc(i.symbol)}</span> · ${esc(tfAr(i.timeframe))}</div>
+    <div>الشمعة (غرينتش)</div><div class="ltr">${esc(dcT(i.bar_open))} → ${esc(dcT(i.at))}</div>
+    <div>السعر وقت القرار</div><div>${isNum(i.price) ? fmtNum(i.price) : "غير مسجّل"}</div>
+    <div>السبب المسجّل</div><div><code class="ltr">${esc(i.signal?.reason || i.rationale || "—")}</code></div>
+    <div>التنفيذ (محاكاة)</div><div>${fills}</div>
+    <div>مصدر البيانات</div><div>${esc(i.source.label)}<span class="insp-sub ltr">${esc(i.ref)}</span>
+      <span class="insp-sub ltr">${[r.decision, r.trace, r.bars].filter(Boolean).map(esc).join(" · ")}</span></div>
+    ${d.linked ? `<div>${i.kind === "entry" ? "خروج هذه الصفقة" : "دخول هذه الصفقة"}</div><div><a href="#" data-dc-link="${esc(d.linked.id)}">${kindPill(d.linked.kind)}
+      <span class="ltr">${esc(dcT(d.linked.at))}</span>${d.linked.fills.length ? ` · <span class="ltr">${fmtNum(d.linked.fills[0].price)}</span>` : ""}</a></div>`
+      : i.kind === "entry" ? `<div>خروج هذه الصفقة</div><div class="muted">ما فيه خروج مسجّل بعد (المركز مفتوح أو الجلسة انتهت)</div>` : ""}
+  </div>
+  <div class="actions"><button class="sm" id="dc-wide">${dcState.wide ? "شموع أقل" : "شموع أكثر"}</button><button class="sm" id="dc-open">افتح المصدر</button></div>`;
+}
+function dcOpenSource(s) {   // the session or run this decision was read from, on its own page
+  if (s.kind === "paper") { shownSession = s.name; return nav("paper"); }
+  if (s.kind === "demo") { demoState.active = s.name; return nav("demo"); }
+  nav("backtest");
+  setTimeout(() => api("/api/run?id=" + encodeURIComponent(s.name)).then(showResult).catch(() => {}), 300);
 }
 function dcMark(c, bars, t) {   // highlight the decided bar (same geometry as candles())
   const g = c.getContext("2d"), w = c.clientWidth, h = c.clientHeight, L = 8, R = w - 72, bw = (R - L) / bars.length;

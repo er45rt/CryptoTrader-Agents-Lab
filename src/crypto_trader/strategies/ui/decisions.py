@@ -246,5 +246,19 @@ def detail(root: Path, item_id: str, *, window: int = 40) -> dict[str, Any]:
     if bars:
         times = [datetime.fromisoformat(b["t"]) for b in bars]
         k = max((i for i, t in enumerate(times) if t <= at), default=0)
-        bars = bars[max(0, k - window): k + 12]
-    return {"item": match, "bars": bars}
+        window = max(10, min(int(window), 300))
+        bars = bars[max(0, k - window): k + 12 + window // 4]
+    # trade inspector (phase 2, A2): the other side of the same trade, read from the same source's records only -
+    # an entry's next exit, an exit's last entry; nothing is computed from them
+    same = sorted((i for i in items if i["source"]["name"] == name), key=lambda i: i["at"])
+    linked = None
+    if match["kind"] == "entry":
+        linked = next((i for i in same if i["kind"] == "exit" and i["at"] > match["at"]), None)
+    elif match["kind"] == "exit":
+        linked = next((i for i in reversed(same) if i["kind"] == "entry" and i["at"] < match["at"]), None)
+    base = f"runs/{name}/engine" if kind == "backtest" else f"{kind}/{name}"
+    records = {"decision": f"{base}/{'decisions.json' if kind == 'backtest' else 'report.json'}",
+               "trace": f"{base}/decision_trace.jsonl" if match["evidence"]["trace"] else None,
+               "bars": f"runs/{name}/result.json" if kind == "backtest" else f"{kind}/{name}/bars.jsonl"}
+    return {"item": match, "bars": bars, "records": records,
+            "linked": None if linked is None else {k: linked[k] for k in ("id", "kind", "at", "fills", "exit_kind")}}

@@ -846,5 +846,16 @@
 "عبرت الصلاحية": "Passed validity",
 "عبرت المخاطر": "Passed risk",
 "عبرت الحماية": "Passed safety",
-"تنفّذت": "Filled"
+"تنفّذت": "Filled",
+"الشمعة (غرينتش)": "Bar (GMT)",
+"السعر وقت القرار": "Price at decision",
+"غير مسجّل": "not recorded",
+"السبب المسجّل": "Recorded reason",
+"مصدر البيانات": "Data source",
+"خروج هذه الصفقة": "This trade's exit",
+"دخول هذه الصفقة": "This trade's entry",
+"ما فيه خروج مسجّل بعد (المركز مفتوح أو الجلسة انتهت)": "No exit recorded yet (position open or the session ended)",
+"شموع أقل": "Fewer bars",
+"شموع أكثر": "More bars",
+"افتح المصدر": "Open the source"
 }

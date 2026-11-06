@@ -138,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,
                     symbol=q.get("symbol") or None, kinds=[k for k in (q.get("kinds") or "").split(",") if k] or None,
                     since=q.get("since") or None, until=q.get("until") or None, limit=int(q.get("limit") or 300)),
-                "/api/decision": lambda: decisions.detail(self.ws.root, q["id"]),
+                "/api/decision": lambda: decisions.detail(self.ws.root, q["id"], window=int(q.get("window") or 40)),
                 # demo mode (D32): offline replay of local bars through the unchanged paper engine
                 "/api/demo": lambda: self.demo.list(),
                 "/api/demo/session": lambda: self.demo.status(q["name"]),

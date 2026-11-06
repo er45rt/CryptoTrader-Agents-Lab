@@ -49,3 +49,39 @@ def test_the_funnel_card_filters_the_list_to_existing_kinds_only():
     used = {k for group in re.findall(r'data-kinds="([a-z_,]+)"', body) for k in group.split(",")}
     used |= {k for k in re.findall(r'"(rejected_validity|rejected_risk|blocked_safety)"', body)}
     assert used and used <= set(decisions.KINDS), used
+
+
+def test_the_inspector_links_each_entry_to_its_recorded_exit_and_names_its_records(root):
+    items = sorted(decisions.collect(root, source="paper:ok", limit=2000)["items"], key=lambda i: i["at"])
+    entries = [i for i in items if i["kind"] == "entry"]
+    assert entries
+    for e in entries:
+        det = decisions.detail(root, e["id"])
+        later_exits = [i for i in items if i["kind"] == "exit" and i["at"] > e["at"]]
+        if later_exits:
+            assert det["linked"]["id"] == later_exits[0]["id"] and det["linked"]["kind"] == "exit"
+            back = decisions.detail(root, det["linked"]["id"])["linked"]
+            assert back["kind"] == "entry" and back["at"] < det["linked"]["at"]
+        else:
+            assert det["linked"] is None
+        assert det["records"] == {"decision": "paper/ok/report.json", "trace": "paper/ok/decision_trace.jsonl",
+                                  "bars": "paper/ok/bars.jsonl"}
+        for rel in det["records"].values():
+            assert (root / rel).exists()
+    no_trade = next(i for i in items if i["kind"] in ("no_entry", "keep", "missed"))
+    assert decisions.detail(root, no_trade["id"])["linked"] is None
+
+
+def test_more_bars_is_bounded(root):
+    pick = decisions.collect(root, source="paper:ok", limit=2000)["items"][-1]
+    small, wide = decisions.detail(root, pick["id"]), decisions.detail(root, pick["id"], window=10_000)
+    assert len(wide["bars"]) >= len(small["bars"]) and len(wide["bars"]) <= 300 + 12 + 75 + 1
+
+
+def test_the_inspector_shows_only_recorded_fields_and_opens_the_real_source():
+    body = JS[JS.index("function dcInspector"):JS.index("function dcMark")]
+    for field in ("i.strategy", "i.symbol", "i.bar_open", "i.price", "i.signal?.reason", "i.fills", "r.decision",
+                  "d.linked"):
+        assert field in body, field
+    assert 'if (s.kind === "paper")' in body and 'if (s.kind === "demo")' in body and "/api/run?id=" in body
+    assert "&window=200" in JS

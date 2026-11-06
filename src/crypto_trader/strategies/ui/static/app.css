@@ -265,3 +265,9 @@ details.tech pre{margin-top:6px;max-height:180px}
 .fn-stop[disabled]{color:var(--muted);cursor:default}
 .fn-why{margin-top:10px;font-weight:600}
 @media (max-width:760px){.fn{grid-template-columns:1fr 1fr}}
+
+/* trade inspector (phase 2, A2) */
+.insp{display:grid;grid-template-columns:minmax(96px,30%) minmax(0,1fr);margin-top:10px}
+.insp>div{padding:8px 2px;border-bottom:1px solid var(--line);font-size:13px;overflow-wrap:anywhere;min-width:0}
+.insp>div:nth-child(odd){color:var(--muted)}
+.insp-sub{display:block;color:var(--muted);font-size:11.5px;margin-top:2px}
