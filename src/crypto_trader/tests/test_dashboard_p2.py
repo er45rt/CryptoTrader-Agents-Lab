@@ -272,3 +272,52 @@ def test_an_existing_lock_file_is_locked_through_a_read_only_handle(tmp_path):
         with _pytest.raises(StrategyError):                # still exclusive against another holder
             other.__enter__()
     assert (tmp_path / ".lock").stat().st_size == 0
+
+
+def test_status_never_creates_a_missing_lock_file_and_ignores_a_client_that_left(tmp_path, monkeypatch):
+    # Sol D42 recheck 2, blocker 1: plans present but portfolio/.lock absent -> the bar created it; a client disconnect
+    # during the response made the server append ui_errors.log
+    import json as _json
+    import threading
+
+    srv = server.make_server(tmp_path, 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+
+    def get(path):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        c.request("GET", path, headers={"Host": "127.0.0.1"})
+        try:
+            r = c.getresponse()
+            return r.status, _json.loads(r.read())
+        except (http.client.RemoteDisconnected, ConnectionError):
+            return None, None
+        finally:
+            c.close()
+
+    try:
+        server.Handler.dca.create({"asset": "BTC", "amount": "10", "day": "1", "start": "2026-01"})
+        lock = tmp_path / "portfolio" / ".lock"
+        lock.unlink()
+        before = _files(tmp_path)
+        st, doc = get("/api/status")
+        assert st == 200 and _files(tmp_path) == before and not lock.exists()
+        assert any(i["code"] == "check_failed" and i["area"] == "dca" for i in doc["items"])
+
+        real_send = server.Handler._send
+
+        def gone(self, code, payload, *a, **k):
+            if self.path.startswith("/api/status"):
+                raise BrokenPipeError(32, "client went away")
+            return real_send(self, code, payload, *a, **k)
+
+        monkeypatch.setattr(server.Handler, "_send", gone)
+        get("/api/status")
+        assert _files(tmp_path) == before                       # nothing logged for the status bar
+        assert get("/api/runs")[0] == 200                       # other routes unchanged
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    with server.Handler.ledger._lock:                           # writers still create the lock on first use
+        pass
+    assert lock.exists()

@@ -153,9 +153,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/compare": lambda: compare.comparison(self.ws.root),
                 # dashboard (D42 B3): one status/alerts bar, read-only and without network
                 "/api/status": lambda: alerts.status(self.ws, demos=self.demo.list, price_cache=self.prices.cached,
-                                                     # no plans file -> no plans: never touch the ledger lock for it
-                                                     dca_status=lambda: (self.dca.status(priced=False)
-                                                                         if self.dca.path.exists() else {"reminders": []})),
+                                                     dca_status=self._status_dca),
             }
             if url.path not in routes:
                 return self._send(404, {"error": "not found"})
@@ -163,8 +161,18 @@ class Handler(BaseHTTPRequestHandler):
         except (StrategyError, KeyError, ValueError, FileNotFoundError) as exc:
             self._send(400, {"error": str(exc)})
         except Exception as exc:  # report, never crash the server
+            if url.path == "/api/status" and isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                return                       # the status bar writes nothing, not even for a client that went away
             self.ws.log_error(f"GET {url.path}: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _status_dca(self) -> dict[str, Any]:
+        """DCA reminders for the status bar: no plans file -> no plans; otherwise read under the ledger lock without ever
+        creating its file (a missing lock file is reported on the bar as a failed check, D42 recheck)."""
+        if not self.dca.path.exists():
+            return {"reminders": []}
+        with self.ledger._lock.no_create():
+            return self.dca.status(priced=False)
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._guard(True):

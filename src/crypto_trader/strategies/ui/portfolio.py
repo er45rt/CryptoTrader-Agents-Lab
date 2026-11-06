@@ -209,6 +209,20 @@ class _LedgerLock:
         self.path, self.timeout = path, timeout
         self._thread = threading.Lock()
         self._fh = None
+        self._local = threading.local()          # per-thread "never create the lock file" (status bar, D42)
+
+    def no_create(self) -> Any:
+        """Within this context, on this thread, a missing lock file is an error instead of being created."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def ctx():
+            self._local.no_create = True
+            try:
+                yield self
+            finally:
+                self._local.no_create = False
+        return ctx()
 
     def __enter__(self) -> "_LedgerLock":
         import time
@@ -218,7 +232,10 @@ class _LedgerLock:
         try:
             # an existing lock file is opened read-only (a byte-range lock needs no write access, and a reader then
             # never holds a write-capable handle - Sol D42 recheck); it is created only on first use
-            fh = open(self.path, "rb") if self.path.exists() else open(self.path, "a+b")
+            if getattr(self._local, "no_create", False):
+                fh = open(self.path, "rb")          # FileNotFoundError if absent: a reader never creates it
+            else:
+                fh = open(self.path, "rb") if self.path.exists() else open(self.path, "a+b")
         except BaseException:          # a failed open must not leave the thread lock held (Sol D40 recheck backlog)
             self._thread.release()
             raise
