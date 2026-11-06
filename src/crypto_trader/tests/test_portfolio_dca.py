@@ -53,6 +53,26 @@ def test_a_new_buy_can_only_be_tagged_with_an_existing_plan_of_its_asset(tmp_pat
     assert lg.transactions() == [] and plans.status()["plans"][0]["qty"] == "0"
 
 
+def test_quantity_and_paid_come_from_the_same_in_plan_buys(tmp_path):
+    # Sol D40 blocker 5: a January buy linked to an April plan counted in quantity (1) but not in paid (0)
+    lg, plans = _setup(tmp_path, prices=lambda a: {"BTC": {"price": "100", "source": "t"}})
+    p = plans.create({"asset": "BTC", "amount": "100", "day": "5", "start": "2026-04"})
+    jan = lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-05", "qty": "1", "price": "100"})
+    with pytest.raises(StrategyError, match="خارج فترة الخطة"):
+        plans.link(jan["id"], p["id"])
+    with pytest.raises(StrategyError, match="خارج فترة الخطة"):
+        lg.add({"type": "buy", "asset": "BTC", "at": "2026-03-31", "qty": "1", "price": "90", "dca_plan": p["id"]})
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-04-05", "qty": "0.5", "price": "200", "dca_plan": p["id"]})
+    s = plans.status()["plans"][0]
+    assert (s["qty"], s["paid"], s["avg_cost"], s["value"]) == ("0.5", "100", "200", "50")
+    # a tag written before this rule (outside the plan) is reported, never counted
+    txs = lg._load()
+    next(t for t in txs if t["id"] == jan["id"])["dca_plan"] = p["id"]
+    lg._save(txs)
+    s = plans.status()["plans"][0]
+    assert s["qty"] == "0.5" and s["paid"] == "100" and s["linked_outside_plan"] == [jan["id"]]
+
+
 def test_a_ledger_without_plans_refuses_plan_tags(tmp_path):
     with pytest.raises(StrategyError, match="غير موجودة"):
         portfolio.Ledger(tmp_path).add({"type": "buy", "asset": "BTC", "at": "2026-04-05", "qty": "1", "price": "1",

@@ -41,6 +41,14 @@ def _months(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int
     return out
 
 
+def _in_plan(plan: dict[str, Any], at: str) -> bool:
+    """A buy belongs to a plan only inside its months: from the start month to the stop date (if stopped).
+    Quantity and paid are both computed from exactly these buys (Sol D40 blocker 5)."""
+    if at[:7] < plan["start"]:
+        return False
+    return not plan.get("stopped_at") or at[:10] <= plan["stopped_at"]
+
+
 class Plans:
     def __init__(self, ledger: portfolio.Ledger, prices: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
                  today: Callable[[], date] = lambda: datetime.now(timezone.utc).date()) -> None:
@@ -55,6 +63,8 @@ class Plans:
             raise StrategyError("الخطة غير موجودة.")
         if tx.get("type") != "buy" or tx.get("asset") != plan["asset"]:
             raise StrategyError("يُربط بالخطة شراءٌ لنفس الأصل فقط.")
+        if not _in_plan(plan, tx["at"]):
+            raise StrategyError("تاريخ الشراء خارج فترة الخطة.")
 
     def _load(self) -> list[dict[str, Any]]:
         return json.loads(self.path.read_text(encoding="utf-8"))["plans"] if self.path.exists() else []
@@ -108,8 +118,7 @@ class Plans:
             if plan_id:
                 if plan_id not in plans:
                     raise KeyError("الخطة غير موجودة.")
-                if tx["type"] != "buy" or tx["asset"] != plans[plan_id]["asset"]:
-                    raise StrategyError("يُربط بالخطة شراءٌ لنفس الأصل فقط.")
+                self.check({**tx, "dca_plan": plan_id})
                 tx["dca_plan"] = plan_id
             else:
                 tx.pop("dca_plan", None)
@@ -125,7 +134,7 @@ class Plans:
         out, reminders = [], []
         for p in plans:
             buys = sorted((t for t in txs if t.get("dca_plan") == p["id"] and t["type"] == "buy"
-                           and t["asset"] == p["asset"]), key=lambda t: t["at"])
+                           and t["asset"] == p["asset"] and _in_plan(p, t["at"])), key=lambda t: t["at"])
             stop = date.fromisoformat(p["stopped_at"]) if p.get("stopped_at") else None
             last = (stop or today)
             months = []
@@ -146,7 +155,9 @@ class Plans:
                                       "planned_date": planned.isoformat(), "state": state})
             qty = sum((Decimal(t["qty"]) - (Decimal(t["fee"]) if t["fee_asset"] == t["asset"] else _ZERO)
                        for t in buys), _ZERO)
-            paid = sum((Decimal(m["paid"]) for m in months), _ZERO)
+            paid = sum((Decimal(t["qty"]) * Decimal(t["price"]) +
+                        (Decimal(t["fee"]) if t["fee_asset"] != t["asset"] else _ZERO) for t in buys), _ZERO)
+            outside = [t["id"] for t in txs if t.get("dca_plan") == p["id"] and t not in buys]
             q = quotes.get(p["asset"]) or {}
             price = Decimal(q["price"]) if q.get("price") is not None else None
             value = qty * price if price is not None else None
@@ -169,6 +180,6 @@ class Plans:
                         "price_missing": (q.get("reason") or "no price source") if price is None else None,
                         "value": portfolio._s(value, 2) if value is not None else None,
                         "value_minus_paid": portfolio._s(value - paid, 2) if value is not None else None,
-                        "next_purchase": nxt})
+                        "next_purchase": nxt, "linked_outside_plan": outside})
         return {"plans": out, "reminders": reminders, "today": today.isoformat(),
                 "note": "tracking only - no purchase is ever placed by this app"}
