@@ -824,5 +824,6 @@
 "سجل المحفظة مشغول؛ حاول بعد لحظات.": "The portfolio ledger is busy; try again in a moment.",
 "دقة الرقم أكبر من المسموح (حتى": "more precision than allowed (up to",
 "خانة عشرية و": "decimal places and ",
-"خانة قبل الفاصلة).": "digits before the decimal point)."
+"خانة قبل الفاصلة).": "digits before the decimal point).",
+"عملية محفوظة برقم خارج حدود الدقة؛ احذفها وأعد إدخالها.": "a saved transaction has a number beyond the allowed precision; delete it and enter it again."
 }

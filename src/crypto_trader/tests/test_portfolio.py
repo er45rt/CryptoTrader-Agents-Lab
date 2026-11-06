@@ -305,3 +305,21 @@ def test_portfolio_api_adds_lists_and_deletes_with_the_ui_guard(live, ws, monkey
     assert (ws.root / "portfolio" / "ledger.json").exists()
     assert _post(live, "/api/portfolio/delete", {"id": doc["transactions"][0]["id"]})[0] == 200
     assert _get(live, "/api/portfolio")[1]["n_transactions"] == 0
+
+
+def test_a_saved_number_beyond_the_bounds_is_refused_on_replay_never_rounded(tmp_path):
+    # Sol D40 recheck, blocker 3: a quantity saved before the precision bounds rounded to 0 in the 80-digit replay and
+    # the 100 USDT cost vanished (qty 0E-79, basis 0, realized 0). Replay now applies the same bounds and refuses it.
+    legacy = {"type": "buy", "asset": "BTC", "at": "2026-01-01T00:00:00+00:00", "qty": "1." + "0" * 80 + "1",
+              "price": "100", "fee": "1", "fee_asset": "BTC"}
+    with pytest.raises(StrategyError, match="خارج حدود الدقة"):
+        portfolio.compute([legacy])
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-02", "qty": "1", "price": "2000"})
+    txs = lg._load()
+    txs.append({**legacy, "id": "legacy1", "seq": 99})
+    lg._save(txs)
+    with pytest.raises(StrategyError, match="خارج حدود الدقة"):
+        lg.summary()
+    lg.delete("legacy1")                      # the owner can remove it and enter it again
+    assert [a["asset"] for a in lg.summary()["assets"]] == ["ETH"]

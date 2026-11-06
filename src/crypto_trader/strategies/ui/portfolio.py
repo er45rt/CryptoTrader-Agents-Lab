@@ -121,6 +121,16 @@ def compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return _compute(txs)
 
 
+def _held(tx: dict[str, Any], field: str) -> Decimal:
+    """A stored number is replayed only within the same bounds as new input (Sol D40 recheck, blocker 3): a value saved
+    before the bounds existed could round away in compute() and erase its cost, so it is refused, never rounded."""
+    try:
+        return _num(tx.get(field, "0"), field, allow_zero=True)
+    except StrategyError:
+        raise StrategyError(f"{tx['asset']} في {tx['at'][:10]}: عملية محفوظة برقم خارج حدود الدقة؛ احذفها وأعد إدخالها.") \
+            from None
+
+
 def _compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     state: dict[str, dict[str, Any]] = {}
     for tx in sorted(txs, key=lambda t: (t["at"], t.get("seq", 0))):
@@ -128,8 +138,7 @@ def _compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                                            "invested": _ZERO, "fees_quote": _ZERO, "fees_asset_cost": _ZERO,
                                            "bought_qty": _ZERO, "sold_qty": _ZERO, "networks": [], "last_at": None,
                                            "n_tx": 0})
-        qty, fee = Decimal(tx.get("qty", "0")), Decimal(tx.get("fee", "0"))
-        price = Decimal(tx.get("price", "0"))
+        qty, fee, price = (_held(tx, f) for f in ("qty", "fee", "price"))
         avg = a["basis"] / a["qty"] if a["qty"] else _ZERO
         in_asset = tx["fee_asset"] == tx["asset"]
 
