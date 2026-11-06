@@ -7,6 +7,7 @@ from the run's own result.json (metrics, benchmark, settings) - nothing is recom
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ def _result(path: Path) -> dict[str, Any] | None:
     m, s = doc.get("metrics") or {}, doc.get("settings") or {}
     row = {"id": doc.get("id"), "at": doc.get("at"), "strategy": doc.get("strategy"), "version": doc.get("strategy_version"),
            "params": doc.get("params") or {}, "mode": doc.get("mode"), "data": Path(str(doc.get("data") or "")).name,
+           # the dataset is the whole path: two folders can hold different files with the same name (Sol D42 blocker 3)
+           "data_path": os.path.normcase(os.path.normpath(str(doc.get("data") or ""))),
            "timeframe": doc.get("timeframe"), "start": doc.get("start"), "end": doc.get("end"), "bars": doc.get("bars_count"),
            "capital": s.get("capital_quote"), "taker_fee": s.get("taker_fee"), "maker_fee": s.get("maker_fee"),
            "slippage_bps": s.get("slippage_bps"), "net_return": _n(m.get("net_return")),
@@ -48,7 +51,8 @@ def _result(path: Path) -> dict[str, Any] | None:
 
 
 def comparable_key(r: dict[str, Any]) -> tuple:
-    return (r["data"], r["timeframe"], r["start"], r["end"], r["mode"], r["taker_fee"], r["maker_fee"], r["slippage_bps"])
+    return (r["data_path"], r["timeframe"], r["start"], r["end"], r["mode"], r["taker_fee"], r["maker_fee"],
+            r["slippage_bps"])
 
 
 def comparison(root: Path) -> dict[str, Any]:
@@ -69,7 +73,8 @@ def comparison(root: Path) -> dict[str, Any]:
     out = []
     for key, rs in groups.items():
         rs = sorted(rs, key=lambda r: (r["net_return"] is None, -(r["net_return"] or 0)))
-        out.append({"key": dict(zip(("data", "timeframe", "start", "end", "mode", "taker_fee", "maker_fee", "slippage_bps"), key)),
+        out.append({"key": {**dict(zip(("data_path", "timeframe", "start", "end", "mode", "taker_fee", "maker_fee",
+                                        "slippage_bps"), key)), "data": rs[0]["data"]},
                     "runs": rs, "comparable": len(rs) > 1})
     out.sort(key=lambda g: max(r["at"] or "" for r in g["runs"]), reverse=True)     # newest first ...
     out.sort(key=lambda g: (not g["comparable"], -len(g["runs"])))                    # ... within: comparable, larger

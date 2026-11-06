@@ -122,7 +122,7 @@ async function dbCompare() {
   let d; try { d = await api("/api/compare"); } catch (e) { box.innerHTML = errBox(e); return; }
   if (current !== "home" || !$("#db-compare")) return;
   const pct = (x) => (isNum(x) ? fmtSPct(x) : "—");
-  const head = (k) => `<span class="ltr">${esc(k.data)}</span> · ${esc(tfAr(k.timeframe))} · <span class="ltr">${esc(dbAt(k.start).slice(0, 10))} → ${esc(dbAt(k.end).slice(0, 10))}</span>
+  const head = (k) => `<span class="ltr" title="${esc(k.data_path)}">${esc(k.data)}</span> · ${esc(tfAr(k.timeframe))} · <span class="ltr">${esc(dbAt(k.start).slice(0, 10))} → ${esc(dbAt(k.end).slice(0, 10))}</span>
     · ${k.mode === "engine" ? "كامل عبر المحرك" : "سريع"} · رسوم <span class="ltr">${isNum(k.taker_fee) ? (+k.taker_fee * 100).toFixed(2) + "%" : "—"}</span> · انزلاق <span class="ltr">${esc(k.slippage_bps ?? "—")} bps</span>`;
   const table = (rs) => `<div class="tw"><table><thead><tr><th>الاستراتيجية</th><th>العائد</th><th>الاحتفاظ</th><th>أقصى تراجع</th><th>الصفقات</th><th>الرسوم</th><th>شارب</th><th>الحكم</th><th>وقت التجربة</th></tr></thead><tbody>
     ${rs.map((r) => `<tr><td><b>${esc(r.strategy)}</b>${Object.keys(r.params).length ? ` <code class="ltr muted" style="font-size:11px">${esc(JSON.stringify(r.params))}</code>` : ""}</td>

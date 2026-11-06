@@ -50,7 +50,7 @@ def test_each_space_names_its_source_and_nothing_can_trade():
 def _run(root, rid, *, at, strategy="s", data="BTC_USDT-4h.feather", start="2024-01-01T00:00:00+00:00",
          end="2025-01-01T00:00:00+00:00", mode="fast", fee="0.001", slip="5", ret=0.1, write=True):
     import json as _json
-    doc = {"id": rid, "at": at, "mode": mode, "strategy": strategy, "strategy_version": "1", "data": f"C:/data/{data}",
+    doc = {"id": rid, "at": at, "mode": mode, "strategy": strategy, "strategy_version": "1", "data": data if "/" in data else f"C:/data/{data}",
            "timeframe": "4h", "start": start, "end": end, "bars_count": 10, "params": {},
            "settings": {"capital_quote": "1000", "taker_fee": fee, "maker_fee": fee, "slippage_bps": slip},
            "metrics": {"net_return": ret, "max_drawdown": -0.2, "sharpe": 1.0, "round_trips": 3, "fills": 6,
@@ -193,3 +193,18 @@ def test_a_recorded_metric_is_never_inserted_as_markup(tmp_path):
     body = DASH[DASH.index("async function dbCompare"):]
     assert "${r.round_trips ?? " not in body and "fmtNum(r.round_trips, 0)" in body
     assert "${x.fills ?? " not in DASH
+
+
+def test_same_file_name_in_another_folder_is_another_dataset(tmp_path):
+    # Sol D42 blocker 3: C:/feed1/BTC_USDT-4h.feather and C:/feed2/BTC_USDT-4h.feather were grouped as comparable
+    from crypto_trader.strategies.ui import compare
+
+    (tmp_path / "runs").mkdir()
+    _run(tmp_path, "a", at="2026-01-01", data="C:/feed1/BTC_USDT-4h.feather")
+    _run(tmp_path, "b", at="2026-01-02", data="C:/feed2/BTC_USDT-4h.feather")
+    _run(tmp_path, "c", at="2026-01-03", data="C:/feed1/./BTC_USDT-4h.feather")          # same file, other spelling
+    groups = compare.comparison(tmp_path)["groups"]
+    comp = [g for g in groups if g["comparable"]]
+    assert [sorted(r["id"] for r in g["runs"]) for g in comp] == [["a", "c"]]
+    assert [r["id"] for g in groups if not g["comparable"] for r in g["runs"]] == ["b"]
+    assert all(g["key"]["data"] == "BTC_USDT-4h.feather" for g in groups)
