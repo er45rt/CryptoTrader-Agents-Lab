@@ -46,7 +46,8 @@ def test_fee_in_the_asset_on_a_buy_is_capitalised_into_the_average(tmp_path):
             "fee_asset": "ETH"})
     s = compute_one(lg, "ETH")
     assert s["qty"] == Decimal("1.998") and s["basis"] == Decimal("5000")
-    assert s["avg_cost"] == Decimal("5000") / Decimal("1.998") and s["realized"] == 0
+    q = Decimal("1e-18")                              # compute() runs at 80 digits; compare at 18 places
+    assert s["avg_cost"].quantize(q) == (Decimal("5000") / Decimal("1.998")).quantize(q) and s["realized"] == 0
 
 
 @pytest.mark.parametrize("fee", ["1", "1.5"])
@@ -58,6 +59,41 @@ def test_an_asset_fee_that_eats_the_whole_purchase_is_refused(tmp_path, fee):
         lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-02", "qty": "1", "price": "100", "fee": fee,
                 "fee_asset": "BTC"})
     assert len(lg.transactions()) == 1
+
+
+def test_more_precision_than_the_ledger_holds_is_refused(tmp_path):
+    # adversarial check of Sol D40 blocker 3: qty 1.00000000000000000000000000001 was rounded to 1 when added, so
+    # "fee 1 < qty" passed on the exact input while the held quantity became 0 and the 100 USDT cost vanished
+    lg = _ledger(tmp_path)
+    for body in ({"qty": "1.00000000000000000000000000001", "fee": "1", "fee_asset": "BTC"},
+                 {"qty": "1", "price": "1.0000000000000000001"}, {"qty": "1000000000000000"}):
+        with pytest.raises(StrategyError, match="دقة الرقم"):
+            lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "price": "100", **body})
+    assert lg.transactions() == []
+
+
+def test_the_smallest_allowed_residual_keeps_the_whole_cost(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "ETH", "at": "2026-01-01", "qty": "1.000000000000000001", "price": "100",
+            "fee": "1", "fee_asset": "ETH"})
+    s = compute_one(lg, "ETH")
+    assert s["qty"] == Decimal("0.000000000000000001") and s["basis"] == Decimal("100.0000000000000001")
+
+
+def test_large_and_tiny_quantities_add_up_exactly(tmp_path):
+    lg = _ledger(tmp_path)
+    lg.add({"type": "buy", "asset": "SHIB", "at": "2026-01-01", "qty": "999999999999999", "price": "0.00001"})
+    lg.add({"type": "buy", "asset": "SHIB", "at": "2026-01-02", "qty": "0.000000000000000001", "price": "0.00001"})
+    assert compute_one(lg, "SHIB")["qty"] == Decimal("999999999999999.000000000000000001")
+    lg.add({"type": "sell", "asset": "SHIB", "at": "2026-01-03", "qty": "999999999999999.000000000000000001",
+            "price": "0.00002"})                                  # the exact held quantity can be sold
+    assert compute_one(lg, "SHIB")["qty"] == 0
+
+
+def test_negative_zero_is_stored_as_zero(tmp_path):
+    tx = _ledger(tmp_path).add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "1",
+                                "fee": "-0.0"})
+    assert tx["fee"] == "0"
 
 
 def test_transfer_between_own_wallets_is_never_a_gain_and_its_network_fee_is_a_cost(tmp_path):

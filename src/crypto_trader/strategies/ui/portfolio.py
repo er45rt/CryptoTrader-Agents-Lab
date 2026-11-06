@@ -20,7 +20,7 @@ import os
 import threading
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -33,6 +33,8 @@ TX_TYPES = ("buy", "sell", "transfer", "fee")
 _ASSET_OK = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 _TEXT_MAX = 120
 _ZERO = Decimal(0)
+_MAX_DECIMALS, _MAX_INT_DIGITS = 18, 15   # 33 significant digits at most per value
+_PREC = 80                                # compute(): sums and qty*price of bounded values stay exact
 
 
 def _now() -> str:
@@ -46,6 +48,12 @@ def _num(value: Any, name: str, *, allow_zero: bool = False) -> Decimal:
         raise StrategyError(f"{name}: لازم يكون رقمًا.") from None
     if not d.is_finite() or d < 0 or (d == 0 and not allow_zero):
         raise StrategyError(f"{name}: لازم يكون رقمًا أكبر من صفر." if not allow_zero else f"{name}: لازم يكون صفرًا أو أكثر.")
+    if d == 0:
+        return Decimal(0)                       # one spelling of zero ("-0" -> "0")
+    # bounded precision (adversarial check of Sol D40 blocker 3): every stored value fits exactly in compute()'s
+    # context, so a check never compares a value other than the one that is held
+    if -d.as_tuple().exponent > _MAX_DECIMALS or d.adjusted() + 1 > _MAX_INT_DIGITS:
+        raise StrategyError(f"{name}: دقة الرقم أكبر من المسموح (حتى {_MAX_DECIMALS} خانة عشرية و{_MAX_INT_DIGITS} خانة قبل الفاصلة).")
     return d
 
 
@@ -106,7 +114,14 @@ def parse_tx(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Replay the ledger with WAC. Returns per-asset state; raises StrategyError if any step would go negative."""
+    """Replay the ledger with WAC. Returns per-asset state; raises StrategyError if any step would go negative.
+    Runs with an 80-digit decimal context: quantities are exact, so a balance check sees the value actually held."""
+    with localcontext() as ctx:
+        ctx.prec = _PREC
+        return _compute(txs)
+
+
+def _compute(txs: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     state: dict[str, dict[str, Any]] = {}
     for tx in sorted(txs, key=lambda t: (t["at"], t.get("seq", 0))):
         a = state.setdefault(tx["asset"], {"asset": tx["asset"], "qty": _ZERO, "basis": _ZERO, "realized": _ZERO,
