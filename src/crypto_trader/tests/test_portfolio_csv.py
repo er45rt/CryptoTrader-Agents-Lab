@@ -130,6 +130,28 @@ def test_a_duplicate_written_with_different_decimals_is_still_a_duplicate(tmp_pa
     assert p["n_duplicates"] == 1 and p["rows"][0]["duplicate"] == "existing" and not p["can_import"]
 
 
+@pytest.mark.parametrize("manual_fee, manual_fee_asset, csv_fee, csv_fee_asset", [
+    ("0", None, "-0", "USDT"), ("", None, "-0.0", ""), ("-0", None, "", ""),          # negative zero
+    ("0", "BTC", "", ""), ("", None, "0", "BTC"),                                      # zero fee, other currency
+])
+def test_zero_fees_match_whatever_their_sign_or_currency(tmp_path, manual_fee, manual_fee_asset, csv_fee, csv_fee_asset):
+    # independent adversarial check of Sol D40 blocker 2: these doubled holdings after the first fix
+    lg = _lg(tmp_path)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "100", "fee": manual_fee,
+            **({"fee_asset": manual_fee_asset} if manual_fee_asset else {})})
+    text = f"date,type,asset,quantity,price,fee,fee_asset\n2026-01-01,buy,BTC,1,100,{csv_fee},{csv_fee_asset}\n"
+    p = pcsv.preview(text, lg)
+    assert p["n_duplicates"] == 1 and not p["can_import"], p["rows"]
+
+
+def test_a_non_zero_fee_in_another_currency_is_a_different_transaction(tmp_path):
+    lg = _lg(tmp_path)
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01", "qty": "1", "price": "100", "fee": "0.001",
+            "fee_asset": "BTC"})
+    p = pcsv.preview("date,type,asset,quantity,price,fee,fee_asset\n2026-01-01,buy,BTC,1,100,0.001,USDT\n", lg)
+    assert p["n_duplicates"] == 0
+
+
 def test_two_concurrent_confirms_of_the_same_file_import_it_once(tmp_path, monkeypatch):
     # Sol D40 blocker 1: both confirms pass their preview, then race into add_many; the guard runs under the lock
     import threading

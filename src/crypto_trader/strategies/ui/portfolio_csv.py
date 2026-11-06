@@ -29,13 +29,18 @@ REQUIRED = ("date", "type", "asset")
 
 
 def _n(value: Any) -> str | None:
-    # numeric identity, not spelling: "1", "1.0" and "1.00" are the same quantity (Sol D40 blocker 2)
-    return None if value is None else format(Decimal(str(value)).normalize(), "f")
+    # numeric identity, not spelling: "1", "1.0", "1e0" and "-0"/"0" are the same number (Sol D40 blocker 2)
+    if value is None:
+        return None
+    d = Decimal(str(value))
+    return "0" if d == 0 else format(d.normalize(), "f")
 
 
 def _key(tx: dict[str, Any]) -> tuple:
-    return (tx["at"], tx["type"], tx["asset"], _n(tx.get("qty")), _n(tx.get("price")), _n(tx.get("fee")),
-            tx["fee_asset"])
+    fee = _n(tx.get("fee")) or "0"
+    # a zero fee has no currency: "fee 0 in USDT" and "fee 0 in BTC" are the same transaction
+    return (tx["at"], tx["type"], tx["asset"], _n(tx.get("qty")), _n(tx.get("price")), fee,
+            None if fee == "0" else tx["fee_asset"])
 
 
 def _parse(text: str, ledger: portfolio.Ledger) -> dict[str, Any]:
