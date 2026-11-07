@@ -36,9 +36,12 @@ def test_the_shortcut_reuses_only_a_server_running_the_current_code():
     assert rc == 0 and c == {"open": ["http://127.0.0.1:8765/"], "serve": [], "stop": []}
     for old in ({"workspace": "W"}, {"workspace": "W", "build": "0" * 16}):        # pre-update server / other build
         rc, c = _launch(old)
-        assert c["stop"] == [8765] and c["serve"] == [["--port", "8765"]] and c["open"] == []
+        assert c["stop"] == [8765] and c["serve"] == [["--port", "8765", "--workspace", "W"]] and c["open"] == []
     rc, c = _launch({"workspace": "W"}, stop_ok=False)                              # could not stop: open, never 2nd
     assert c["serve"] == [] and c["open"] == ["http://127.0.0.1:8765/"]
+    # Sol review 2026-11-07: the restarted server keeps the stopped server's workspace unless one is given
+    rc, c = _launch({"workspace": "D:/ws-of-the-old-server", "build": "0" * 16})
+    assert c["serve"] == [["--port", "8765", "--workspace", "D:/ws-of-the-old-server"]]
 
 
 class _Run:
@@ -58,12 +61,17 @@ class _Run:
 
 def test_only_this_ui_process_is_ever_stopped(monkeypatch):
     monkeypatch.setattr(launcher, "running_system", lambda port, timeout=1.5: None)     # port frees after the stop
-    ui = _Run(r'"C:\venv\Scripts\pythonw.exe" "C:\Users\Jamal\Documents\ct-d29-engine\src\crypto_trader\strategies\ui\launch.pyw"')
+    ui = _Run(f'"C:\\venv\\Scripts\\pythonw.exe" "{launcher.LAUNCH.resolve()}"')     # this tree's own shortcut server
     assert launcher.stop_stale(8765, run=ui, wait=1)
     assert ["taskkill", "/PID", "4242", "/F"] in ui.calls
     assert any("ProcessId=4242" in " ".join(c) for c in ui.calls if c[0] == "powershell")
     other = _Run(r'"C:\Program Files\Something\other.exe" --serve')
     assert not launcher.stop_stale(8765, run=other, wait=1) and not any(c[0] == "taskkill" for c in other.calls)
+    # Sol review 2026-11-07: another checkout's UI, or a server started by hand, is never stopped
+    for cmd in (r'"C:\venv\pythonw.exe" "D:\other-checkout\src\crypto_trader\strategies\ui\launch.pyw"',
+                r'"C:\venv\python.exe" -m crypto_trader.strategies.ui --port 8765'):
+        run = _Run(cmd)
+        assert not launcher.stop_stale(8765, run=run, wait=1) and not any(c[0] == "taskkill" for c in run.calls), cmd
     nothing = _Run("")
     assert not launcher.stop_stale(1234, run=nothing, wait=1) and not any(c[0] == "taskkill" for c in nothing.calls)
 
