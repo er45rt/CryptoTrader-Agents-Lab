@@ -166,7 +166,7 @@ class BinanceLink:
             if r["value"] is not None:
                 value += _dec(r["value"])
         if ledger is not None:
-            _reconcile(rows, ledger)
+            _reconcile(rows, ledger, self._staged())
         doc = self._state()
         doc.update(last_sync=_now(), last_error=None, last_error_at=None)
         self._save_state(doc)
@@ -209,7 +209,8 @@ class BinanceLink:
                     from_id = max(int(t["id"]) for t in page) + 1
         except Exception as exc:  # noqa: BLE001
             raise self._fail(exc) from None
-        doc = {"synced_at": _now(), "trades": sorted(staged.values(), key=lambda t: (t["at"], t["ext_id"]))}
+        doc = {"synced_at": _now(), "assets": assets,
+               "trades": sorted(staged.values(), key=lambda t: (t["at"], t["ext_id"]))}
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = self.trades_path.with_name(self.trades_path.name + ".tmp")
         tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -302,10 +303,14 @@ def _order_totals(trades: list[dict[str, Any]]) -> dict[tuple[str, Any], Decimal
 
 def _manual_matches(t: dict[str, Any], totals: dict[tuple[str, Any], Decimal], current: list[dict[str, Any]]) -> list[int]:
     """Indexes of the manual ledger rows this Binance trade (or its whole order) may duplicate."""
+    return _manual_rows(t, [_dec(t["qty"]), totals.get((t["symbol"], t.get("order_id")))], current)
+
+
+def _manual_rows(t: dict[str, Any], sizes: list[Decimal | None], current: list[dict[str, Any]]) -> list[int]:
     from datetime import datetime as _dt
 
     at = _dt.fromisoformat(t["at"])
-    sizes = [x for x in (_dec(t["qty"]), totals.get((t["symbol"], t.get("order_id")))) if x is not None and x > 0]
+    sizes = [x for x in sizes if x is not None and x > 0]
     out = []
     for i, row in enumerate(current):
         if row.get("ext_id") or row.get("type") != t["side"] or row.get("asset") != t["asset"]:
@@ -339,15 +344,55 @@ def _tx_body(t: dict[str, Any]) -> dict[str, Any]:
             "note": "Binance", "wallet": "Binance", "ext_id": t["ext_id"]}
 
 
-def _reconcile(rows: list[dict[str, Any]], ledger: Any) -> None:
+def _uncovered(trades: list[dict[str, Any]], current: list[dict[str, Any]]) -> set[str]:
+    """Assets whose synced Binance trades are NOT all represented in the ledger (Sol D44 review B2). A trade is
+    represented when it was imported (its ext_id is in the ledger) or when it is paired ONE-TO-ONE with a distinct
+    manual row (a whole order may be one manual row). A fee paid in a third asset touches that asset too, so both are
+    uncovered. A matching quantity alone proves nothing: buy 1@100, buy 1@200, sell 1@300 and a lone buy 1@200 both
+    leave 1."""
+    imported = {t.get("ext_id") for t in current if t.get("ext_id")}
+    totals = _order_totals(trades)
+    used: set[int] = set()
+    bad: set[str] = set()
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for t in sorted(trades, key=lambda t: (t["at"], t["ext_id"])):
+        groups.setdefault((t["symbol"], t["order_id"]) if t.get("order_id") is not None else t["ext_id"], []).append(t)
+    for g in groups.values():
+        for t in g:
+            if _dec(t["fee"]) != 0 and t["fee_asset"] not in (QUOTE, t["asset"]):
+                bad.update((t["asset"], t["fee_asset"]))
+        pending = [t for t in g if t["ext_id"] not in imported]
+        if not pending:
+            continue
+        if len(g) > 1 and len(pending) == len(g):        # the whole order typed once
+            free = [i for i in _manual_rows(g[0], [totals.get((g[0]["symbol"], g[0].get("order_id")))], current)
+                    if i not in used]
+            if free:
+                used.add(free[0])
+                continue
+        for t in pending:
+            free = [i for i in _manual_rows(t, [_dec(t["qty"])], current) if i not in used]
+            if free:
+                used.add(free[0])
+            else:
+                bad.add(t["asset"])
+    return bad
+
+
+def _reconcile(rows: list[dict[str, Any]], ledger: Any, staged: dict[str, Any] | None = None) -> None:
     """Cost and profit of a Binance balance only when the recorded Binance history explains it exactly (D44): the
-    ledger rows of wallet "Binance" must hold the same quantity as the account. Otherwise both are "not available"
-    with the reason - never an estimate from partial history."""
+    latest sync covered the asset, every synced Binance trade of it is in the ledger (imported, or one-to-one with a
+    manual row - Sol D44 review B2) and the ledger rows of wallet "Binance" hold the same quantity as the account.
+    Otherwise both are "not available" with the reason - never an estimate from partial history."""
     from . import portfolio
 
+    staged = staged or {"assets": [], "trades": []}
     with ledger._lock:
-        txs = [t for t in ledger._load() if str(t.get("wallet") or "").lower() == "binance"]
+        current = ledger._load()
+    txs = [t for t in current if str(t.get("wallet") or "").lower() == "binance"]
     state = portfolio.compute(txs) if txs else {}
+    synced = set(staged.get("assets") or [])
+    uncovered = _uncovered(staged.get("trades") or [], current)
     for r in rows:
         if r["asset"] == QUOTE:
             r.update(history="quote", ledger_qty=None, cost=None, avg_cost=None, unrealized=None)
@@ -356,8 +401,12 @@ def _reconcile(rows: list[dict[str, Any]], ledger: Any) -> None:
         held = s["qty"] if s else None
         r["ledger_qty"] = str(held) if held is not None else None
         total = _dec(r["total"])
-        if held is None:
+        if r["asset"] not in synced:
+            r["history"] = "unsynced"                      # the trade history of this asset was not read yet
+        elif held is None:
             r["history"] = "missing"                       # no recorded purchase at all
+        elif r["asset"] in uncovered:
+            r["history"] = "incomplete"                    # Binance has trades the ledger does not hold
         elif abs(held - total) <= Decimal("1e-8"):
             r["history"] = "complete"
         else:

@@ -1056,5 +1056,9 @@
 "تضيف": "Add",
 "صفقة إلى محفظتي؟ كل صفقة تُضاف مرة وحدة فقط، وتقدر تحذفها لاحقًا من صفحة محفظتي.": "trades to my portfolio? Each trade is added only once, and you can delete it later from My portfolio.",
 "تمت إضافة": "Added",
-"صفقة إلى محفظتك.": "trades to your portfolio."
+"صفقة إلى محفظتك.": "trades to your portfolio.",
+"زامن سجل الصفقات أولًا": "Sync the trade history first",
+"التكلفة والربح تظهر فقط إذا كانت كل صفقات": "Cost and profit appear only when every",
+"لهذا الأصل من آخر مزامنة موجودة في محفظتك (مستوردة أو مطابقة لعملية سجّلتها بنفسك) وكمية محفظة": "trade of this asset from the latest sync is in your portfolio (imported, or matching an operation you recorded yourself) and the quantity of wallet",
+"تطابق الرصيد تمامًا. غير كذا تبقى «غير متاحة» بدل رقم مضلل.": "matches the balance exactly. Otherwise they stay \"not available\" instead of a misleading number."
 }

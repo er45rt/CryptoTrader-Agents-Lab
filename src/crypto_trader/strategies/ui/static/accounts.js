@@ -6,7 +6,7 @@
 
 const ACC = { sel: new Set(), preview: null };
 const ACC_HIST = { complete: ["مطابق", "good"], incomplete: ["تاريخ الشراء ناقص", "warn"], exceeds: ["السجل أكبر من الرصيد", "warn"],
-  missing: ["ما فيه سجل شراء", "warn"], quote: ["عملة التسعير", ""] };
+  missing: ["ما فيه سجل شراء", "warn"], quote: ["عملة التسعير", ""], unsynced: ["زامن سجل الصفقات أولًا", "warn"] };
 const ACC_STATUS = { ready: ["جاهزة", "good"], imported: ["مستوردة", ""], possible_duplicate: ["مكررة محتملة", "warn"], blocked: ["محجوبة", "bad"] };
 const ACC_REASON = { fee_other_asset: "الرسوم مدفوعة بعملة ثالثة (مثل BNB)؛ ما تُستورد تلقائيًا", same_as_ledger_row: "مطابقة لعملية مسجّلة يدويًا" };
 const accAt = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
@@ -84,7 +84,7 @@ async function accBalances() {
       <td class="ltr">${isNum(r.cost) ? fmtUsd(r.cost) : r.history === "quote" ? "—" : `<span class="muted">${esc("غير متاحة")}</span>`}</td>
       <td class="ltr ${sign(r.unrealized)}">${isNum(r.unrealized) ? fmtUsd(r.unrealized) : r.history === "quote" ? "—" : `<span class="muted">${esc("غير متاح")}</span>`}</td></tr>`; }).join("")}
     </tbody></table></div>
-    <div class="muted" style="font-size:12px;margin-top:6px">التكلفة والربح تظهر فقط إذا كان سجل الشراء المسجّل في محفظتك (محفظة Binance) يطابق الرصيد تمامًا. غير كذا تبقى «غير متاحة» بدل رقم مضلل.</div>`
+    <div class="muted" style="font-size:12px;margin-top:6px">التكلفة والربح تظهر فقط إذا كانت كل صفقات Binance لهذا الأصل من آخر مزامنة موجودة في محفظتك (مستوردة أو مطابقة لعملية سجّلتها بنفسك) وكمية محفظة Binance تطابق الرصيد تمامًا. غير كذا تبقى «غير متاحة» بدل رقم مضلل.</div>`
     : empty("ما فيه أرصدة في الحساب.", "wallet")}`;
   $("#bal-go").onclick = accBalances;
 }

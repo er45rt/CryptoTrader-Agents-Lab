@@ -2,6 +2,7 @@
 history explains the balance exactly (otherwise "not available" with the reason)."""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -26,6 +27,11 @@ def test_cost_and_profit_only_when_the_recorded_history_matches_the_balance(tmp_
                  {"asset": "SOL", "qty": "5", "price": "100"},                 # exceeds (holds 3)
                  {"asset": "ADA", "qty": "10", "price": "1", "wallet": "Ledger"}):   # other wallet: no Binance record
         lg.add({"type": "buy", "at": "2026-01-01", "wallet": "Binance", **body})
+    rows = {r["asset"]: r for r in link.balances(lg)["balances"]}
+    assert {rows[a]["history"] for a in ("BTC", "ETH", "SOL", "ADA")} == {"unsynced"}      # no history read yet (Sol B2)
+    assert all(rows[a]["cost"] is None for a in rows)
+    link.trades_path.write_text(json.dumps({"synced_at": "t", "assets": ["ADA", "BTC", "ETH", "SOL"], "trades": []}),
+                                encoding="utf-8")                   # a sync that found no Binance trades (deposits)
     rows = {r["asset"]: r for r in link.balances(lg)["balances"]}
     assert rows["BTC"]["history"] == "complete" and rows["BTC"]["cost"] == "1800.00" and rows["BTC"]["unrealized"] == "200.00"
     for asset, why in (("ETH", "incomplete"), ("SOL", "exceeds"), ("ADA", "missing")):
