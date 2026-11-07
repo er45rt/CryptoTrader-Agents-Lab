@@ -38,8 +38,9 @@ async function api(path, body, timeoutMs) {
 async function apiOnce(path, body, timeoutMs) {
   // no-store: never wait behind another in-flight request for the same URL; abort: never hang the page
   const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), timeoutMs);
-  const opt = { cache: "no-store", signal: ctl.signal };
-  if (body !== undefined) Object.assign(opt, { method: "POST", headers: { "Content-Type": "application/json", "X-CT-UI": "1" }, body: JSON.stringify(body) });
+  const opt = { cache: "no-store", signal: ctl.signal, headers: {} };
+  if (Date.now() - lastInput < ACTIVE_MS) opt.headers["X-CT-Active"] = "1";   // only requests after real input extend the session
+  if (body !== undefined) Object.assign(opt, { method: "POST", body: JSON.stringify(body) }, { headers: { ...opt.headers, "Content-Type": "application/json", "X-CT-UI": "1" } });
   try {
     const r = await fetch(path, opt);
     const j = await r.json();
@@ -602,13 +603,32 @@ window.addEventListener("DOMContentLoaded", async () => {
 
 /** Local PIN login (owner decision D44). The PIN never stays in the page: it is sent once and the field is cleared. */
 let authState = null;
+/* Auto-lock (Sol D44 review B1): background polling never keeps the session open. Requests made within ACTIVE_MS of a
+   click/key/scroll carry X-CT-Active and extend it on the server; with no input for the server's idle time the page
+   ends the session and shows the PIN screen itself, without waiting for a later request. */
+const ACTIVE_MS = 60000;
+let lastInput = Date.now(), lastPing = 0;
+for (const ev of ["pointerdown", "keydown", "wheel", "touchstart"]) addEventListener(ev, () => { lastInput = Date.now(); }, { capture: true, passive: true });
+setInterval(async () => {
+  if (!(authState && authState.enabled && authState.logged_in)) return;
+  const idle = Date.now() - lastInput, limit = (authState.idle_s || 900) * 1000;
+  if (idle >= limit) {
+    authState = { ...authState, logged_in: false };
+    try { await api("/api/auth/logout", {}); } catch (e) { /* the session ends either way */ }
+    loginPage(current);
+  } else if (idle < ACTIVE_MS && Date.now() - lastPing > 120000) {   // reading/scrolling without requests still counts as use
+    lastPing = Date.now();
+    try { const s = await api("/api/auth/status"); if (!s.logged_in) { authState = { ...authState, ...s }; loginPage(current); } } catch (e) { /* next tick */ }
+  }
+}, 15000);
 function loginPage(next) {
+  clearInterval(timer);   // a locked page polls nothing
   main.innerHTML = header("تسجيل الدخول", "أدخل رمز الدخول (PIN) لفتح البرنامج.") + `<div class="card login-card">
     <label>رمز الدخول</label><input id="pin" type="password" inputmode="numeric" autocomplete="current-password" class="ltr" maxlength="12">
     <div class="actions"><button class="primary" id="pin-go">دخول</button></div><div id="pin-msg"></div></div>`;
   const go = async () => {
     const pin = $("#pin").value; $("#pin").value = "";
-    try { await api("/api/auth/login", { pin }); authState = { enabled: true, logged_in: true }; paintLock(); nav(next || "home"); }
+    try { await api("/api/auth/login", { pin }); authState = { ...authState, enabled: true, logged_in: true }; lastInput = Date.now(); paintLock(); nav(next || "home"); }
     catch (e) { $("#pin-msg").innerHTML = errBox(e); $("#pin").focus(); }
   };
   $("#pin-go").onclick = go;

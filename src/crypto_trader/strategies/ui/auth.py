@@ -97,26 +97,29 @@ class Auth:
             return token
 
     # --- sessions ----------------------------------------------------------------------------------------
-    def _valid(self, token: str | None) -> bool:
+    def _valid(self, token: str | None, touch: bool = False) -> bool:
         if not token or token not in self._sessions:
             return False
         now = self._now()
         if now - self._sessions[token] > IDLE_S:
             del self._sessions[token]
             return False
-        self._sessions[token] = now               # activity keeps the session open
+        if touch:
+            # only the owner's own activity keeps the session open: a page polling in the background must not
+            # (Sol D44 review B1), so the caller says whether this request follows real input
+            self._sessions[token] = now
         return True
 
-    def check(self, token: str | None) -> bool:
-        """True when no PIN is set (login not in use) or the session is live."""
+    def check(self, token: str | None, touch: bool = False) -> bool:
+        """True when no PIN is set (login not in use) or the session is live; ``touch`` = the request follows input."""
         if not self.enabled():
             return True
         with self._lock:
-            return self._valid(token)
+            return self._valid(token, touch)
 
-    def logged_in(self, token: str | None) -> bool:
+    def logged_in(self, token: str | None, touch: bool = False) -> bool:
         with self._lock:
-            return self.enabled() and self._valid(token)
+            return self.enabled() and self._valid(token, touch)
 
     def logout(self, token: str | None) -> None:
         with self._lock:

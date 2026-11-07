@@ -106,7 +106,7 @@ def test_once_a_pin_exists_every_private_api_needs_the_session_cookie(tmp_path):
             assert _call(port, "GET", path, cookie=session)[0] == 200, path
         assert _call(port, "POST", "/api/portfolio/add", {"type": "buy"})[0] == 401
         assert _call(port, "GET", "/api/system")[0] == 200 and _call(port, "GET", "/app.js")[0] == 200
-        assert _call(port, "GET", "/api/auth/status", cookie=session)[1] == {"enabled": True, "logged_in": True}
+        assert _call(port, "GET", "/api/auth/status", cookie=session)[1] == {"enabled": True, "logged_in": True, "idle_s": 900}
         assert _call(port, "POST", "/api/auth/setup", {"pin": "999999"})[0] == 400      # no session: no change
         _, _, cleared = _call(port, "POST", "/api/auth/logout", {}, cookie=session)
         assert "Max-Age=0" in cleared and _call(port, "GET", "/api/portfolio", cookie=session)[0] == 401

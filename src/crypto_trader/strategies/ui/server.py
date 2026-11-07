@@ -133,13 +133,17 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         public = (path in ("/", "/index.html") or path.lstrip("/") in STATIC_FILES
                   or path in ("/api/system", "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"))
-        if not public and not self.auth.check(self._token()):
+        if not public and not self.auth.check(self._token(), touch=self._active()):
             n = int(self.headers.get("Content-Length") or 0)
             if 0 < n <= 2_000_000:
                 self.rfile.read(n)
             self._send(HTTPStatus.UNAUTHORIZED, {"error": "login required", "auth": True})
             return False
         return True
+
+    def _active(self) -> bool:
+        """The page marks requests that follow the owner's input (click/key) - only those extend the idle timer."""
+        return self.headers.get("X-CT-Active") == "1"
 
     def _token(self) -> str | None:
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -181,7 +185,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/logs": lambda: self.ws.logs(),
                 "/api/system": lambda: {**self.ws.system(), "build": BUILD, "disk_build": build_id()},
                 # local PIN login (D44)
-                "/api/auth/status": lambda: {"enabled": self.auth.enabled(), "logged_in": self.auth.logged_in(self._token())},
+                "/api/auth/status": lambda: {"enabled": self.auth.enabled(), "idle_s": auth.IDLE_S,
+                                             "logged_in": self.auth.logged_in(self._token(), touch=self._active())},
                 # linked accounts (D44): Binance READ-ONLY
                 "/api/accounts": lambda: {**self.link.status(), "pin_set": self.auth.enabled()},
                 "/api/accounts/binance/balances": lambda: self.link.balances(self.ledger),
