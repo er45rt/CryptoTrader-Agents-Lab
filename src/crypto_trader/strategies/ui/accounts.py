@@ -228,8 +228,10 @@ class BinanceLink:
             current = ledger._load()
         imported = {t.get("ext_id") for t in current if t.get("ext_id")}
         keys = {_key(t) for t in current}
+        staged = self._staged()["trades"]
+        totals = _order_totals(staged)
         rows = []
-        for t in self._staged()["trades"]:
+        for t in staged:
             row = {"trade": t, "tx": None, "status": "ready", "reason": None}
             if t["ext_id"] in imported:
                 row["status"] = "imported"
@@ -238,7 +240,7 @@ class BinanceLink:
             else:
                 tx = portfolio.parse_tx(_tx_body(t))
                 row["tx"] = tx
-                if _key(tx) in keys:
+                if _key(tx) in keys or _manual_matches(t, totals, current):
                     row.update(status="possible_duplicate", reason="same_as_ledger_row")
             rows.append(row)
         ready = [r["tx"] for r in rows if r["status"] == "ready"]
@@ -267,16 +269,56 @@ class BinanceLink:
         if not_ready:
             raise StrategyError("لا يُستورد إلا ما حالته «جاهزة»: المكررة والمحجوبة والمستوردة سابقًا تُستثنى.")
         bodies = [_tx_body(by_id[x]) for x in sorted(want, key=lambda x: (by_id[x]["at"], x))]
+        totals = _order_totals(list(by_id.values()))
 
         def guard(current: list[dict[str, Any]]) -> None:   # under the ledger lock: nothing imported twice
             have = {t.get("ext_id") for t in current}
             keys = {_key(t) for t in current}
             from . import portfolio
-            if any(b["ext_id"] in have for b in bodies) or any(_key(portfolio.parse_tx(b)) in keys for b in bodies):
+            if (any(b["ext_id"] in have for b in bodies) or any(_key(portfolio.parse_tx(b)) in keys for b in bodies)
+                    or any(_manual_matches(by_id[x], totals, current) for x in want)):
                 raise StrategyError("تغيّر السجل بعد المعاينة (صفقة مستوردة أو مطابقة)؛ أعد المعاينة.")
 
         added = ledger.add_many(bodies, source="binance", guard=guard)
         return {"imported": len(added)}
+
+
+#: A hand-recorded operation is entered to the minute (the form has no seconds), sometimes in the wrong time zone, and
+#: often as one row for a whole order that Binance filled in several parts. So a Binance trade is a possible duplicate
+#: of any manual row (no ext_id) of the same type and asset within a day whose quantity is within 1% of the fill or of
+#: its whole order (Sol D44 review B3). A false alarm only keeps a trade out of the automatic import.
+DUP_WINDOW_S = 24 * 3600
+DUP_QTY_TOL = Decimal("0.01")
+
+
+def _order_totals(trades: list[dict[str, Any]]) -> dict[tuple[str, Any], Decimal]:
+    totals: dict[tuple[str, Any], Decimal] = {}
+    for t in trades:
+        if t.get("order_id") is not None:
+            k = (t["symbol"], t["order_id"])
+            totals[k] = totals.get(k, Decimal(0)) + _dec(t["qty"])
+    return totals
+
+
+def _manual_matches(t: dict[str, Any], totals: dict[tuple[str, Any], Decimal], current: list[dict[str, Any]]) -> list[int]:
+    """Indexes of the manual ledger rows this Binance trade (or its whole order) may duplicate."""
+    from datetime import datetime as _dt
+
+    at = _dt.fromisoformat(t["at"])
+    sizes = [x for x in (_dec(t["qty"]), totals.get((t["symbol"], t.get("order_id")))) if x is not None and x > 0]
+    out = []
+    for i, row in enumerate(current):
+        if row.get("ext_id") or row.get("type") != t["side"] or row.get("asset") != t["asset"]:
+            continue
+        try:
+            gap = abs((_dt.fromisoformat(str(row.get("at"))) - at).total_seconds())
+            qty = _dec(row.get("qty"))
+        except (ValueError, TypeError, ArithmeticError):
+            out.append(i)                                  # an unreadable row is never assumed different
+            continue
+        if gap <= DUP_WINDOW_S and any(abs(qty - x) <= x * DUP_QTY_TOL for x in sizes):
+            out.append(i)
+    return out
 
 
 def _trade_row(symbol: str, asset: str, t: Any) -> dict[str, Any]:
