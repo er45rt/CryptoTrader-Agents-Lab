@@ -111,3 +111,17 @@ def test_an_empty_portfolio_says_why_and_which_ledger(live, ws):
     js = (STATIC / "dashboard.js").read_text(encoding="utf-8")
     card = js[js.index('if (k === "portfolio") {'):js.index('if (k === "demo") {')]
     assert "if (!d.n_transactions)" in card and "ما فيه عمليات مسجّلة في محفظتك بعد" in card and "d.storage" in card
+
+
+# R4 - backtest result cards: the sparkline sat on the icon and title in Arabic. canvas{direction:ltr} turned the
+#      spark's inset-inline-end into "right" on the RTL page. It is now placed by the page direction and the title row
+#      keeps room for it.
+def test_the_card_sparkline_is_placed_by_the_page_direction_and_never_over_the_title():
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    assert "canvas{direction:ltr}" in css                      # why inline-end alone was wrong on the canvas
+    i_rule = css.index('html[dir="rtl"] .kpi canvas.spark{left:14px;right:auto}')
+    assert css.index(".kpi canvas.spark{top:14px;") < i_rule      # later, so it wins over the inline-end placement
+    assert 'html[dir="ltr"] .kpi canvas.spark{right:14px;left:auto}' in css
+    assert ".kpi:has(canvas.spark) .top{padding-inline-end:92px}" in css     # 84px chart + gap: the title wraps
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert '<canvas class="spark"' in app[app.index("function kpi("):app.index("const header")]

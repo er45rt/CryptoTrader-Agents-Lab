@@ -206,6 +206,12 @@ th[data-k]{cursor:pointer;user-select:none}th[data-k]:hover{color:var(--text)}
 .cols>*{min-width:0}
 .stack{display:flex;flex-direction:column;gap:16px;min-width:0}.stack>.card{margin-bottom:0}
 .kpi canvas.spark{top:14px;bottom:auto;inset-inline-end:14px;left:auto;width:84px;height:28px;opacity:.95}
+/* owner report 2026-11-07 (backtest cards): canvas{direction:ltr} turned inset-inline-end into "right" even on the
+   Arabic page, so the sparkline covered the icon and title. Place it by the PAGE direction, and keep the title row
+   clear of it (a long title wraps instead of running under the chart). */
+html[dir="rtl"] .kpi canvas.spark{left:14px;right:auto}
+html[dir="ltr"] .kpi canvas.spark{right:14px;left:auto}
+.kpi:has(canvas.spark) .top{padding-inline-end:92px}
 canvas{direction:ltr}
 .heat{direction:rtl;grid-template-columns:48px repeat(12,minmax(34px,1fr)) 58px;min-width:560px}.heat .c,.heat .t{direction:ltr}
 
