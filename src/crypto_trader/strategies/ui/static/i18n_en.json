@@ -936,5 +936,14 @@
 "سجل الأخطاء": "error log",
 "الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).": "The running server is older than these pages, so some pages do not work correctly. Open the UI from the desktop shortcut: it stops the old server and starts the current version (running demos pause and resume where they were).",
 "ما فيه عمليات مسجّلة في محفظتك بعد؛ أضفها من صفحة «محفظتي»": "No transactions recorded in your portfolio yet; add them from the \"My portfolio\" page",
-"سجل المحفظة فاضي": "Portfolio ledger is empty"
+"سجل المحفظة فاضي": "Portfolio ledger is empty",
+"محاولة متتالية فشلت": "consecutive attempts failed",
+"رفض محلي: مرشّح على هذا الجهاز": "Local refusal: a filter on this computer",
+"رفض الاتصال قبل ما يوصل للإنترنت — مو انقطاع شبكة ولا خطأ من": "refused the connection before it reached the internet — not a network outage and not an error from",
+"رفض محلي: تعذّر التحقق من شهادة الأمان (قد يكون برنامج حماية يعترض الاتصال)": "Local refusal: the security certificate could not be verified (a protection program may be intercepting the connection)",
+"انقطاع شبكة: تعذّر الوصول إلى": "Network failure: could not reach",
+"انقطاع شبكة: الاتصال مرفوض": "Network failure: connection refused",
+"انقطاع شبكة: انقطع الاتصال من الطرف الآخر": "Network failure: the other side reset the connection",
+"انقطاع شبكة: انتهت مهلة الاتصال": "Network failure: the connection timed out",
+"آخر دورة ناجحة": "last successful cycle"
 }

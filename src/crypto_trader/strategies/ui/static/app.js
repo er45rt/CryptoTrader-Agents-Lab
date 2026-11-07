@@ -497,7 +497,7 @@ async function paperDetail(name) {
     el.innerHTML = `<div class="card"><div class="card-h"><h2>${esc(name)} <small>${esc(d.session.strategy_name)} · ${esc(d.session.market.symbol)} · ${esc(tfAr(d.session.timeframe))}</small></h2>
       <div class="actions" style="margin:0">${d.running ? '<span class="pill good">تعمل · تحدّث كل 30 ثانية</span>' : '<span class="pill">متوقفة</span>'}
       <button class="sm" data-dc-source="paper:${esc(name)}">قراراتها في مركز القرارات ←</button></div></div>
-    ${d.error ? `<div class="err"><b>الجلسة ما تقدر تجيب الأسعار</b> · آخر محاولة <span class="ltr">${esc(String(d.error.at).slice(0, 16).replace("T", " "))} غرينتش</span> · ${esc(d.error.consecutive)} محاولة متتالية فشلت.
+    ${d.error ? `<div class="err"><b>الجلسة ما تقدر تجيب الأسعار</b> · آخر محاولة <span class="ltr">${esc(String(d.error.at).slice(0, 16).replace("T", " "))} غرينتش</span> · ${esc(d.error.consecutive)} محاولة متتالية فشلت${s.cycle_at ? ` · آخر دورة ناجحة <span class="ltr">${esc(String(s.cycle_at).slice(0, 16).replace("T", " "))} غرينتش</span>` : ""}.
       <br>السبب: ${esc(trErr(d.error.error).ar || "خطأ غير معروف")}. الشموع اللي تفوت وقتها تنسجّل «فائتة» وما تتداول.
       <details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(d.error.error)}</pre></details></div>` : ""}
     <div class="kpis">

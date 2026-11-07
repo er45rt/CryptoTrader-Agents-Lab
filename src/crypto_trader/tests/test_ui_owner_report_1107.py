@@ -125,3 +125,48 @@ def test_the_card_sparkline_is_placed_by_the_page_direction_and_never_over_the_t
     assert ".kpi:has(canvas.spark) .top{padding-inline-end:92px}" in css     # 84px chart + gap: the title wraps
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     assert '<canvas class="spark"' in app[app.index("function kpi("):app.index("const header")]
+
+
+# R5 - paper session sma-cross-btc-4h, 58 failed price fetches: the page named a product as the cause without showing
+#      evidence. Each connection cause now carries its kind (local refusal / network failure / Binance API error) from
+#      the recorded error only; the session line shows the last successful cycle; the outdated-server message (R1) no
+#      longer sticks over the page content.
+def test_connection_causes_are_classified_from_the_recorded_error_only():
+    import re
+    import shutil
+    import subprocess
+
+    import pytest
+
+    src = (STATIC / "i18n.js").read_text(encoding="utf-8")
+    fn = re.search(r"^function netCause\(text\) \{.*?^\}", src, re.S | re.M).group(0)
+    assert "Avast" not in fn
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    cases = {
+        "local": "PermissionError: [Errno 13] Permission denied: '\\\\.\\aswMonFltProxy\\5cb2265d41ce0e6c'",
+        "dns": "URLError: <urlopen error [Errno 11001] getaddrinfo failed>",
+        "timeout": "TimeoutError: The read operation timed out",
+        "api": "HTTPError: HTTP Error 429: Too Many Requests",
+        "other_perm": "PermissionError: [Errno 13] Permission denied: 'C:/x/state.json'",
+    }
+    js = fn + "\nconst C = " + json.dumps(cases) + ";\nconsole.log(JSON.stringify(Object.fromEntries(Object.entries(C).map(([k, v]) => [k, netCause(v)]))));"
+    got = json.loads(subprocess.run([node, "-e", js], capture_output=True, text=True, encoding="utf-8", timeout=60,
+                                    check=True).stdout.strip().splitlines()[-1])
+    assert got["local"].startswith("رفض محلي:") and "(aswMonFltProxy)" in got["local"] and "مو انقطاع شبكة ولا خطأ من Binance" in got["local"]
+    assert got["dns"].startswith("انقطاع شبكة:") and got["timeout"].startswith("انقطاع شبكة:")
+    assert got["api"].startswith("خطأ من Binance (API):")
+    assert not got["other_perm"].startswith("رفض محلي")          # a file permission is not a network block
+
+
+def test_the_session_error_line_shows_last_attempt_and_last_success_and_the_banner_is_in_flow():
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    line = app[app.index("الجلسة ما تقدر تجيب الأسعار"):app.index("الجلسة ما تقدر تجيب الأسعار") + 700]
+    assert "d.error.at" in line and "d.error.consecutive" in line and "s.cycle_at" in line and "آخر دورة ناجحة" in line
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    rule = css[css.index(".stale-server{"):].split("}")[0]
+    assert "sticky" not in rule and "fixed" not in rule and "absolute" not in rule
+    i18n = (STATIC / "i18n.js").read_text(encoding="utf-8")
+    body = i18n[i18n.index("function trErr"):]
+    assert body.index('LANG === "en" && net0') < body.index("English: the original message")

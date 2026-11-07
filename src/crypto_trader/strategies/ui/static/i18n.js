@@ -68,19 +68,22 @@ function rationaleText(r) {
   return r;
 }
 
-/** Network / OS error text from the paper loop -> Arabic cause (or null). */
+/** Network / OS error text from the paper loop -> Arabic cause (or null), with its kind first (owner report
+    2026-11-07): a local refusal on this computer, a network failure, or an error answered by Binance's API. Only what
+    the recorded error text shows is said; no product is named as the cause. */
 function netCause(text) {
   const t = String(text || "");
-  if (/aswMonFltProxy/.test(t)) return "برنامج الحماية Avast يمنع اتصال الجلسة بـ Binance";
-  if (/CERTIFICATE_VERIFY_FAILED/.test(t)) return "تعذّر التحقق من شهادة الأمان (قد يكون برنامج حماية يعترض الاتصال)";
-  if (/getaddrinfo failed|11001|Name or service not known/.test(t)) return "تعذّر الوصول إلى Binance — تحقّق من الإنترنت";
-  if (/10061|Connection refused/.test(t)) return "الاتصال مرفوض";
-  if (/10054|ConnectionReset|reset by peer/.test(t)) return "انقطع الاتصال من الطرف الآخر";
-  if (/timed out|TimeoutError/.test(t)) return "انتهت مهلة الاتصال";
-  if (/HTTP Error 400/.test(t)) return "Binance رفض الطلب: رمز الزوج غير صحيح أو غير مدعوم (اكتبه بحروف كبيرة مثل BTCUSDT)";
-  if (/HTTP Error (429|418)/.test(t)) return "Binance حدّ من عدد الطلبات مؤقتًا";
-  if (/HTTP Error 451/.test(t)) return "Binance غير متاح من هذا الموقع";
-  if (/HTTP Error (\d{3})/.test(t)) return `Binance ردّ بخطأ ${/HTTP Error (\d{3})/.exec(t)[1]}`;
+  const local = /PermissionError.*\.\\+([A-Za-z]\w+)/.exec(t);      // a local device path refused (\\.\<filter>\...)
+  if (local) return `رفض محلي: مرشّح على هذا الجهاز (${local[1]}) رفض الاتصال قبل ما يوصل للإنترنت — مو انقطاع شبكة ولا خطأ من Binance`;
+  if (/CERTIFICATE_VERIFY_FAILED/.test(t)) return "رفض محلي: تعذّر التحقق من شهادة الأمان (قد يكون برنامج حماية يعترض الاتصال)";
+  if (/getaddrinfo failed|11001|Name or service not known/.test(t)) return "انقطاع شبكة: تعذّر الوصول إلى Binance — تحقّق من الإنترنت";
+  if (/10061|Connection refused/.test(t)) return "انقطاع شبكة: الاتصال مرفوض";
+  if (/10054|ConnectionReset|reset by peer/.test(t)) return "انقطاع شبكة: انقطع الاتصال من الطرف الآخر";
+  if (/timed out|TimeoutError/.test(t)) return "انقطاع شبكة: انتهت مهلة الاتصال";
+  if (/HTTP Error 400/.test(t)) return "خطأ من Binance (API): Binance رفض الطلب: رمز الزوج غير صحيح أو غير مدعوم (اكتبه بحروف كبيرة مثل BTCUSDT)";
+  if (/HTTP Error (429|418)/.test(t)) return "خطأ من Binance (API): Binance حدّ من عدد الطلبات مؤقتًا";
+  if (/HTTP Error 451/.test(t)) return "خطأ من Binance (API): Binance غير متاح من هذا الموقع";
+  if (/HTTP Error (\d{3})/.test(t)) return `خطأ من Binance (API): Binance ردّ بخطأ ${/HTTP Error (\d{3})/.exec(t)[1]}`;
   if (/URLError|ConnectionError|OSError|PermissionError/.test(t)) return "تعذّر الاتصال بـ Binance";
   return null;
 }
@@ -163,6 +166,8 @@ const ERRS = [
 /** Any error text -> {ar, raw}; ar is null only when nothing safe is known (then the raw text is shown as technical detail). */
 function trErr(text) {
   const raw = String(text ?? "").replace(/^ERROR: /, "");
+  const net0 = netCause(raw);   // a connection cause is classified in both languages (owner report 2026-11-07)
+  if (typeof LANG !== "undefined" && LANG === "en" && net0) return { ar: net0, raw };
   if (typeof LANG !== "undefined" && LANG === "en" && !/[\u0600-\u06FF]/.test(raw)) return { ar: raw, raw: null };   // English: the original message
   if (/[؀-ۿ]/.test(raw)) return { ar: raw, raw: null };   // the UI's own messages are already Arabic
   for (const [re, fn] of ERRS) { const m = re.exec(raw); if (m) return { ar: fn(m), raw }; }
