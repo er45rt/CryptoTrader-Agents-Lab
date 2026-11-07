@@ -44,6 +44,16 @@ def test_the_shortcut_reuses_only_a_server_running_the_current_code():
     assert c["serve"] == [["--port", "8765", "--workspace", "D:/ws-of-the-old-server"]]
 
 
+def test_an_outdated_server_never_renders_a_page_only_the_explanation():
+    # Sol review 2026-11-07: a warning above a page that still failed ("reading 'stopped'") was not enough
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    boot = app[app.index('window.addEventListener("DOMContentLoaded"'):]
+    assert boot.index("await checkServerBuild();") < boot.index("nav((location.hash")
+    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 700]
+    assert nav.index("if (serverStale)") < nav.index("(PAGES[page] || PAGES.home)()")
+    assert "esc(STALE_TEXT)" in nav and "return; }" in nav[nav.index("if (serverStale)"):]
+
+
 class _Run:
     def __init__(self, cmdline):
         self.cmdline, self.calls = cmdline, []
@@ -91,7 +101,8 @@ def test_every_page_says_plainly_when_the_server_is_older_than_the_pages():
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     body = app[app.index("async function checkServerBuild"):]
     assert "checkServerBuild();" in app and 'api("/api/system")' in body
-    assert "d.build && d.build === d.disk_build" in body and "اختصار سطح المكتب" in body
+    assert "d.build && d.build === d.disk_build" in body
+    assert "اختصار سطح المكتب" in app[app.index("const STALE_TEXT"):app.index("async function checkServerBuild")]
 
 
 # R2 - the demo page replaced its whole live card every 2.5 s, even when nothing changed, and every new card replayed

@@ -70,6 +70,7 @@ function nav(page) {
   main.onclick = null;   // a page's delegated click handler never outlives the page
   current = page;
   document.querySelectorAll(".side a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
+  if (serverStale) { main.innerHTML = `<div class="err stale-server">${esc(STALE_TEXT)}</div>`; return; }   // never a broken page
   (PAGES[page] || PAGES.home)().catch((e) => { main.innerHTML = errBox(e); });
   if (location.hash.slice(1) !== page) location.hash = page;
 }
@@ -582,18 +583,17 @@ window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTi
 window.addEventListener("DOMContentLoaded", async () => {
   await initLang();                       // lang.js: Arabic or English, display only
   $("#lang-btn").onclick = () => setLang(LANG === "en" ? "ar" : "en");
-  checkServerBuild();
+  await checkServerBuild();
   nav((location.hash || "#home").slice(1));
 });
 
 /** Owner report 2026-11-07: a server started before an update keeps running its older code while the pages come from
     disk, so pages break. The server reports the code it started with (build) and the code on disk now (disk_build);
-    any difference - or a server too old to report it - is said plainly at the top of every page. */
+    any difference - or a server too old to report it - means no page is rendered on it: every page shows only this
+    explanation (Sol review 2026-11-07: a warning above a page that still errors is not enough). */
+let serverStale = false;
+const STALE_TEXT = "الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).";
 async function checkServerBuild() {
   let d; try { d = await api("/api/system"); } catch (e) { return; }
-  if (d.build && d.build === d.disk_build) return;
-  const bar = document.createElement("div");
-  bar.className = "err stale-server";
-  bar.textContent = "الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).";
-  document.body.insertBefore(bar, document.body.firstChild);
+  serverStale = !(d.build && d.build === d.disk_build);
 }
