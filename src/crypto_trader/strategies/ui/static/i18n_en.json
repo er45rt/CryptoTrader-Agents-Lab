@@ -946,5 +946,14 @@
 "انقطاع شبكة: انقطع الاتصال من الطرف الآخر": "Network failure: the other side reset the connection",
 "انقطاع شبكة: انتهت مهلة الاتصال": "Network failure: the connection timed out",
 "آخر دورة ناجحة": "last successful cycle",
-"التحقق من نسخة الخادم": "Checking the server version"
+"التحقق من نسخة الخادم": "Checking the server version",
+"حماية المفاتيح تعتمد على حماية ويندوز": "Key protection relies on Windows protection",
+"، وهي متاحة على ويندوز فقط.": ", which is available on Windows only.",
+"تعذّر استخدام حماية ويندوز": "Could not use Windows protection",
+"لهذا الحساب.": "for this account.",
+"مفتاح": "key",
+"أو المفتاح السري غير صالح: انسخهما كما هما من صفحة إدارة": "or secret key is not valid: copy both exactly as shown on the management page of",
+"لا تُدخل كلمة مرور ولا عبارة استرداد": "Never enter a password or a recovery phrase",
+"حماية المفاتيح لم تعمل؛ ما انحفظ شي.": "Key protection did not work; nothing was saved.",
+"تعذّر فك حماية المفتاح المحفوظ (حساب ويندوز آخر أو ملف تالف). افصل الحساب واربطه من جديد.": "Could not decrypt the stored key (another Windows account or a damaged file). Disconnect the account and link it again."
 }
