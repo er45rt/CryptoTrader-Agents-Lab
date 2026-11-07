@@ -184,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                 # linked accounts (D44): Binance READ-ONLY
                 "/api/accounts": lambda: {**self.link.status(), "pin_set": self.auth.enabled()},
                 "/api/accounts/binance/balances": lambda: self.link.balances(),
+                "/api/accounts/binance/preview": lambda: self.link.preview(self.ledger),
                 # decision center (D31): read-only views over the engine's recorded decisions
                 "/api/decisions": lambda: decisions.collect(
                     self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,
@@ -248,6 +249,13 @@ class Handler(BaseHTTPRequestHandler):
                 res = self.link.connect(body.get("api_key"), body.get("api_secret"), pin_set=self.auth.enabled())
                 body = None                                            # the pair leaves this handler now
                 self.ws._event("accounts.binance.connected", permission="read_only")
+                return self._send(200, res)
+            if url.path == "/api/accounts/binance/sync":           # D44 K4: into the review file only
+                held = {r["asset"] for r in self.link.balances()["balances"]}
+                return self._send(200, self.link.sync_trades(sorted(held | {t["asset"] for t in self.ledger.transactions()})))
+            if url.path == "/api/accounts/binance/import":         # only selected trades marked ready
+                res = self.link.import_selected(self.ledger, list(body.get("ext_ids") or []))
+                self.ws._event("accounts.binance.imported", rows=res["imported"])
                 return self._send(200, res)
             if url.path == "/api/accounts/binance/disconnect":
                 res = self.link.disconnect()

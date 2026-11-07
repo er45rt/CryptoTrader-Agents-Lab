@@ -129,13 +129,18 @@ class MainnetReadOnlyClient:
             raise MainnetError("the open-orders response was not understood.")
         return tuple(item for item in body if isinstance(item, Mapping))
 
-    def my_trades(self, symbol: str | None = None, *, limit: int = 50) -> tuple[Mapping[str, Any], ...]:
-        """Account trade history (read-only)."""
+    def my_trades(self, symbol: str | None = None, *, limit: int = 50,
+                  from_id: int | None = None) -> tuple[Mapping[str, Any], ...]:
+        """Account trade history (read-only). ``from_id`` pages forward from a trade id (D44 history sync)."""
         if not isinstance(limit, int) or limit <= 0 or limit > 1000:
             raise MainnetError("my_trades limit must be between 1 and 1000.")
+        if from_id is not None and (not isinstance(from_id, int) or isinstance(from_id, bool) or from_id < 0):
+            raise MainnetError("my_trades from_id must be a non-negative integer.")
         params: dict[str, Any] = {"limit": limit}
         if symbol:
             params["symbol"] = symbol
+        if from_id is not None:
+            params["fromId"] = from_id
         body = self._get(PATH_MY_TRADES, params, signed=True)
         if not isinstance(body, list):
             raise MainnetError("the trade-history response was not understood.")

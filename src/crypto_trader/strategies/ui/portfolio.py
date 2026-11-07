@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -110,6 +111,11 @@ def parse_tx(body: dict[str, Any]) -> dict[str, Any]:
         if kind != "buy":
             raise StrategyError("الربط بخطة الشراء الشهري للمشتريات فقط.")
         tx["dca_plan"] = _text(plan)
+    ext = str(body.get("ext_id") or "").strip()
+    if ext:                                   # a venue trade's own id (D44): one ledger row per Binance trade, ever
+        if not re.fullmatch(r"binance:[A-Z0-9]{2,30}:\d{1,20}", ext) or kind not in ("buy", "sell"):
+            raise StrategyError("معرّف الصفقة الخارجي غير صالح.")
+        tx["ext_id"] = ext
     return tx
 
 

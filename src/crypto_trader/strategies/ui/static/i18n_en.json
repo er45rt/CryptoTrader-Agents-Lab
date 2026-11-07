@@ -978,5 +978,10 @@
 "غير مربوط.": "is not linked.",
 "المفتاح مرفوض: صلاحياته ليست قراءة فقط. أنشئ مفتاحًا بصلاحية": "Key refused: its permissions are not read-only. Create a key with only",
 "وحدها": "enabled",
-"رفض الطلب (تحقق من المفتاح وتقييد عنوان": "refused the request (check the key and the address restriction"
+"رفض الطلب (تحقق من المفتاح وتقييد عنوان": "refused the request (check the key and the address restriction",
+"معرّف الصفقة الخارجي غير صالح.": "The external trade id is not valid.",
+"اختر صفقة واحدة على الأقل للاستيراد.": "Select at least one trade to import.",
+"بعض الصفقات المختارة غير موجودة في آخر مزامنة؛ زامن من جديد.": "Some selected trades are not in the last sync; sync again.",
+"لا يُستورد إلا ما حالته «جاهزة»: المكررة والمحجوبة والمستوردة سابقًا تُستثنى.": "Only trades marked \"ready\" are imported: duplicates, blocked and already imported trades are left out.",
+"تغيّر السجل بعد المعاينة (صفقة مستوردة أو مطابقة)؛ أعد المعاينة.": "The ledger changed after the preview (a trade imported or matching); preview again."
 }

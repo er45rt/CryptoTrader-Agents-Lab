@@ -10,7 +10,11 @@ withdrawal or transfer capability. This module adds only:
 * re-check on every use: each balance read re-validates the permission contract first (a key whose permissions were
   widened at Binance afterwards stops working here at once);
 * status: connected / masked key / IP restriction / last sync / last error (errors are the client's redacted text);
-* disconnect: the stored pair and every synced file are deleted.
+* disconnect: the stored pair and every synced file are deleted;
+* trade history (K4): synced into a REVIEW file (accounts/binance_trades.json), never straight into the ledger. A
+  preview classifies every trade - already imported (same Binance trade id), possible duplicate of a ledger row
+  (same date/type/asset/quantity/price/fee), blocked (fee in a third asset such as BNB), or ready - and only ready
+  trades the owner selects are imported, each carrying its Binance trade id so it can never be imported twice.
 No order, cancel, withdrawal or transfer path exists here or in the client; MAINNET_ENABLED is untouched.
 """
 from __future__ import annotations
@@ -29,7 +33,10 @@ from ...mainnet.errors import MainnetError
 from ..api import StrategyError
 from .vault import Vault
 
-__all__ = ["BinanceLink", "real_client"]
+__all__ = ["BinanceLink", "real_client", "QUOTE"]
+
+QUOTE = "USDT"
+PAGE = 1000
 
 
 def real_client(creds: MainnetReadOnlyCredentials) -> MainnetReadOnlyClient:
@@ -163,3 +170,126 @@ class BinanceLink:
         self._save_state(doc)
         return {"balances": rows, "value": str(value), "value_complete": all(r["value"] is not None for r in rows),
                 "at": doc["last_sync"]}
+
+    # --- trade history: review first, import only what the owner selects (K4) -----------------------------
+    @property
+    def trades_path(self) -> Path:
+        return self.dir / "binance_trades.json"
+
+    def _staged(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.trades_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"synced_at": None, "trades": []}
+
+    def sync_trades(self, assets: list[str]) -> dict[str, Any]:
+        """Fetch the available history of <asset>USDT for each asset into the review file (merged by trade id)."""
+        import re
+
+        assets = sorted({a for a in assets if re.fullmatch(r"[A-Z0-9]{2,15}", str(a)) and a != QUOTE})
+        staged = {t["ext_id"]: t for t in self._staged()["trades"]}
+        try:
+            client = self.client()                                 # permission contract checked first
+            for asset in assets:
+                symbol, from_id = f"{asset}{QUOTE}", 0
+                while True:
+                    try:
+                        page = client.my_trades(symbol, limit=PAGE, from_id=from_id)
+                    except MainnetError as exc:
+                        if "-1121" in str(exc) or "Invalid symbol" in str(exc):
+                            break                                  # no <asset>USDT market: nothing to fetch
+                        raise
+                    for t in page:
+                        row = _trade_row(symbol, asset, t)
+                        staged.setdefault(row["ext_id"], row)
+                    if len(page) < PAGE:
+                        break
+                    from_id = max(int(t["id"]) for t in page) + 1
+        except Exception as exc:  # noqa: BLE001
+            raise self._fail(exc) from None
+        doc = {"synced_at": _now(), "trades": sorted(staged.values(), key=lambda t: (t["at"], t["ext_id"]))}
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.trades_path.with_name(self.trades_path.name + ".tmp")
+        tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, self.trades_path)
+        state = self._state()
+        state.update(last_sync=doc["synced_at"], last_error=None, last_error_at=None)
+        self._save_state(state)
+        return {"synced_at": doc["synced_at"], "trades": len(doc["trades"]), "assets": assets}
+
+    def preview(self, ledger: Any) -> dict[str, Any]:
+        """Every staged trade with its status against the ledger; nothing is written."""
+        from . import portfolio
+        from .portfolio_csv import _key
+
+        with ledger._lock:
+            current = ledger._load()
+        imported = {t.get("ext_id") for t in current if t.get("ext_id")}
+        keys = {_key(t) for t in current}
+        rows = []
+        for t in self._staged()["trades"]:
+            row = {"trade": t, "tx": None, "status": "ready", "reason": None}
+            if t["ext_id"] in imported:
+                row["status"] = "imported"
+            elif t["fee_asset"] not in (QUOTE, t["asset"]) and _dec(t["fee"]) != 0:
+                row.update(status="blocked", reason="fee_other_asset")
+            else:
+                tx = portfolio.parse_tx(_tx_body(t))
+                row["tx"] = tx
+                if _key(tx) in keys:
+                    row.update(status="possible_duplicate", reason="same_as_ledger_row")
+            rows.append(row)
+        ready = [r["tx"] for r in rows if r["status"] == "ready"]
+        replay_error = None
+        if ready:
+            try:
+                portfolio.compute(current + ready)
+            except StrategyError as exc:
+                replay_error = str(exc)
+        counts = {k: sum(r["status"] == k for r in rows) for k in ("ready", "imported", "possible_duplicate", "blocked")}
+        return {"synced_at": self._staged()["synced_at"], "rows": rows, "counts": counts, "replay_error": replay_error}
+
+    def import_selected(self, ledger: Any, ext_ids: list[str]) -> dict[str, Any]:
+        """Import ONLY the selected trades that the preview marks ready, all or nothing, re-checked under the lock."""
+        from .portfolio_csv import _key
+
+        want = {str(x) for x in ext_ids or []}
+        if not want:
+            raise StrategyError("اختر صفقة واحدة على الأقل للاستيراد.")
+        by_id = {t["ext_id"]: t for t in self._staged()["trades"]}
+        unknown = want - set(by_id)
+        if unknown:
+            raise StrategyError("بعض الصفقات المختارة غير موجودة في آخر مزامنة؛ زامن من جديد.")
+        rows = {r["trade"]["ext_id"]: r for r in self.preview(ledger)["rows"]}
+        not_ready = [x for x in want if rows[x]["status"] != "ready"]
+        if not_ready:
+            raise StrategyError("لا يُستورد إلا ما حالته «جاهزة»: المكررة والمحجوبة والمستوردة سابقًا تُستثنى.")
+        bodies = [_tx_body(by_id[x]) for x in sorted(want, key=lambda x: (by_id[x]["at"], x))]
+
+        def guard(current: list[dict[str, Any]]) -> None:   # under the ledger lock: nothing imported twice
+            have = {t.get("ext_id") for t in current}
+            keys = {_key(t) for t in current}
+            from . import portfolio
+            if any(b["ext_id"] in have for b in bodies) or any(_key(portfolio.parse_tx(b)) in keys for b in bodies):
+                raise StrategyError("تغيّر السجل بعد المعاينة (صفقة مستوردة أو مطابقة)؛ أعد المعاينة.")
+
+        added = ledger.add_many(bodies, source="binance", guard=guard)
+        return {"imported": len(added)}
+
+
+def _trade_row(symbol: str, asset: str, t: Any) -> dict[str, Any]:
+    from datetime import datetime as _dt
+
+    at = _dt.fromtimestamp(int(t["time"]) / 1000, tz=timezone.utc).isoformat()
+    return {"ext_id": f"binance:{symbol}:{int(t['id'])}", "symbol": symbol, "asset": asset,
+            "side": "buy" if t.get("isBuyer") else "sell", "qty": str(_dec(t.get("qty"))),
+            "price": str(_dec(t.get("price"))), "quote_qty": str(_dec(t.get("quoteQty"))),
+            "fee": str(_dec(t.get("commission"))), "fee_asset": str(t.get("commissionAsset") or QUOTE), "at": at,
+            "order_id": t.get("orderId")}
+
+
+def _tx_body(t: dict[str, Any]) -> dict[str, Any]:
+    fee = _dec(t["fee"])
+    return {"type": t["side"], "asset": t["asset"], "at": t["at"], "qty": t["qty"], "price": t["price"],
+            "fee": t["fee"] if fee != 0 else "0", "fee_asset": t["fee_asset"] if fee != 0 else QUOTE,
+            "note": "Binance", "wallet": "Binance", "ext_id": t["ext_id"]}
