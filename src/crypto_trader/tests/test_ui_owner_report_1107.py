@@ -114,7 +114,7 @@ def test_the_demo_refresh_keeps_an_unchanged_page_and_never_replays_the_entrance
     body = js[js.index("async function demoDraw"):js.index("async function demoAction")]
     assert body.count("box.innerHTML =") == 1 and "if (fresh) {" in body[:body.index("box.innerHTML =")]
     assert "if (demoState.secs[k] === html) continue;" in body
-    assert "if (charts !== demoState.charts) {" in body and body.index("if (charts !== demoState.charts) {") < body.index("candles(")
+    assert "if (candleSig !== demoState.candles) {" in body and body.index("if (candleSig !== demoState.candles) {") < body.index("candles(")
     assert 'box.classList.add("no-anim")' in body and "box.onclick = demoAction" in body
     for k in ("head", "err", "prog", "kpis", "trades"):
         assert f'data-sec="{k}"' in body
@@ -232,3 +232,15 @@ def test_no_page_runs_until_the_server_check_has_answered():
     assert 'loading("التحقق من نسخة الخادم…")' in nav and "errBox(serverCheckError)" in nav
     check = app[app.index("async function checkServerBuild"):]
     assert "catch (e) { serverCheckError = e; serverStale = true; return; }" in check
+
+
+# Sol review 2026-11-07, round 2 - H3: each chart has its own signature, and the card's buttons act on the demo that
+#      card shows (switching demos while the old card is still visible never touches the newly selected one).
+def test_each_chart_redraws_alone_and_buttons_act_on_their_own_card():
+    js = (STATIC / "demo.js").read_text(encoding="utf-8")
+    body = js[js.index("async function demoDraw"):js.index("async function demoAction")]
+    i_c, i_e = body.index("if (candleSig !== demoState.candles) {"), body.index("if (eqSig !== demoState.eq) {")
+    assert i_c < body.index("candles($(\"#dch\")") < i_e < body.index("lines($(\"#deq\")")
+    assert "box.dataset.demo = name;" in body and "demoState.charts" not in js
+    act = js[js.index("async function demoAction"):]
+    assert "name = box?.dataset.demo" in act and "demoState.active" not in act.split("if (act === \"delete\")")[0]

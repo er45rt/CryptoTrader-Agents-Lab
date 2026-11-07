@@ -3,7 +3,7 @@
    Every number on this page comes from the engine's own files for the selected demo (status.json, equity.jsonl,
    bars.jsonl); nothing is simulated in the browser. */
 
-const demoState = { active: null, poll: null, built: "", secs: {}, charts: "" };
+const demoState = { active: null, poll: null, built: "", secs: {}, candles: "", eq: "" };
 const SPEED_LABEL = { "1": "1×", "2": "2×", "5": "5×", max: "أقصى" };
 
 PAGES.demo = async () => {
@@ -93,7 +93,8 @@ async function demoDraw(full) {
         <div><div class="card-h"><h2>الأداء <small>الرصيد مقابل الاحتفاظ</small></h2></div><canvas id="deq"></canvas>
         <div class="muted" id="deq-empty">يظهر منحنى الأداء بعد أول شمعتين.</div></div></div>
       <div class="card-h" style="margin-top:14px"><h2>آخر الصفقات</h2></div><div data-sec="trades"></div></div>`;
-    demoState.built = name; demoState.secs = {}; demoState.charts = "";
+    demoState.built = name; demoState.secs = {}; demoState.candles = ""; demoState.eq = "";
+    box.dataset.demo = name;                         // the card's buttons act on the demo this card shows
     box.onclick = demoAction;
   } else box.classList.add("no-anim");
   if (full) demoState.secs.head = "";              // after an action: the buttons are rebuilt (never left disabled)
@@ -104,12 +105,18 @@ async function demoDraw(full) {
     demoState.secs[k] = html;
     if (k === "kpis") kpisNew = true;
   }
+  // each chart has its own signature: candles (bars + trade markers) and the equity chart are redrawn only when their
+  // own data changed; the sparkline when the equity changed or its card was re-rendered (Sol review, round 2)
   const lastEq = d.equity[d.equity.length - 1];
-  const charts = `${d.bars.length}|${lastBar ? lastBar.t + lastBar.c : ""}|${(s.trades || []).length}|${JSON.stringify((s.trades || []).slice(-1))}|${d.equity.length}|${lastEq ? lastEq.t + lastEq.equity : ""}`;
-  if (charts !== demoState.charts) {
-    demoState.charts = charts;
+  const candleSig = `${d.bars.length}|${lastBar ? lastBar.t + lastBar.c : ""}|${JSON.stringify(s.trades || [])}`;
+  const eqSig = `${d.equity.length}|${lastEq ? lastEq.t + lastEq.equity : ""}`;
+  if (candleSig !== demoState.candles) {
+    demoState.candles = candleSig;
     const bars = d.bars.slice(-160);
     if (bars.length) candles($("#dch"), bars, s.trades || [], [{ values: sma(bars, 20), color: css("--sma1") }], 300);
+  }
+  if (eqSig !== demoState.eq) {
+    demoState.eq = eqSig;
     $("#deq").style.display = d.equity.length > 1 ? "" : "none";
     $("#deq-empty").style.display = d.equity.length > 1 ? "none" : "";
     if (d.equity.length > 1) {
@@ -123,7 +130,7 @@ async function demoDraw(full) {
 }
 
 async function demoAction(e) {   // one delegated handler for the live card's buttons (they may be re-rendered)
-  const box = $("#demo-live"), name = demoState.active; if (!box || !name) return;
+  const box = $("#demo-live"), name = box?.dataset.demo; if (!box || !name) return;   // the demo THIS card shows
   const sp = e.target.closest("[data-speed]");
   if (sp) {
     try { await api("/api/demo/speed", { name, speed: sp.dataset.speed }); } catch (er) { box.insertAdjacentHTML("afterbegin", errBox(er)); }
@@ -134,7 +141,7 @@ async function demoAction(e) {   // one delegated handler for the live card's bu
   try {
     if (act === "delete") {
       if (!(await uiConfirm(`تحذف التجربة ${name} نهائيًا مع سجلاتها؟ ما يمكن التراجع.`, "حذف نهائي"))) return;
-      await api("/api/demo/delete", { name, confirm: name }); demoState.active = null; return PAGES.demo();
+      await api("/api/demo/delete", { name, confirm: name }); if (demoState.active === name) demoState.active = null; return PAGES.demo();
     }
     b.disabled = true;
     await api("/api/demo/" + act, { name, ...(act === "step" ? { n: 1 } : {}) });
