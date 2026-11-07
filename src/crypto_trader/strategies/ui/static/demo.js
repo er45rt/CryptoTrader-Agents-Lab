@@ -3,7 +3,7 @@
    Every number on this page comes from the engine's own files for the selected demo (status.json, equity.jsonl,
    bars.jsonl); nothing is simulated in the browser. */
 
-const demoState = { active: null, poll: null, sig: "" };
+const demoState = { active: null, poll: null, built: "", secs: {}, charts: "" };
 const SPEED_LABEL = { "1": "1×", "2": "2×", "5": "5×", max: "أقصى" };
 
 PAGES.demo = async () => {
@@ -58,58 +58,86 @@ async function demoDraw(full) {
   const doc = d.demo, s = d.status || {}, cap = +doc.capital, eq = isNum(s.equity_quote) ? +s.equity_quote : cap, pnl = eq - cap;
   const pct = d.progress.total ? d.progress.done / d.progress.total : 0, running = d.running;
   const lastBar = d.bars[d.bars.length - 1];
-  const html = `<div class="card"><div class="card-h"><h2>${esc(doc.strategy)} <small class="ltr">${esc(name)}</small> ${demoStatePill(doc.state, running)}</h2>
+  const sec = {
+    head: `<div class="card-h"><h2>${esc(doc.strategy)} <small class="ltr">${esc(name)}</small> ${demoStatePill(doc.state, running)}</h2>
       <div class="actions" style="margin:0">
         ${running ? `<button class="sm" data-dact="pause">⏸ إيقاف مؤقت</button>` : doc.state === "finished" ? "" : `<button class="sm ok" data-dact="start">▶ تشغيل</button><button class="sm" data-dact="step">⏭ شمعة واحدة</button>`}
         <div class="tabs" id="demo-speed">${Object.keys(SPEED_LABEL).map((v) => `<button data-speed="${v}" class="${doc.speed === v ? "on" : ""}">${SPEED_LABEL[v]}</button>`).join("")}</div>
         <button class="sm" data-dc-source="demo:${esc(name)}">قراراتها في مركز القرارات ←</button>
-        <button class="sm danger" data-dact="delete">حذف</button></div></div>
-    ${doc.state === "error" ? `<div class="err">توقفت التجربة بسبب خطأ: ${esc(trErr(doc.error).ar || "خطأ غير معروف")}<details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(doc.error)}</pre></details></div>` : ""}
-    <div class="demo-progress"><div style="width:${(pct * 100).toFixed(1)}%"></div></div>
+        <button class="sm danger" data-dact="delete">حذف</button></div></div>`,
+    err: doc.state === "error" ? `<div class="err">توقفت التجربة بسبب خطأ: ${esc(trErr(doc.error).ar || "خطأ غير معروف")}<details class="tech"><summary>تفاصيل تقنية</summary><pre>${esc(doc.error)}</pre></details></div>` : "",
+    prog: `<div class="demo-progress"><div style="width:${(pct * 100).toFixed(1)}%"></div></div>
     <div class="muted" style="font-size:12.5px;margin:6px 0 14px">الساعة التجريبية: <span class="ltr">${esc((doc.clock || doc.replay_from).slice(0, 16).replace("T", " "))} غرينتش</span> ·
-      تقدّم الإعادة ${d.progress.done} / ${d.progress.total} · فترة البيانات <span class="ltr">${esc(doc.replay_from.slice(0, 10))} – ${esc(doc.replay_to.slice(0, 10))}</span></div>
-    <div class="kpis">
+      تقدّم الإعادة ${d.progress.done} / ${d.progress.total} · فترة البيانات <span class="ltr">${esc(doc.replay_from.slice(0, 10))} – ${esc(doc.replay_to.slice(0, 10))}</span></div>`,
+    kpis: `<div class="kpis">
       ${kpi({ k: "الرصيد", v: fmtUsd(eq), ic: "wallet", s: `رأس المال ${fmtUsd(cap, 0)}`, spark: "dsp" })}
       ${kpi({ k: "الربح / الخسارة", v: (pnl > 0 ? "+" : "") + fmtUsd(pnl), cls: sign(pnl), ic: pnl >= 0 ? "trend" : "down", tone: pnl >= 0 ? "g" : "r", s: fmtSPct(cap ? pnl / cap : null, 2) })}
       ${kpi({ k: "آخر سعر", v: lastBar ? fmtUsd(lastBar.c) : "—", ic: "trend", s: esc(doc.timeframe ? tfAr(doc.timeframe) : "") })}
       ${kpi({ k: "المركز المفتوح", v: posText(s.position), ic: "box", small: true })}
       ${kpi({ k: "عمليات التنفيذ", v: String(s.fills ?? 0), ic: "coins", s: `أقصى تراجع ${fmtPct(s.max_drawdown)}` })}
-    </div>
-    <div class="cols"><div><div class="card-h"><h2>السعر والصفقات</h2></div><canvas id="dch"></canvas></div>
-      <div><div class="card-h"><h2>الأداء <small>الرصيد مقابل الاحتفاظ</small></h2></div><canvas id="deq"></canvas></div></div>
-    <div class="card-h" style="margin-top:14px"><h2>آخر الصفقات</h2></div>
-    ${(s.trades || []).length ? `<div class="tw" style="max-height:260px"><table><thead><tr><th>دخول</th><th>سعر</th><th>خروج</th><th>سعر</th><th>كمية</th><th>ربح/خسارة</th></tr></thead><tbody>
+    </div>`,
+    trades: (s.trades || []).length ? `<div class="tw" style="max-height:260px"><table><thead><tr><th>دخول</th><th>سعر</th><th>خروج</th><th>سعر</th><th>كمية</th><th>ربح/خسارة</th></tr></thead><tbody>
       ${s.trades.slice().reverse().map((t) => `<tr><td class="ltr">${esc((t.entry_time || "").slice(0, 16).replace("T", " "))}</td><td class="ltr">${fmtNum(t.entry_price)}</td>
       <td class="ltr">${t.exit_time ? esc(t.exit_time.slice(0, 16).replace("T", " ")) : '<span class="pill warn">مفتوحة</span>'}</td><td class="ltr">${fmtNum(t.exit_price)}</td>
       <td class="ltr">${fmtNum(t.quantity, 5)}</td><td class="ltr ${sign(t.pnl_quote)}">${isNum(t.pnl_quote) ? fmtNum(t.pnl_quote) : "—"}</td></tr>`).join("")}</tbody></table></div>`
-      : empty("ما فيه صفقات بعد. شغّل التجربة وانتظر إشارة من الاستراتيجية.", "box")}</div>`;
-  // smooth refresh (owner report 2026-11-07): nothing changed -> leave the page as it is; changed -> replace in place
-  // without replaying the cards' entrance animation (it starts from opacity 0, which looked like a blink every 2.5 s)
-  const sig = `${name}|${html}|${d.bars.length}|${d.equity.length}|${lastBar ? lastBar.t + lastBar.c : ""}`;
-  if (!full && sig === demoState.sig && box.firstElementChild) return;
-  demoState.sig = sig;
-  box.classList.toggle("no-anim", !!box.firstElementChild);
-  box.innerHTML = html;
-  const bars = d.bars.slice(-160);
-  if (bars.length) candles($("#dch"), bars, s.trades || [], [{ values: sma(bars, 20), color: css("--sma1") }], 300);
-  if (d.equity.length > 1) {
-    const p0 = +d.equity[0].price, e0 = +d.equity[0].equity, accent = css("--accent");
-    lines($("#deq"), [{ name: "الرصيد", points: d.equity.map((x) => [x.t, +x.equity]), color: accent, area: [accent + "55", accent + "00"] },
-      { name: "الاحتفاظ", points: d.equity.map((x) => [x.t, e0 * +x.price / p0]), color: css("--hold"), dash: true, width: 1.5 }], 300);
-    spark($("#dsp"), thin(d.equity).map((x) => +x.equity), pnl >= 0 ? css("--good") : css("--bad"));
-  } else $("#deq").replaceWith(Object.assign(document.createElement("div"), { className: "muted", textContent: "يظهر منحنى الأداء بعد أول شمعتين." }));
-  box.querySelectorAll("[data-dact]").forEach((b) => b.onclick = async () => {
-    const act = b.dataset.dact;
-    try {
-      if (act === "delete") {
-        if (!(await uiConfirm(`تحذف التجربة ${name} نهائيًا مع سجلاتها؟ ما يمكن التراجع.`, "حذف نهائي"))) return;
-        await api("/api/demo/delete", { name, confirm: name }); demoState.active = null; return PAGES.demo();
-      }
-      b.disabled = true;
-      await api("/api/demo/" + act, { name, ...(act === "step" ? { n: 1 } : {}) });
-    } catch (e) { box.insertAdjacentHTML("afterbegin", errBox(e)); }
-    demoDraw(true);
-  });
-  $("#demo-speed").onclick = async (e) => { const b = e.target.closest("[data-speed]"); if (!b) return;
-    try { await api("/api/demo/speed", { name, speed: b.dataset.speed }); } catch (er) { box.insertAdjacentHTML("afterbegin", errBox(er)); } demoDraw(true); };
+      : empty("ما فيه صفقات بعد. شغّل التجربة وانتظر إشارة من الاستراتيجية.", "box"),
+  };
+  // smooth refresh (owner report 2026-11-07, Sol review): the card is built once per demo; afterwards only a section
+  // whose content changed is replaced, charts are redrawn only when their data changed, and an update never replays
+  // the entrance animation (it starts from opacity 0, which looked like a blink every 2.5 s)
+  const fresh = demoState.built !== name || !box.querySelector("[data-sec=head]");
+  if (fresh) {
+    box.classList.remove("no-anim");
+    box.innerHTML = `<div class="card"><div data-sec="head"></div><div data-sec="err"></div><div data-sec="prog"></div><div data-sec="kpis"></div>
+      <div class="cols"><div><div class="card-h"><h2>السعر والصفقات</h2></div><canvas id="dch"></canvas></div>
+        <div><div class="card-h"><h2>الأداء <small>الرصيد مقابل الاحتفاظ</small></h2></div><canvas id="deq"></canvas>
+        <div class="muted" id="deq-empty">يظهر منحنى الأداء بعد أول شمعتين.</div></div></div>
+      <div class="card-h" style="margin-top:14px"><h2>آخر الصفقات</h2></div><div data-sec="trades"></div></div>`;
+    demoState.built = name; demoState.secs = {}; demoState.charts = "";
+    box.onclick = demoAction;
+  } else box.classList.add("no-anim");
+  if (full) demoState.secs.head = "";              // after an action: the buttons are rebuilt (never left disabled)
+  let kpisNew = false;
+  for (const [k, html] of Object.entries(sec)) {
+    if (demoState.secs[k] === html) continue;
+    box.querySelector(`[data-sec=${k}]`).innerHTML = html;
+    demoState.secs[k] = html;
+    if (k === "kpis") kpisNew = true;
+  }
+  const lastEq = d.equity[d.equity.length - 1];
+  const charts = `${d.bars.length}|${lastBar ? lastBar.t + lastBar.c : ""}|${(s.trades || []).length}|${JSON.stringify((s.trades || []).slice(-1))}|${d.equity.length}|${lastEq ? lastEq.t + lastEq.equity : ""}`;
+  if (charts !== demoState.charts) {
+    demoState.charts = charts;
+    const bars = d.bars.slice(-160);
+    if (bars.length) candles($("#dch"), bars, s.trades || [], [{ values: sma(bars, 20), color: css("--sma1") }], 300);
+    $("#deq").style.display = d.equity.length > 1 ? "" : "none";
+    $("#deq-empty").style.display = d.equity.length > 1 ? "none" : "";
+    if (d.equity.length > 1) {
+      const p0 = +d.equity[0].price, e0 = +d.equity[0].equity, accent = css("--accent");
+      lines($("#deq"), [{ name: "الرصيد", points: d.equity.map((x) => [x.t, +x.equity]), color: accent, area: [accent + "55", accent + "00"] },
+        { name: "الاحتفاظ", points: d.equity.map((x) => [x.t, e0 * +x.price / p0]), color: css("--hold"), dash: true, width: 1.5 }], 300);
+    }
+    kpisNew = true;
+  }
+  if (kpisNew && d.equity.length > 1) spark($("#dsp"), thin(d.equity).map((x) => +x.equity), pnl >= 0 ? css("--good") : css("--bad"));
+}
+
+async function demoAction(e) {   // one delegated handler for the live card's buttons (they may be re-rendered)
+  const box = $("#demo-live"), name = demoState.active; if (!box || !name) return;
+  const sp = e.target.closest("[data-speed]");
+  if (sp) {
+    try { await api("/api/demo/speed", { name, speed: sp.dataset.speed }); } catch (er) { box.insertAdjacentHTML("afterbegin", errBox(er)); }
+    return demoDraw(true);
+  }
+  const b = e.target.closest("[data-dact]"); if (!b) return;
+  const act = b.dataset.dact;
+  try {
+    if (act === "delete") {
+      if (!(await uiConfirm(`تحذف التجربة ${name} نهائيًا مع سجلاتها؟ ما يمكن التراجع.`, "حذف نهائي"))) return;
+      await api("/api/demo/delete", { name, confirm: name }); demoState.active = null; return PAGES.demo();
+    }
+    b.disabled = true;
+    await api("/api/demo/" + act, { name, ...(act === "step" ? { n: 1 } : {}) });
+  } catch (er) { box.insertAdjacentHTML("afterbegin", errBox(er)); }
+  demoDraw(true);
 }

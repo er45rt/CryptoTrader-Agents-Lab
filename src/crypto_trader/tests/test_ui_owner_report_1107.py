@@ -108,10 +108,16 @@ def test_every_page_says_plainly_when_the_server_is_older_than_the_pages():
 # R2 - the demo page replaced its whole live card every 2.5 s, even when nothing changed, and every new card replayed
 #      its entrance animation from opacity 0: the page blinked.
 def test_the_demo_refresh_keeps_an_unchanged_page_and_never_replays_the_entrance_animation():
+    # updated after the Sol review 2026-11-07: the card is built once; each section is replaced only when its content
+    # changed and the charts only when their data changed (a whole-card swap on any change was a needless redraw)
     js = (STATIC / "demo.js").read_text(encoding="utf-8")
-    body = js[js.index("async function demoDraw"):]
-    i_skip, i_swap = body.index("if (!full && sig === demoState.sig && box.firstElementChild) return;"), body.index("box.innerHTML = html;")
-    assert i_skip < i_swap and body.index('box.classList.toggle("no-anim", !!box.firstElementChild);') < i_swap
+    body = js[js.index("async function demoDraw"):js.index("async function demoAction")]
+    assert body.count("box.innerHTML =") == 1 and "if (fresh) {" in body[:body.index("box.innerHTML =")]
+    assert "if (demoState.secs[k] === html) continue;" in body
+    assert "if (charts !== demoState.charts) {" in body and body.index("if (charts !== demoState.charts) {") < body.index("candles(")
+    assert 'box.classList.add("no-anim")' in body and "box.onclick = demoAction" in body
+    for k in ("head", "err", "prog", "kpis", "trades"):
+        assert f'data-sec="{k}"' in body
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     assert ".no-anim .card,.no-anim .kpi,.no-anim .kpi .v{animation:none}" in css
     assert "animation:rise" in css and "animation:pop" in css      # first appearance still animates
