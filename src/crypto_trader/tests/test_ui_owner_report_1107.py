@@ -85,3 +85,14 @@ def test_every_page_says_plainly_when_the_server_is_older_than_the_pages():
     assert "checkServerBuild();" in app and 'api("/api/system")' in body
     assert "d.build && d.build === d.disk_build" in body and "اختصار سطح المكتب" in body
 
+
+# R2 - the demo page replaced its whole live card every 2.5 s, even when nothing changed, and every new card replayed
+#      its entrance animation from opacity 0: the page blinked.
+def test_the_demo_refresh_keeps_an_unchanged_page_and_never_replays_the_entrance_animation():
+    js = (STATIC / "demo.js").read_text(encoding="utf-8")
+    body = js[js.index("async function demoDraw"):]
+    i_skip, i_swap = body.index("if (!full && sig === demoState.sig && box.firstElementChild) return;"), body.index("box.innerHTML = html;")
+    assert i_skip < i_swap and body.index('box.classList.toggle("no-anim", !!box.firstElementChild);') < i_swap
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    assert ".no-anim .card,.no-anim .kpi,.no-anim .kpi .v{animation:none}" in css
+    assert "animation:rise" in css and "animation:pop" in css      # first appearance still animates

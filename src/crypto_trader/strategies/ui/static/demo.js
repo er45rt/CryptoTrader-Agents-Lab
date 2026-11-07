@@ -3,7 +3,7 @@
    Every number on this page comes from the engine's own files for the selected demo (status.json, equity.jsonl,
    bars.jsonl); nothing is simulated in the browser. */
 
-const demoState = { active: null, poll: null };
+const demoState = { active: null, poll: null, sig: "" };
 const SPEED_LABEL = { "1": "1×", "2": "2×", "5": "5×", max: "أقصى" };
 
 PAGES.demo = async () => {
@@ -83,6 +83,12 @@ async function demoDraw(full) {
       <td class="ltr">${t.exit_time ? esc(t.exit_time.slice(0, 16).replace("T", " ")) : '<span class="pill warn">مفتوحة</span>'}</td><td class="ltr">${fmtNum(t.exit_price)}</td>
       <td class="ltr">${fmtNum(t.quantity, 5)}</td><td class="ltr ${sign(t.pnl_quote)}">${isNum(t.pnl_quote) ? fmtNum(t.pnl_quote) : "—"}</td></tr>`).join("")}</tbody></table></div>`
       : empty("ما فيه صفقات بعد. شغّل التجربة وانتظر إشارة من الاستراتيجية.", "box")}</div>`;
+  // smooth refresh (owner report 2026-11-07): nothing changed -> leave the page as it is; changed -> replace in place
+  // without replaying the cards' entrance animation (it starts from opacity 0, which looked like a blink every 2.5 s)
+  const sig = `${name}|${html}|${d.bars.length}|${d.equity.length}|${lastBar ? lastBar.t + lastBar.c : ""}`;
+  if (!full && sig === demoState.sig && box.firstElementChild) return;
+  demoState.sig = sig;
+  box.classList.toggle("no-anim", !!box.firstElementChild);
   box.innerHTML = html;
   const bars = d.bars.slice(-160);
   if (bars.length) candles($("#dch"), bars, s.trades || [], [{ values: sma(bars, 20), color: css("--sma1") }], 300);

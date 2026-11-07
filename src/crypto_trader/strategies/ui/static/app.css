@@ -288,4 +288,7 @@ details.tech pre{margin-top:6px;max-height:180px}
 /* status and alerts bar (phase 2, B3) */
 .stbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 12px;margin-bottom:14px;border-radius:12px;background:var(--panel);border:1px solid var(--line)}
 .stbar .pill{white-space:normal}.stbar-at{font-size:11.5px;margin-inline-start:auto}
+
+/* demo live card refresh (owner report 2026-11-07): an update in place never replays the entrance animation */
+.no-anim .card,.no-anim .kpi,.no-anim .kpi .v{animation:none}
 .stale-server{position:sticky;top:0;z-index:20;margin:0;border-radius:0;text-align:center;font-weight:600}
