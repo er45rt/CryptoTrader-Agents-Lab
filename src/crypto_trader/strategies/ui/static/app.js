@@ -582,5 +582,18 @@ window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTi
 window.addEventListener("DOMContentLoaded", async () => {
   await initLang();                       // lang.js: Arabic or English, display only
   $("#lang-btn").onclick = () => setLang(LANG === "en" ? "ar" : "en");
+  checkServerBuild();
   nav((location.hash || "#home").slice(1));
 });
+
+/** Owner report 2026-11-07: a server started before an update keeps running its older code while the pages come from
+    disk, so pages break. The server reports the code it started with (build) and the code on disk now (disk_build);
+    any difference - or a server too old to report it - is said plainly at the top of every page. */
+async function checkServerBuild() {
+  let d; try { d = await api("/api/system"); } catch (e) { return; }
+  if (d.build && d.build === d.disk_build) return;
+  const bar = document.createElement("div");
+  bar.className = "err stale-server";
+  bar.textContent = "الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).";
+  document.body.insertBefore(bar, document.body.firstChild);
+}

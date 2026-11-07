@@ -42,6 +42,23 @@ STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/jav
                 "lang.js": "text/javascript; charset=utf-8", "i18n_en.json": "application/json; charset=utf-8",
                 "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"
+
+
+def build_id() -> str:
+    """Fingerprint of the UI code on disk (this package's .py/.pyw and every static file). A server reports the one it
+    started with, so the launcher and the page can tell a server running older code (owner report 2026-11-07)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    here = Path(__file__).parent
+    for p in sorted([*here.glob("*.py"), *here.glob("*.pyw"), *STATIC.iterdir()], key=lambda p: (p.parent.name, p.name)):
+        if p.is_file():
+            h.update(f"{p.parent.name}/{p.name}\0".encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+BUILD = build_id()                     # the code this server process is running
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
 
@@ -134,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/paper/session": lambda: self.ws.paper_detail(q["name"]),
                 "/api/risk": lambda: self.ws.risk(),
                 "/api/logs": lambda: self.ws.logs(),
-                "/api/system": lambda: self.ws.system(),
+                "/api/system": lambda: {**self.ws.system(), "build": BUILD, "disk_build": build_id()},
                 # decision center (D31): read-only views over the engine's recorded decisions
                 "/api/decisions": lambda: decisions.collect(
                     self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,

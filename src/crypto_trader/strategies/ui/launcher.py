@@ -4,7 +4,9 @@
 
 The shortcut runs pythonw.exe (no console window) on this file's sibling `launch.pyw`, which puts THIS source tree
 first on sys.path (so the shortcut always runs the code it was installed from, not another installed copy) and then:
-  * if the UI already answers on 127.0.0.1:<port>, it only opens the browser there (no second server);
+  * if the UI already answers on 127.0.0.1:<port> running THIS code (same build fingerprint), it only opens the
+    browser there (no second server); if it runs older code, that server - verified to be this UI by its answer and
+    its command line - is stopped first and the current one started (owner report 2026-11-07);
   * otherwise it starts the server (loopback only, real trading disabled as before) and opens the browser.
 Creating the .lnk uses Windows' own WScript.Shell through PowerShell; nothing else on the system is changed.
 """
@@ -19,36 +21,80 @@ import sys
 import webbrowser
 from pathlib import Path
 
-__all__ = ["already_running", "launch", "shortcut_script", "install"]
+__all__ = ["already_running", "running_system", "stop_stale", "launch", "shortcut_script", "install"]
 
 LAUNCH = Path(__file__).with_name("launch.pyw")
 SRC = Path(__file__).resolve().parents[3]          # .../src
 DEFAULT_PORT = 8765
 
 
-def already_running(port: int, timeout: float = 1.5) -> bool:
-    """True only if OUR UI answers on the port (server header + system API), not just any listener."""
+def running_system(port: int, timeout: float = 1.5) -> dict | None:
+    """OUR UI's /api/system answer on the port (server header + system API), or None for nothing / any other listener."""
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         conn.request("GET", "/api/system", headers={"Host": "127.0.0.1"})
         resp = conn.getresponse()
         body = resp.read()
         conn.close()
-        return resp.status == 200 and (resp.getheader("Server") or "").startswith("CTEngineUI/") \
-            and "workspace" in json.loads(body)
+        doc = json.loads(body)
+        ok = resp.status == 200 and (resp.getheader("Server") or "").startswith("CTEngineUI/") and "workspace" in doc
+        return doc if ok else None
     except (OSError, ValueError):
+        return None
+
+
+def already_running(port: int, timeout: float = 1.5) -> bool:
+    """True only if OUR UI answers on the port, not just any listener."""
+    return running_system(port, timeout) is not None
+
+
+def _listener_pid(port: int, run=subprocess.run) -> int | None:
+    out = run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1] in (f"127.0.0.1:{port}", f"0.0.0.0:{port}") and parts[3].upper() == "LISTENING":
+            return int(parts[4])
+    return None
+
+
+def _command_line(pid: int, run=subprocess.run) -> str:
+    return run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+               capture_output=True, text=True, check=False).stdout.strip()
+
+
+def stop_stale(port: int, run=subprocess.run, wait: float = 15.0) -> bool:
+    """Stop the UI server on the port that runs older code. Only a process whose command line is this UI (launch.pyw or
+    the crypto_trader.strategies.ui module) is stopped; anything else is left alone. True once the port is free."""
+    import time
+
+    pid = _listener_pid(port, run)
+    if pid is None:
         return False
+    cmd = _command_line(pid, run).replace("\\", "/").lower()
+    if not ("crypto_trader/strategies/ui/launch.pyw" in cmd or "crypto_trader.strategies.ui" in cmd):
+        return False
+    run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if running_system(port, timeout=0.5) is None:
+            return True
+        time.sleep(0.3)
+    return False
 
 
-def launch(argv: list[str] | None = None, *, open_browser=webbrowser.open, serve=None) -> int:
+def launch(argv: list[str] | None = None, *, open_browser=webbrowser.open, serve=None, stop=stop_stale) -> int:
     from . import server
 
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     known, rest = ap.parse_known_args(argv or [])
-    if already_running(known.port):
-        open_browser(f"http://127.0.0.1:{known.port}/")
-        return 0
+    doc = running_system(known.port)
+    if doc is not None:
+        if doc.get("build") == server.build_id() or not stop(known.port):
+            # same code: reuse it. Could not stop an older one: open it anyway; the page says it is outdated.
+            open_browser(f"http://127.0.0.1:{known.port}/")
+            return 0
     return (serve or server.main)(["--port", str(known.port), *rest])
 
 

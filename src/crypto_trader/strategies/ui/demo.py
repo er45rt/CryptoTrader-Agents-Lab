@@ -76,6 +76,16 @@ class DemoManager:
         self._lock = threading.Lock()
         self._replays: dict[str, _Replay] = {}
         self._session_locks: dict[str, threading.Lock] = {}   # one step at a time per demo (manual or background)
+        # a demo saved as "running" by a server that is gone has no thread here: it is paused, resumable from its
+        # saved cursor (owner report 2026-11-07: a restarted server must not show stopped replays as running)
+        for f in sorted(self.base.iterdir()):
+            try:
+                doc = json.loads((f / "demo.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if doc.get("state") == "running":
+                doc["state"] = "paused"
+                _atomic(f / "demo.json", json.dumps(doc, indent=1))
 
     def _session_lock(self, name: str) -> threading.Lock:
         with self._lock:
