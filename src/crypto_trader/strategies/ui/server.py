@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import alerts, auth, compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
+from . import accounts, alerts, auth, compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -181,6 +181,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/system": lambda: {**self.ws.system(), "build": BUILD, "disk_build": build_id()},
                 # local PIN login (D44)
                 "/api/auth/status": lambda: {"enabled": self.auth.enabled(), "logged_in": self.auth.logged_in(self._token())},
+                # linked accounts (D44): Binance READ-ONLY
+                "/api/accounts": lambda: {**self.link.status(), "pin_set": self.auth.enabled()},
+                "/api/accounts/binance/balances": lambda: self.link.balances(),
                 # decision center (D31): read-only views over the engine's recorded decisions
                 "/api/decisions": lambda: decisions.collect(
                     self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,
@@ -241,6 +244,15 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/auth/setup":
                     self.auth.set_pin(body.get("pin"), token=self._token())
                 return self._send_session(self.auth.login(body.get("pin")), {"ok": True})
+            if url.path == "/api/accounts/binance/connect":         # D44: read-only key, checked before it is stored
+                res = self.link.connect(body.get("api_key"), body.get("api_secret"), pin_set=self.auth.enabled())
+                body = None                                            # the pair leaves this handler now
+                self.ws._event("accounts.binance.connected", permission="read_only")
+                return self._send(200, res)
+            if url.path == "/api/accounts/binance/disconnect":
+                res = self.link.disconnect()
+                self.ws._event("accounts.binance.disconnected")
+                return self._send(200, res)
             if url.path == "/api/auth/logout":
                 self.auth.logout(self._token())
                 return self._send_session(None, {"ok": True})
@@ -365,6 +377,7 @@ def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.demo = demo.DemoManager(workspace)
     Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
     Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)
+    Handler.link = accounts.BinanceLink(workspace, prices=Handler.prices.latest)   # D44: Binance read-only
     Handler.dca = dca.Plans(Handler.ledger, prices=Handler.prices.latest)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 

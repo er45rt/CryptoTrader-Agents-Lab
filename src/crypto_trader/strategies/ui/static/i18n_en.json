@@ -971,5 +971,12 @@
 "باقي": "remaining:",
 "محاولة.": "attempts.",
 "قُفل الدخول": "Sign-in locked for",
-"دقائق.": "minutes."
+"دقائق.": "minutes.",
+"أنشئ رمز الدخول": "Create the PIN",
+"أولًا، ثم اربط": "first, then link",
+"حساب": "account",
+"غير مربوط.": "is not linked.",
+"المفتاح مرفوض: صلاحياته ليست قراءة فقط. أنشئ مفتاحًا بصلاحية": "Key refused: its permissions are not read-only. Create a key with only",
+"وحدها": "enabled",
+"رفض الطلب (تحقق من المفتاح وتقييد عنوان": "refused the request (check the key and the address restriction"
 }
