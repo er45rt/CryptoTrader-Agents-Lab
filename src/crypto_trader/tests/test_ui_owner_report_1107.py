@@ -49,7 +49,7 @@ def test_an_outdated_server_never_renders_a_page_only_the_explanation():
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     boot = app[app.index('window.addEventListener("DOMContentLoaded"'):]
     assert boot.index("await checkServerBuild();") < boot.index("nav((location.hash")
-    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 900]
+    nav = app[app.index("function nav(page)"):app.index("\n}", app.index("function nav(page)"))]   # the whole function
     assert nav.index("if (serverStale !== false) {") < nav.index("(PAGES[page] || PAGES.home)()")
     assert "esc(STALE_TEXT)" in nav and "return;" in nav[nav.index("if (serverStale !== false) {"):]
 
@@ -227,7 +227,7 @@ def test_an_explicit_workspace_in_either_spelling_is_kept():
 def test_no_page_runs_until_the_server_check_has_answered():
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     assert "let serverStale = null, serverCheckError = null;" in app
-    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 900]
+    nav = app[app.index("function nav(page)"):app.index("\n}", app.index("function nav(page)"))]   # the whole function
     assert nav.index("if (serverStale !== false) {") < nav.index("(PAGES[page] || PAGES.home)()")
     assert 'loading("التحقق من نسخة الخادم…")' in nav and "errBox(serverCheckError)" in nav
     check = app[app.index("async function checkServerBuild"):]

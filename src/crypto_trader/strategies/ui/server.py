@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from ..api import StrategyError
 from ..loader import list_strategies, load_strategy
 from ..runtime import MarketSpec, RunSettings
-from . import alerts, compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
+from . import alerts, auth, compare, dca, decisions, demo, portfolio, portfolio_csv, prices, store
 
 STATIC = Path(__file__).with_name("static")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
@@ -99,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'")
+        cookie = getattr(self, "_cookie", None)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+            self._cookie = None
         self.end_headers()
         self.wfile.write(data)
 
@@ -124,7 +128,30 @@ class Handler(BaseHTTPRequestHandler):
         if write and self.headers.get("X-CT-UI") != "1":
             self._refuse("missing X-CT-UI header")
             return False
+        # local PIN login (D44): once a PIN exists, every API call except the public ones needs a live session
+        path = urlparse(self.path).path
+        public = (path in ("/", "/index.html") or path.lstrip("/") in STATIC_FILES
+                  or path in ("/api/system", "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/api/auth/logout"))
+        if not public and not self.auth.check(self._token()):
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 2_000_000:
+                self.rfile.read(n)
+            self._send(HTTPStatus.UNAUTHORIZED, {"error": "login required", "auth": True})
+            return False
         return True
+
+    def _token(self) -> str | None:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "ct_session" and value:
+                return value
+        return None
+
+    def _send_session(self, token: str | None, body: Any) -> None:
+        """Reply with the session cookie set (token) or cleared (None): HttpOnly, SameSite=Strict, this site only."""
+        self._cookie = (f"ct_session={token}; HttpOnly; SameSite=Strict; Path=/" if token
+                        else "ct_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        self._send(200, body)
 
     # --- routing --------------------------------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
@@ -152,6 +179,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/risk": lambda: self.ws.risk(),
                 "/api/logs": lambda: self.ws.logs(),
                 "/api/system": lambda: {**self.ws.system(), "build": BUILD, "disk_build": build_id()},
+                # local PIN login (D44)
+                "/api/auth/status": lambda: {"enabled": self.auth.enabled(), "logged_in": self.auth.logged_in(self._token())},
                 # decision center (D31): read-only views over the engine's recorded decisions
                 "/api/decisions": lambda: decisions.collect(
                     self.ws.root, source=q.get("source") or None, strategy=q.get("strategy") or None,
@@ -208,6 +237,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         try:
             body = self._body()
+            if url.path in ("/api/auth/setup", "/api/auth/login"):     # local PIN login (D44)
+                if url.path == "/api/auth/setup":
+                    self.auth.set_pin(body.get("pin"), token=self._token())
+                return self._send_session(self.auth.login(body.get("pin")), {"ok": True})
+            if url.path == "/api/auth/logout":
+                self.auth.logout(self._token())
+                return self._send_session(None, {"ok": True})
             if url.path == "/api/strategies/check":
                 return self._send(200, self.ws.check_strategy(body["spec"]))
             if url.path == "/api/strategies/upload":
@@ -325,6 +361,7 @@ def _job(jid: str) -> dict[str, Any]:
 
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     Handler.ws = store.Workspace(workspace)
+    Handler.auth = auth.Auth(workspace)
     Handler.demo = demo.DemoManager(workspace)
     Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
     Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)

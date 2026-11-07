@@ -43,6 +43,10 @@ async function apiOnce(path, body, timeoutMs) {
   try {
     const r = await fetch(path, opt);
     const j = await r.json();
+    if (r.status === 401 && j.auth) {          // session ended (auto-lock / restart): back to the PIN screen
+      if (authState) authState.logged_in = false;
+      setTimeout(() => { if (!$("#pin")) loginPage(current); }, 0);
+    }
     if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status });
     return j;
   } catch (e) {
@@ -78,6 +82,7 @@ function nav(page) {
       : serverCheckError ? errBox(serverCheckError) : `<div class="err stale-server">${esc(STALE_TEXT)}</div>`;
     return;
   }
+  if (authState && authState.enabled && !authState.logged_in) { loginPage(page); return; }   // PIN first (D44)
   (PAGES[page] || PAGES.home)().catch((e) => { main.innerHTML = errBox(e); });
 }
 document.querySelectorAll(".side a").forEach((a) => a.addEventListener("click", () => nav(a.dataset.page)));
@@ -590,8 +595,37 @@ window.addEventListener("DOMContentLoaded", async () => {
   await initLang();                       // lang.js: Arabic or English, display only
   $("#lang-btn").onclick = () => setLang(LANG === "en" ? "ar" : "en");
   await checkServerBuild();
+  try { authState = await api("/api/auth/status"); } catch (e) { authState = null; }
+  paintLock();
   nav((location.hash || "#home").slice(1));
 });
+
+/** Local PIN login (owner decision D44). The PIN never stays in the page: it is sent once and the field is cleared. */
+let authState = null;
+function loginPage(next) {
+  main.innerHTML = header("تسجيل الدخول", "أدخل رمز الدخول (PIN) لفتح البرنامج.") + `<div class="card login-card">
+    <label>رمز الدخول</label><input id="pin" type="password" inputmode="numeric" autocomplete="current-password" class="ltr" maxlength="12">
+    <div class="actions"><button class="primary" id="pin-go">دخول</button></div><div id="pin-msg"></div></div>`;
+  const go = async () => {
+    const pin = $("#pin").value; $("#pin").value = "";
+    try { await api("/api/auth/login", { pin }); authState = { enabled: true, logged_in: true }; paintLock(); nav(next || "home"); }
+    catch (e) { $("#pin-msg").innerHTML = errBox(e); $("#pin").focus(); }
+  };
+  $("#pin-go").onclick = go;
+  $("#pin").onkeydown = (e) => { if (e.key === "Enter") go(); };
+  $("#pin").focus();
+}
+function paintLock() {   // a lock button once a PIN is in use
+  let b = $("#lock-btn");
+  if (!(authState && authState.enabled)) { if (b) b.remove(); return; }
+  if (!b) {
+    b = Object.assign(document.createElement("button"), { id: "lock-btn", type: "button", className: "theme" });
+    b.innerHTML = "<span>قفل البرنامج</span><span>🔒</span>";
+    b.onclick = async () => { try { await api("/api/auth/logout", {}); } catch (e) { /* the session ends either way */ }
+      authState = { enabled: true, logged_in: false }; loginPage(current); };
+    $("#lang-btn").after(b);
+  }
+}
 
 /** Owner report 2026-11-07: a server started before an update keeps running its older code while the pages come from
     disk, so pages break. The server reports the code it started with (build) and the code on disk now (disk_build);

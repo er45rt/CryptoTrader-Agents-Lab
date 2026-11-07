@@ -955,5 +955,21 @@
 "أو المفتاح السري غير صالح: انسخهما كما هما من صفحة إدارة": "or secret key is not valid: copy both exactly as shown on the management page of",
 "لا تُدخل كلمة مرور ولا عبارة استرداد": "Never enter a password or a recovery phrase",
 "حماية المفاتيح لم تعمل؛ ما انحفظ شي.": "Key protection did not work; nothing was saved.",
-"تعذّر فك حماية المفتاح المحفوظ (حساب ويندوز آخر أو ملف تالف). افصل الحساب واربطه من جديد.": "Could not decrypt the stored key (another Windows account or a damaged file). Disconnect the account and link it again."
+"تعذّر فك حماية المفتاح المحفوظ (حساب ويندوز آخر أو ملف تالف). افصل الحساب واربطه من جديد.": "Could not decrypt the stored key (another Windows account or a damaged file). Disconnect the account and link it again.",
+"تسجيل الدخول": "Sign in",
+"أدخل رمز الدخول": "Enter the PIN",
+"لفتح البرنامج.": "to open the program.",
+"رمز الدخول": "PIN",
+"قفل البرنامج": "Lock the program",
+"انتهت الجلسة؛ أدخل رمز الدخول من جديد.": "The session ended; enter the PIN again.",
+"رمز الدخول لازم يكون من 6 إلى 12 رقم.": "The PIN must be 6 to 12 digits.",
+"سجّل الدخول أولًا لتغيير رمز الدخول.": "Sign in first to change the PIN.",
+"ما فيه رمز دخول بعد؛ أنشئ واحد أولًا.": "No PIN yet; create one first.",
+"الدخول مقفل مؤقتًا بعد محاولات خاطئة؛ حاول بعد": "Sign-in is locked for now after wrong attempts; try again in",
+"ثانية.": "seconds.",
+"رمز الدخول غير صحيح.": "Wrong PIN.",
+"باقي": "remaining:",
+"محاولة.": "attempts.",
+"قُفل الدخول": "Sign-in locked for",
+"دقائق.": "minutes."
 }
