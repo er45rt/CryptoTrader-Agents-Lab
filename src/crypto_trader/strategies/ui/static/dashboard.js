@@ -38,6 +38,8 @@ function dbCard(k) {
   const d = s.d;
   if (k === "portfolio") {
     const t = d.totals, at = d.assets.map((a) => a.price_at).filter(Boolean).sort().pop();
+    if (!d.n_transactions) return set("—", "ما فيه عمليات مسجّلة في محفظتك بعد؛ أضفها من صفحة «محفظتي»",   // the reason, not a blank
+      `سجل المحفظة فاضي · <span class="ltr">${esc(d.storage)}</span>`);
     return set(t.value ? fmtUsd(t.value) : "—",
       (t.unrealized !== null ? `<span class="${sign(t.unrealized)}">${+t.unrealized > 0 ? "+" : ""}${fmtUsd(t.unrealized)}</span> غير محقق` : "ما فيه أصول مسعّرة")
         + (t.value_complete ? "" : ` · <span class="warn">${d.unpriced.length} أصل بدون سعر</span>`),

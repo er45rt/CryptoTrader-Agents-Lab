@@ -96,3 +96,18 @@ def test_the_demo_refresh_keeps_an_unchanged_page_and_never_replays_the_entrance
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     assert ".no-anim .card,.no-anim .kpi,.no-anim .kpi .v{animation:none}" in css
     assert "animation:rise" in css and "animation:pop" in css      # first appearance still animates
+
+
+# R3 - with an empty ledger the dashboard's portfolio card said "no priced assets" (reads like a price problem); it
+#      now says there are no transactions yet and names the ledger file the shortcut's workspace uses.
+def test_an_empty_portfolio_says_why_and_which_ledger(live, ws):
+    import http.client
+
+    c = http.client.HTTPConnection("127.0.0.1", live, timeout=30)
+    c.request("GET", "/api/portfolio", headers={"Host": "127.0.0.1"})
+    doc = json.loads(c.getresponse().read())
+    c.close()
+    assert doc["n_transactions"] == 0 and doc["storage"].endswith("ledger.json")
+    js = (STATIC / "dashboard.js").read_text(encoding="utf-8")
+    card = js[js.index('if (k === "portfolio") {'):js.index('if (k === "demo") {')]
+    assert "if (!d.n_transactions)" in card and "ما فيه عمليات مسجّلة في محفظتك بعد" in card and "d.storage" in card

@@ -934,5 +934,7 @@
 "الجلسات التجريبية": "demo sessions",
 "الشراء الشهري": "monthly buys",
 "سجل الأخطاء": "error log",
-"الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).": "The running server is older than these pages, so some pages do not work correctly. Open the UI from the desktop shortcut: it stops the old server and starts the current version (running demos pause and resume where they were)."
+"الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).": "The running server is older than these pages, so some pages do not work correctly. Open the UI from the desktop shortcut: it stops the old server and starts the current version (running demos pause and resume where they were).",
+"ما فيه عمليات مسجّلة في محفظتك بعد؛ أضفها من صفحة «محفظتي»": "No transactions recorded in your portfolio yet; add them from the \"My portfolio\" page",
+"سجل المحفظة فاضي": "Portfolio ledger is empty"
 }
