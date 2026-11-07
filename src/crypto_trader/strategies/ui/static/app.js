@@ -70,9 +70,15 @@ function nav(page) {
   main.onclick = null;   // a page's delegated click handler never outlives the page
   current = page;
   document.querySelectorAll(".side a").forEach((a) => a.classList.toggle("active", a.dataset.page === page));
-  if (serverStale) { main.innerHTML = `<div class="err stale-server">${esc(STALE_TEXT)}</div>`; return; }   // never a broken page
-  (PAGES[page] || PAGES.home)().catch((e) => { main.innerHTML = errBox(e); });
   if (location.hash.slice(1) !== page) location.hash = page;
+  // no page runs until the server's code is known to match the pages (Sol review 2026-11-07, round 2): while the check
+  // is pending -> "checking"; outdated -> only the explanation; the check itself failed -> its error. Never a broken page.
+  if (serverStale !== false) {
+    main.innerHTML = serverStale === null ? loading("التحقق من نسخة الخادم…")
+      : serverCheckError ? errBox(serverCheckError) : `<div class="err stale-server">${esc(STALE_TEXT)}</div>`;
+    return;
+  }
+  (PAGES[page] || PAGES.home)().catch((e) => { main.innerHTML = errBox(e); });
 }
 document.querySelectorAll(".side a").forEach((a) => a.addEventListener("click", () => nav(a.dataset.page)));
 
@@ -591,9 +597,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     disk, so pages break. The server reports the code it started with (build) and the code on disk now (disk_build);
     any difference - or a server too old to report it - means no page is rendered on it: every page shows only this
     explanation (Sol review 2026-11-07: a warning above a page that still errors is not enough). */
-let serverStale = false;
+let serverStale = null, serverCheckError = null;   // null = not checked yet: no page runs until it is known
 const STALE_TEXT = "الخادم الشغّال من نسخة أقدم من الواجهة، فبعض الصفحات ما تشتغل صح. افتح الواجهة من اختصار سطح المكتب: يوقف الخادم القديم ويشغّل النسخة الحالية (التجارب الجارية تتوقف مؤقتًا وتكمل من مكانها).";
 async function checkServerBuild() {
-  let d; try { d = await api("/api/system"); } catch (e) { return; }
+  let d;
+  try { d = await api("/api/system"); } catch (e) { serverCheckError = e; serverStale = true; return; }
   serverStale = !(d.build && d.build === d.disk_build);
 }

@@ -945,5 +945,6 @@
 "انقطاع شبكة: الاتصال مرفوض": "Network failure: connection refused",
 "انقطاع شبكة: انقطع الاتصال من الطرف الآخر": "Network failure: the other side reset the connection",
 "انقطاع شبكة: انتهت مهلة الاتصال": "Network failure: the connection timed out",
-"آخر دورة ناجحة": "last successful cycle"
+"آخر دورة ناجحة": "last successful cycle",
+"التحقق من نسخة الخادم": "Checking the server version"
 }

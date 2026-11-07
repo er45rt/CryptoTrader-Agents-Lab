@@ -49,9 +49,9 @@ def test_an_outdated_server_never_renders_a_page_only_the_explanation():
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     boot = app[app.index('window.addEventListener("DOMContentLoaded"'):]
     assert boot.index("await checkServerBuild();") < boot.index("nav((location.hash")
-    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 700]
-    assert nav.index("if (serverStale)") < nav.index("(PAGES[page] || PAGES.home)()")
-    assert "esc(STALE_TEXT)" in nav and "return; }" in nav[nav.index("if (serverStale)"):]
+    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 900]
+    assert nav.index("if (serverStale !== false) {") < nav.index("(PAGES[page] || PAGES.home)()")
+    assert "esc(STALE_TEXT)" in nav and "return;" in nav[nav.index("if (serverStale !== false) {"):]
 
 
 class _Run:
@@ -220,3 +220,15 @@ def test_an_explicit_workspace_in_either_spelling_is_kept():
         finally:
             launcher.running_system = orig
         assert calls["serve"] == [["--port", "8765", *given]], given
+
+
+# Sol review 2026-11-07, round 2 - H2: no page runs before the server check has answered, and a failed check shows its
+#      error, never a page.
+def test_no_page_runs_until_the_server_check_has_answered():
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "let serverStale = null, serverCheckError = null;" in app
+    nav = app[app.index("function nav(page)"):app.index("function nav(page)") + 900]
+    assert nav.index("if (serverStale !== false) {") < nav.index("(PAGES[page] || PAGES.home)()")
+    assert 'loading("التحقق من نسخة الخادم…")' in nav and "errBox(serverCheckError)" in nav
+    check = app[app.index("async function checkServerBuild"):]
+    assert "catch (e) { serverCheckError = e; serverStale = true; return; }" in check
