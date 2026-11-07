@@ -39,6 +39,7 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 STATIC_FILES = {"app.js": "text/javascript; charset=utf-8", "i18n.js": "text/javascript; charset=utf-8",
                 "decisions.js": "text/javascript; charset=utf-8", "demo.js": "text/javascript; charset=utf-8",
                 "portfolio.js": "text/javascript; charset=utf-8", "dashboard.js": "text/javascript; charset=utf-8",
+                "accounts.js": "text/javascript; charset=utf-8",
                 "lang.js": "text/javascript; charset=utf-8", "i18n_en.json": "application/json; charset=utf-8",
                 "app.css": "text/css; charset=utf-8"}
 SEALED_FROM = "2025-09-07T00:00:00+00:00"
@@ -183,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/auth/status": lambda: {"enabled": self.auth.enabled(), "logged_in": self.auth.logged_in(self._token())},
                 # linked accounts (D44): Binance READ-ONLY
                 "/api/accounts": lambda: {**self.link.status(), "pin_set": self.auth.enabled()},
-                "/api/accounts/binance/balances": lambda: self.link.balances(),
+                "/api/accounts/binance/balances": lambda: self.link.balances(self.ledger),
                 "/api/accounts/binance/preview": lambda: self.link.preview(self.ledger),
                 # decision center (D31): read-only views over the engine's recorded decisions
                 "/api/decisions": lambda: decisions.collect(

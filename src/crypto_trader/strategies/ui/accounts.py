@@ -142,7 +142,7 @@ class BinanceLink:
         client.verify_read_only_permissions()                     # re-checked before every read
         return client
 
-    def balances(self) -> dict[str, Any]:
+    def balances(self, ledger: Any = None) -> dict[str, Any]:
         try:
             account = self.client().account_snapshot()
         except Exception as exc:  # noqa: BLE001
@@ -165,6 +165,8 @@ class BinanceLink:
                          price_missing=None if p is not None else (q.get("reason") or "no price source"))
             if r["value"] is not None:
                 value += _dec(r["value"])
+        if ledger is not None:
+            _reconcile(rows, ledger)
         doc = self._state()
         doc.update(last_sync=_now(), last_error=None, last_error_at=None)
         self._save_state(doc)
@@ -293,3 +295,34 @@ def _tx_body(t: dict[str, Any]) -> dict[str, Any]:
     return {"type": t["side"], "asset": t["asset"], "at": t["at"], "qty": t["qty"], "price": t["price"],
             "fee": t["fee"] if fee != 0 else "0", "fee_asset": t["fee_asset"] if fee != 0 else QUOTE,
             "note": "Binance", "wallet": "Binance", "ext_id": t["ext_id"]}
+
+
+def _reconcile(rows: list[dict[str, Any]], ledger: Any) -> None:
+    """Cost and profit of a Binance balance only when the recorded Binance history explains it exactly (D44): the
+    ledger rows of wallet "Binance" must hold the same quantity as the account. Otherwise both are "not available"
+    with the reason - never an estimate from partial history."""
+    from . import portfolio
+
+    with ledger._lock:
+        txs = [t for t in ledger._load() if str(t.get("wallet") or "").lower() == "binance"]
+    state = portfolio.compute(txs) if txs else {}
+    for r in rows:
+        if r["asset"] == QUOTE:
+            r.update(history="quote", ledger_qty=None, cost=None, avg_cost=None, unrealized=None)
+            continue
+        s = state.get(r["asset"])
+        held = s["qty"] if s else None
+        r["ledger_qty"] = str(held) if held is not None else None
+        total = _dec(r["total"])
+        if held is None:
+            r["history"] = "missing"                       # no recorded purchase at all
+        elif abs(held - total) <= Decimal("1e-8"):
+            r["history"] = "complete"
+        else:
+            r["history"] = "incomplete" if held < total else "exceeds"
+        if r["history"] == "complete":
+            basis = s["basis"]
+            r.update(cost=str(basis.quantize(Decimal("0.01"))), avg_cost=str((basis / held).quantize(Decimal("0.00000001"))) if held else None,
+                     unrealized=str((_dec(r["value"]) - basis).quantize(Decimal("0.01"))) if r["value"] is not None else None)
+        else:
+            r.update(cost=None, avg_cost=None, unrealized=None)
