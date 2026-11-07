@@ -8,7 +8,8 @@ const ACC = { sel: new Set(), preview: null };
 const ACC_HIST = { complete: ["مطابق", "good"], incomplete: ["تاريخ الشراء ناقص", "warn"], exceeds: ["السجل أكبر من الرصيد", "warn"],
   missing: ["ما فيه سجل شراء", "warn"], quote: ["عملة التسعير", ""], unsynced: ["زامن سجل الصفقات أولًا", "warn"] };
 const ACC_STATUS = { ready: ["جاهزة", "good"], imported: ["مستوردة", ""], possible_duplicate: ["مكررة محتملة", "warn"], blocked: ["محجوبة", "bad"] };
-const ACC_REASON = { fee_other_asset: "الرسوم مدفوعة بعملة ثالثة (مثل BNB)؛ ما تُستورد تلقائيًا", same_as_ledger_row: "مطابقة لعملية مسجّلة يدويًا" };
+const ACC_REASON = { fee_other_asset: "الرسوم مدفوعة بعملة ثالثة (مثل BNB)؛ ما تُستورد تلقائيًا", same_as_ledger_row: "مطابقة لعملية مسجّلة يدويًا",
+  quote_not_usdt: "مقابل عملة غير USDT؛ ما تُستورد تلقائيًا" };
 const accAt = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
 
 PAGES.accounts = async () => {
@@ -89,13 +90,19 @@ async function accBalances() {
   $("#bal-go").onclick = accBalances;
 }
 
+function accSyncGo() { ACC.extra = $("#tr-extra") ? $("#tr-extra").value : ""; accPreview(true); }
 async function accPreview(sync = false) {
   const box = $("#acc-trades"); if (!box) return;
-  const head = `<div class="card-h"><h2>سجل الصفقات <small>مراجعة قبل الدمج في محفظتك</small></h2><button class="sm" id="tr-sync">مزامنة من Binance</button></div>`;
+  const head = `<div class="card-h"><h2>سجل الصفقات <small>مراجعة قبل الدمج في محفظتك</small></h2><button class="sm" id="tr-sync">مزامنة من Binance</button></div>
+    <div class="muted" style="font-size:12px">المزامنة تقرأ كل أسواق عملاتك (الحالية والمسجّلة في محفظتك) مقابل USDT وغيرها. Binance ما يعطي قائمة بالعملات اللي تداولتها سابقًا، فالعملة اللي بعتها بالكامل وما هي في محفظتك اكتبها هنا:</div>
+    <div class="actions"><input id="tr-extra" class="ltr" style="max-width:260px" placeholder="SOL, DOGE" value="${esc(ACC.extra || "")}"></div>`;
   box.innerHTML = head + loading(sync ? "جلب سجل الصفقات من Binance…" : "تحميل المعاينة…");
   let p;
-  try { if (sync) await api("/api/accounts/binance/sync", {}, 180000); p = await api("/api/accounts/binance/preview"); }
-  catch (e) { box.innerHTML = head + errBox(e); $("#tr-sync").onclick = () => accPreview(true); return; }
+  try {
+    if (sync) { await api("/api/accounts/binance/sync", { extra: (ACC.extra || "").toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean) }, 600000); accBalances(); }   // the history states depend on the sync
+    p = await api("/api/accounts/binance/preview");
+  }
+  catch (e) { box.innerHTML = head + errBox(e); $("#tr-sync").onclick = accSyncGo; return; }
   if (current !== "accounts" || !$("#acc-trades")) return;
   ACC.preview = p; ACC.sel = new Set([...ACC.sel].filter((x) => p.rows.some((r) => r.trade.ext_id === x && r.status === "ready")));
   const c = p.counts;
@@ -106,13 +113,13 @@ async function accPreview(sync = false) {
     ${p.rows.slice().reverse().map((r) => { const t = r.trade, s = ACC_STATUS[r.status] || [r.status, ""];
       return `<tr><td>${r.status === "ready" ? `<input type="checkbox" data-ext="${esc(t.ext_id)}" ${ACC.sel.has(t.ext_id) ? "checked" : ""}>` : ""}</td>
       <td class="ltr">${esc(accAt(t.at))}</td><td>${t.side === "buy" ? '<span class="pill good">شراء</span>' : '<span class="pill bad">بيع</span>'}</td>
-      <td><b>${esc(t.asset)}</b></td><td class="ltr">${fmtNum(t.qty, 8)}</td><td class="ltr">${fmtNum(t.price, 6)}</td>
+      <td><b>${esc(t.asset)}</b></td><td class="ltr">${fmtNum(t.qty, 8)}</td><td class="ltr">${fmtNum(t.price, 6)}${t.quote && t.quote !== "USDT" ? ` <span class="muted">${esc(t.quote)}</span>` : ""}</td>
       <td class="ltr">${fmtNum(t.fee, 8)} <span class="muted">${esc(t.fee_asset)}</span></td>
       <td><span class="pill ${s[1]}">${esc(s[0])}</span>${r.reason ? ` <span class="muted" style="font-size:11.5px">${esc(ACC_REASON[r.reason] || r.reason)}</span>` : ""}</td></tr>`; }).join("")}
     </tbody></table></div>
     <div class="actions"><button class="sm" id="tr-all">تحديد كل الجاهزة</button><button class="primary" id="tr-import">استيراد المحدد إلى محفظتي (<span id="tr-n">${ACC.sel.size}</span>)</button></div>`
     : empty("ما فيه صفقات للمراجعة. اضغط «مزامنة من Binance».", "layers")}<div id="tr-msg"></div>`;
-  $("#tr-sync").onclick = () => accPreview(true);
+  $("#tr-sync").onclick = accSyncGo;
   box.querySelectorAll("[data-ext]").forEach((cb) => cb.onchange = () => { cb.checked ? ACC.sel.add(cb.dataset.ext) : ACC.sel.delete(cb.dataset.ext); $("#tr-n").textContent = ACC.sel.size; });
   const all = $("#tr-all"); if (all) all.onclick = () => { p.rows.filter((r) => r.status === "ready").forEach((r) => ACC.sel.add(r.trade.ext_id)); accPreview(); };
   const imp = $("#tr-import");

@@ -30,6 +30,9 @@ class Client:
     def verify_read_only_permissions(self):
         return self.api_restrictions()
 
+    def market_symbols(self):                         # every <BASE>USDT market this fake holds (B4)
+        return tuple({"symbol": s, "base": s[:-4], "quote": "USDT"} for s in self.trades)
+
     def my_trades(self, symbol, *, limit, from_id=None):
         self.log.append((symbol, from_id))
         if symbol not in self.trades:

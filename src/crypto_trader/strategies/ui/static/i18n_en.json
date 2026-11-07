@@ -1060,5 +1060,9 @@
 "زامن سجل الصفقات أولًا": "Sync the trade history first",
 "التكلفة والربح تظهر فقط إذا كانت كل صفقات": "Cost and profit appear only when every",
 "لهذا الأصل من آخر مزامنة موجودة في محفظتك (مستوردة أو مطابقة لعملية سجّلتها بنفسك) وكمية محفظة": "trade of this asset from the latest sync is in your portfolio (imported, or matching an operation you recorded yourself) and the quantity of wallet",
-"تطابق الرصيد تمامًا. غير كذا تبقى «غير متاحة» بدل رقم مضلل.": "matches the balance exactly. Otherwise they stay \"not available\" instead of a misleading number."
+"تطابق الرصيد تمامًا. غير كذا تبقى «غير متاحة» بدل رقم مضلل.": "matches the balance exactly. Otherwise they stay \"not available\" instead of a misleading number.",
+"مقابل عملة غير": "Against a currency other than",
+"المزامنة تقرأ كل أسواق عملاتك (الحالية والمسجّلة في محفظتك) مقابل": "Sync reads every market of your coins (current and recorded in your portfolio) against",
+"وغيرها.": "and others.",
+"ما يعطي قائمة بالعملات اللي تداولتها سابقًا، فالعملة اللي بعتها بالكامل وما هي في محفظتك اكتبها هنا": "gives no list of the coins you traded before, so type here any coin you sold completely that is not in your portfolio"
 }

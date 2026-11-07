@@ -258,7 +258,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, res)
             if url.path == "/api/accounts/binance/sync":           # D44 K4: into the review file only
                 held = {r["asset"] for r in self.link.balances()["balances"]}
-                return self._send(200, self.link.sync_trades(sorted(held | {t["asset"] for t in self.ledger.transactions()})))
+                known = {t["asset"] for t in self.ledger.transactions()} | {t["asset"] for t in self.link._staged()["trades"]}
+                extra = body.get("extra") if isinstance(body.get("extra"), list) else []      # coins sold completely
+                extra = {str(x).strip().upper() for x in extra[:50] if isinstance(x, str)}
+                return self._send(200, self.link.sync_trades(sorted(held | known | extra)))
             if url.path == "/api/accounts/binance/import":         # only selected trades marked ready
                 res = self.link.import_selected(self.ledger, list(body.get("ext_ids") or []))
                 self.ws._event("accounts.binance.imported", rows=res["imported"])

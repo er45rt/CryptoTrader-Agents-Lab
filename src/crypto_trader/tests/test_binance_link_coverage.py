@@ -32,6 +32,9 @@ class Fake:
     def account_snapshot(self):
         return {"balances": [{"asset": a, "free": q, "locked": "0"} for a, q in self.balances.items()]}
 
+    def market_symbols(self):                         # every <BASE>USDT market this fake holds (B4)
+        return tuple({"symbol": s, "base": s[:-4], "quote": "USDT"} for s in self.trades)
+
     def my_trades(self, symbol, *, limit, from_id=None):
         if symbol not in self.trades:
             raise accounts.MainnetError("HTTP 400, code -1121: Invalid symbol.")

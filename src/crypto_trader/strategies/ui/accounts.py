@@ -185,24 +185,31 @@ class BinanceLink:
             return {"synced_at": None, "trades": []}
 
     def sync_trades(self, assets: list[str]) -> dict[str, Any]:
-        """Fetch the available history of <asset>USDT for each asset into the review file (merged by trade id)."""
+        """Fetch the available history of EVERY market whose base is one of ``assets`` - against USDT and any other
+        quote (FDUSD, USDC, BTC, ...) - into the review file, merged by trade id (Sol D44 review B4). Binance offers no
+        read-only list of the markets an account has traded, so the caller passes the current balances, the ledger,
+        the earlier syncs and any coins the owner names (sold completely). Trades against a quote other than USDT are
+        kept for review but never imported automatically (no USD price for them here)."""
         import re
 
         assets = sorted({a for a in assets if re.fullmatch(r"[A-Z0-9]{2,15}", str(a)) and a != QUOTE})
         staged = {t["ext_id"]: t for t in self._staged()["trades"]}
         try:
             client = self.client()                                 # permission contract checked first
-            for asset in assets:
-                symbol, from_id = f"{asset}{QUOTE}", 0
+            wanted = set(assets)
+            markets = sorted((m for m in client.market_symbols() if m["base"] in wanted), key=lambda m: m["symbol"])
+            for m in markets:
+                symbol, from_id = m["symbol"], 0
                 while True:
+                    time.sleep(PAUSE_S)                            # stay far below the account's request weight limit
                     try:
                         page = client.my_trades(symbol, limit=PAGE, from_id=from_id)
                     except MainnetError as exc:
                         if "-1121" in str(exc) or "Invalid symbol" in str(exc):
-                            break                                  # no <asset>USDT market: nothing to fetch
+                            break                                  # market listed but not tradable: nothing to fetch
                         raise
                     for t in page:
-                        row = _trade_row(symbol, asset, t)
+                        row = _trade_row(symbol, m["base"], m["quote"], t)
                         staged.setdefault(row["ext_id"], row)
                     if len(page) < PAGE:
                         break
@@ -218,7 +225,7 @@ class BinanceLink:
         state = self._state()
         state.update(last_sync=doc["synced_at"], last_error=None, last_error_at=None)
         self._save_state(state)
-        return {"synced_at": doc["synced_at"], "trades": len(doc["trades"]), "assets": assets}
+        return {"synced_at": doc["synced_at"], "trades": len(doc["trades"]), "assets": assets, "markets": len(markets)}
 
     def preview(self, ledger: Any) -> dict[str, Any]:
         """Every staged trade with its status against the ledger; nothing is written."""
@@ -236,6 +243,8 @@ class BinanceLink:
             row = {"trade": t, "tx": None, "status": "ready", "reason": None}
             if t["ext_id"] in imported:
                 row["status"] = "imported"
+            elif t.get("quote", QUOTE) != QUOTE:
+                row.update(status="blocked", reason="quote_not_usdt")
             elif t["fee_asset"] not in (QUOTE, t["asset"]) and _dec(t["fee"]) != 0:
                 row.update(status="blocked", reason="fee_other_asset")
             else:
@@ -284,6 +293,9 @@ class BinanceLink:
         return {"imported": len(added)}
 
 
+#: Pause before each history request: a full sync reads every market of each coin (weight 20 per request).
+PAUSE_S = 0.25
+
 #: A hand-recorded operation is entered to the minute (the form has no seconds), sometimes in the wrong time zone, and
 #: often as one row for a whole order that Binance filled in several parts. So a Binance trade is a possible duplicate
 #: of any manual row (no ext_id) of the same type and asset within a day whose quantity is within 1% of the fill or of
@@ -326,14 +338,14 @@ def _manual_rows(t: dict[str, Any], sizes: list[Decimal | None], current: list[d
     return out
 
 
-def _trade_row(symbol: str, asset: str, t: Any) -> dict[str, Any]:
+def _trade_row(symbol: str, asset: str, quote: str, t: Any) -> dict[str, Any]:
     from datetime import datetime as _dt
 
     at = _dt.fromtimestamp(int(t["time"]) / 1000, tz=timezone.utc).isoformat()
-    return {"ext_id": f"binance:{symbol}:{int(t['id'])}", "symbol": symbol, "asset": asset,
+    return {"ext_id": f"binance:{symbol}:{int(t['id'])}", "symbol": symbol, "asset": asset, "quote": quote,
             "side": "buy" if t.get("isBuyer") else "sell", "qty": str(_dec(t.get("qty"))),
             "price": str(_dec(t.get("price"))), "quote_qty": str(_dec(t.get("quoteQty"))),
-            "fee": str(_dec(t.get("commission"))), "fee_asset": str(t.get("commissionAsset") or QUOTE), "at": at,
+            "fee": str(_dec(t.get("commission"))), "fee_asset": str(t.get("commissionAsset") or quote), "at": at,
             "order_id": t.get("orderId")}
 
 
@@ -361,6 +373,8 @@ def _uncovered(trades: list[dict[str, Any]], current: list[dict[str, Any]]) -> s
         for t in g:
             if _dec(t["fee"]) != 0 and t["fee_asset"] not in (QUOTE, t["asset"]):
                 bad.update((t["asset"], t["fee_asset"]))
+            if t.get("quote", QUOTE) != QUOTE:             # e.g. ETHBTC moves both ETH and BTC; not importable
+                bad.update((t["asset"], t["quote"]))
         pending = [t for t in g if t["ext_id"] not in imported]
         if not pending:
             continue

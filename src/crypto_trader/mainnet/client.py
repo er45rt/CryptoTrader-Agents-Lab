@@ -154,6 +154,17 @@ class MainnetReadOnlyClient:
         body = self._get(PATH_EXCHANGE_INFO, {"symbol": target}, signed=False, weight=20)
         return parse_symbol_filters(body, target)
 
+    def market_symbols(self) -> tuple[Mapping[str, str], ...]:
+        """Every spot market as {symbol, base, quote}: the same public, allow-listed exchangeInfo GET without a symbol
+        (D44 history sync: which markets to read trade history from)."""
+        body = self._get(PATH_EXCHANGE_INFO, {}, signed=False, weight=20)
+        rows = body.get("symbols") if isinstance(body, Mapping) else None
+        if not isinstance(rows, list):
+            raise MainnetError("the exchange-info response was not understood.")
+        return tuple({"symbol": s["symbol"], "base": s["baseAsset"], "quote": s["quoteAsset"]} for s in rows
+                     if isinstance(s, Mapping)
+                     and all(isinstance(s.get(k), str) and s.get(k) for k in ("symbol", "baseAsset", "quoteAsset")))
+
     def price(self, symbol: str | None = None) -> Decimal:
         body = self._get(PATH_PRICE, {"symbol": symbol or self.symbol}, signed=False)
         value = body.get("price") if isinstance(body, Mapping) else None
