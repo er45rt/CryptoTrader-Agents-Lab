@@ -67,6 +67,34 @@ def _norm(text: object) -> str:
     return str(text).replace("\\", "/").lower()
 
 
+def _argv(cmdline: str) -> list[str]:
+    """The process's arguments, split by Windows' own rules (CommandLineToArgvW); elsewhere by POSIX rules."""
+    if os.name != "nt":
+        import shlex
+        return shlex.split(cmdline)
+    import ctypes
+    from ctypes import wintypes
+
+    fn = ctypes.windll.shell32.CommandLineToArgvW
+    fn.argtypes, fn.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
+    n = ctypes.c_int(0)
+    arr = fn(cmdline, ctypes.byref(n))
+    if not arr:
+        return []
+    try:
+        return [arr[i] for i in range(n.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(arr)
+
+
+def _runs_this_launcher(cmdline: str) -> bool:
+    """True only when the process is a Python interpreter whose script argument IS this tree's launch.pyw - not a
+    command line that merely contains that path somewhere (Sol review 2026-11-07, round 2)."""
+    argv = _argv(cmdline)
+    return (len(argv) >= 2 and Path(argv[0]).name.lower() in ("python.exe", "pythonw.exe", "python", "pythonw")
+            and _norm(argv[1]) == _norm(LAUNCH.resolve()))
+
+
 def stop_stale(port: int, run=subprocess.run, wait: float = 15.0) -> bool:
     """Stop the UI server on the port that runs older code - only if its command line runs THIS source tree's
     launch.pyw (the desktop shortcut's own server). Any other process, including another checkout's UI or a server
@@ -76,7 +104,7 @@ def stop_stale(port: int, run=subprocess.run, wait: float = 15.0) -> bool:
     pid = _listener_pid(port, run)
     if pid is None:
         return False
-    if _norm(LAUNCH.resolve()) not in _norm(_command_line(pid, run)):
+    if not _runs_this_launcher(_command_line(pid, run)):
         return False
     run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
     deadline = time.monotonic() + wait
@@ -100,7 +128,8 @@ def launch(argv: list[str] | None = None, *, open_browser=webbrowser.open, serve
             # explanation, never a broken page (app.js checkServerBuild).
             open_browser(f"http://127.0.0.1:{known.port}/")
             return 0
-        if "--workspace" not in rest and doc.get("workspace"):
+        given = any(a == "--workspace" or a.startswith("--workspace=") for a in rest)   # both argparse spellings
+        if not given and doc.get("workspace"):
             rest = [*rest, "--workspace", str(doc["workspace"])]   # the restarted server keeps the same workspace
     return (serve or server.main)(["--port", str(known.port), *rest])
 

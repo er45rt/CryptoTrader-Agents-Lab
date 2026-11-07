@@ -195,3 +195,28 @@ def test_the_session_error_line_shows_last_attempt_and_last_success_and_the_bann
     i18n = (STATIC / "i18n.js").read_text(encoding="utf-8")
     body = i18n[i18n.index("function trErr"):]
     assert body.index('LANG === "en" && net0') < body.index("English: the original message")
+
+
+# Sol review 2026-11-07, round 2 - H1: ownership is the script argument itself, not a path found anywhere in the command
+#      line; an explicit --workspace=PATH is honoured.
+def test_only_a_python_running_exactly_this_launch_file_is_ours():
+    me = str(launcher.LAUNCH.resolve())
+    assert launcher._runs_this_launcher(f'"C:\\venv\\Scripts\\pythonw.exe" "{me}"')
+    assert launcher._runs_this_launcher(f'"C:/VENV/PYTHONW.EXE" "{me.upper().replace(chr(92), "/")}"')
+    for forged in (f'"C:\\venv\\python.exe" -m crypto_trader.strategies.ui --workspace "{me}-data"',
+                   f'"C:\\venv\\pythonw.exe" "D:\\other\\src\\crypto_trader\\strategies\\ui\\launch.pyw" --workspace "{me}-data"',
+                   f'"C:\\tools\\other.exe" "{me}"'):
+        assert not launcher._runs_this_launcher(forged), forged
+
+
+def test_an_explicit_workspace_in_either_spelling_is_kept():
+    for given in (["--workspace", "D:/mine"], ["--workspace=D:/mine"]):
+        calls = {"serve": []}
+        orig = launcher.running_system
+        launcher.running_system = lambda port, timeout=1.5: {"workspace": "D:/old", "build": "0" * 16}
+        try:
+            launcher.launch(["--port", "8765", *given], open_browser=lambda u: None,
+                            serve=lambda argv: calls["serve"].append(argv) or 0, stop=lambda port: True)
+        finally:
+            launcher.running_system = orig
+        assert calls["serve"] == [["--port", "8765", *given]], given
