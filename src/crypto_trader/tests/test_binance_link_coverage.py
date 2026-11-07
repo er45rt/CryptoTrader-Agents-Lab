@@ -103,3 +103,16 @@ def test_only_the_assets_of_the_latest_sync_count(tmp_path):
     assert _row(link, lg, "ETH")["history"] == "complete"
     link.sync_trades(["BTC"])
     assert _row(link, lg, "ETH")["history"] == "unsynced" and _row(link, lg, "ETH")["cost"] is None
+
+
+def test_rows_in_another_wallet_never_cover_binance_trades(tmp_path):
+    # Sol D44 recheck: Binance buy@100, buy@200, sell@300; ledger has only buy@200 in wallet Binance plus unrelated
+    # buy@100 / sell@300 rows in another exchange inside the matching window -> must stay "incomplete", not cost 200
+    full = [_t(1, True, "1", "100", 0), _t(2, True, "1", "200", 3), _t(3, False, "1", "300", 6)]
+    link, lg = _setup(tmp_path, {"BTC": "1"}, {"BTCUSDT": full})
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-04T00:00", "qty": "1", "price": "200", "wallet": "Binance"})
+    lg.add({"type": "buy", "asset": "BTC", "at": "2026-01-01T00:00", "qty": "1", "price": "100", "wallet": "Other exchange"})
+    lg.add({"type": "sell", "asset": "BTC", "at": "2026-01-07T00:00", "qty": "1", "price": "300", "wallet": "Other exchange"})
+    link.sync_trades(["BTC"])
+    r = _row(link, lg, "BTC")
+    assert r["history"] == "incomplete" and r["cost"] is None and r["unrealized"] is None

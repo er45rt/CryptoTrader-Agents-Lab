@@ -406,7 +406,9 @@ def _reconcile(rows: list[dict[str, Any]], ledger: Any, staged: dict[str, Any] |
     txs = [t for t in current if str(t.get("wallet") or "").lower() == "binance"]
     state = portfolio.compute(txs) if txs else {}
     synced = set(staged.get("assets") or [])
-    uncovered = _uncovered(staged.get("trades") or [], current)
+    # coverage only from the same Binance-wallet rows the cost is computed from: a row in another wallet can never
+    # stand for a Binance trade here (Sol D44 recheck: other-exchange rows satisfied coverage)
+    uncovered = _uncovered(staged.get("trades") or [], txs)
     for r in rows:
         if r["asset"] == QUOTE:
             r.update(history="quote", ledger_qty=None, cost=None, avg_cost=None, unrealized=None)
