@@ -41,7 +41,9 @@ _NAME = re.compile(r"^demo-[0-9]{8}T[0-9]{6}-[0-9a-f]{4}$")
 
 
 def _atomic(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # a temp name of its own per writer: with one shared "demo.json.tmp" two overlapping saves let the first rename
+    # the other's file away and the second failed with FileNotFoundError (owner status bar 2026-11-08)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
@@ -182,9 +184,10 @@ class DemoManager:
         doc = self._doc(name)
         if doc["state"] == "finished":
             raise StrategyError("انتهت بيانات هذه التجربة؛ ابدأ تجربة جديدة.")
-        if speed in SPEEDS:
-            doc["speed"] = speed
-        with self._lock:
+        with self._session_lock(name), self._lock:
+            doc = self._doc(name)                          # re-read under the demo lock: never write back a stale doc
+            if speed in SPEEDS:
+                doc["speed"] = speed
             if name in self._threads and self._threads[name].is_alive():
                 doc["state"] = "running"
                 _atomic(self.folder(name) / "demo.json", json.dumps(doc, indent=1))
@@ -203,9 +206,10 @@ class DemoManager:
             try:
                 doc = self._step(name)
             except Exception as exc:                       # stop and say why; never invent a price
-                d = self._doc(name)
-                d.update(state="error", error=f"{type(exc).__name__}: {exc}")
-                _atomic(self.folder(name) / "demo.json", json.dumps(d, indent=1))
+                with self._session_lock(name):
+                    d = self._doc(name)
+                    d.update(state="error", error=f"{type(exc).__name__}: {exc}")
+                    _atomic(self.folder(name) / "demo.json", json.dumps(d, indent=1))
                 return
             if doc.get("state") == "finished":
                 return
@@ -220,18 +224,20 @@ class DemoManager:
             t = self._threads.get(name)
         if t:
             t.join(timeout=120)
-        doc = self._doc(name)
-        if doc["state"] == "running":
-            doc["state"] = "paused"
-            _atomic(self.folder(name) / "demo.json", json.dumps(doc, indent=1))
+        with self._session_lock(name):
+            doc = self._doc(name)
+            if doc["state"] == "running":
+                doc["state"] = "paused"
+                _atomic(self.folder(name) / "demo.json", json.dumps(doc, indent=1))
         return self.status(name)
 
     def set_speed(self, name: str, speed: str) -> dict[str, Any]:
         if speed not in SPEEDS:
             raise StrategyError("سرعة غير معروفة.")
-        doc = self._doc(name)
-        doc["speed"] = speed
-        _atomic(self.folder(name) / "demo.json", json.dumps(doc, indent=1))
+        with self._session_lock(name):                     # a running step must not write back the old speed
+            doc = self._doc(name)
+            doc["speed"] = speed
+            _atomic(self.folder(name) / "demo.json", json.dumps(doc, indent=1))
         return self.status(name)
 
     def delete(self, name: str, confirm: str) -> dict[str, Any]:
