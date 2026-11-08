@@ -218,3 +218,24 @@ def test_the_demo_page_is_drawn_once_with_its_live_card():
     assert i_pre < page.index("main.innerHTML =") and "await demoDraw(true, pre);" in page
     draw = js[js.index("async function demoDraw"):js.index("async function demoAction")]
     assert "pre && pre.demo && pre.demo.name === name ? pre : await api(" in draw   # only the demo it was fetched for
+
+
+# Removing the fade showed two jumps it had hidden (cards moved while still transparent): the paper session detail and
+# the dashboard spaces/detail arrived after their page and pushed the rest down.
+def test_the_paper_page_is_drawn_once_with_the_shown_session():
+    page = APP[APP.index("PAGES.paper = async () => {"):APP.index("let shownSession")]
+    i_pre = page.index('const preDetail = pick ? { name: pick.name, d: await api("/api/paper/session?name="')
+    assert i_pre < page.index("main.innerHTML =") and "paperDetail(pick.name, preDetail);" in page
+    det = APP[APP.index("async function paperDetail"):]
+    det = det[:det.index("\n}\n")]
+    assert "const draw = async (got = null) => { const d = got || await api(" in det
+    assert "await draw(pre && pre.name === name ? pre.d : null);" in det          # only for the session it was fetched for
+
+
+def test_the_dashboard_is_drawn_once_with_its_spaces_but_never_held_by_a_slow_one():
+    home = DASH[DASH.index("PAGES.home = async () => {"):DASH.index("function dbPaint")]
+    assert "const DB_WAIT_MS = 300;" in DASH
+    i_wait = home.index("await Promise.race([Promise.all(loads), new Promise((r) => setTimeout(r, DB_WAIT_MS))]);")
+    assert i_wait < home.index("main.innerHTML =")
+    assert 'if (!drawn || current !== "home" || DB.visit !== visit) return;' in home      # later spaces fill their own card
+    assert "DB_SPACES.forEach(([k]) => dbCard(k));" in home and home.index("main.innerHTML =") < home.rindex("dbDetail();")   # the drawn page's detail; the first one is the late-space callback

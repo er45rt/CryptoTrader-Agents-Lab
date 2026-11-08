@@ -4,10 +4,29 @@
    never added, netted or compared in one figure. */
 
 const DB = { space: "portfolio", spaces: {}, demo: null, status: null };
+const DB_WAIT_MS = 300;   // longest the dashboard waits to draw all its spaces in one go
 const DB_SPACES = [["portfolio", "محفظتي", "حقيقية"], ["demo", "التجريبي", "Demo"], ["paper", "التداول الورقي", "Paper"], ["backtest", "الاختبارات", "Backtest"]];
 const dbAt = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
 
 PAGES.home = async () => {
+  // the four spaces' data first, then the page is drawn once, complete (owner 2026-11-08: the space cards and the
+  // detail filled in one by one and moved the page); each space still loads, succeeds or fails on its own
+  // A slow space (e.g. prices being fetched) never holds the page: after DB_WAIT_MS the page is drawn with what has
+  // arrived and each later space fills its own card, as before.
+  const got = {}, visit = DB.visit = (DB.visit || 0) + 1;   // a late answer of an earlier visit never writes here
+  let drawn = false;
+  const load = (k, p) => p.then((d) => ({ ok: true, d }), (e) => ({ ok: false, e })).then((s) => {
+    got[k] = s;
+    if (!drawn || current !== "home" || DB.visit !== visit) return;
+    DB.spaces[k] = s; dbCard(k); if (k === DB.space) dbDetail();
+  });
+  const loads = [load("portfolio", api("/api/portfolio")), load("demo", api("/api/demo")), load("paper", api("/api/paper")),
+    load("backtest", api("/api/runs"))];
+  await Promise.race([Promise.all(loads), new Promise((r) => setTimeout(r, DB_WAIT_MS))]);
+  if (current !== "home" || DB.visit !== visit) return;
+  DB.spaces = {};
+  for (const k in got) DB.spaces[k] = got[k];
+  drawn = true;
   main.innerHTML = header("لوحة المتابعة", "كل مساحة مالية لحالها: محفظتك الحقيقية، والتجريبي، والورقي، والاختبارات. أرقامها ما تنجمع مع بعض أبدًا.",
     chip("التداول الحقيقي معطّل", "") + chip("بدون مفاتيح", ""))
   // the status bar keeps its place from the first paint (owner 2026-11-08: it arrived last and pushed the page 61 px):
@@ -19,14 +38,11 @@ PAGES.home = async () => {
   <div class="card" id="db-compare"></div>`;
   $("#db-spaces").onclick = (e) => { const b = e.target.closest("[data-space]"); if (!b) return; DB.space = b.dataset.space; dbPaint(); dbDetail(); };
   dbPaint();
+  DB_SPACES.forEach(([k]) => dbCard(k));
+  dbDetail();
   dbStatus();
   timer = setInterval(() => { if (current === "home") dbStatus(); }, 60000);
   dbCompare();
-  const load = (k, p) => p.then((d) => { DB.spaces[k] = { ok: true, d }; }, (e) => { DB.spaces[k] = { ok: false, e }; })
-    .then(() => { if (current !== "home") return; dbCard(k); if (k === DB.space) dbDetail(); });
-  DB.spaces = {};
-  await Promise.all([load("portfolio", api("/api/portfolio")), load("demo", api("/api/demo")), load("paper", api("/api/paper")),
-    load("backtest", api("/api/runs"))]);
 };
 
 function dbPaint() { document.querySelectorAll("#db-spaces [data-space]").forEach((b) => b.classList.toggle("on", b.dataset.space === DB.space)); }

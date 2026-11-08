@@ -476,6 +476,10 @@ const CHECK_HELP = {
 
 PAGES.paper = async () => {
   const [d, st] = await Promise.all([api("/api/paper"), api("/api/strategies")]);
+  // the shown session's detail comes with the page's data, so the page is drawn once, complete (owner 2026-11-08: the
+  // detail arrived ~40 ms after the page and pushed the "new session" card down)
+  const pick = d.sessions.find((s) => s.name === shownSession) || d.sessions.find((s) => s.running) || d.sessions[0];
+  const preDetail = pick ? { name: pick.name, d: await api("/api/paper/session?name=" + encodeURIComponent(pick.name)).catch(() => null) } : null;
   const pre = sessionStorage.getItem("spec") || "";
   const run = d.sessions.filter((s) => s.running).length;
   main.innerHTML = header("التداول الورقي", "تشغيل الاستراتيجية على الأسعار الحية بدون فلوس حقيقية", chip(`${run} تعمل`, run ? "good" : "") + chip("Binance عامة · بدون مفاتيح", ""))
@@ -495,15 +499,14 @@ PAGES.paper = async () => {
   document.querySelectorAll("[data-start]").forEach((b) => b.onclick = async () => { try { await api("/api/paper/start", { name: b.dataset.start }); }
     catch (e) { await PAGES.paper(); if ($("#pmsg")) $("#pmsg").innerHTML = errBox(e); return; } PAGES.paper(); });
   document.querySelectorAll("[data-stop]").forEach((b) => b.onclick = async () => { await api("/api/paper/stop", { name: b.dataset.stop }); PAGES.paper(); });
-  const pick = d.sessions.find((s) => s.name === shownSession) || d.sessions.find((s) => s.running) || d.sessions[0];
-  if (pick) paperDetail(pick.name);
+  if (pick) paperDetail(pick.name, preDetail);
 };
 let shownSession = null;
 const paperZoom = {};
-async function paperDetail(name) {
+async function paperDetail(name, pre = null) {
   shownSession = name;
   if (current !== "paper" || !$("#pdet")) { nav("paper"); return; }   // the paper page then shows this session
-  const draw = async () => { const d = await api("/api/paper/session?name=" + encodeURIComponent(name)); const s = d.status || {}; const el = $("#pdet");
+  const draw = async (got = null) => { const d = got || await api("/api/paper/session?name=" + encodeURIComponent(name)); const s = d.status || {}; const el = $("#pdet");
     if (!el || shownSession !== name) return;
     const lastBar = d.bars[d.bars.length - 1], prev = d.bars[d.bars.length - 2], ch = lastBar && prev ? lastBar.c / prev.c - 1 : null;
     const nextOpen = s.next_open ? s.next_open[0] : null;
@@ -534,7 +537,7 @@ async function paperDetail(name) {
     candles($("#pc"), bars, s.trades || [], [{ values: sma(bars, 20), color: css("--sma1") }], 360, view);
     if (keep) view.set(view.tmax - keep[0], view.tmax - keep[1]); else view.set(ms[Math.max(0, ms.length - 120)], view.tmax);
     view.subs.push(() => { paperZoom[name] = [view.tmax - view.t0, view.tmax - view.t1]; }); };
-  await draw(); clearInterval(timer); timer = setInterval(() => { if (current === "paper") draw().catch(() => {}); }, 30000);
+  await draw(pre && pre.name === name ? pre.d : null); clearInterval(timer); timer = setInterval(() => { if (current === "paper") draw().catch(() => {}); }, 30000);
 }
 
 PAGES.risk = async () => {
