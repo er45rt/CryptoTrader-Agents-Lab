@@ -132,6 +132,21 @@ def load_bars(path: str | Path, timeframe: str, *, start: datetime | None = None
     return bars
 
 
+def _tls_context(cafile: str | None = None):
+    r"""ssl.create_default_context(cafile=...) for a client, WITHOUT the SSLKEYLOGFILE key log: the same certificate
+    verification and hostname check, never a write to whatever path that environment variable names. A long-running
+    paper session inherited SSLKEYLOGFILE='\\.\aswMonFltProxy\<id>'; once that path refused writes, every TLS setup
+    (ssl.py: context.keylog_filename = ...) failed until the process restarted (paper session 2026-11-08 traceback)."""
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)          # check_hostname=True, verify_mode=CERT_REQUIRED
+    if cafile:
+        ctx.load_verify_locations(cafile=cafile)
+    else:
+        ctx.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    return ctx
+
+
 def fetch_forming_open(symbol: str, timeframe: str, *, now: datetime | None = None,
                        cafile: str | None = None, timeout: float = 20.0) -> tuple[datetime, Decimal] | None:
     """(open_time, open) of the candle forming at `now` - its open price is final once it starts."""
@@ -143,7 +158,7 @@ def fetch_forming_open(symbol: str, timeframe: str, *, now: datetime | None = No
     step = TIMEFRAMES[timeframe]
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     start = epoch + ((now - epoch) // step) * step
-    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    ctx = _tls_context(cafile)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
     query = urllib.parse.urlencode({"symbol": symbol, "interval": timeframe,
                                     "startTime": int(start.timestamp() * 1000), "limit": 1})
@@ -166,7 +181,7 @@ def fetch_public_klines(symbol: str, timeframe: str, *, start: datetime, end: da
     if timeframe not in TIMEFRAMES:
         raise StrategyError(f"unsupported timeframe {timeframe!r}.")
     now = now or datetime.now(timezone.utc)
-    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    ctx = _tls_context(cafile)
 
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):  # noqa: ANN001
