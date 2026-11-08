@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -194,6 +195,7 @@ def run_paper_loop(folder: str | Path, *, poll_seconds: float = 60.0, max_cycles
     folder = Path(folder)
     cycles = 0
     backoff = poll_seconds
+    traced: set[str] = set()       # errors whose full traceback this process has already logged
     while not (folder / "STOP").exists():
         try:
             st = paper_cycle(folder, cafile=cafile)
@@ -204,6 +206,11 @@ def run_paper_loop(folder: str | Path, *, poll_seconds: float = 60.0, max_cycles
             raise
         except Exception as exc:   # network trouble: keep state, retry with backoff (never invent data)
             log(f"cycle failed, will retry: {type(exc).__name__}: {exc}")
+            if f"{type(exc).__name__}: {exc}" not in traced:
+                # the operation that failed, once per distinct error in this process (paper session 2026-11-08: a
+                # PermissionError on a device path repeated for hours and only its message was kept)
+                traced.add(f"{type(exc).__name__}: {exc}")
+                log("".join(traceback.format_exception(exc)).rstrip())
             failures = 1
             err_path = folder / "last_error.json"
             if err_path.exists():
