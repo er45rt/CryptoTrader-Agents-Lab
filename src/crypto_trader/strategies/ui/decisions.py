@@ -13,6 +13,7 @@ No AI takes part in this path (decision_source == "strategy-plugin"); the AI ste
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -107,6 +108,37 @@ def _items(source: dict[str, Any], decisions: list[dict[str, Any]], fills: list[
     return out
 
 
+#: Decisions per session folder, re-read only when one of the files they come from changed (owner 2026-11-08: the
+#: decision center re-read ~2,500 decisions of finished demos, ~150 ms, on every open and every 30 s refresh).
+#: Key: the folder; stamp: (path, mtime_ns, size) of each file read, taken BEFORE reading, so a file that changes
+#: while it is being read makes the next request read it again. Items are never mutated after they are built.
+_CACHE: dict[str, tuple[tuple, list[dict[str, Any]]]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _stamp(files: list[Path]) -> tuple:
+    out = []
+    for f in files:
+        try:
+            st = f.stat()
+            out.append((str(f), st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append((str(f), None, None))
+    return tuple(out)
+
+
+def _cached(folder: Path, files: list[Path], build: Any) -> list[dict[str, Any]]:
+    key, stamp = str(folder), _stamp(files)
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    items = build()
+    with _CACHE_LOCK:
+        _CACHE[key] = (stamp, items)
+    return items
+
+
 def _paper(root: Path, only: str | None = None) -> list[dict[str, Any]]:
     out = []
     base = root / "paper"
@@ -117,11 +149,15 @@ def _paper(root: Path, only: str | None = None) -> list[dict[str, Any]]:
             continue
         if not (folder / "session.json").exists() or not (folder / "report.json").exists():
             continue
-        doc = _json(folder / "session.json")
-        rep = _json(folder / "report.json")
-        source = {"kind": "paper", "name": folder.name, "label": f"ورقي · {folder.name}", "strategy": doc["strategy_name"],
-                  "symbol": doc["market"]["symbol"], "timeframe": doc["timeframe"]}
-        out += _items(source, rep.get("decisions", []), rep.get("fills", []), _traces(folder / "decision_trace.jsonl"))
+
+        def build(folder=folder):
+            doc = _json(folder / "session.json")
+            rep = _json(folder / "report.json")
+            source = {"kind": "paper", "name": folder.name, "label": f"ورقي · {folder.name}", "strategy": doc["strategy_name"],
+                      "symbol": doc["market"]["symbol"], "timeframe": doc["timeframe"]}
+            return _items(source, rep.get("decisions", []), rep.get("fills", []), _traces(folder / "decision_trace.jsonl"))
+
+        out += _cached(folder, [folder / "session.json", folder / "report.json", folder / "decision_trace.jsonl"], build)
     return out
 
 
@@ -136,11 +172,15 @@ def _demos(root: Path, only: str | None = None) -> list[dict[str, Any]]:
             continue
         if not (folder / "session.json").exists() or not (folder / "report.json").exists():
             continue
-        doc = _json(folder / "session.json")
-        rep = _json(folder / "report.json")
-        source = {"kind": "demo", "name": folder.name, "label": f"تجريبي · {folder.name}", "strategy": doc["strategy_name"],
-                  "symbol": doc["market"]["symbol"], "timeframe": doc["timeframe"]}
-        out += _items(source, rep.get("decisions", []), rep.get("fills", []), _traces(folder / "decision_trace.jsonl"))
+
+        def build(folder=folder):
+            doc = _json(folder / "session.json")
+            rep = _json(folder / "report.json")
+            source = {"kind": "demo", "name": folder.name, "label": f"تجريبي · {folder.name}", "strategy": doc["strategy_name"],
+                      "symbol": doc["market"]["symbol"], "timeframe": doc["timeframe"]}
+            return _items(source, rep.get("decisions", []), rep.get("fills", []), _traces(folder / "decision_trace.jsonl"))
+
+        out += _cached(folder, [folder / "session.json", folder / "report.json", folder / "decision_trace.jsonl"], build)
     return out
 
 
@@ -155,11 +195,15 @@ def _backtests(root: Path, only: str | None = None) -> list[dict[str, Any]]:
         eng = run / "engine"
         if not (eng / "decisions.json").exists() or not (eng / "backtest_result.json").exists():
             continue
-        res = _json(eng / "backtest_result.json")
-        chain = _json(eng / "decisions.json")
-        source = {"kind": "backtest", "name": run.name, "label": f"اختبار كامل · {run.name}", "strategy": res["strategy"],
-                  "symbol": res["symbol"], "timeframe": res["timeframe"]}
-        out += _items(source, chain.get("decisions", []), chain.get("fills", []), _traces(eng / "decision_trace.jsonl"))
+
+        def build(run=run, eng=eng):
+            res = _json(eng / "backtest_result.json")
+            chain = _json(eng / "decisions.json")
+            source = {"kind": "backtest", "name": run.name, "label": f"اختبار كامل · {run.name}", "strategy": res["strategy"],
+                      "symbol": res["symbol"], "timeframe": res["timeframe"]}
+            return _items(source, chain.get("decisions", []), chain.get("fills", []), _traces(eng / "decision_trace.jsonl"))
+
+        out += _cached(eng, [eng / "backtest_result.json", eng / "decisions.json", eng / "decision_trace.jsonl"], build)
     return out
 
 

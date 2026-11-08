@@ -131,8 +131,10 @@ def test_a_decision_detail_reads_only_its_own_session(root, monkeypatch):
     seen = []
     real = decisions._items
     monkeypatch.setattr(decisions, "_items", lambda source, *a: seen.append(source["name"]) or real(source, *a))
+    decisions._CACHE.clear()                   # 2026-11-08 per-folder cache: prove a COLD read touches only this session
     assert decisions.detail(root, pick["id"])["item"]["id"] == pick["id"]
     assert seen == ["ok"]
+    assert decisions.detail(root, pick["id"])["item"]["id"] == pick["id"] and seen == ["ok"]   # warm: nothing re-read
 
 
 def test_trade_links_follow_the_recorded_position_when_it_is_scaled(monkeypatch, tmp_path):
