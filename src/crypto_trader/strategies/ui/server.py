@@ -388,32 +388,90 @@ def _job(jid: str) -> dict[str, Any]:
         return dict(_JOBS[jid])
 
 
-def port_in_use(port: int, timeout: float = 2.0) -> bool:
-    """True when anything accepts a TCP connection on 127.0.0.1:<port>. The OS completes the connection even while a
-    busy server is slow to answer HTTP, so this never mistakes a slow UI for an absent one."""
+def port_in_use(port: int, timeout: float = 5.0) -> bool:
+    """False ONLY when the connection is refused (nothing listens on 127.0.0.1:<port>). The OS completes a connection
+    even while a busy server is slow to answer HTTP; a timeout or any other error is treated as in use - never as free
+    (Sol review 2026-11-08: the probe failed open). Windows takes about 2 s to refuse a closed local port, so the
+    timeout stays well above that."""
     import socket
 
     try:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
             return True
-    except OSError:
+    except ConnectionRefusedError:
         return False
+    except OSError:
+        return True
+
+
+def _lock_path(port: int) -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f"ct-engine-ui-{int(port)}.lock"
+
+
+def _hold_port_lock(port: int, wait: float = 5.0):
+    """An OS lock on a per-port file, held for the server's whole life and released by the OS when the process ends
+    (even when killed). Taken atomically, so two starts can never both pass (Sol review 2026-11-08: check-to-bind
+    race). Waits briefly for a just-stopped server's lock to be released."""
+    import time
+
+    deadline = time.monotonic() + wait
+    fh = open(_lock_path(port), "a+b")                         # noqa: SIM115 - kept open as the lock
+    while True:
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise OSError(f"another CryptoTrader UI holds port {port}; the UI is not started twice.") from None
+            time.sleep(0.2)
+
+
+class _UIServer(ThreadingHTTPServer):
+    _port_lock = None
+
+    def server_close(self) -> None:
+        super().server_close()
+        if self._port_lock is not None:
+            self._port_lock.close()                                # closing the handle releases the OS lock
+            self._port_lock = None
 
 
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     # Windows lets a second server bind the same port (address reuse, needed for a quick restart), and the managers
     # below change demo state on disk - so refuse BEFORE anything is created (2026-11-08: a launcher whose status check
-    # timed out started a second UI on 8765 next to the running one).
-    if port and port_in_use(port):
-        raise OSError(f"127.0.0.1:{port} is already in use; the UI is not started twice.")
-    Handler.ws = store.Workspace(workspace)
-    Handler.auth = auth.Auth(workspace)
-    Handler.demo = demo.DemoManager(workspace)
-    Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
-    Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)
-    Handler.link = accounts.BinanceLink(workspace, prices=Handler.prices.latest)   # D44: Binance read-only
-    Handler.dca = dca.Plans(Handler.ledger, prices=Handler.prices.latest)
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # timed out started a second UI on 8765 next to the running one). Port 0 (tests) has no fixed port to share.
+    lock = None
+    if port:
+        lock = _hold_port_lock(port)                               # one of OUR servers per port, atomically
+        if port_in_use(port):                                      # any other program on the port
+            lock.close()
+            raise OSError(f"127.0.0.1:{port} is already in use; the UI is not started twice.")
+    try:
+        Handler.ws = store.Workspace(workspace)
+        Handler.auth = auth.Auth(workspace)
+        Handler.demo = demo.DemoManager(workspace)
+        Handler.prices = prices.BinancePrices(Path(workspace) / "portfolio" / "prices")
+        Handler.ledger = portfolio.Ledger(workspace, prices=Handler.prices.latest)
+        Handler.link = accounts.BinanceLink(workspace, prices=Handler.prices.latest)   # D44: Binance read-only
+        Handler.dca = dca.Plans(Handler.ledger, prices=Handler.prices.latest)
+        srv = _UIServer(("127.0.0.1", port), Handler)
+    except BaseException:
+        if lock is not None:
+            lock.close()
+        raise
+    srv._port_lock = lock
+    return srv
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -90,3 +90,71 @@ def test_nothing_listening_still_starts_the_ui(monkeypatch):
                          serve=lambda argv: served.append(argv) or 0)
     assert rc == 0 and served == [["--port", str(port), "--workspace", "W"]]
     assert Path(launcher.__file__).exists()
+
+
+# Sol review 2026-11-08 (FAIL on b23f709): the probe failed open, and a check-then-bind race could still pass twice.
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_only_a_refused_connection_counts_as_free(monkeypatch):
+    def refuse(*a, **k):
+        raise ConnectionRefusedError()
+
+    def slow(*a, **k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    assert server.port_in_use(1) is False
+    monkeypatch.setattr(socket, "create_connection", slow)
+    assert server.port_in_use(1) is True                      # a handshake timeout is never "free"
+
+
+def test_two_simultaneous_starts_never_both_succeed(tmp_path):
+    port, results, gate = _free_port(), [], threading.Barrier(2)
+
+    def start():
+        gate.wait()
+        try:
+            results.append(server.make_server(tmp_path, port))
+        except OSError as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    started = [r for r in results if not isinstance(r, OSError)]
+    try:
+        assert len(results) == 2 and len(started) == 1, results
+    finally:
+        for r in started:
+            r.server_close()
+
+
+def test_a_killed_server_releases_the_port_for_the_shortcut_restart(tmp_path):
+    import subprocess
+    import sys
+
+    port = _free_port()
+    src = str(Path(server.__file__).resolve().parents[3])
+    code = ("import sys; from pathlib import Path; from crypto_trader.strategies.ui import server; "
+            f"server.make_server(Path(r'{tmp_path}'), {port}).serve_forever()")
+    p = subprocess.Popen([sys.executable, "-c", code], env={**__import__("os").environ, "PYTHONPATH": src})
+    try:
+        deadline = time.monotonic() + 30
+        while not server.port_in_use(port) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert server.port_in_use(port)
+        with pytest.raises(OSError):
+            server.make_server(tmp_path, port)                     # the live server holds the port lock
+    finally:
+        p.kill()
+        p.wait(30)
+    srv = server.make_server(tmp_path, port)                       # killed: lock and port are released
+    srv.server_close()
