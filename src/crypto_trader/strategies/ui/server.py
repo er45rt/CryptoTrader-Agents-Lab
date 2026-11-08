@@ -388,7 +388,24 @@ def _job(jid: str) -> dict[str, Any]:
         return dict(_JOBS[jid])
 
 
+def port_in_use(port: int, timeout: float = 2.0) -> bool:
+    """True when anything accepts a TCP connection on 127.0.0.1:<port>. The OS completes the connection even while a
+    busy server is slow to answer HTTP, so this never mistakes a slow UI for an absent one."""
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
+    # Windows lets a second server bind the same port (address reuse, needed for a quick restart), and the managers
+    # below change demo state on disk - so refuse BEFORE anything is created (2026-11-08: a launcher whose status check
+    # timed out started a second UI on 8765 next to the running one).
+    if port and port_in_use(port):
+        raise OSError(f"127.0.0.1:{port} is already in use; the UI is not started twice.")
     Handler.ws = store.Workspace(workspace)
     Handler.auth = auth.Auth(workspace)
     Handler.demo = demo.DemoManager(workspace)

@@ -122,6 +122,13 @@ def launch(argv: list[str] | None = None, *, open_browser=webbrowser.open, serve
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     known, rest = ap.parse_known_args(argv or [])
     doc = running_system(known.port)
+    if doc is None and server.port_in_use(known.port):
+        # something listens but did not answer in time (a busy UI): ask again patiently, and never start a second
+        # server next to it (2026-11-08 duplicate server on 8765)
+        doc = running_system(known.port, timeout=15.0)
+        if doc is None:
+            open_browser(f"http://127.0.0.1:{known.port}/")
+            return 1
     if doc is not None:
         if doc.get("build") == server.build_id() or not stop(known.port):
             # same code: reuse it. An older one that could not be stopped: open it; the page then shows only the
