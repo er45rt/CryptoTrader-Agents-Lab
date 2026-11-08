@@ -474,9 +474,20 @@ def make_server(workspace: Path, port: int = 8765) -> ThreadingHTTPServer:
     return srv
 
 
+def no_tls_key_log() -> None:
+    r"""Remove SSLKEYLOGFILE from THIS process before any thread or connection exists. ssl.create_default_context and
+    urllib3 (used by requests, so by the Binance read-only link) open the path it names on every new TLS context; the
+    process inherited '\\.\aswMonFltProxy\<id>' and, once that path refused writes, every connection failed until a
+    restart (paper session 2026-11-08). The UI never writes TLS session keys (which would also decrypt the signed,
+    API-key requests) to an external file. Avast itself is not touched; child processes started here inherit this."""
+    os.environ.pop("SSLKEYLOGFILE", None)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import webbrowser
+
+    no_tls_key_log()                       # first: before the port lock, the managers and any thread
 
     ap = argparse.ArgumentParser(prog="python -m crypto_trader.strategies.ui")
     ap.add_argument("--port", type=int, default=8765)
