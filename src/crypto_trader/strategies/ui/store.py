@@ -66,9 +66,15 @@ def _spec_file(spec: str) -> str:
     return Path(path).name
 
 
+#: Console programs started from the window-less pythonw UI open a visible terminal window unless told not to
+#: (owner 2026-11-08: opening the dashboard flashed three windows, one per tasklist call).
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
+                             creationflags=NO_WINDOW)
         return str(pid) in out.stdout
     try:
         os.kill(pid, 0)

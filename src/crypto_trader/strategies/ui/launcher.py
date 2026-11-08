@@ -48,8 +48,13 @@ def already_running(port: int, timeout: float = 1.5) -> bool:
     return running_system(port, timeout) is not None
 
 
+#: Console programs started from the window-less pythonw UI open a visible terminal window unless told not to
+#: (owner 2026-11-08: opening the dashboard flashed three windows, one per tasklist call).
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _listener_pid(port: int, run=subprocess.run) -> int | None:
-    out = run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False).stdout
+    out = run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, check=False, creationflags=NO_WINDOW).stdout
     for line in out.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[1] in (f"127.0.0.1:{port}", f"0.0.0.0:{port}") and parts[3].upper() == "LISTENING":
@@ -60,7 +65,7 @@ def _listener_pid(port: int, run=subprocess.run) -> int | None:
 def _command_line(pid: int, run=subprocess.run) -> str:
     return run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                 f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
-               capture_output=True, text=True, check=False).stdout.strip()
+               capture_output=True, text=True, check=False, creationflags=NO_WINDOW).stdout.strip()
 
 
 def _norm(text: object) -> str:
@@ -106,7 +111,7 @@ def stop_stale(port: int, run=subprocess.run, wait: float = 15.0) -> bool:
         return False
     if not _runs_this_launcher(_command_line(pid, run)):
         return False
-    run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+    run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False, creationflags=NO_WINDOW)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if running_system(port, timeout=0.5) is None:
@@ -164,7 +169,7 @@ def install(desktop: Path | None = None, python: Path | None = None, run=subproc
     desktop = Path(desktop or Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop")
     lnk = desktop / "CryptoTrader.lnk"
     run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-         shortcut_script(lnk, pythonw, LAUNCH, Path.home())], check=True, capture_output=True)
+         shortcut_script(lnk, pythonw, LAUNCH, Path.home())], check=True, capture_output=True, creationflags=NO_WINDOW)
     return lnk
 
 
