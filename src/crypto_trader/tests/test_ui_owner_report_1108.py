@@ -200,3 +200,21 @@ def test_a_cached_paint_whose_check_fails_is_taken_off_the_screen():
       hook = async () => answer(400, "a"); await dcLoad(true);                   // the next refresh succeeds
       console.log(JSON.stringify({ ...after, back: !els["dc-data"].hidden && !els["dc-wait"], rows: rows() }));""")
     assert got == {"hidden": True, "err": '<div id="dc-wait">ERR:down</div>', "back": True, "rows": 50}
+
+
+# Owner 2026-11-08, "the same on every page": measured on all 12 pages - no page had a long frame, but every card and
+# KPI faded in (fully visible only ~240-290 ms after the click), and the demo page jumped when its live card arrived.
+def test_no_page_fades_in():
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert '<main id="main" class="no-anim">' in html
+    assert ".no-anim .card,.no-anim .kpi,.no-anim .kpi .v{animation:none}" in CSS
+    assert not re.search(r"main\.className\s*=|main\.classList\.remove", APP + DEC + DASH)   # nothing takes it off
+
+
+def test_the_demo_page_is_drawn_once_with_its_live_card():
+    js = (STATIC / "demo.js").read_text(encoding="utf-8")
+    page = js[js.index("PAGES.demo = async () => {"):js.index("async function demoDraw")]
+    i_pre = page.index('const pre = demoState.active ? await api("/api/demo/session?name="')
+    assert i_pre < page.index("main.innerHTML =") and "await demoDraw(true, pre);" in page
+    draw = js[js.index("async function demoDraw"):js.index("async function demoAction")]
+    assert "pre && pre.demo && pre.demo.name === name ? pre : await api(" in draw   # only the demo it was fetched for

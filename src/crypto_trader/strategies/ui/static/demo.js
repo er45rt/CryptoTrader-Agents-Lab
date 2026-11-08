@@ -10,6 +10,9 @@ PAGES.demo = async () => {
   const [lst, st, df] = await Promise.all([api("/api/demo"), api("/api/strategies"), api("/api/data")]);
   const okS = st.strategies.filter((s) => s.ok);
   if (!demoState.active || !lst.demos.some((d) => d.name === demoState.active)) demoState.active = lst.demos[0]?.name || null;
+  // the live demo's data comes with the page's, so the page is drawn once, complete (owner 2026-11-08: the live card
+  // arrived ~70 ms after the page and pushed everything below it down)
+  const pre = demoState.active ? await api("/api/demo/session?name=" + encodeURIComponent(demoState.active)).catch(() => null) : null;
   main.innerHTML = header("الوضع التجريبي", "تجربة كاملة بدون فلوس وبدون إنترنت: أسعار تاريخية حقيقية من ملفاتك تُعاد شمعة شمعة عبر نفس المحرك، وكل قرار يروح لمركز القرارات.",
     chip("بدون إنترنت", "good") + chip("ما ينرسل أي أمر", "") + chip("قبل 2025-09-07 فقط", ""))
   + `<div id="demo-live"></div>
@@ -41,7 +44,7 @@ PAGES.demo = async () => {
     } catch (e) { $("#dn-msg").innerHTML = errBox(e); $("#dn-go").disabled = false; }
   };
   document.querySelectorAll("[data-demo]").forEach((tr) => tr.onclick = () => { demoState.active = tr.dataset.demo; PAGES.demo(); });
-  if (demoState.active) await demoDraw(true);
+  if (demoState.active) await demoDraw(true, pre);
   clearInterval(timer);
   timer = setInterval(() => { if (current === "demo" && demoState.active) demoDraw(false).catch(() => {}); }, 2500);
 };
@@ -51,9 +54,9 @@ function demoStatePill(state, running) {
   return { paused: '<span class="pill">متوقفة مؤقتًا</span>', finished: '<span class="pill warn">انتهت البيانات</span>', error: '<span class="pill bad">خطأ</span>' }[state] || `<span class="pill">${esc(state)}</span>`;
 }
 
-async function demoDraw(full) {
+async function demoDraw(full, pre = null) {
   const name = demoState.active, box = $("#demo-live"); if (!box || !name) return;
-  const d = await api("/api/demo/session?name=" + encodeURIComponent(name));
+  const d = pre && pre.demo && pre.demo.name === name ? pre : await api("/api/demo/session?name=" + encodeURIComponent(name));
   if (current !== "demo" || demoState.active !== name || !$("#demo-live")) return;
   const doc = d.demo, s = d.status || {}, cap = +doc.capital, eq = isNum(s.equity_quote) ? +s.equity_quote : cap, pnl = eq - cap;
   const pct = d.progress.total ? d.progress.done / d.progress.total : 0, running = d.running;
