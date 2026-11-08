@@ -81,13 +81,14 @@ class DemoManager:
         # a demo saved as "running" by a server that is gone has no thread here: it is paused, resumable from its
         # saved cursor (owner report 2026-11-07: a restarted server must not show stopped replays as running)
         for f in sorted(self.base.iterdir()):
-            try:
-                doc = json.loads((f / "demo.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if doc.get("state") == "running":
-                doc["state"] = "paused"
-                _atomic(f / "demo.json", json.dumps(doc, indent=1))
+            with self._session_lock(f.name):              # every demo.json write under its demo's lock (Sol D1 review)
+                try:
+                    doc = json.loads((f / "demo.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if doc.get("state") == "running":
+                    doc["state"] = "paused"
+                    _atomic(f / "demo.json", json.dumps(doc, indent=1))
 
     def _session_lock(self, name: str) -> threading.Lock:
         with self._lock:
@@ -128,7 +129,8 @@ class DemoManager:
                "state": "paused", "created_at": datetime.now(timezone.utc).isoformat(),
                "replay_from": bars[first].open_time.isoformat(), "replay_to": bars[-1].close_time.isoformat(),
                "capital": str(settings.capital_quote)}
-        _atomic(folder / "demo.json", json.dumps(doc, indent=1))
+        with self._session_lock(name):                     # every demo.json write under its demo's lock (Sol D1 review)
+            _atomic(folder / "demo.json", json.dumps(doc, indent=1))
         (folder / "equity.jsonl").touch()
         self._replays[name] = _Replay(bars)
         self._step(name, clock=clock0)                    # warm-up history only (no live bar yet)
