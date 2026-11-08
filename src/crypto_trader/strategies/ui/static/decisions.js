@@ -26,10 +26,32 @@ function oneLine(i) {   // fixed template over recorded fields; no free text is 
   return rationaleAr(i.rationale);
 }
 
-const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null, wide: false, reason: "" };
+const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", until: "", kinds: [] }, selected: null, auto: true, data: null, wide: false, reason: "",
+  key: null, sig: null, drawn: null, shown: 0 };
+/* Owner 2026-11-08: the content appeared 170-270 ms after the click although the data arrived at ~60 ms - laying out all
+   400 rows (3,200 elements, ~7 visible) blocked the frame ~100-157 ms, a 250 ms fade ran on every card and the table
+   jumped when the data landed. Now: the first DC_FIRST_ROWS rows, the rest while scrolling; no entrance fade here; the
+   data area appears complete in one paint; a repeat visit paints the last answer for the SAME filters at once and asks
+   again in the background; an unchanged refresh leaves the page untouched. */
+const DC_FIRST_ROWS = 50;
+function dcQuery() {   // the exact query for the filters on screen
+  const f = dcState.filters, q = new URLSearchParams();
+  ["source", "strategy", "symbol"].forEach((k) => { if (f[k]) q.set(k, f[k]); });
+  if (f.since) q.set("since", new Date(f.since + "Z").toISOString());
+  if (f.until) q.set("until", new Date(f.until + "Z").toISOString());
+  if (f.kinds.length) q.set("kinds", f.kinds.join(","));
+  if (dcState.reason) q.set("reason", dcState.reason);
+  q.set("limit", "400");
+  return q.toString();
+}
+const dcRow = (i) => `<tr data-dc="${esc(i.id)}" class="${i.id === dcState.selected ? "sel" : ""}" style="cursor:pointer">
+    <td class="ltr">${esc(i.at.slice(0, 16).replace("T", " "))}</td><td>${kindPill(i.kind)}</td>
+    <td><b>${esc(i.strategy)}</b> <span class="muted">· ${esc(i.symbol)} · ${esc(tfAr(i.timeframe))} · ${esc(({ paper: "ورقي", demo: "تجريبي", backtest: "اختبار" })[i.source.kind] || i.source.kind)}</span></td>
+    <td class="wrap">${esc(oneLine(i))}</td></tr>`;
 
 PAGES.decisions = async () => {
-  main.innerHTML = header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
+  const cached = !!dcState.data && dcState.key === dcQuery();
+  main.innerHTML = `<div class="no-anim">` + header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
     chip("الذكاء الاصطناعي: غير مشارك في هذا المحرك", "") + `<span class="chip" style="cursor:pointer" id="dc-auto"><i></i>تحديث تلقائي</span>`)
   + `<div class="card"><div class="form" id="dc-form">
     <div><label>المصدر</label><select id="dc-source"><option value="">الكل</option></select></div>
@@ -38,32 +60,52 @@ PAGES.decisions = async () => {
     <div><label>من</label><input id="dc-since" type="datetime-local"></div>
     <div><label>إلى</label><input id="dc-until" type="datetime-local"></div>
   </div><div class="actions"><div class="tabs" id="dc-kinds"></div></div></div>
-  <div class="card" id="dc-funnel"><div class="skel"></div></div>
+  ${cached ? "" : `<div id="dc-wait">${loading("تحميل…")}</div>`}<div id="dc-data"${cached ? "" : " hidden"}>
+  <div class="card" id="dc-funnel"></div>
   <div class="card" id="dc-reasons"></div>
   <div class="cols dc-cols"><div class="card"><div class="card-h"><h2>القرارات <small id="dc-total"></small></h2></div><div class="tw" style="max-height:640px"><table>
     <thead><tr><th>الوقت (غرينتش)</th><th>النوع</th><th>الاستراتيجية · الزوج</th><th>الخلاصة</th></tr></thead><tbody id="dc-rows"></tbody></table></div></div>
-  <div class="stack" id="dc-detail">${empty("اختر قرار من القائمة عشان تشوف سلسلته كاملة", "layers")}</div></div>`;
+  <div class="stack" id="dc-detail">${empty("اختر قرار من القائمة عشان تشوف سلسلته كاملة", "layers")}</div></div></div></div>`;
   const f = dcState.filters;
   ["source", "strategy", "symbol", "since", "until"].forEach((k) => { const el = $("#dc-" + k); el.value = f[k];
     el.onchange = () => { f[k] = el.value; dcLoad(); }; });
   const autoChip = $("#dc-auto"); const paintAuto = () => autoChip.classList.toggle("good", dcState.auto); paintAuto();
   autoChip.onclick = () => { dcState.auto = !dcState.auto; paintAuto(); };
-  await dcLoad();
+  // set before any await: a refresh timer set after leaving the page would replace the next page's timer
   timer = setInterval(() => { if (current === "decisions" && dcState.auto) dcLoad(true).catch(() => {}); }, 30000);
+  const tw = $("#dc-rows").closest(".tw");
+  tw.onscroll = () => { if (tw.scrollTop + tw.clientHeight >= tw.scrollHeight - 2 * tw.clientHeight) dcMore(); };
+  if (cached) {   // the last answer for exactly these filters, painted with the page; then asked again in the background
+    dcRender(dcState.data, false, dcState.sig);
+    if (dcState.selected) dcShow(dcState.selected, true);
+    dcLoad(true, true).catch(() => {});
+  } else await dcLoad();
 };
 
-async function dcLoad(quiet = false) {
-  const f = dcState.filters, q = new URLSearchParams();
-  ["source", "strategy", "symbol"].forEach((k) => { if (f[k]) q.set(k, f[k]); });
-  if (f.since) q.set("since", new Date(f.since + "Z").toISOString());
-  if (f.until) q.set("until", new Date(f.until + "Z").toISOString());
-  if (f.kinds.length) q.set("kinds", f.kinds.join(","));
-  if (dcState.reason) q.set("reason", dcState.reason);
-  q.set("limit", "400");
+async function dcLoad(quiet = false, revalidate = false) {
+  const key = dcQuery();
   let d;
-  try { d = await api("/api/decisions?" + q.toString()); } catch (e) { if (!quiet) $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; return; }
-  dcState.data = d;
+  try { d = await api("/api/decisions?" + key); } catch (e) {
+    if ((quiet && !revalidate) || current !== "decisions" || key !== dcQuery()) return;   // a failed background refresh, or a superseded request, leaves the page as it is
+    const wait = $("#dc-wait"), box = $("#dc-data");
+    if (wait) wait.innerHTML = errBox(e);                    // nothing drawn yet: the error takes the loading line's place
+    else if (revalidate && box) {                            // the painted answer was not confirmed: none of it stays on screen as if current
+      box.hidden = true; box.insertAdjacentHTML("beforebegin", `<div id="dc-wait">${errBox(e)}</div>`); dcState.drawn = null;
+    } else if ($("#dc-rows")) { $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; dcState.drawn = null; }   // never the old list as if fresh
+    return;
+  }
+  if (key !== dcQuery()) return;                            // the filters changed meanwhile: the newer request draws
+  const sig = JSON.stringify(d);
+  dcState.data = d; dcState.key = key; dcState.sig = sig;
   if (current !== "decisions" || !$("#dc-funnel")) return;   // the user moved to another page meanwhile
+  const shownNow = !$("#dc-data").hidden;                     // what is on THIS page now (dcState.drawn may describe an earlier visit)
+  if (quiet && shownNow && sig === dcState.drawn) return;     // nothing changed: the page is left untouched
+  dcRender(d, quiet && shownNow, sig);
+  if (dcState.selected && !quiet) dcShow(dcState.selected, true);
+}
+
+function dcRender(d, keepRows, sig) {
+  const f = dcState.filters;
   const fill = (id, opts, cur) => { const el = $(id); if (!el) return; el.innerHTML = `<option value="">الكل</option>` + opts.map(([v, t]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(t)}</option>`).join(""); };
   fill("#dc-source", d.facets.sources.map((s) => [s.id, s.label]), f.source);
   fill("#dc-strategy", d.facets.strategies.map((s) => [s, s]), f.strategy);
@@ -77,12 +119,22 @@ async function dcLoad(quiet = false) {
   kt.onclick = (e) => { const b = e.target.closest("button"); if (!b) return; const k = b.dataset.k;
     f.kinds = !k ? [] : f.kinds.includes(k) ? f.kinds.filter((x) => x !== k) : [...f.kinds, k]; dcState.reason = ""; dcLoad(); };
   $("#dc-total").textContent = d.total > d.items.length ? `أحدث ${d.items.length} من ${d.total}` : `${d.total}`;
-  $("#dc-rows").innerHTML = d.items.map((i) => `<tr data-dc="${esc(i.id)}" class="${i.id === dcState.selected ? "sel" : ""}" style="cursor:pointer">
-    <td class="ltr">${esc(i.at.slice(0, 16).replace("T", " "))}</td><td>${kindPill(i.kind)}</td>
-    <td><b>${esc(i.strategy)}</b> <span class="muted">· ${esc(i.symbol)} · ${esc(tfAr(i.timeframe))} · ${esc(({ paper: "ورقي", demo: "تجريبي", backtest: "اختبار" })[i.source.kind] || i.source.kind)}</span></td>
-    <td class="wrap">${esc(oneLine(i))}</td></tr>`).join("") || `<tr><td colspan="4">${empty("ما فيه قرارات بهالفلاتر. القرارات تظهر هنا بعد أول شمعة حيّة في جلسة ورقية، أو بعد اختبار «كامل عبر المحرك».", "layers")}</td></tr>`;
-  $("#dc-rows").onclick = (e) => { const tr = e.target.closest("tr[data-dc]"); if (!tr) return; dcShow(tr.dataset.dc); };
-  if (dcState.selected && !quiet) dcShow(dcState.selected, true);
+  const tb = $("#dc-rows"), tw = tb.closest(".tw"), top = keepRows ? tw.scrollTop : 0;
+  const n = Math.min(d.items.length, keepRows ? Math.max(DC_FIRST_ROWS, dcState.shown) : DC_FIRST_ROWS);   // a refresh keeps the rows (and the scroll) the owner had
+  tb.innerHTML = d.items.slice(0, n).map(dcRow).join("") || `<tr><td colspan="4">${empty("ما فيه قرارات بهالفلاتر. القرارات تظهر هنا بعد أول شمعة حيّة في جلسة ورقية، أو بعد اختبار «كامل عبر المحرك».", "layers")}</td></tr>`;
+  tw.scrollTop = top;
+  dcState.shown = n; dcState.drawn = sig;
+  tb.onclick = (e) => { const tr = e.target.closest("tr[data-dc]"); if (!tr) return; dcShow(tr.dataset.dc); };
+  const box = $("#dc-data");
+  if (box && box.hidden) { box.hidden = false; const wait = $("#dc-wait"); if (wait) wait.remove(); }   // the whole data area in one paint
+}
+
+function dcMore() {   // the next rows of the SAME answer that is on screen, appended while scrolling
+  const d = dcState.data, tb = $("#dc-rows");
+  if (!d || !tb || dcState.drawn !== dcState.sig || dcState.shown >= d.items.length) return;
+  const n = Math.min(d.items.length, dcState.shown + DC_FIRST_ROWS);
+  tb.insertAdjacentHTML("beforeend", d.items.slice(dcState.shown, n).map(dcRow).join(""));
+  dcState.shown = n;
 }
 const KIND_ORDER = ["entry", "exit", "rejected_risk", "rejected_validity", "blocked_safety", "missed", "no_entry", "keep", "other"];
 

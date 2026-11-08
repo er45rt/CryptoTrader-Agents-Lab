@@ -3,14 +3,16 @@
    Each card shows its own numbers with their source and time and loads on its own; numbers from different spaces are
    never added, netted or compared in one figure. */
 
-const DB = { space: "portfolio", spaces: {}, demo: null };
+const DB = { space: "portfolio", spaces: {}, demo: null, status: null };
 const DB_SPACES = [["portfolio", "محفظتي", "حقيقية"], ["demo", "التجريبي", "Demo"], ["paper", "التداول الورقي", "Paper"], ["backtest", "الاختبارات", "Backtest"]];
 const dbAt = (t) => (t ? String(t).slice(0, 16).replace("T", " ") : "—");
 
 PAGES.home = async () => {
   main.innerHTML = header("لوحة المتابعة", "كل مساحة مالية لحالها: محفظتك الحقيقية، والتجريبي، والورقي، والاختبارات. أرقامها ما تنجمع مع بعض أبدًا.",
     chip("التداول الحقيقي معطّل", "") + chip("بدون مفاتيح", ""))
-  + `<div id="db-status"></div>
+  // the status bar keeps its place from the first paint (owner 2026-11-08: it arrived last and pushed the page 61 px):
+  // the last answer, refreshed in place by dbStatus() just below, or a one-line placeholder of the same height
+  + `<div id="db-status">${DB.status ? dbStatusHtml(DB.status) : '<div class="stbar"><span class="pill">تحميل…</span></div>'}</div>
   <div class="spaces" id="db-spaces">${DB_SPACES.map(([k, t, s]) => `<button type="button" class="space sp-${k}" data-space="${k}">
     <small>${t} <span class="muted">· ${s}</span></small><b>…</b><span class="sp-sub"></span><span class="sp-src"></span></button>`).join("")}</div>
   <div class="card" id="db-detail">${loading("تحميل…")}</div>
@@ -167,12 +169,16 @@ const DB_ST_NAV = { paper: "paper", demo: "demo", prices: "portfolio", collector
 async function dbStatus() {
   const box = $("#db-status"); if (!box) return;
   let d; try { d = await api("/api/status"); } catch (e) { box.innerHTML = `<div class="stbar">${errBox(e)}</div>`; return; }
+  DB.status = d;
   if (current !== "home" || !$("#db-status")) return;
+  $("#db-status").innerHTML = dbStatusHtml(d);
+}
+function dbStatusHtml(d) {
   const order = { bad: 0, warn: 1, info: 2, ok: 3 }, tone = { bad: "bad", warn: "warn", info: "", ok: "good" };
   const items = [...d.items].sort((a, b) => order[a.level] - order[b.level]);
   const head = d.summary.bad ? `<span class="pill bad">${d.summary.bad} مشكلة</span>` : d.summary.warn ? `<span class="pill warn">${d.summary.warn} تنبيه</span>`
     : `<span class="pill good">كل شي سليم</span>`;
-  box.innerHTML = `<div class="stbar">${head}${items.map((i) => {
+  return `<div class="stbar">${head}${items.map((i) => {
     const nav = DB_ST_NAV[i.area], text = (DB_ST[i.code] || (() => i.code))(i);
     return `<span class="pill ${tone[i.level]}" ${nav ? `data-nav="${nav}" style="cursor:pointer"` : ""} title="${esc(i.detail || "")}">${esc(text)}</span>`; }).join("")}
     <span class="muted stbar-at">تحديث <span class="ltr">${esc(dbAt(d.at))}</span> غرينتش</span></div>`;
