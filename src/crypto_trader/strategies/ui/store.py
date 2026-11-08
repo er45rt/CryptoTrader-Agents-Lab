@@ -73,9 +73,24 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
-                             creationflags=NO_WINDOW)
-        return str(pid) in out.stdout
+        # ask Windows directly: starting tasklist cost ~260 ms per check, paid by the paper page, its detail view and
+        # every status-bar refresh (owner 2026-11-08: those pages appeared a fraction of a second late)
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenProcess(0x1000, False, int(pid))         # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5                   # access denied: it exists; anything else: gone
+        try:
+            code = wintypes.DWORD()
+            return bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True

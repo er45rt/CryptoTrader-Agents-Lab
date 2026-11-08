@@ -26,7 +26,7 @@ def test_the_paper_alive_check_hides_its_window_and_still_works(monkeypatch):
     monkeypatch.setattr(store.subprocess, "run", spy)
     assert store._pid_alive(os.getpid()) is True
     if os.name == "nt":
-        assert seen == [("tasklist", NO_WINDOW)] and NO_WINDOW != 0
+        assert seen == []                                     # since 2026-11-08 no program is started at all (no window)
 
 
 class _Run:
