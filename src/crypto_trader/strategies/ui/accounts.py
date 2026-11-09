@@ -346,6 +346,26 @@ def _manual_rows(t: dict[str, Any], sizes: list[Decimal | None], current: list[d
     return out
 
 
+def link_tls_context() -> "Any":
+    """The certificate rules of the link's HTTPS library (urllib3 create_urllib3_context, as used by requests), so the
+    diagnosis accepts exactly what the link accepts (Sol review 2026-11-09: a plain SSLContext still allowed the
+    Common Name fallback). Built by hand because urllib3 opens SSLKEYLOGFILE; this context never does."""
+    import ssl
+    import sys
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_COMPRESSION | ssl.OP_NO_TICKET
+    if sys.version_info >= (3, 13):
+        ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
+    if getattr(ctx, "post_handshake_auth", None) is not None:
+        ctx.post_handshake_auth = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    ctx.hostname_checks_common_name = False
+    return ctx
+
+
 def tls_diagnosis(host: str = "api.binance.com", timeout: float = 10.0, handshake: Any = None) -> str | None:
     """After a failed connection: the same certificate check the link's HTTPS library does (its own CA list, certifi),
     as a TLS handshake only - no request, no key. None when the certificate is trusted (the failure was something
@@ -361,7 +381,7 @@ def tls_diagnosis(host: str = "api.binance.com", timeout: float = 10.0, handshak
             return tls.getpeercert()
 
     handshake = handshake or live
-    strict = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)      # never reads SSLKEYLOGFILE
+    strict = link_tls_context()
     strict.load_verify_locations(cafile=certifi.where())
     try:
         handshake(strict)

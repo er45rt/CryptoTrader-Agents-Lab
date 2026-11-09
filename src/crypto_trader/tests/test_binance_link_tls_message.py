@@ -78,3 +78,19 @@ def test_without_a_certificate_reason_the_original_message_stays(tmp_path):
         link = _link(tmp_path, TransportError("x"), check)
         with pytest.raises(StrategyError, match="تعذّر الاتصال بـ Binance — TransportError"):
             link.connect("A" * 64, "B" * 64, pin_set=True)
+
+
+# Sol High review 2026-11-09: a plain SSLContext still allowed the Common Name fallback that the link's library
+# (urllib3) disables, so a CN-only certificate could pass the diagnosis although the link rejects it.
+def test_the_diagnosis_uses_exactly_the_link_librarys_certificate_rules(monkeypatch):
+    from urllib3.util.ssl_ import create_urllib3_context
+
+    monkeypatch.delenv("SSLKEYLOGFILE", raising=False)
+    mine, link = accounts.link_tls_context(), create_urllib3_context()
+    for k in ("minimum_version", "maximum_version", "options", "verify_flags", "verify_mode", "check_hostname",
+              "hostname_checks_common_name", "post_handshake_auth"):
+        assert getattr(mine, k) == getattr(link, k), k
+    assert mine.hostname_checks_common_name is False and mine.keylog_filename is None
+    hs, seen = _calls({"issuer": ()})
+    accounts.tls_diagnosis(handshake=hs)
+    assert seen[0].hostname_checks_common_name is False                 # the context the diagnosis really used
