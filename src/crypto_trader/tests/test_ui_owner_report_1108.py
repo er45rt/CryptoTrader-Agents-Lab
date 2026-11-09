@@ -293,3 +293,20 @@ def test_sol_4_5_leaving_demo_or_paper_while_it_loads_never_draws_over_the_next_
     paper = APP[APP.index("PAGES.paper = async () => {"):APP.index("let shownSession")]
     i = paper.index("const preDetail = pick ?")
     assert paper.index('if (current !== "paper") return;', i) < paper.index("main.innerHTML =")
+
+
+# Review backlog (2026-11-08 adversarial review, finding 7): a date the browser accepts but Date cannot read (e.g. a
+# 5-digit year) made dcQuery throw: the old list stayed and returning to the page broke it until a reload.
+def test_an_unreadable_date_is_refused_at_the_filter_and_never_breaks_the_query():
+    code = DEC[DEC.index("function dcIso(v)"):DEC.index("const dcRow")]
+    js = """const dcState = { filters: { source: "", strategy: "", symbol: "", since: "20260-01-01T00:00", until: "2026-13-01T00:00",
+      kinds: [] }, reason: "" };\n""" + code + """
+console.log(JSON.stringify({ q: dcQuery(), ok: dcIso("2026-01-05T10:00"), bad: [dcIso("20260-01-01T00:00"), dcIso(""), dcIso("x")] }));"""
+    out = json.loads(subprocess.run([_node(), "-e", js], capture_output=True, text=True, encoding="utf-8", timeout=60,
+                                    check=True).stdout.strip().splitlines()[-1])
+    assert out == {"q": "limit=400", "ok": "2026-01-05T10:00:00.000Z", "bad": [None, None, None]}
+    page = DEC[DEC.index("PAGES.decisions = async () => {"):DEC.index("async function dcLoad")]
+    refuse = page[page.index('if ((k === "since" || k === "until") && el.value && !dcIso(el.value)) {'):]
+    refuse = refuse[:refuse.index("return;")]
+    assert "el.value = f[k];" in refuse and '$("#dc-msg").innerHTML' in refuse and "dcLoad" not in refuse
+    assert '<div id="dc-msg"></div>' in page

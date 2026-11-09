@@ -34,11 +34,19 @@ const dcState = { filters: { source: "", strategy: "", symbol: "", since: "", un
    data area appears complete in one paint; a repeat visit paints the last answer for the SAME filters at once and asks
    again in the background; an unchanged refresh leaves the page untouched. */
 const DC_FIRST_ROWS = 50;
+/* a typed date the browser accepts but Date cannot read (e.g. a 5-digit year) threw here and broke the page until a
+   reload (Sol review 2026-11-08, finding 7): an unreadable date is refused at the filter and never reaches a query */
+function dcIso(v) {
+  if (!v) return null;
+  const d = new Date(v + "Z");
+  if (Number.isNaN(d.getTime())) return null;
+  try { return d.toISOString(); } catch (e) { return null; }
+}
 function dcQuery() {   // the exact query for the filters on screen
   const f = dcState.filters, q = new URLSearchParams();
   ["source", "strategy", "symbol"].forEach((k) => { if (f[k]) q.set(k, f[k]); });
-  if (f.since) q.set("since", new Date(f.since + "Z").toISOString());
-  if (f.until) q.set("until", new Date(f.until + "Z").toISOString());
+  if (dcIso(f.since)) q.set("since", dcIso(f.since));
+  if (dcIso(f.until)) q.set("until", dcIso(f.until));
   if (f.kinds.length) q.set("kinds", f.kinds.join(","));
   if (dcState.reason) q.set("reason", dcState.reason);
   q.set("limit", "400");
@@ -60,7 +68,7 @@ PAGES.decisions = async () => {
     <div><label>الزوج</label><select id="dc-symbol"><option value="">الكل</option></select></div>
     <div><label>من</label><input id="dc-since" type="datetime-local"></div>
     <div><label>إلى</label><input id="dc-until" type="datetime-local"></div>
-  </div><div class="actions"><div class="tabs" id="dc-kinds"></div></div></div>
+  </div><div id="dc-msg"></div><div class="actions"><div class="tabs" id="dc-kinds"></div></div></div>
   ${cached ? "" : `<div id="dc-wait">${loading("تحميل…")}</div>`}<div id="dc-data"${cached ? "" : " hidden"}>
   <div class="card" id="dc-funnel"></div>
   <div class="card" id="dc-reasons"></div>
@@ -69,7 +77,11 @@ PAGES.decisions = async () => {
   <div class="stack" id="dc-detail">${empty("اختر قرار من القائمة عشان تشوف سلسلته كاملة", "layers")}</div></div></div></div>`;
   const f = dcState.filters;
   ["source", "strategy", "symbol", "since", "until"].forEach((k) => { const el = $("#dc-" + k); el.value = f[k];
-    el.onchange = () => { f[k] = el.value; dcLoad(); }; });
+    el.onchange = () => {
+      if ((k === "since" || k === "until") && el.value && !dcIso(el.value)) {   // refused: the filter on screen stays the applied one
+        el.value = f[k]; $("#dc-msg").innerHTML = `<div class="err">${esc("تاريخ غير صحيح؛ اكتبه مثل 2026-01-05 10:00.")}</div>`; return;
+      }
+      $("#dc-msg").innerHTML = ""; f[k] = el.value; dcLoad(); }; });
   const autoChip = $("#dc-auto"); const paintAuto = () => autoChip.classList.toggle("good", dcState.auto); paintAuto();
   autoChip.onclick = () => { dcState.auto = !dcState.auto; paintAuto(); };
   // set before any await: a refresh timer set after leaving the page would replace the next page's timer
