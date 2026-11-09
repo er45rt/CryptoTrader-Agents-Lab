@@ -1,5 +1,12 @@
 # CryptoTrader Documentation
 
+> **ملاحظة التحميل والتشغيل (Download & run)**
+>
+> - المتطلبات: **Python 3.12 بالضبط** (المشروع لا يقبل 3.13)، وأداة **uv**.
+> - بعد التحميل: `uv sync` ثم `uv run python -m crypto_trader.strategies.ui.launcher --install` لإنشاء اختصار CryptoTrader على سطح المكتب.
+> - البيانات والإعدادات التي تتكوّن وقت التشغيل **ليست في GitHub**: جلسات التداول الورقي، ورقم الدخول (PIN)، وربط Binance. على أي جهاز جديد يُعاد ربط Binance بمفتاح **قراءة فقط**.
+> - Requirements: Python 3.12 exactly (3.13 is not supported) and uv. Run-time data (paper sessions, PIN, Binance link) is not in this repository; on a new machine link Binance again with a read-only key.
+
 ## Overview
 
 CryptoTrader is an AI-driven cryptocurrency trading plan generator powered by [crewAI](https://crewai.com). The system employs multiple AI agents that collaborate to analyze cryptocurrency market data, research news and sentiment, and develop actionable trading strategies.
