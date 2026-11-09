@@ -239,3 +239,57 @@ def test_the_dashboard_is_drawn_once_with_its_spaces_but_never_held_by_a_slow_on
     assert i_wait < home.index("main.innerHTML =")
     assert 'if (!drawn || current !== "home" || DB.visit !== visit) return;' in home      # later spaces fill their own card
     assert "DB_SPACES.forEach(([k]) => dbCard(k));" in home and home.index("main.innerHTML =") < home.rindex("dbDetail();")   # the drawn page's detail; the first one is the late-space callback
+
+
+# Sol High review 2026-11-09 of W1..G2 (FAIL, 5 blocking findings) - each reproduced here.
+def test_sol_1_an_exited_process_with_exit_code_259_is_not_alive():
+    import os
+    import sys
+
+    from crypto_trader.strategies.ui import store
+
+    if os.name != "nt":
+        pytest.skip("the Windows path")
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(259)"])   # its handle stays open in this process
+    assert child.wait(30) == 259
+    assert store._pid_alive(child.pid) is False                       # exit code 259 is STILL_ACTIVE's value
+
+
+def test_sol_2_an_older_status_answer_never_overwrites_a_newer_one():
+    body = DASH[DASH.index("async function dbStatus"):DASH.index("function dbStatusHtml")]
+    js = r"""
+let current = "home"; const els = { "db-status": { innerHTML: "", isConnected: true } };
+const $ = (s) => els[s.replace("#", "")] || null; const errBox = (e) => "ERR";
+const DB = { status: null }; const dbStatusHtml = (d) => "BAR:" + d.v;
+const resolvers = []; const api = () => new Promise((r) => resolvers.push(r));
+""" + body + r"""
+(async () => {
+  const a = dbStatus(), b = dbStatus();          // an older request (a) and a newer one (b)
+  resolvers[1]({ v: "new" }); await b;
+  resolvers[0]({ v: "old" }); await a;           // the older answer lands last
+  console.log(JSON.stringify({ bar: els["db-status"].innerHTML, kept: DB.status.v }));
+})();"""
+    out = subprocess.run([_node(), "-e", js], capture_output=True, text=True, encoding="utf-8", timeout=60, check=True)
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {"bar": "BAR:new", "kept": "new"}
+
+
+def test_sol_3_an_earlier_visits_failed_check_never_hides_a_newer_visit():
+    got = _run("""
+      fresh(false); dcState.visit = 1;
+      let failOld; hook = () => new Promise((_, rej) => { failOld = rej; });
+      const old = dcLoad(true, true);                       // visit 1: cached paint, its background check hangs
+      fresh(false); dcState.visit = 2;                      // the owner leaves and comes back: visit 2, same filters
+      hook = async () => answer(400, "new"); await dcLoad(true, true);
+      failOld(new Error("down")); await old;                // the earlier check fails last
+      console.log(JSON.stringify({ hidden: els["dc-data"].hidden, wait: !!els["dc-wait"], rows: rows() }));""")
+    assert got == {"hidden": False, "wait": False, "rows": 50}
+
+
+def test_sol_4_5_leaving_demo_or_paper_while_it_loads_never_draws_over_the_next_page():
+    demo = (STATIC / "demo.js").read_text(encoding="utf-8")
+    page = demo[demo.index("PAGES.demo = async () => {"):demo.index("async function demoDraw")]
+    i = page.index("const pre = demoState.active ? await api(")
+    assert page.index('if (current !== "demo") return;', i) < page.index("main.innerHTML =")
+    paper = APP[APP.index("PAGES.paper = async () => {"):APP.index("let shownSession")]
+    i = paper.index("const preDetail = pick ?")
+    assert paper.index('if (current !== "paper") return;', i) < paper.index("main.innerHTML =")

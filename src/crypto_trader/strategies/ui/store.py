@@ -81,14 +81,15 @@ def _pid_alive(pid: int) -> bool:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         k32.OpenProcess.restype = wintypes.HANDLE
-        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = k32.OpenProcess(0x1000, False, int(pid))         # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = k32.OpenProcess(0x00100000 | 0x1000, False, int(pid))   # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return ctypes.get_last_error() == 5                   # access denied: it exists; anything else: gone
         try:
-            code = wintypes.DWORD()
-            return bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+            # alive = not yet signalled; an exit code of 259 (STILL_ACTIVE) can also be a real exit code (Sol review)
+            return k32.WaitForSingleObject(handle, 0) == 0x102    # WAIT_TIMEOUT
         finally:
             k32.CloseHandle(handle)
     try:

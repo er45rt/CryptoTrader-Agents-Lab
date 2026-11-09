@@ -13,6 +13,7 @@ PAGES.demo = async () => {
   // the live demo's data comes with the page's, so the page is drawn once, complete (owner 2026-11-08: the live card
   // arrived ~70 ms after the page and pushed everything below it down)
   const pre = demoState.active ? await api("/api/demo/session?name=" + encodeURIComponent(demoState.active)).catch(() => null) : null;
+  if (current !== "demo") return;                    // the owner moved on while it loaded: never draw over that page (Sol review)
   main.innerHTML = header("الوضع التجريبي", "تجربة كاملة بدون فلوس وبدون إنترنت: أسعار تاريخية حقيقية من ملفاتك تُعاد شمعة شمعة عبر نفس المحرك، وكل قرار يروح لمركز القرارات.",
     chip("بدون إنترنت", "good") + chip("ما ينرسل أي أمر", "") + chip("قبل 2025-09-07 فقط", ""))
   + `<div id="demo-live"></div>

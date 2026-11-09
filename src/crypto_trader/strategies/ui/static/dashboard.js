@@ -184,10 +184,13 @@ const DB_ST_AREA = { paper: "الجلسات الورقية", demo: "الجلسا
 const DB_ST_NAV = { paper: "paper", demo: "demo", prices: "portfolio", collector: "system", dca: "dca", errors: "logs" };
 async function dbStatus() {
   const box = $("#db-status"); if (!box) return;
-  let d; try { d = await api("/api/status"); } catch (e) { box.innerHTML = `<div class="stbar">${errBox(e)}</div>`; return; }
+  const seq = DB.statusSeq = (DB.statusSeq || 0) + 1;   // only the newest request writes (Sol review: an older answer overwrote a newer one)
+  let d; try { d = await api("/api/status"); } catch (e) {
+    if (seq === DB.statusSeq && box.isConnected) box.innerHTML = `<div class="stbar">${errBox(e)}</div>`; return; }
+  if (seq !== DB.statusSeq) return;
   DB.status = d;
-  if (current !== "home" || !$("#db-status")) return;
-  $("#db-status").innerHTML = dbStatusHtml(d);
+  if (current !== "home" || !box.isConnected) return;
+  box.innerHTML = dbStatusHtml(d);
 }
 function dbStatusHtml(d) {
   const order = { bad: 0, warn: 1, info: 2, ok: 3 }, tone = { bad: "bad", warn: "warn", info: "", ok: "good" };

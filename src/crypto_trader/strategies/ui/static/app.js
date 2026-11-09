@@ -480,6 +480,7 @@ PAGES.paper = async () => {
   // detail arrived ~40 ms after the page and pushed the "new session" card down)
   const pick = d.sessions.find((s) => s.name === shownSession) || d.sessions.find((s) => s.running) || d.sessions[0];
   const preDetail = pick ? { name: pick.name, d: await api("/api/paper/session?name=" + encodeURIComponent(pick.name)).catch(() => null) } : null;
+  if (current !== "paper") return;                   // the owner moved on while it loaded: never draw over that page (Sol review)
   const pre = sessionStorage.getItem("spec") || "";
   const run = d.sessions.filter((s) => s.running).length;
   main.innerHTML = header("التداول الورقي", "تشغيل الاستراتيجية على الأسعار الحية بدون فلوس حقيقية", chip(`${run} تعمل`, run ? "good" : "") + chip("Binance عامة · بدون مفاتيح", ""))

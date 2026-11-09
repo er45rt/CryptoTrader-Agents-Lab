@@ -50,6 +50,7 @@ const dcRow = (i) => `<tr data-dc="${esc(i.id)}" class="${i.id === dcState.selec
     <td class="wrap">${esc(oneLine(i))}</td></tr>`;
 
 PAGES.decisions = async () => {
+  dcState.visit = (dcState.visit || 0) + 1;   // answers and errors of an earlier visit never touch this one (Sol review)
   const cached = !!dcState.data && dcState.key === dcQuery();
   main.innerHTML = `<div class="no-anim">` + header("مركز القرارات", "ليش دخلت الاستراتيجية أو ما دخلت أو طلعت، ومن قرّر كل خطوة. كل شي هنا من سجلات المحرك وقت القرار.",
     chip("الذكاء الاصطناعي: غير مشارك في هذا المحرك", "") + `<span class="chip" style="cursor:pointer" id="dc-auto"><i></i>تحديث تلقائي</span>`)
@@ -83,10 +84,10 @@ PAGES.decisions = async () => {
 };
 
 async function dcLoad(quiet = false, revalidate = false) {
-  const key = dcQuery();
+  const key = dcQuery(), visit = dcState.visit;
   let d;
   try { d = await api("/api/decisions?" + key); } catch (e) {
-    if ((quiet && !revalidate) || current !== "decisions" || key !== dcQuery()) return;   // a failed background refresh, or a superseded request, leaves the page as it is
+    if ((quiet && !revalidate) || current !== "decisions" || key !== dcQuery() || visit !== dcState.visit) return;   // a failed background refresh, or a superseded request, leaves the page as it is
     const wait = $("#dc-wait"), box = $("#dc-data");
     if (wait) wait.innerHTML = errBox(e);                    // nothing drawn yet: the error takes the loading line's place
     else if (revalidate && box) {                            // the painted answer was not confirmed: none of it stays on screen as if current
@@ -94,7 +95,7 @@ async function dcLoad(quiet = false, revalidate = false) {
     } else if ($("#dc-rows")) { $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; dcState.drawn = null; }   // never the old list as if fresh
     return;
   }
-  if (key !== dcQuery()) return;                            // the filters changed meanwhile: the newer request draws
+  if (key !== dcQuery() || visit !== dcState.visit) return;  // the filters or the visit changed meanwhile: the newer request draws
   const sig = JSON.stringify(d);
   dcState.data = d; dcState.key = key; dcState.sig = sig;
   if (current !== "decisions" || !$("#dc-funnel")) return;   // the user moved to another page meanwhile
