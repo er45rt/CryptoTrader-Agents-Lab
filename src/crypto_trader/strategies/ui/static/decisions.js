@@ -97,13 +97,17 @@ PAGES.decisions = async () => {
 
 async function dcLoad(quiet = false, revalidate = false) {
   const key = dcQuery(), visit = dcState.visit;
+  // a filter change: what is on screen belongs to the previous filters until the new answer is drawn - shown dimmed,
+  // never as the answer for the new filters (Sol review 2026-11-09)
+  const busy = !quiet && $("#dc-data");
+  if (busy && !busy.hidden) busy.classList.add("dc-busy");
   let d;
   try { d = await api("/api/decisions?" + key); } catch (e) {
     if ((quiet && !revalidate) || current !== "decisions" || key !== dcQuery() || visit !== dcState.visit) return;   // a failed background refresh, or a superseded request, leaves the page as it is
     const wait = $("#dc-wait"), box = $("#dc-data");
     if (wait) wait.innerHTML = errBox(e);                    // nothing drawn yet: the error takes the loading line's place
-    else if (revalidate && box) {                            // the painted answer was not confirmed: none of it stays on screen as if current
-      box.hidden = true; box.insertAdjacentHTML("beforebegin", `<div id="dc-wait">${errBox(e)}</div>`); dcState.drawn = null;
+    else if (box) {                                          // the answer on screen is not confirmed for these filters: none of it stays
+      box.hidden = true; box.classList.remove("dc-busy"); box.insertAdjacentHTML("beforebegin", `<div id="dc-wait">${errBox(e)}</div>`); dcState.drawn = null;
     } else if ($("#dc-rows")) { $("#dc-rows").innerHTML = `<tr><td colspan="4">${errBox(e)}</td></tr>`; dcState.drawn = null; }   // never the old list as if fresh
     return;
   }
@@ -139,6 +143,7 @@ function dcRender(d, keepRows, sig) {
   dcState.shown = n; dcState.drawn = sig;
   tb.onclick = (e) => { const tr = e.target.closest("tr[data-dc]"); if (!tr) return; dcShow(tr.dataset.dc); };
   const box = $("#dc-data");
+  if (box) box.classList.remove("dc-busy");
   if (box && box.hidden) { box.hidden = false; const wait = $("#dc-wait"); if (wait) wait.remove(); }   // the whole data area in one paint
 }
 

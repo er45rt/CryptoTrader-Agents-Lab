@@ -53,7 +53,8 @@ def test_only_the_first_rows_are_built_on_open():
 
 HARNESS = r"""
 class El { constructor(id) { this.id = id; this._h = ""; this.writes = 0; this.hidden = false; this.scrollTop = 0;
-    this.textContent = ""; this.onclick = null; this.value = ""; }
+    this.textContent = ""; this.onclick = null; this.value = ""; const c = new Set();
+    this.classList = { add: (x) => c.add(x), remove: (x) => c.delete(x), contains: (x) => c.has(x) }; }
   get innerHTML() { return this._h; } set innerHTML(v) { this._h = v; this.writes++; }
   insertAdjacentHTML(pos, h) {
     if (pos === "beforebegin") { const id = h.match(/id="([^"]+)"/)[1]; els[id] = new El(id); els[id]._h = h; return; }   // a new sibling
@@ -310,3 +311,23 @@ console.log(JSON.stringify({ q: dcQuery(), ok: dcIso("2026-01-05T10:00"), bad: [
     refuse = refuse[:refuse.index("return;")]
     assert "el.value = f[k];" in refuse and '$("#dc-msg").innerHTML' in refuse and "dcLoad" not in refuse
     assert '<div id="dc-msg"></div>' in page
+
+
+# Sol High review 2026-11-09 of item 4: after a filter change the previous answer stayed on screen as current while the
+# new one loaded, and only the table became an error when it failed (the funnel, reasons and detail stayed).
+def test_after_a_filter_change_the_old_answer_is_dimmed_and_a_failure_removes_all_of_it():
+    got = _run("""
+      fresh(false); hook = async () => answer(400, "a"); await dcLoad();
+      let fail; hook = () => new Promise((_, rej) => { fail = rej; });
+      dcState.filters.symbol = "ETHUSDT";
+      const pending = dcLoad();                              // the owner changed a filter
+      const dimmed = els["dc-data"].classList.contains("dc-busy");
+      fail(new Error("down")); await pending;
+      const failed = { hidden: els["dc-data"].hidden, err: els["dc-wait"] ? els["dc-wait"]._h : null,
+        busy: els["dc-data"].classList.contains("dc-busy") };
+      hook = async () => answer(400, "b"); await dcLoad();   // the next answer for the filters on screen
+      console.log(JSON.stringify({ dimmed, ...failed, back: !els["dc-data"].hidden && !els["dc-wait"],
+        busyAfter: els["dc-data"].classList.contains("dc-busy") }));""")
+    assert got == {"dimmed": True, "hidden": True, "err": '<div id="dc-wait">ERR:down</div>', "busy": False,
+                   "back": True, "busyAfter": False}
+    assert ".dc-busy{opacity:.45;pointer-events:none}" in CSS

@@ -218,6 +218,7 @@ canvas{direction:ltr}
 /* decision center (D31) */
 .dc-cols{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);align-items:start}
 .dc-cols .stack{position:sticky;top:14px}
+.dc-busy{opacity:.45;pointer-events:none}   /* answer of the previous filters while the new one loads */
 .dc-sum{font-size:15px;font-weight:600}
 .dc-steps{position:relative;margin-top:14px;display:grid;gap:0}
 .dc-step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;position:relative;padding-bottom:14px}
