@@ -1064,5 +1064,11 @@
 "مقابل عملة غير": "Against a currency other than",
 "المزامنة تقرأ كل أسواق عملاتك (الحالية والمسجّلة في محفظتك) مقابل": "Sync reads every market of your coins (current and recorded in your portfolio) against",
 "وغيرها.": "and others.",
-"ما يعطي قائمة بالعملات اللي تداولتها سابقًا، فالعملة اللي بعتها بالكامل وما هي في محفظتك اكتبها هنا": "gives no list of the coins you traded before, so type here any coin you sold completely that is not in your portfolio"
+"ما يعطي قائمة بالعملات اللي تداولتها سابقًا، فالعملة اللي بعتها بالكامل وما هي في محفظتك اكتبها هنا": "gives no list of the coins you traded before, so type here any coin you sold completely that is not in your portfolio",
+"شهادة الاتصال بـ": "The connection certificate for",
+"ما تحققت: غالبًا برنامج حماية يفحص اتصالات": "could not be verified: most likely a security program is scanning",
+"أضف": "Add",
+"إلى استثناءات فحص": "to the",
+"فيه ثم أعد المحاولة.": "scanning exceptions there, then try again.",
+"الشهادة صادرة من": "The certificate was issued by"
 }

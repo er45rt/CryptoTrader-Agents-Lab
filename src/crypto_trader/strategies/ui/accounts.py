@@ -62,8 +62,10 @@ def _dec(x: Any) -> Decimal:
 class BinanceLink:
     def __init__(self, root: Path, *, vault: Vault | None = None,
                  client_factory: Callable[[MainnetReadOnlyCredentials], Any] = real_client,
-                 prices: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None) -> None:
+                 prices: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
+                 tls_check: Callable[[], str | None] | None = None) -> None:
         self.dir = Path(root) / "accounts"
+        self._tls_check = tls_check or tls_diagnosis
         self.vault = vault or Vault(root)
         self._client = client_factory
         self._prices = prices
@@ -92,7 +94,13 @@ class BinanceLink:
         elif isinstance(exc, (StrategyError, MainnetError)):
             msg = str(exc)
         else:
-            msg = "تعذّر الاتصال بـ Binance — " + type(exc).__name__
+            hint = None
+            if type(exc).__name__ in ("TransportError", "PreSendTransportError", "SSLError"):
+                try:
+                    hint = self._tls_check()                 # the transport hides its cause; check the certificate itself
+                except Exception:  # noqa: BLE001 - a diagnosis never replaces the original error
+                    hint = None
+            msg = hint or "تعذّر الاتصال بـ Binance — " + type(exc).__name__
         doc = self._state()
         doc.update(last_error=msg[:400], last_error_at=_now())
         self._save_state(doc)
@@ -336,6 +344,43 @@ def _manual_rows(t: dict[str, Any], sizes: list[Decimal | None], current: list[d
         if gap <= DUP_WINDOW_S and any(abs(qty - x) <= x * DUP_QTY_TOL for x in sizes):
             out.append(i)
     return out
+
+
+def tls_diagnosis(host: str = "api.binance.com", timeout: float = 10.0, handshake: Any = None) -> str | None:
+    """After a failed connection: the same certificate check the link's HTTPS library does (its own CA list, certifi),
+    as a TLS handshake only - no request, no key. None when the certificate is trusted (the failure was something
+    else); otherwise an explanation naming who issued the certificate presented, read from the Windows store side
+    (owner 2026-11-09: Avast's HTTPS scanning re-signed api.binance.com and the link showed only "TransportError")."""
+    import socket
+    import ssl
+
+    import certifi
+
+    def live(ctx: ssl.SSLContext) -> dict[str, Any]:
+        with socket.create_connection((host, 443), timeout=timeout) as raw, ctx.wrap_socket(raw, server_hostname=host) as tls:
+            return tls.getpeercert()
+
+    handshake = handshake or live
+    strict = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)      # never reads SSLKEYLOGFILE
+    strict.load_verify_locations(cafile=certifi.where())
+    try:
+        handshake(strict)
+        return None
+    except ssl.SSLCertVerificationError:
+        pass
+    except OSError:
+        return None                                          # no connection at all: not a certificate question
+    issuer = None
+    try:
+        store = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        store.load_default_certs(ssl.Purpose.SERVER_AUTH)
+        names = dict(x[0] for x in handshake(store).get("issuer", ()))
+        issuer = names.get("organizationName") or names.get("commonName")
+    except (OSError, ValueError):
+        pass
+    msg = ("شهادة الاتصال بـ Binance ما تحققت: غالبًا برنامج حماية يفحص اتصالات HTTPS. "
+           "أضف api.binance.com إلى استثناءات فحص HTTPS فيه ثم أعد المحاولة.")
+    return msg + (f" الشهادة صادرة من: {issuer}" if issuer else "")
 
 
 def _trade_row(symbol: str, asset: str, quote: str, t: Any) -> dict[str, Any]:
